@@ -175,9 +175,59 @@ class SupabaseDB:
     def create_tables(self):
         """Create necessary tables if they don't exist"""
         try:
+            # Check if candle_data table exists
             self.client.table('candle_data').select('id').limit(1).execute()
-        except:
-            st.info("Database tables may need to be created. Please run the SQL setup first.")
+        except Exception as e:
+            st.warning("Database tables may need to be created. Please run the SQL setup first.")
+            st.code("""
+            -- SQL to create the tables in Supabase:
+            
+            -- 1. Create candle_data table
+            CREATE TABLE IF NOT EXISTS candle_data (
+                id BIGSERIAL PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                timestamp BIGINT NOT NULL,
+                datetime TIMESTAMP WITH TIME ZONE NOT NULL,
+                open DOUBLE PRECISION NOT NULL,
+                high DOUBLE PRECISION NOT NULL,
+                low DOUBLE PRECISION NOT NULL,
+                close DOUBLE PRECISION NOT NULL,
+                volume BIGINT NOT NULL,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                UNIQUE(symbol, exchange, timeframe, timestamp)
+            );
+            
+            -- 2. Create user_preferences table
+            CREATE TABLE IF NOT EXISTS user_preferences (
+                id BIGSERIAL PRIMARY KEY,
+                user_id TEXT UNIQUE NOT NULL,
+                timeframe TEXT,
+                auto_refresh BOOLEAN DEFAULT true,
+                days_back INTEGER DEFAULT 1,
+                pivot_settings JSONB DEFAULT '{}',
+                pivot_proximity INTEGER DEFAULT 5,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+            );
+            
+            -- 3. Create market_analytics table
+            CREATE TABLE IF NOT EXISTS market_analytics (
+                id BIGSERIAL PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                date DATE NOT NULL,
+                day_high DOUBLE PRECISION,
+                day_low DOUBLE PRECISION,
+                day_open DOUBLE PRECISION,
+                day_close DOUBLE PRECISION,
+                total_volume BIGINT,
+                avg_price DOUBLE PRECISION,
+                price_change DOUBLE PRECISION,
+                price_change_pct DOUBLE PRECISION,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+                UNIQUE(symbol, date)
+            );
+            """, language='sql')
     
     def save_candle_data(self, symbol, exchange, timeframe, df):
         """Save candle data to Supabase"""
@@ -207,7 +257,10 @@ class SupabaseDB:
             ).execute()
             
         except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
+            # Check if it's a column error
+            if "column" in str(e) and "does not exist" in str(e):
+                st.error(f"Database column error. Please create the tables with the SQL provided above. Error: {e}")
+            elif "23505" not in str(e) and "duplicate key" not in str(e).lower():
                 st.error(f"Error saving candle data: {str(e)}")
     
     def get_candle_data(self, symbol, exchange, timeframe, hours_back=24):
@@ -232,6 +285,9 @@ class SupabaseDB:
                 return pd.DataFrame()
                 
         except Exception as e:
+            # If column doesn't exist, return empty dataframe
+            if "column" in str(e) and "does not exist" in str(e):
+                return pd.DataFrame()
             st.error(f"Error retrieving candle data: {str(e)}")
             return pd.DataFrame()
     
@@ -301,6 +357,17 @@ class SupabaseDB:
                 }
                 
         except Exception as e:
+            # If table doesn't exist, return defaults
+            if "relation" in str(e) and "does not exist" in str(e):
+                return {
+                    'timeframe': '5', 
+                    'auto_refresh': True, 
+                    'days_back': 1,
+                    'pivot_proximity': 5,
+                    'pivot_settings': {
+                        'show_3m': True, 'show_5m': True, 'show_10m': True, 'show_15m': True
+                    }
+                }
             st.error(f"Error retrieving preferences: {str(e)}")
             return {
                 'timeframe': '5', 
@@ -336,7 +403,10 @@ class SupabaseDB:
             ).execute()
             
         except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
+            # Check if it's a column error
+            if "column" in str(e) and "does not exist" in str(e):
+                st.error(f"Database column error. Please create the tables with the SQL provided above. Error: {e}")
+            elif "23505" not in str(e) and "duplicate key" not in str(e).lower():
                 st.error(f"Error saving analytics: {str(e)}")
     
     def get_market_analytics(self, symbol, days_back=30):
@@ -357,6 +427,9 @@ class SupabaseDB:
                 return pd.DataFrame()
                 
         except Exception as e:
+            # If table doesn't exist, return empty dataframe
+            if "relation" in str(e) and "does not exist" in str(e):
+                return pd.DataFrame()
             st.error(f"Error retrieving analytics: {str(e)}")
             return pd.DataFrame()
 
@@ -1045,7 +1118,12 @@ def display_metrics(ltp_data, df, db, symbol="NIFTY50"):
                 'price_change': float(change),
                 'price_change_pct': float(change_pct)
             }
-            db.save_market_analytics(symbol, analytics_data)
+            
+            # Try to save analytics, but continue if it fails
+            try:
+                db.save_market_analytics(symbol, analytics_data)
+            except:
+                pass  # Continue without analytics
             
             col1, col2, col3, col4, col5 = st.columns(5)
             
@@ -1604,7 +1682,10 @@ def main():
                     
                     if data:
                         df = process_candle_data(data, interval)
-                        db.save_candle_data("NIFTY50", "IDX_I", interval, df)
+                        try:
+                            db.save_candle_data("NIFTY50", "IDX_I", interval, df)
+                        except:
+                            pass  # Continue without saving to database
         else:
             # Always fetch fresh data when not using cache
             with st.spinner("Fetching fresh data from API..."):
@@ -1618,7 +1699,10 @@ def main():
                 
                 if data:
                     df = process_candle_data(data, interval)
-                    db.save_candle_data("NIFTY50", "IDX_I", interval, df)
+                    try:
+                        db.save_candle_data("NIFTY50", "IDX_I", interval, df)
+                    except:
+                        pass  # Continue without saving to database
         
         # Get LTP data and current price
         ltp_data = api.get_ltp_data("13", "IDX_I")
