@@ -1400,6 +1400,7 @@ def analyze_option_chain(selected_expiry=None):
         if 'ce' in strike_data:
             ce_data = strike_data['ce']
             ce_data['strikePrice'] = float(strike)
+            # Handle Dhan API field names - they use underscores
             calls.append(ce_data)
         if 'pe' in strike_data:
             pe_data = strike_data['pe']
@@ -1408,36 +1409,70 @@ def analyze_option_chain(selected_expiry=None):
     
     df_ce = pd.DataFrame(calls)
     df_pe = pd.DataFrame(puts)
-    df = pd.merge(df_ce, df_pe, on='strikePrice', suffixes=('_CE', '_PE')).sort_values('strikePrice')
-
-    column_mapping = {
-        'last_price': 'lastPrice',
-        'oi': 'openInterest',
-        'previous_oi': 'previousOpenInterest',
-        'top_ask_quantity': 'askQty',
-        'top_bid_quantity': 'bidQty',
-        'volume': 'totalTradedVolume'
-    }
-    for old_col, new_col in column_mapping.items():
-        if f"{old_col}_CE" in df.columns:
-            df.rename(columns={f"{old_col}_CE": f"{new_col}_CE"}, inplace=True)
-        if f"{old_col}_PE" in df.columns:
-            df.rename(columns={f"{old_col}_PE": f"{new_col}_PE"}, inplace=True)
     
-    df['changeinOpenInterest_CE'] = df['openInterest_CE'] - df['previousOpenInterest_CE']
-    df['changeinOpenInterest_PE'] = df['openInterest_PE'] - df['previousOpenInterest_PE']
+    # Handle Dhan API field names - they might use underscores
+    # Create a mapping for Dhan API field names to our expected names
+    def map_dhan_fields(df, suffix):
+        """Map Dhan API field names to our expected column names"""
+        column_mapping = {
+            'last_price': f'lastPrice_{suffix}',
+            'oi': f'openInterest_{suffix}',
+            'previous_oi': f'previousOpenInterest_{suffix}',
+            'implied_volatility': f'impliedVolatility_{suffix}',
+            'top_ask_quantity': f'askQty_{suffix}',
+            'top_bid_quantity': f'bidQty_{suffix}',
+            'volume': f'totalTradedVolume_{suffix}',
+            'changein_oi': f'changeinOpenInterest_{suffix}'
+        }
+        
+        for old_col, new_col in column_mapping.items():
+            if old_col in df.columns:
+                df.rename(columns={old_col: new_col}, inplace=True)
+        return df
+    
+    # Map field names for calls and puts
+    df_ce = map_dhan_fields(df_ce, 'CE')
+    df_pe = map_dhan_fields(df_pe, 'PE')
+    
+    # Merge the dataframes
+    df = pd.merge(df_ce, df_pe, on='strikePrice', how='outer').sort_values('strikePrice')
+    
+    # Fill NaN values with 0 for numerical columns
+    numeric_cols = [col for col in df.columns if col not in ['strikePrice']]
+    df[numeric_cols] = df[numeric_cols].fillna(0)
+    
+    # Calculate change in OI if not provided by API
+    if 'changeinOpenInterest_CE' not in df.columns and 'openInterest_CE' in df.columns and 'previousOpenInterest_CE' in df.columns:
+        df['changeinOpenInterest_CE'] = df['openInterest_CE'] - df['previousOpenInterest_CE']
+    
+    if 'changeinOpenInterest_PE' not in df.columns and 'openInterest_PE' in df.columns and 'previousOpenInterest_PE' in df.columns:
+        df['changeinOpenInterest_PE'] = df['openInterest_PE'] - df['previousOpenInterest_PE']
+    
+    # If changeinOpenInterest columns still don't exist, create them with 0
+    if 'changeinOpenInterest_CE' not in df.columns:
+        df['changeinOpenInterest_CE'] = 0
+    if 'changeinOpenInterest_PE' not in df.columns:
+        df['changeinOpenInterest_PE'] = 0
 
     # Enhanced Greeks calculation with exact time-to-expiry
     T = calculate_exact_time_to_expiry(expiry)
     r = 0.06
     
+    # Check if impliedVolatility columns exist, create them if not
+    if 'impliedVolatility_CE' not in df.columns:
+        df['impliedVolatility_CE'] = 15  # Default value
+    
+    if 'impliedVolatility_PE' not in df.columns:
+        df['impliedVolatility_PE'] = 15  # Default value
+    
     for idx, row in df.iterrows():
         strike = row['strikePrice']
         
-        # Enhanced IV fallback using nearest strike average
-        iv_ce = row.get('impliedVolatility_CE')
-        iv_pe = row.get('impliedVolatility_PE')
+        # Get IV values
+        iv_ce = row.get('impliedVolatility_CE', 15)
+        iv_pe = row.get('impliedVolatility_PE', 15)
         
+        # Use fallback if IV is 0 or NaN
         if pd.isna(iv_ce) or iv_ce == 0:
             iv_ce, _ = get_iv_fallback(df, strike)
         if pd.isna(iv_pe) or iv_pe == 0:
@@ -1446,8 +1481,10 @@ def analyze_option_chain(selected_expiry=None):
         iv_ce = iv_ce or 15
         iv_pe = iv_pe or 15
         
+        # Calculate Greeks
         greeks_ce = calculate_greeks('CE', underlying, strike, T, r, iv_ce / 100)
         greeks_pe = calculate_greeks('PE', underlying, strike, T, r, iv_pe / 100)
+        
         df.at[idx, 'Delta_CE'], df.at[idx, 'Gamma_CE'], df.at[idx, 'Vega_CE'], df.at[idx, 'Theta_CE'], df.at[idx, 'Rho_CE'] = greeks_ce
         df.at[idx, 'Delta_PE'], df.at[idx, 'Gamma_PE'], df.at[idx, 'Vega_PE'], df.at[idx, 'Theta_PE'], df.at[idx, 'Rho_PE'] = greeks_pe
 
@@ -1558,8 +1595,22 @@ def analyze_option_chain(selected_expiry=None):
         # 2. VOLATILITY REGIME
         # Note: You'll need to fetch historical IV data from your database
         historical_iv = []  # Placeholder - implement historical IV fetch
-        # Get current ATM IV
-        current_atm_iv = df[df['Zone'] == 'ATM']['impliedVolatility_CE'].mean() if not df[df['Zone'] == 'ATM'].empty else 15
+        # Get current ATM IV - FIXED: Handle case where impliedVolatility_CE might not exist
+        try:
+            # Check if we have ATM data
+            atm_data = df[df['Zone'] == 'ATM']
+            if not atm_data.empty:
+                # Try to get implied volatility from ATM strike
+                if 'impliedVolatility_CE' in atm_data.columns:
+                    current_atm_iv = atm_data['impliedVolatility_CE'].iloc[0]
+                else:
+                    # Calculate average IV from nearby strikes
+                    current_atm_iv = df['impliedVolatility_CE'].mean() if 'impliedVolatility_CE' in df.columns else 15
+            else:
+                current_atm_iv = df['impliedVolatility_CE'].mean() if 'impliedVolatility_CE' in df.columns else 15
+        except:
+            current_atm_iv = 15  # Default fallback
+        
         regime, action, iv_rank, iv_perc, color = calculate_volatility_regime_bias(
             current_atm_iv,
             historical_iv
