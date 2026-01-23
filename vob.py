@@ -17,6 +17,7 @@ from scipy.stats import norm
 from pytz import timezone
 import io
 import os
+from scipy import stats
 
 # Page configuration
 st.set_page_config(
@@ -55,6 +56,21 @@ st.markdown("""
         background-color: #FFD700 !important;
         font-weight: bold !important;
     }
+    .seller-positive {
+        background-color: #004d00 !important;
+        color: white !important;
+        font-weight: bold !important;
+    }
+    .seller-caution {
+        background-color: #4d4d00 !important;
+        color: white !important;
+        font-weight: bold !important;
+    }
+    .seller-negative {
+        background-color: #660000 !important;
+        color: white !important;
+        font-weight: bold !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -71,13 +87,11 @@ try:
     supabase_url = st.secrets.get("supabase", {}).get("url", "")
     supabase_key = st.secrets.get("supabase", {}).get("anon_key", "")
     
-    # Enhanced Telegram Configuration with better error handling
+    # Enhanced Telegram Configuration
     try:
-        # Try multiple ways to get the credentials
         TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
         TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "")
         
-        # If still empty, try alternative approaches
         if not TELEGRAM_BOT_TOKEN:
             try:
                 TELEGRAM_BOT_TOKEN = st.secrets.TELEGRAM_BOT_TOKEN
@@ -90,7 +104,6 @@ try:
             except:
                 pass
         
-        # Convert chat ID to string if it's numeric
         if TELEGRAM_CHAT_ID and isinstance(TELEGRAM_CHAT_ID, (int, float)):
             TELEGRAM_CHAT_ID = str(int(TELEGRAM_CHAT_ID))
             
@@ -109,21 +122,6 @@ except Exception:
 
 NIFTY_UNDERLYING_SCRIP = 13
 NIFTY_UNDERLYING_SEG = "IDX_I"
-
-# Cached functions for performance - ADD REFRESH TRACKING
-@st.cache_data(ttl=60)  # Reduce cache time to 1 minute for chart data
-def cached_pivot_calculation(df_json, pivot_settings, refresh_counter):
-    """Cache pivot calculations to improve performance"""
-    df = pd.read_json(df_json)
-    return PivotIndicator.get_all_pivots(df, pivot_settings)
-
-@st.cache_data(ttl=30)  # Reduce cache time for IV calculation
-def cached_iv_average(option_data_json, refresh_counter):
-    """Cache IV average calculation"""
-    df = pd.read_json(option_data_json)
-    iv_ce_avg = df['impliedVolatility_CE'].mean()
-    iv_pe_avg = df['impliedVolatility_PE'].mean()
-    return iv_ce_avg, iv_pe_avg
 
 # Add refresh counter to session state
 if 'refresh_counter' not in st.session_state:
@@ -175,59 +173,9 @@ class SupabaseDB:
     def create_tables(self):
         """Create necessary tables if they don't exist"""
         try:
-            # Check if candle_data table exists
             self.client.table('candle_data').select('id').limit(1).execute()
         except Exception as e:
             st.warning("Database tables may need to be created. Please run the SQL setup first.")
-            st.code("""
-            -- SQL to create the tables in Supabase:
-            
-            -- 1. Create candle_data table
-            CREATE TABLE IF NOT EXISTS candle_data (
-                id BIGSERIAL PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                exchange TEXT NOT NULL,
-                timeframe TEXT NOT NULL,
-                timestamp BIGINT NOT NULL,
-                datetime TIMESTAMP WITH TIME ZONE NOT NULL,
-                open DOUBLE PRECISION NOT NULL,
-                high DOUBLE PRECISION NOT NULL,
-                low DOUBLE PRECISION NOT NULL,
-                close DOUBLE PRECISION NOT NULL,
-                volume BIGINT NOT NULL,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                UNIQUE(symbol, exchange, timeframe, timestamp)
-            );
-            
-            -- 2. Create user_preferences table
-            CREATE TABLE IF NOT EXISTS user_preferences (
-                id BIGSERIAL PRIMARY KEY,
-                user_id TEXT UNIQUE NOT NULL,
-                timeframe TEXT,
-                auto_refresh BOOLEAN DEFAULT true,
-                days_back INTEGER DEFAULT 1,
-                pivot_settings JSONB DEFAULT '{}',
-                pivot_proximity INTEGER DEFAULT 5,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
-            );
-            
-            -- 3. Create market_analytics table
-            CREATE TABLE IF NOT EXISTS market_analytics (
-                id BIGSERIAL PRIMARY KEY,
-                symbol TEXT NOT NULL,
-                date DATE NOT NULL,
-                day_high DOUBLE PRECISION,
-                day_low DOUBLE PRECISION,
-                day_open DOUBLE PRECISION,
-                day_close DOUBLE PRECISION,
-                total_volume BIGINT,
-                avg_price DOUBLE PRECISION,
-                price_change DOUBLE PRECISION,
-                price_change_pct DOUBLE PRECISION,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
-                UNIQUE(symbol, date)
-            );
-            """, language='sql')
     
     def save_candle_data(self, symbol, exchange, timeframe, df):
         """Save candle data to Supabase"""
@@ -257,10 +205,7 @@ class SupabaseDB:
             ).execute()
             
         except Exception as e:
-            # Check if it's a column error
-            if "column" in str(e) and "does not exist" in str(e):
-                st.error(f"Database column error. Please create the tables with the SQL provided above. Error: {e}")
-            elif "23505" not in str(e) and "duplicate key" not in str(e).lower():
+            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
                 st.error(f"Error saving candle data: {str(e)}")
     
     def get_candle_data(self, symbol, exchange, timeframe, hours_back=24):
@@ -285,7 +230,6 @@ class SupabaseDB:
                 return pd.DataFrame()
                 
         except Exception as e:
-            # If column doesn't exist, return empty dataframe
             if "column" in str(e) and "does not exist" in str(e):
                 return pd.DataFrame()
             st.error(f"Error retrieving candle data: {str(e)}")
@@ -357,7 +301,6 @@ class SupabaseDB:
                 }
                 
         except Exception as e:
-            # If table doesn't exist, return defaults
             if "relation" in str(e) and "does not exist" in str(e):
                 return {
                     'timeframe': '5', 
@@ -403,10 +346,7 @@ class SupabaseDB:
             ).execute()
             
         except Exception as e:
-            # Check if it's a column error
-            if "column" in str(e) and "does not exist" in str(e):
-                st.error(f"Database column error. Please create the tables with the SQL provided above. Error: {e}")
-            elif "23505" not in str(e) and "duplicate key" not in str(e).lower():
+            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
                 st.error(f"Error saving analytics: {str(e)}")
     
     def get_market_analytics(self, symbol, days_back=30):
@@ -427,7 +367,6 @@ class SupabaseDB:
                 return pd.DataFrame()
                 
         except Exception as e:
-            # If table doesn't exist, return empty dataframe
             if "relation" in str(e) and "does not exist" in str(e):
                 return pd.DataFrame()
             st.error(f"Error retrieving analytics: {str(e)}")
@@ -493,7 +432,7 @@ class DhanAPI:
             st.error(f"Error fetching LTP: {str(e)}")
             return None
 
-@st.cache_data(ttl=300)  # Cache expiry list for 5 minutes
+@st.cache_data(ttl=300)
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
     return get_dhan_expiry_list(underlying_scrip, underlying_seg)
 
@@ -652,16 +591,224 @@ class PivotIndicator:
         
         return all_pivots
 
+# ============================
+# NEW: SELLER-FOCUSED ANALYTICS
+# ============================
+
+def calculate_net_delta_gamma_exposure(option_chain_df, spot_price):
+    """
+    Calculates the Net Delta and Gamma Exposure (NDE & NGE) for the entire option chain.
+    This shows the aggregate directional (Delta) and acceleration (Gamma) risk
+    held by option writers (primarily institutions/market makers).
+    """
+    try:
+        df = option_chain_df.copy()
+        # Initialize columns for contribution
+        df['delta_contribution'] = 0.0
+        df['gamma_contribution'] = 0.0
+        
+        # Loop through each strike to calculate its contribution to market exposure
+        for idx, row in df.iterrows():
+            strike = row['strikePrice']
+            # Use absolute open interest to gauge market maker's net sold position
+            ce_oi, pe_oi = row['openInterest_CE'], row['openInterest_PE']
+            
+            # Delta Contribution: Calls have +Delta, Puts have -Delta for the seller
+            # Market makers are typically net short options. Their Delta exposure is:
+            # - (Call Delta * Call OI) + (Put Delta * Put OI) [Simplified model]
+            delta_contrib = (-row.get('Delta_CE', 0) * ce_oi) + (row.get('Delta_PE', 0) * pe_oi)
+            
+            # Gamma Contribution: Both short calls and short puts have negative Gamma
+            # Market makers' Gamma exposure is negative and accelerates their hedging needs.
+            gamma_contrib = (-row.get('Gamma_CE', 0) * ce_oi) + (-row.get('Gamma_PE', 0) * pe_oi)
+            
+            df.at[idx, 'delta_contribution'] = delta_contrib
+            df.at[idx, 'gamma_contribution'] = gamma_contrib
+        
+        net_delta_exposure = df['delta_contribution'].sum()
+        net_gamma_exposure = df['gamma_contribution'].sum()
+        
+        # Normalize by total OI for a relative view
+        total_oi = df['openInterest_CE'].sum() + df['openInterest_PE'].sum()
+        norm_nde = (net_delta_exposure / total_oi * 10000) if total_oi > 0 else 0  # Per 10k contracts
+        norm_nge = (net_gamma_exposure / total_oi * 10000) if total_oi > 0 else 0
+        
+        return {
+            'net_delta': net_delta_exposure,
+            'net_gamma': net_gamma_exposure,
+            'norm_delta': norm_nde,
+            'norm_gamma': norm_nge
+        }
+    except Exception as e:
+        st.error(f"Error calculating exposure: {e}")
+        return {'net_delta': 0, 'net_gamma': 0, 'norm_delta': 0, 'norm_gamma': 0}
+
+def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
+    """
+    Identifies significant 'walls' of Open Interest where heavy institutional
+    selling (writing) has occurred, creating potential support/resistance.
+    Returns actionable bias for a seller.
+    """
+    from scipy import stats
+    import numpy as np
+    
+    def find_walls(oi_series, strike_series, option_type='CE'):
+        walls = []
+        if len(oi_series) < 5:
+            return walls
+        
+        # Calculate z-score of OI to find statistically significant outliers
+        oi_zscore = np.abs(stats.zscore(oi_series.fillna(0)))
+        
+        # A 'wall' is a strike where OI is high (top 20%) and significantly above local mean
+        high_oi_threshold = np.percentile(oi_series, 80)
+        
+        for i in range(2, len(oi_series)-2):
+            if (oi_series.iloc[i] > high_oi_threshold and 
+                oi_zscore[i] > 1.5 and  # Statistically significant
+                oi_series.iloc[i] > 1.8 * np.mean(oi_series.iloc[max(0,i-2):min(len(oi_series),i+3)])):
+                
+                wall_strength = "STRONG" if oi_zscore[i] > 2.5 else "MODERATE"
+                distance_pct = ((strike_series.iloc[i] - spot_price) / spot_price * 100)
+                
+                walls.append({
+                    'strike': strike_series.iloc[i],
+                    'oi': int(oi_series.iloc[i]),
+                    'strength': wall_strength,
+                    'distance_pct': distance_pct,
+                    'type': 'RESISTANCE' if option_type == 'CE' else 'SUPPORT'
+                })
+        return sorted(walls, key=lambda x: x['oi'], reverse=True)[:3]  # Return top 3
+    
+    call_walls = find_walls(df_ce['openInterest'], df_ce['strikePrice'], 'CE')
+    put_walls = find_walls(df_pe['openInterest'], df_pe['strikePrice'], 'PE')
+    
+    # Generate seller's bias from walls
+    seller_bias = "NEUTRAL"
+    reasoning = []
+    
+    if call_walls:
+        nearest_call = min(call_walls, key=lambda x: abs(x['strike'] - spot_price))
+        if nearest_call['distance_pct'] < 2:  # Within 2% of spot
+            seller_bias = "BEARISH_PRESSURE"
+            reasoning.append(f"Strong call wall at {nearest_call['strike']} (resistance)")
+    
+    if put_walls:
+        nearest_put = min(put_walls, key=lambda x: abs(x['strike'] - spot_price))
+        if nearest_put['distance_pct'] > -2:  # Within 2% below spot
+            seller_bias = "BULLISH_SUPPORT"
+            reasoning.append(f"Strong put wall at {nearest_put['strike']} (support)")
+    
+    # If both strong walls are close, market is likely range-bound (GOOD FOR SELLING STRANGLES)
+    if (call_walls and put_walls and 
+        abs(call_walls[0]['distance_pct']) < 3 and 
+        abs(put_walls[0]['distance_pct']) < 3):
+        seller_bias = "RANGE_BOUND"
+        reasoning.append("Strong walls both sides → range likely")
+    
+    return {
+        'call_walls': call_walls,
+        'put_walls': put_walls,
+        'seller_bias': seller_bias,
+        'reasoning': reasoning
+    }
+
+def calculate_volatility_regime_bias(current_atm_iv, historical_iv_data):
+    """
+    Determines if current volatility is HIGH (optimal for SELLING)
+    or LOW (dangerous for selling, good for buying).
+    Uses IV Rank and IV Percentile for robust regime detection.
+    """
+    if not historical_iv_data or len(historical_iv_data) < 20:
+        return "INSUFFICIENT_DATA", "Need 20+ days of IV history", 0, 0, "⚪"
+    
+    iv_rank = ((current_atm_iv - min(historical_iv_data)) / 
+               (max(historical_iv_data) - min(historical_iv_data)) * 100)
+    
+    # IV Percentile: % of days where IV was below current
+    iv_percentile = sum(1 for iv in historical_iv_data if iv < current_atm_iv) / len(historical_iv_data) * 100
+    
+    # Regime determination for SELLERS
+    if iv_rank > 70 or iv_percentile > 70:
+        regime = "HIGH_VOLATILITY"
+        action = "OPTIMAL FOR SELLING PREMIUM"
+        color = "🟢"
+    elif iv_rank < 30 or iv_percentile < 30:
+        regime = "LOW_VOLATILITY"
+        action = "AVOID SELLING - Consider buying or defined-risk spreads only"
+        color = "🔴"
+    else:
+        regime = "MODERATE_VOLATILITY"
+        action = "Neutral - Standard credit spreads favored"
+        color = "🟡"
+    
+    return regime, action, round(iv_rank, 1), round(iv_percentile, 1), color
+
+def generate_seller_recommendation(exposure_data, vol_regime, oi_bias_data, spot_price, df):
+    """Generates specific option selling strategies based on current market biases."""
+    
+    # Base recommendation
+    recommendation = {
+        'action': 'WAIT_FOR_BETTER_SETUP',
+        'strikes': '',
+        'rationale': []
+    }
+    
+    # Check Volatility Regime First - Most Important Filter
+    if "HIGH" in vol_regime:
+        recommendation['rationale'].append("High IV regime optimal for selling")
+        
+        # Check OI Structure
+        if oi_bias_data['seller_bias'] == "RANGE_BOUND":
+            recommendation['action'] = "SELL STRANGLE/IRON CONDOR"
+            if oi_bias_data['call_walls'] and oi_bias_data['put_walls']:
+                call_strike = oi_bias_data['call_walls'][0]['strike']
+                put_strike = oi_bias_data['put_walls'][0]['strike']
+                recommendation['strikes'] = f"Sell {put_strike} PE / Sell {call_strike} CE"
+                recommendation['rationale'].append("Strong OI walls both sides suggest range-bound action")
+        
+        elif oi_bias_data['seller_bias'] == "BEARISH_PRESSURE":
+            recommendation['action'] = "SELL PUT SPREAD / CASH-SECURED PUT"
+            # Find put wall and sell just above it
+            if oi_bias_data['put_walls']:
+                put_wall = oi_bias_data['put_walls'][0]['strike']
+                sell_strike = min(put_wall + 50, spot_price * 0.99)  # 1% OTM or above wall
+                recommendation['strikes'] = f"Sell {sell_strike} PE"
+                recommendation['rationale'].append("Strong put wall provides support")
+        
+        elif oi_bias_data['seller_bias'] == "BULLISH_SUPPORT":
+            recommendation['action'] = "SELL CALL SPREAD"
+            if oi_bias_data['call_walls']:
+                call_wall = oi_bias_data['call_walls'][0]['strike']
+                sell_strike = max(call_wall - 50, spot_price * 1.01)  # 1% OTM or below wall
+                recommendation['strikes'] = f"Sell {sell_strike} CE"
+                recommendation['rationale'].append("Strong call wall provides resistance")
+    
+    # Check Gamma Exposure for Risk Warning
+    if exposure_data['norm_gamma'] < -10:  # Strongly negative gamma
+        recommendation['rationale'].append(f"⚠️ High Negative Gamma ({exposure_data['norm_gamma']:.1f}) - Volatile moves likely, use defined risk")
+        if recommendation['action'] == 'SELL STRANGLE/IRON CONDOR':
+            recommendation['action'] = 'SELL IRON CONDOR (DEFINED RISK)'
+    
+    # If low volatility regime, be cautious
+    if "LOW" in vol_regime:
+        recommendation['action'] = "AVOID NAKED SELLING"
+        recommendation['rationale'] = ["Low IV regime - Premiums too low for risk"]
+        recommendation['strikes'] = "Consider buying options or calendar spreads instead"
+    
+    recommendation['rationale'] = " | ".join(recommendation['rationale'])
+    return recommendation
+
+# ============================
+# END OF NEW SELLER ANALYTICS
+# ============================
+
 def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5):
     """Trading signal detection with Normal Bias OR OI Dominance (both require full ATM bias alignment)."""
     if df.empty or option_data is None or len(option_data) == 0 or not current_price:
         return
     
-    try:
-        df_json = df.to_json()
-        pivots = cached_pivot_calculation(df_json, pivot_settings, st.session_state.refresh_counter)
-    except:
-        pivots = PivotIndicator.get_all_pivots(df, pivot_settings)
+    pivots = PivotIndicator.get_all_pivots(df, pivot_settings)
     
     near_pivot = False
     pivot_level = None
@@ -908,6 +1055,17 @@ def highlight_atm_row(row):
         return ['background-color: #FFD700; font-weight: bold'] * len(row)
     return [''] * len(row)
 
+def color_seller_bias(val):
+    """Color code for seller bias"""
+    if val == "HIGH_VOLATILITY" or val == "RANGE_BOUND":
+        return 'background-color: #004d00; color: white; font-weight: bold'
+    elif val == "LOW_VOLATILITY" or "AVOID" in str(val):
+        return 'background-color: #660000; color: white; font-weight: bold'
+    elif "MODERATE" in str(val) or "NEUTRAL" in str(val):
+        return 'background-color: #4d4d00; color: white; font-weight: bold'
+    else:
+        return ''
+
 def process_candle_data(data, interval):
     """Process API response into DataFrame"""
     if not data or 'open' not in data:
@@ -959,9 +1117,7 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
     
     if show_pivots and len(df) > 50:
         try:
-            # Use cached pivot calculation for performance
-            df_json = df.to_json()
-            pivots = cached_pivot_calculation(df_json, pivot_settings or {}, st.session_state.refresh_counter)
+            pivots = PivotIndicator.get_all_pivots(df, pivot_settings or {})
             
             timeframes = {}
             for pivot in pivots:
@@ -1213,7 +1369,7 @@ def create_csv_download(df_summary):
 
 
 def analyze_option_chain(selected_expiry=None):
-    """Enhanced options chain analysis with expiry selection"""
+    """Enhanced options chain analysis with SELLER'S EDGE dashboard."""
     now = datetime.now(timezone("Asia/Kolkata"))
     
     # Get expiry list - use cached version for performance
@@ -1355,9 +1511,11 @@ def analyze_option_chain(selected_expiry=None):
     df_summary['PCR'] = df_summary['openInterest_PE'] / df_summary['openInterest_CE']
     df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
     df_summary['PCR'] = df_summary['PCR'].round(2)
+    
+    # FIXED: Correct PCR interpretation for sellers
     df_summary['PCR_Signal'] = np.where(
-        df_summary['PCR'] > 1.2, "Bullish",
-        np.where(df_summary['PCR'] < 0.7, "Bearish", "Neutral")
+        df_summary['PCR'] > 1.2, "BEARISH_SENTIMENT",  # High PCR = Bearish = Good for PUT SELLING
+        np.where(df_summary['PCR'] < 0.7, "BULLISH_SENTIMENT", "NEUTRAL")  # Low PCR = Bullish = Good for CALL SELLING
     )
 
     st.markdown("## Option Chain Bias Summary")
@@ -1378,6 +1536,91 @@ def analyze_option_chain(selected_expiry=None):
         file_name=f"nifty_options_summary_{expiry}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv"
     )
+
+    # === NEW: SELLER'S EDGE DASHBOARD ===
+    st.markdown("---")
+    st.subheader("📊 SELLER'S EDGE DASHBOARD")
+    
+    # Create 4 columns for key metrics
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        # 1. DELTA/GAMMA EXPOSURE
+        exposure = calculate_net_delta_gamma_exposure(df, underlying)
+        st.metric("Net Delta Exposure", f"{exposure['norm_delta']:+.1f}",
+                 delta=f"Raw: {exposure['net_delta']:+.0f}",
+                 help="Positive = Net long delta exposure in market | Negative = Net short delta exposure")
+        st.metric("Net Gamma Exposure", f"{exposure['norm_gamma']:+.1f}",
+                 delta=f"Raw: {exposure['net_gamma']:+.0f}", 
+                 help="Negative Gamma = Market makers short gamma = hedging can amplify moves")
+    
+    with col2:
+        # 2. VOLATILITY REGIME
+        # Note: You'll need to fetch historical IV data from your database
+        historical_iv = []  # Placeholder - implement historical IV fetch
+        # Get current ATM IV
+        current_atm_iv = df[df['Zone'] == 'ATM']['impliedVolatility_CE'].mean() if not df[df['Zone'] == 'ATM'].empty else 15
+        regime, action, iv_rank, iv_perc, color = calculate_volatility_regime_bias(
+            current_atm_iv,
+            historical_iv
+        )
+        st.metric("Volatility Regime", f"{color} {regime}",
+                 delta=f"IV Rank: {iv_rank}%")
+        st.caption(f"**Action:** {action}")
+    
+    with col3:
+        # 3. OI CONCENTRATION BIAS
+        oi_bias_data = calculate_oi_concentration_bias(df_ce, df_pe, underlying)
+        st.metric("OI Structure Bias", oi_bias_data['seller_bias'])
+        
+        # Display nearest walls
+        if oi_bias_data['call_walls']:
+            nearest_call = min(oi_bias_data['call_walls'], key=lambda x: abs(x['strike'] - underlying))
+            st.caption(f"Nearest Call Wall: **{nearest_call['strike']}** ({nearest_call['strength']})")
+        if oi_bias_data['put_walls']:
+            nearest_put = min(oi_bias_data['put_walls'], key=lambda x: abs(x['strike'] - underlying))
+            st.caption(f"Nearest Put Wall: **{nearest_put['strike']}** ({nearest_put['strength']})")
+    
+    with col4:
+        # 4. SELLER'S STRATEGY RECOMMENDATION
+        recommendation = generate_seller_recommendation(
+            exposure, regime, oi_bias_data, underlying, df
+        )
+        st.metric("Recommended Action", recommendation['action'])
+        st.caption(f"**Strikes:** {recommendation.get('strikes', 'N/A')}")
+        st.caption(f"**Rationale:** {recommendation.get('rationale', '')}")
+
+    # Detailed OI Walls Visualization
+    with st.expander("🔍 Detailed OI Walls Analysis"):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            if oi_bias_data['call_walls']:
+                st.write("**Top Call Walls (Resistance)**")
+                for wall in oi_bias_data['call_walls'][:3]:
+                    st.write(f"{wall['strike']}: {wall['oi']:,} OI ({wall['strength']}) - {wall['distance_pct']:.1f}% from spot")
+        
+        with col_b:
+            if oi_bias_data['put_walls']:
+                st.write("**Top Put Walls (Support)**")
+                for wall in oi_bias_data['put_walls'][:3]:
+                    st.write(f"{wall['strike']}: {wall['oi']:,} OI ({wall['strength']}) - {wall['distance_pct']:.1f}% from spot")
+    
+    # Delta-Gamma Exposure Visualization
+    with st.expander("📉 Delta-Gamma Exposure Heatmap"):
+        # Calculate exposure contributions for visualization
+        exposure_df = df[['strikePrice', 'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE']].copy()
+        exposure_df['delta_contribution'] = (-exposure_df['Delta_CE'] * df['openInterest_CE']) + (exposure_df['Delta_PE'] * df['openInterest_PE'])
+        exposure_df['gamma_contribution'] = (-exposure_df['Gamma_CE'] * df['openInterest_CE']) + (-exposure_df['Gamma_PE'] * df['openInterest_PE'])
+        exposure_df['abs_delta_impact'] = abs(exposure_df['delta_contribution'])
+        exposure_df['abs_gamma_impact'] = abs(exposure_df['gamma_contribution'])
+        
+        st.dataframe(
+            exposure_df.style.background_gradient(subset=['abs_delta_impact'], cmap='Reds')
+                              .background_gradient(subset=['abs_gamma_impact'], cmap='Blues'),
+            use_container_width=True,
+            height=300
+        )
+        st.caption("Red: Delta Exposure Intensity | Blue: Gamma Exposure Intensity")
 
     return underlying, df_summary, expiry_dates
 
@@ -1662,7 +1905,7 @@ def main():
     with col1:
         st.header("📈 Trading Chart")
         
-        # Data fetching strategy - USE REFRESH COUNTER TO FORCE FRESH DATA
+        # Data fetching strategy
         df = pd.DataFrame()
         current_price = None
         
@@ -1685,7 +1928,7 @@ def main():
                         try:
                             db.save_candle_data("NIFTY50", "IDX_I", interval, df)
                         except:
-                            pass  # Continue without saving to database
+                            pass
         else:
             # Always fetch fresh data when not using cache
             with st.spinner("Fetching fresh data from API..."):
@@ -1702,7 +1945,7 @@ def main():
                     try:
                         db.save_candle_data("NIFTY50", "IDX_I", interval, df)
                     except:
-                        pass  # Continue without saving to database
+                        pass
         
         # Get LTP data and current price
         ltp_data = api.get_ltp_data("13", "IDX_I")
@@ -1719,7 +1962,7 @@ def main():
         if not df.empty:
             display_metrics(ltp_data, df, db)
         
-        # Create and display chart - PASS REFRESH COUNTER
+        # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
                 df, 
