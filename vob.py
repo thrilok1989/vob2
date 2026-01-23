@@ -27,7 +27,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Auto-refresh every 80 seconds
+# Auto-refresh every 30 seconds
 st_autorefresh(interval=30000, key="datarefresh")
 
 # Custom CSS for TradingView-like appearance + ATM highlighting
@@ -592,14 +592,12 @@ class PivotIndicator:
         return all_pivots
 
 # ============================
-# NEW: SELLER-FOCUSED ANALYTICS
+# SELLER-FOCUSED ANALYTICS
 # ============================
 
 def calculate_net_delta_gamma_exposure(option_chain_df, spot_price):
     """
     Calculates the Net Delta and Gamma Exposure (NDE & NGE) for the entire option chain.
-    This shows the aggregate directional (Delta) and acceleration (Gamma) risk
-    held by option writers (primarily institutions/market makers).
     """
     try:
         df = option_chain_df.copy()
@@ -610,16 +608,13 @@ def calculate_net_delta_gamma_exposure(option_chain_df, spot_price):
         # Loop through each strike to calculate its contribution to market exposure
         for idx, row in df.iterrows():
             strike = row['strikePrice']
-            # Use absolute open interest to gauge market maker's net sold position
-            ce_oi, pe_oi = row['openInterest_CE'], row['openInterest_PE']
+            ce_oi = row.get('openInterest_CE', 0)
+            pe_oi = row.get('openInterest_PE', 0)
             
-            # Delta Contribution: Calls have +Delta, Puts have -Delta for the seller
-            # Market makers are typically net short options. Their Delta exposure is:
-            # - (Call Delta * Call OI) + (Put Delta * Put OI) [Simplified model]
+            # Delta Contribution
             delta_contrib = (-row.get('Delta_CE', 0) * ce_oi) + (row.get('Delta_PE', 0) * pe_oi)
             
-            # Gamma Contribution: Both short calls and short puts have negative Gamma
-            # Market makers' Gamma exposure is negative and accelerates their hedging needs.
+            # Gamma Contribution
             gamma_contrib = (-row.get('Gamma_CE', 0) * ce_oi) + (-row.get('Gamma_PE', 0) * pe_oi)
             
             df.at[idx, 'delta_contribution'] = delta_contrib
@@ -630,7 +625,7 @@ def calculate_net_delta_gamma_exposure(option_chain_df, spot_price):
         
         # Normalize by total OI for a relative view
         total_oi = df['openInterest_CE'].sum() + df['openInterest_PE'].sum()
-        norm_nde = (net_delta_exposure / total_oi * 10000) if total_oi > 0 else 0  # Per 10k contracts
+        norm_nde = (net_delta_exposure / total_oi * 10000) if total_oi > 0 else 0
         norm_nge = (net_gamma_exposure / total_oi * 10000) if total_oi > 0 else 0
         
         return {
@@ -647,7 +642,6 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
     """
     Identifies significant 'walls' of Open Interest where heavy institutional
     selling (writing) has occurred, creating potential support/resistance.
-    Returns actionable bias for a seller.
     """
     from scipy import stats
     import numpy as np
@@ -665,7 +659,7 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
         
         for i in range(2, len(oi_series)-2):
             if (oi_series.iloc[i] > high_oi_threshold and 
-                oi_zscore[i] > 1.5 and  # Statistically significant
+                oi_zscore[i] > 1.5 and
                 oi_series.iloc[i] > 1.8 * np.mean(oi_series.iloc[max(0,i-2):min(len(oi_series),i+3)])):
                 
                 wall_strength = "STRONG" if oi_zscore[i] > 2.5 else "MODERATE"
@@ -678,21 +672,19 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
                     'distance_pct': distance_pct,
                     'type': 'RESISTANCE' if option_type == 'CE' else 'SUPPORT'
                 })
-        return sorted(walls, key=lambda x: x['oi'], reverse=True)[:3]  # Return top 3
+        return sorted(walls, key=lambda x: x['oi'], reverse=True)[:3]
     
-    # FIX: Use the correct column names - they have suffixes
-    # Check which column names actually exist
     call_oi_column = None
     put_oi_column = None
     
-    # Try to find the open interest column in df_ce
+    # Find open interest column in df_ce
     possible_ce_columns = ['openInterest_CE', 'openInterest', 'oi']
     for col in possible_ce_columns:
         if col in df_ce.columns:
             call_oi_column = col
             break
     
-    # Try to find the open interest column in df_pe  
+    # Find open interest column in df_pe  
     possible_pe_columns = ['openInterest_PE', 'openInterest', 'oi']
     for col in possible_pe_columns:
         if col in df_pe.columns:
@@ -717,17 +709,17 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
     
     if call_walls:
         nearest_call = min(call_walls, key=lambda x: abs(x['strike'] - spot_price))
-        if nearest_call['distance_pct'] < 2:  # Within 2% of spot
+        if nearest_call['distance_pct'] < 2:
             seller_bias = "BEARISH_PRESSURE"
             reasoning.append(f"Strong call wall at {nearest_call['strike']} (resistance)")
     
     if put_walls:
         nearest_put = min(put_walls, key=lambda x: abs(x['strike'] - spot_price))
-        if nearest_put['distance_pct'] > -2:  # Within 2% below spot
+        if nearest_put['distance_pct'] > -2:
             seller_bias = "BULLISH_SUPPORT"
             reasoning.append(f"Strong put wall at {nearest_put['strike']} (support)")
     
-    # If both strong walls are close, market is likely range-bound (GOOD FOR SELLING STRANGLES)
+    # If both strong walls are close, market is likely range-bound
     if (call_walls and put_walls and 
         abs(call_walls[0]['distance_pct']) < 3 and 
         abs(put_walls[0]['distance_pct']) < 3):
@@ -745,7 +737,6 @@ def calculate_volatility_regime_bias(current_atm_iv, historical_iv_data):
     """
     Determines if current volatility is HIGH (optimal for SELLING)
     or LOW (dangerous for selling, good for buying).
-    Uses IV Rank and IV Percentile for robust regime detection.
     """
     if not historical_iv_data or len(historical_iv_data) < 20:
         return "INSUFFICIENT_DATA", "Need 20+ days of IV history", 0, 0, "⚪"
@@ -797,10 +788,9 @@ def generate_seller_recommendation(exposure_data, vol_regime, oi_bias_data, spot
         
         elif oi_bias_data['seller_bias'] == "BEARISH_PRESSURE":
             recommendation['action'] = "SELL PUT SPREAD / CASH-SECURED PUT"
-            # Find put wall and sell just above it
             if oi_bias_data['put_walls']:
                 put_wall = oi_bias_data['put_walls'][0]['strike']
-                sell_strike = min(put_wall + 50, spot_price * 0.99)  # 1% OTM or above wall
+                sell_strike = min(put_wall + 50, spot_price * 0.99)
                 recommendation['strikes'] = f"Sell {sell_strike} PE"
                 recommendation['rationale'].append("Strong put wall provides support")
         
@@ -808,12 +798,12 @@ def generate_seller_recommendation(exposure_data, vol_regime, oi_bias_data, spot
             recommendation['action'] = "SELL CALL SPREAD"
             if oi_bias_data['call_walls']:
                 call_wall = oi_bias_data['call_walls'][0]['strike']
-                sell_strike = max(call_wall - 50, spot_price * 1.01)  # 1% OTM or below wall
+                sell_strike = max(call_wall - 50, spot_price * 1.01)
                 recommendation['strikes'] = f"Sell {sell_strike} CE"
                 recommendation['rationale'].append("Strong call wall provides resistance")
     
     # Check Gamma Exposure for Risk Warning
-    if exposure_data['norm_gamma'] < -10:  # Strongly negative gamma
+    if exposure_data['norm_gamma'] < -10:
         recommendation['rationale'].append(f"⚠️ High Negative Gamma ({exposure_data['norm_gamma']:.1f}) - Volatile moves likely, use defined risk")
         if recommendation['action'] == 'SELL STRANGLE/IRON CONDOR':
             recommendation['action'] = 'SELL IRON CONDOR (DEFINED RISK)'
@@ -827,12 +817,8 @@ def generate_seller_recommendation(exposure_data, vol_regime, oi_bias_data, spot
     recommendation['rationale'] = " | ".join(recommendation['rationale'])
     return recommendation
 
-# ============================
-# END OF NEW SELLER ANALYTICS
-# ============================
-
 def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5):
-    """Trading signal detection with Normal Bias OR OI Dominance (both require full ATM bias alignment)."""
+    """Trading signal detection with Normal Bias OR OI Dominance."""
     if df.empty or option_data is None or len(option_data) == 0 or not current_price:
         return
     
@@ -884,7 +870,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
             bullish_oi_confirm = pe_chg_oi > 1.5 * ce_chg_oi
             bearish_oi_confirm = ce_chg_oi > 1.5 * pe_chg_oi
 
-            # === Bullish Call Signal ===
+            # Bullish Call Signal
             if (
                 (all(bullish_conditions.values()) and price_relation == 'above' and 0 < (current_price - pivot_level['value']) <= pivot_proximity)
                 or (bullish_oi_confirm and all(bullish_conditions.values()) and price_relation == 'above' and 0 < (current_price - pivot_level['value']) <= pivot_proximity)
@@ -919,7 +905,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                 except Exception as e:
                     st.error(f"Failed to send notification: {e}")
             
-            # === Bearish Put Signal ===
+            # Bearish Put Signal
             elif (
                 (all(bearish_conditions.values()) and price_relation == 'below' and -pivot_proximity <= (current_price - pivot_level['value']) < 0)
                 or (bearish_oi_confirm and all(bearish_conditions.values()) and price_relation == 'below' and -pivot_proximity <= (current_price - pivot_level['value']) < 0)
@@ -953,7 +939,6 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                     st.success("🔴 Bearish signal notification sent!")
                 except Exception as e:
                     st.error(f"Failed to send notification: {e}")
-
 
 def calculate_exact_time_to_expiry(expiry_date_str):
     """Calculate exact time to expiry in years (days + hours)"""
@@ -1306,8 +1291,8 @@ def display_metrics(ltp_data, df, db, symbol="NIFTY50"):
             # Try to save analytics, but continue if it fails
             try:
                 db.save_market_analytics(symbol, analytics_data)
-            except:
-                pass  # Continue without analytics
+            except Exception as e:
+                st.warning(f"Could not save analytics: {e}")
             
             col1, col2, col3, col4, col5 = st.columns(5)
             
@@ -1350,7 +1335,7 @@ def display_metrics(ltp_data, df, db, symbol="NIFTY50"):
                 st.markdown(f"""
                 <div class="metric-container">
                     <h4>Volume</h4>
-                    <h3>{volume:,}</h3>
+                    <h3>{volume:,.0f}</h3>
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -1395,7 +1380,6 @@ def create_csv_download(df_summary):
     df_summary.to_csv(output, index=False)
     return output.getvalue()
 
-
 def analyze_option_chain(selected_expiry=None):
     """Enhanced options chain analysis with SELLER'S EDGE dashboard."""
     now = datetime.now(timezone("Asia/Kolkata"))
@@ -1437,13 +1421,12 @@ def analyze_option_chain(selected_expiry=None):
     df_ce = pd.DataFrame(calls)
     df_pe = pd.DataFrame(puts)
     
-    # FIX: Let's see what columns actually exist in the Dhan API response
-    # Add debug to see column names
-    st.sidebar.write("DEBUG: df_ce columns", df_ce.columns.tolist() if not df_ce.empty else "Empty")
-    st.sidebar.write("DEBUG: df_pe columns", df_pe.columns.tolist() if not df_pe.empty else "Empty")
+    # Debug to see column names
+    if df_ce.empty:
+        st.error("No call data available")
+        return None, None, expiry_dates
     
-    # Handle Dhan API field names - they might use underscores
-    # Create a mapping for Dhan API field names to our expected names
+    # Create a mapping function for Dhan API field names
     def map_dhan_fields(df, suffix):
         """Map Dhan API field names to our expected column names"""
         column_mapping = {
@@ -1605,7 +1588,7 @@ def analyze_option_chain(selected_expiry=None):
     df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
     df_summary['PCR'] = df_summary['PCR'].round(2)
     
-    # FIXED: Correct PCR interpretation for sellers
+    # Fixed: Correct PCR interpretation for sellers
     df_summary['PCR_Signal'] = np.where(
         df_summary['PCR'] > 1.2, "BEARISH_SENTIMENT",
         np.where(df_summary['PCR'] < 0.7, "BULLISH_SENTIMENT", "NEUTRAL")
@@ -1649,7 +1632,7 @@ def analyze_option_chain(selected_expiry=None):
     
     with col2:
         # 2. VOLATILITY REGIME
-        historical_iv = []  # Placeholder
+        historical_iv = []  # Placeholder - would need historical data
         try:
             # Get current ATM IV
             atm_data = df[df['Zone'] == 'ATM']
@@ -1705,7 +1688,7 @@ def analyze_option_chain(selected_expiry=None):
                 for wall in oi_bias_data['put_walls'][:3]:
                     st.write(f"{wall['strike']}: {wall['oi']:,} OI ({wall['strength']}) - {wall['distance_pct']:.1f}% from spot")
     
-    # Delta-Gamma Exposure Visualization
+    # Delta-Gamma Exposure Visualization - FIXED VERSION
     with st.expander("📉 Delta-Gamma Exposure Heatmap"):
         # Calculate exposure contributions for visualization
         exposure_df = df[['strikePrice']].copy()
@@ -1723,12 +1706,18 @@ def analyze_option_chain(selected_expiry=None):
         exposure_df['abs_delta_impact'] = abs(exposure_df['delta_contribution'])
         exposure_df['abs_gamma_impact'] = abs(exposure_df['gamma_contribution'])
         
-        st.dataframe(
-            exposure_df.style.background_gradient(subset=['abs_delta_impact'], cmap='Reds')
-                              .background_gradient(subset=['abs_gamma_impact'], cmap='Blues'),
-            use_container_width=True,
-            height=300
-        )
+        # FIX: Use simpler styling to avoid matplotlib dependency issues
+        try:
+            # Try to use background gradient if available
+            styled_exposure = exposure_df.style\
+                .background_gradient(subset=['abs_delta_impact'], cmap='Reds', axis=None)\
+                .background_gradient(subset=['abs_gamma_impact'], cmap='Blues', axis=None)
+            st.dataframe(styled_exposure, use_container_width=True, height=300)
+        except Exception as e:
+            # Fallback to simpler styling
+            st.warning("Using simplified heatmap due to styling limitations")
+            st.dataframe(exposure_df, use_container_width=True, height=300)
+        
         st.caption("Red: Delta Exposure Intensity | Blue: Gamma Exposure Intensity")
 
     return underlying, df_summary, expiry_dates
@@ -2036,8 +2025,8 @@ def main():
                         df = process_candle_data(data, interval)
                         try:
                             db.save_candle_data("NIFTY50", "IDX_I", interval, df)
-                        except:
-                            pass
+                        except Exception as e:
+                            st.warning(f"Could not save candle data: {e}")
         else:
             # Always fetch fresh data when not using cache
             with st.spinner("Fetching fresh data from API..."):
@@ -2053,8 +2042,8 @@ def main():
                     df = process_candle_data(data, interval)
                     try:
                         db.save_candle_data("NIFTY50", "IDX_I", interval, df)
-                    except:
-                        pass
+                    except Exception as e:
+                        st.warning(f"Could not save candle data: {e}")
         
         # Get LTP data and current price
         ltp_data = api.get_ltp_data("13", "IDX_I")
@@ -2113,14 +2102,18 @@ def main():
         st.header("📊 Options Analysis")
         
         # Options chain analysis with expiry selection
-        underlying_price, df_summary, available_expiries = analyze_option_chain(selected_expiry)
-        
-        if underlying_price:
-            st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
+        try:
+            underlying_price, df_summary, available_expiries = analyze_option_chain(selected_expiry)
             
-            # Check for trading signals if enabled
-            if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
-                check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
+            if underlying_price:
+                st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
+                
+                # Check for trading signals if enabled
+                if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
+                    check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
+        except Exception as e:
+            st.error(f"Error analyzing option chain: {str(e)}")
+            st.info("Please check your Dhan API credentials and try again.")
     
     # Analytics dashboard below
     if show_analytics:
