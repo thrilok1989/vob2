@@ -680,8 +680,36 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
                 })
         return sorted(walls, key=lambda x: x['oi'], reverse=True)[:3]  # Return top 3
     
-    call_walls = find_walls(df_ce['openInterest'], df_ce['strikePrice'], 'CE')
-    put_walls = find_walls(df_pe['openInterest'], df_pe['strikePrice'], 'PE')
+    # FIX: Use the correct column names - they have suffixes
+    # Check which column names actually exist
+    call_oi_column = None
+    put_oi_column = None
+    
+    # Try to find the open interest column in df_ce
+    possible_ce_columns = ['openInterest_CE', 'openInterest', 'oi']
+    for col in possible_ce_columns:
+        if col in df_ce.columns:
+            call_oi_column = col
+            break
+    
+    # Try to find the open interest column in df_pe  
+    possible_pe_columns = ['openInterest_PE', 'openInterest', 'oi']
+    for col in possible_pe_columns:
+        if col in df_pe.columns:
+            put_oi_column = col
+            break
+    
+    # If columns not found, return empty results
+    if not call_oi_column or not put_oi_column:
+        return {
+            'call_walls': [],
+            'put_walls': [],
+            'seller_bias': "NEUTRAL",
+            'reasoning': ["Missing OI data columns"]
+        }
+    
+    call_walls = find_walls(df_ce[call_oi_column], df_ce['strikePrice'], 'CE')
+    put_walls = find_walls(df_pe[put_oi_column], df_pe['strikePrice'], 'PE')
     
     # Generate seller's bias from walls
     seller_bias = "NEUTRAL"
@@ -1400,7 +1428,6 @@ def analyze_option_chain(selected_expiry=None):
         if 'ce' in strike_data:
             ce_data = strike_data['ce']
             ce_data['strikePrice'] = float(strike)
-            # Handle Dhan API field names - they use underscores
             calls.append(ce_data)
         if 'pe' in strike_data:
             pe_data = strike_data['pe']
@@ -1409,6 +1436,11 @@ def analyze_option_chain(selected_expiry=None):
     
     df_ce = pd.DataFrame(calls)
     df_pe = pd.DataFrame(puts)
+    
+    # FIX: Let's see what columns actually exist in the Dhan API response
+    # Add debug to see column names
+    st.sidebar.write("DEBUG: df_ce columns", df_ce.columns.tolist() if not df_ce.empty else "Empty")
+    st.sidebar.write("DEBUG: df_pe columns", df_pe.columns.tolist() if not df_pe.empty else "Empty")
     
     # Handle Dhan API field names - they might use underscores
     # Create a mapping for Dhan API field names to our expected names
@@ -1425,9 +1457,26 @@ def analyze_option_chain(selected_expiry=None):
             'changein_oi': f'changeinOpenInterest_{suffix}'
         }
         
+        # Apply mapping only if column exists
         for old_col, new_col in column_mapping.items():
             if old_col in df.columns:
                 df.rename(columns={old_col: new_col}, inplace=True)
+        
+        # Ensure required columns exist
+        required_cols = [
+            f'openInterest_{suffix}',
+            f'impliedVolatility_{suffix}',
+            f'lastPrice_{suffix}',
+            f'askQty_{suffix}',
+            f'bidQty_{suffix}',
+            f'totalTradedVolume_{suffix}',
+            f'changeinOpenInterest_{suffix}'
+        ]
+        
+        for col in required_cols:
+            if col not in df.columns:
+                df[col] = 0
+        
         return df
     
     # Map field names for calls and puts
@@ -1439,31 +1488,27 @@ def analyze_option_chain(selected_expiry=None):
     
     # Fill NaN values with 0 for numerical columns
     numeric_cols = [col for col in df.columns if col not in ['strikePrice']]
-    df[numeric_cols] = df[numeric_cols].fillna(0)
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
     
-    # Calculate change in OI if not provided by API
-    if 'changeinOpenInterest_CE' not in df.columns and 'openInterest_CE' in df.columns and 'previousOpenInterest_CE' in df.columns:
-        df['changeinOpenInterest_CE'] = df['openInterest_CE'] - df['previousOpenInterest_CE']
-    
-    if 'changeinOpenInterest_PE' not in df.columns and 'openInterest_PE' in df.columns and 'previousOpenInterest_PE' in df.columns:
-        df['changeinOpenInterest_PE'] = df['openInterest_PE'] - df['previousOpenInterest_PE']
-    
-    # If changeinOpenInterest columns still don't exist, create them with 0
-    if 'changeinOpenInterest_CE' not in df.columns:
-        df['changeinOpenInterest_CE'] = 0
-    if 'changeinOpenInterest_PE' not in df.columns:
-        df['changeinOpenInterest_PE'] = 0
-
     # Enhanced Greeks calculation with exact time-to-expiry
     T = calculate_exact_time_to_expiry(expiry)
     r = 0.06
     
     # Check if impliedVolatility columns exist, create them if not
     if 'impliedVolatility_CE' not in df.columns:
-        df['impliedVolatility_CE'] = 15  # Default value
+        df['impliedVolatility_CE'] = 15
     
     if 'impliedVolatility_PE' not in df.columns:
-        df['impliedVolatility_PE'] = 15  # Default value
+        df['impliedVolatility_PE'] = 15
+    
+    # Also check for openInterest columns
+    if 'openInterest_CE' not in df.columns:
+        df['openInterest_CE'] = 0
+    
+    if 'openInterest_PE' not in df.columns:
+        df['openInterest_PE'] = 0
     
     for idx, row in df.iterrows():
         strike = row['strikePrice']
@@ -1491,8 +1536,9 @@ def analyze_option_chain(selected_expiry=None):
     atm_strike = min(df['strikePrice'], key=lambda x: abs(x - underlying))
     
     # Limit to ATM ± 2 strikes for faster UI (performance optimization)
-    atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]  # Assuming 50 point strikes
-    df = atm_plus_minus_2.copy()
+    atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]
+    if not atm_plus_minus_2.empty:
+        df = atm_plus_minus_2.copy()
     
     df['Zone'] = df['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
     df['Level'] = df.apply(determine_level, axis=1)
@@ -1539,11 +1585,21 @@ def analyze_option_chain(selected_expiry=None):
         bias_results.append(row_data)
 
     df_summary = pd.DataFrame(bias_results)
-    df_summary = pd.merge(
-        df_summary,
-        df[['strikePrice', 'openInterest_CE', 'openInterest_PE']],
-        left_on='Strike', right_on='strikePrice', how='left'
-    )
+    
+    # Ensure we have the required columns for merging
+    required_summary_cols = ['strikePrice', 'openInterest_CE', 'openInterest_PE']
+    available_cols = [col for col in required_summary_cols if col in df.columns]
+    
+    if available_cols:
+        df_summary = pd.merge(
+            df_summary,
+            df[available_cols],
+            left_on='Strike', right_on='strikePrice', how='left'
+        )
+    else:
+        # Add dummy columns if they don't exist
+        df_summary['openInterest_CE'] = 0
+        df_summary['openInterest_PE'] = 0
 
     df_summary['PCR'] = df_summary['openInterest_PE'] / df_summary['openInterest_CE']
     df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
@@ -1551,8 +1607,8 @@ def analyze_option_chain(selected_expiry=None):
     
     # FIXED: Correct PCR interpretation for sellers
     df_summary['PCR_Signal'] = np.where(
-        df_summary['PCR'] > 1.2, "BEARISH_SENTIMENT",  # High PCR = Bearish = Good for PUT SELLING
-        np.where(df_summary['PCR'] < 0.7, "BULLISH_SENTIMENT", "NEUTRAL")  # Low PCR = Bullish = Good for CALL SELLING
+        df_summary['PCR'] > 1.2, "BEARISH_SENTIMENT",
+        np.where(df_summary['PCR'] < 0.7, "BULLISH_SENTIMENT", "NEUTRAL")
     )
 
     st.markdown("## Option Chain Bias Summary")
@@ -1593,23 +1649,16 @@ def analyze_option_chain(selected_expiry=None):
     
     with col2:
         # 2. VOLATILITY REGIME
-        # Note: You'll need to fetch historical IV data from your database
-        historical_iv = []  # Placeholder - implement historical IV fetch
-        # Get current ATM IV - FIXED: Handle case where impliedVolatility_CE might not exist
+        historical_iv = []  # Placeholder
         try:
-            # Check if we have ATM data
+            # Get current ATM IV
             atm_data = df[df['Zone'] == 'ATM']
             if not atm_data.empty:
-                # Try to get implied volatility from ATM strike
-                if 'impliedVolatility_CE' in atm_data.columns:
-                    current_atm_iv = atm_data['impliedVolatility_CE'].iloc[0]
-                else:
-                    # Calculate average IV from nearby strikes
-                    current_atm_iv = df['impliedVolatility_CE'].mean() if 'impliedVolatility_CE' in df.columns else 15
+                current_atm_iv = atm_data['impliedVolatility_CE'].iloc[0] if 'impliedVolatility_CE' in atm_data.columns else 15
             else:
                 current_atm_iv = df['impliedVolatility_CE'].mean() if 'impliedVolatility_CE' in df.columns else 15
         except:
-            current_atm_iv = 15  # Default fallback
+            current_atm_iv = 15
         
         regime, action, iv_rank, iv_perc, color = calculate_volatility_regime_bias(
             current_atm_iv,
@@ -1659,9 +1708,18 @@ def analyze_option_chain(selected_expiry=None):
     # Delta-Gamma Exposure Visualization
     with st.expander("📉 Delta-Gamma Exposure Heatmap"):
         # Calculate exposure contributions for visualization
-        exposure_df = df[['strikePrice', 'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE']].copy()
-        exposure_df['delta_contribution'] = (-exposure_df['Delta_CE'] * df['openInterest_CE']) + (exposure_df['Delta_PE'] * df['openInterest_PE'])
-        exposure_df['gamma_contribution'] = (-exposure_df['Gamma_CE'] * df['openInterest_CE']) + (-exposure_df['Gamma_PE'] * df['openInterest_PE'])
+        exposure_df = df[['strikePrice']].copy()
+        
+        # Add Greek columns if they exist
+        greek_cols = ['Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'openInterest_CE', 'openInterest_PE']
+        for col in greek_cols:
+            if col in df.columns:
+                exposure_df[col] = df[col]
+            else:
+                exposure_df[col] = 0
+        
+        exposure_df['delta_contribution'] = (-exposure_df['Delta_CE'] * exposure_df['openInterest_CE']) + (exposure_df['Delta_PE'] * exposure_df['openInterest_PE'])
+        exposure_df['gamma_contribution'] = (-exposure_df['Gamma_CE'] * exposure_df['openInterest_CE']) + (-exposure_df['Gamma_PE'] * exposure_df['openInterest_PE'])
         exposure_df['abs_delta_impact'] = abs(exposure_df['delta_contribution'])
         exposure_df['abs_gamma_impact'] = abs(exposure_df['gamma_contribution'])
         
