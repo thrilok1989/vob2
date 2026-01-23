@@ -18,6 +18,7 @@ from pytz import timezone
 import io
 import os
 from scipy import stats
+import plotly.express as px
 
 # Page configuration
 st.set_page_config(
@@ -70,6 +71,18 @@ st.markdown("""
         background-color: #660000 !important;
         color: white !important;
         font-weight: bold !important;
+    }
+    .depth-support {
+        background-color: rgba(0, 100, 0, 0.3) !important;
+        border-left: 3px solid green !important;
+    }
+    .depth-resistance {
+        background-color: rgba(100, 0, 0, 0.3) !important;
+        border-left: 3px solid red !important;
+    }
+    .depth-neutral {
+        background-color: rgba(100, 100, 0, 0.3) !important;
+        border-left: 3px solid yellow !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -431,6 +444,26 @@ class DhanAPI:
         except Exception as e:
             st.error(f"Error fetching LTP: {str(e)}")
             return None
+    
+    def get_market_depth(self, security_id="13", exchange_segment="IDX_I"):
+        """Get Market Depth (Order Book) data"""
+        url = f"{self.base_url}/marketfeed/quotes"
+        
+        payload = {
+            "securityId": security_id,
+            "exchangeSegment": exchange_segment
+        }
+        
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                st.error(f"Market Depth API Error: {response.status_code}")
+                return None
+        except Exception as e:
+            st.error(f"Error fetching market depth: {str(e)}")
+            return None
 
 @st.cache_data(ttl=300)
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
@@ -480,6 +513,393 @@ def get_dhan_expiry_list(underlying_scrip: int, underlying_seg: str):
     except requests.exceptions.RequestException as e:
         st.error(f"Error fetching Dhan expiry list: {e}")
         return None
+
+# ============================================
+# MARKET DEPTH ANALYSIS (SELLER'S PERSPECTIVE)
+# ============================================
+
+class MarketDepthAnalyzer:
+    """Analyze market depth from a seller's perspective"""
+    
+    @staticmethod
+    def analyze_depth_structure(depth_data, current_price):
+        """Analyze market depth for support/resistance levels"""
+        try:
+            if not depth_data or 'data' not in depth_data:
+                return {"error": "No depth data available"}
+            
+            data = depth_data['data']
+            
+            # Extract bid and ask levels
+            bids = []
+            asks = []
+            
+            # Parse bid levels (buy orders)
+            for i in range(1, 6):  # Typically 5 levels
+                bid_key = f'bid{i}'
+                if bid_key in data:
+                    bid_price = data.get(f'{bid_key}Price', 0)
+                    bid_qty = data.get(f'{bid_key}Quantity', 0)
+                    if bid_price > 0 and bid_qty > 0:
+                        bids.append({
+                            'price': bid_price,
+                            'quantity': bid_qty,
+                            'type': 'bid',
+                            'level': i
+                        })
+            
+            # Parse ask levels (sell orders)
+            for i in range(1, 6):
+                ask_key = f'ask{i}'
+                if ask_key in data:
+                    ask_price = data.get(f'{ask_key}Price', 0)
+                    ask_qty = data.get(f'{ask_key}Quantity', 0)
+                    if ask_price > 0 and ask_qty > 0:
+                        asks.append({
+                            'price': ask_price,
+                            'quantity': ask_qty,
+                            'type': 'ask',
+                            'level': i
+                        })
+            
+            # Calculate depth metrics
+            total_bid_qty = sum(b['quantity'] for b in bids)
+            total_ask_qty = sum(a['quantity'] for a in asks)
+            
+            # Identify significant depth levels (walls)
+            depth_walls = []
+            
+            # Strong support walls (large bid quantities)
+            for bid in bids:
+                if bid['quantity'] > 1000:  # Threshold for significant wall
+                    wall_strength = "STRONG" if bid['quantity'] > 5000 else "MODERATE"
+                    distance_pct = ((bid['price'] - current_price) / current_price * 100)
+                    
+                    depth_walls.append({
+                        'price': bid['price'],
+                        'quantity': bid['quantity'],
+                        'type': 'SUPPORT',
+                        'strength': wall_strength,
+                        'distance_pct': distance_pct,
+                        'side': 'bid',
+                        'depth_ratio': bid['quantity'] / total_bid_qty if total_bid_qty > 0 else 0
+                    })
+            
+            # Strong resistance walls (large ask quantities)
+            for ask in asks:
+                if ask['quantity'] > 1000:
+                    wall_strength = "STRONG" if ask['quantity'] > 5000 else "MODERATE"
+                    distance_pct = ((ask['price'] - current_price) / current_price * 100)
+                    
+                    depth_walls.append({
+                        'price': ask['price'],
+                        'quantity': ask['quantity'],
+                        'type': 'RESISTANCE',
+                        'strength': wall_strength,
+                        'distance_pct': distance_pct,
+                        'side': 'ask',
+                        'depth_ratio': ask['quantity'] / total_ask_qty if total_ask_qty > 0 else 0
+                    })
+            
+            # Sort walls by quantity (descending)
+            depth_walls.sort(key=lambda x: x['quantity'], reverse=True)
+            
+            # Calculate depth imbalance
+            bid_ask_imbalance = total_bid_qty - total_ask_qty
+            imbalance_ratio = bid_ask_imbalance / (total_bid_qty + total_ask_qty) if (total_bid_qty + total_ask_qty) > 0 else 0
+            
+            # Determine depth bias for sellers
+            depth_bias = "NEUTRAL"
+            reasoning = []
+            
+            if imbalance_ratio > 0.2:  # Strong buying pressure
+                depth_bias = "BULLISH_PRESSURE"
+                reasoning.append(f"Strong bid dominance: {imbalance_ratio:.2%} imbalance")
+            elif imbalance_ratio < -0.2:  # Strong selling pressure
+                depth_bias = "BEARISH_PRESSURE"
+                reasoning.append(f"Strong ask dominance: {abs(imbalance_ratio):.2%} imbalance")
+            else:
+                depth_bias = "BALANCED"
+                reasoning.append("Balanced order book")
+            
+            # Check for near-term support/resistance
+            near_support = []
+            near_resistance = []
+            
+            for wall in depth_walls:
+                if abs(wall['distance_pct']) < 1:  # Within 1% of current price
+                    if wall['type'] == 'SUPPORT':
+                        near_support.append(wall)
+                    else:
+                        near_resistance.append(wall)
+            
+            return {
+                'bids': bids,
+                'asks': asks,
+                'total_bid_qty': total_bid_qty,
+                'total_ask_qty': total_ask_qty,
+                'depth_walls': depth_walls,
+                'bid_ask_imbalance': bid_ask_imbalance,
+                'imbalance_ratio': imbalance_ratio,
+                'depth_bias': depth_bias,
+                'reasoning': reasoning,
+                'near_support': sorted(near_support, key=lambda x: x['quantity'], reverse=True)[:3],
+                'near_resistance': sorted(near_resistance, key=lambda x: x['quantity'], reverse=True)[:3],
+                'current_price': current_price
+            }
+            
+        except Exception as e:
+            st.error(f"Error analyzing market depth: {e}")
+            return {"error": str(e)}
+    
+    @staticmethod
+    def calculate_depth_based_support_resistance(depth_analysis, price_range_percent=2):
+        """Calculate support and resistance levels based on market depth"""
+        try:
+            current_price = depth_analysis.get('current_price', 0)
+            if current_price == 0:
+                return {"error": "No current price available"}
+            
+            # Price range for analysis
+            lower_bound = current_price * (1 - price_range_percent/100)
+            upper_bound = current_price * (1 + price_range_percent/100)
+            
+            # Filter walls within price range
+            relevant_walls = [w for w in depth_analysis.get('depth_walls', []) 
+                            if lower_bound <= w['price'] <= upper_bound]
+            
+            # Separate support and resistance walls
+            support_walls = [w for w in relevant_walls if w['type'] == 'SUPPORT']
+            resistance_walls = [w for w in relevant_walls if w['type'] == 'RESISTANCE']
+            
+            # Calculate cumulative strength at each price level
+            support_levels = []
+            resistance_levels = []
+            
+            # Group nearby support levels
+            support_groups = {}
+            for wall in support_walls:
+                rounded_price = round(wall['price'] / 50) * 50  # Group by 50-point intervals
+                if rounded_price not in support_groups:
+                    support_groups[rounded_price] = {
+                        'price': rounded_price,
+                        'total_quantity': 0,
+                        'wall_count': 0,
+                        'walls': []
+                    }
+                support_groups[rounded_price]['total_quantity'] += wall['quantity']
+                support_groups[rounded_price]['wall_count'] += 1
+                support_groups[rounded_price]['walls'].append(wall)
+            
+            # Group nearby resistance levels
+            resistance_groups = {}
+            for wall in resistance_walls:
+                rounded_price = round(wall['price'] / 50) * 50
+                if rounded_price not in resistance_groups:
+                    resistance_groups[rounded_price] = {
+                        'price': rounded_price,
+                        'total_quantity': 0,
+                        'wall_count': 0,
+                        'walls': []
+                    }
+                resistance_groups[rounded_price]['total_quantity'] += wall['quantity']
+                resistance_groups[rounded_price]['wall_count'] += 1
+                resistance_groups[rounded_price]['walls'].append(wall)
+            
+            # Convert to lists and calculate strength scores
+            for price, group in support_groups.items():
+                strength_score = (group['total_quantity'] / 10000) * (group['wall_count'] ** 0.5)
+                support_levels.append({
+                    'price': price,
+                    'strength_score': round(strength_score, 2),
+                    'total_quantity': group['total_quantity'],
+                    'wall_count': group['wall_count'],
+                    'type': 'SUPPORT',
+                    'distance_pct': ((price - current_price) / current_price * 100)
+                })
+            
+            for price, group in resistance_groups.items():
+                strength_score = (group['total_quantity'] / 10000) * (group['wall_count'] ** 0.5)
+                resistance_levels.append({
+                    'price': price,
+                    'strength_score': round(strength_score, 2),
+                    'total_quantity': group['total_quantity'],
+                    'wall_count': group['wall_count'],
+                    'type': 'RESISTANCE',
+                    'distance_pct': ((price - current_price) / current_price * 100)
+                })
+            
+            # Sort by strength
+            support_levels.sort(key=lambda x: x['strength_score'], reverse=True)
+            resistance_levels.sort(key=lambda x: x['strength_score'], reverse=True)
+            
+            # Get strongest levels
+            strongest_support = support_levels[:3] if support_levels else []
+            strongest_resistance = resistance_levels[:3] if resistance_levels else []
+            
+            # Calculate depth-based price targets for sellers
+            price_targets = {
+                'immediate_support': strongest_support[0]['price'] if strongest_support else None,
+                'immediate_resistance': strongest_resistance[0]['price'] if strongest_resistance else None,
+                'next_support': strongest_support[1]['price'] if len(strongest_support) > 1 else None,
+                'next_resistance': strongest_resistance[1]['price'] if len(strongest_resistance) > 1 else None
+            }
+            
+            return {
+                'support_levels': support_levels,
+                'resistance_levels': resistance_levels,
+                'strongest_support': strongest_support,
+                'strongest_resistance': strongest_resistance,
+                'price_targets': price_targets,
+                'current_price': current_price,
+                'analysis_range': f"±{price_range_percent}%"
+            }
+            
+        except Exception as e:
+            st.error(f"Error calculating depth-based S/R: {e}")
+            return {"error": str(e)}
+    
+    @staticmethod
+    def visualize_market_depth(depth_analysis, title="Market Depth Analysis"):
+        """Create visualization for market depth"""
+        try:
+            bids = depth_analysis.get('bids', [])
+            asks = depth_analysis.get('asks', [])
+            
+            if not bids and not asks:
+                return None
+            
+            # Create DataFrames
+            bids_df = pd.DataFrame(bids)
+            asks_df = pd.DataFrame(asks)
+            
+            fig = go.Figure()
+            
+            # Add bid bars (green)
+            if not bids_df.empty:
+                fig.add_trace(go.Bar(
+                    x=bids_df['quantity'],
+                    y=bids_df['price'],
+                    name='Bids (Buyers)',
+                    orientation='h',
+                    marker_color='green',
+                    opacity=0.7,
+                    text=bids_df['quantity'].apply(lambda x: f'{x:,}'),
+                    textposition='auto',
+                ))
+            
+            # Add ask bars (red)
+            if not asks_df.empty:
+                fig.add_trace(go.Bar(
+                    x=asks_df['quantity'],
+                    y=asks_df['price'],
+                    name='Asks (Sellers)',
+                    orientation='h',
+                    marker_color='red',
+                    opacity=0.7,
+                    text=asks_df['quantity'].apply(lambda x: f'{x:,}'),
+                    textposition='auto',
+                ))
+            
+            # Add current price line
+            current_price = depth_analysis.get('current_price', 0)
+            if current_price > 0:
+                fig.add_hline(y=current_price, line_dash="dash", line_color="yellow",
+                            annotation_text=f"Current: {current_price:.2f}",
+                            annotation_position="top right")
+            
+            # Update layout
+            fig.update_layout(
+                title=title,
+                template='plotly_dark',
+                height=500,
+                xaxis_title="Order Quantity",
+                yaxis_title="Price (₹)",
+                barmode='relative',
+                showlegend=True,
+                margin=dict(l=0, r=0, t=40, b=0),
+                font=dict(color='white'),
+                plot_bgcolor='#1e1e1e',
+                paper_bgcolor='#1e1e1e'
+            )
+            
+            return fig
+            
+        except Exception as e:
+            st.error(f"Error creating depth visualization: {e}")
+            return None
+    
+    @staticmethod
+    def generate_depth_trading_signals(depth_analysis, option_data, current_price):
+        """Generate trading signals based on market depth analysis"""
+        try:
+            signals = []
+            
+            # Get depth-based S/R analysis
+            sr_analysis = MarketDepthAnalyzer.calculate_depth_based_support_resistance(depth_analysis)
+            
+            if 'error' in sr_analysis:
+                return signals
+            
+            # Check for breakout/breakdown signals
+            strongest_support = sr_analysis.get('strongest_support', [])
+            strongest_resistance = sr_analysis.get('strongest_resistance', [])
+            
+            # Signal 1: Strong Support Bounce
+            if strongest_support:
+                nearest_support = min(strongest_support, key=lambda x: abs(x['distance_pct']))
+                if abs(nearest_support['distance_pct']) < 0.5 and nearest_support['strength_score'] > 5:
+                    signals.append({
+                        'type': 'SUPPORT_BOUNCE',
+                        'direction': 'BULLISH',
+                        'price_level': nearest_support['price'],
+                        'strength': nearest_support['strength_score'],
+                        'signal_strength': min(10, nearest_support['strength_score']),
+                        'action': 'BUY_NEAR_SUPPORT',
+                        'reason': f"Strong support at {nearest_support['price']} with strength {nearest_support['strength_score']:.1f}"
+                    })
+            
+            # Signal 2: Strong Resistance Rejection
+            if strongest_resistance:
+                nearest_resistance = min(strongest_resistance, key=lambda x: abs(x['distance_pct']))
+                if abs(nearest_resistance['distance_pct']) < 0.5 and nearest_resistance['strength_score'] > 5:
+                    signals.append({
+                        'type': 'RESISTANCE_REJECTION',
+                        'direction': 'BEARISH',
+                        'price_level': nearest_resistance['price'],
+                        'strength': nearest_resistance['strength_score'],
+                        'signal_strength': min(10, nearest_resistance['strength_score']),
+                        'action': 'SELL_NEAR_RESISTANCE',
+                        'reason': f"Strong resistance at {nearest_resistance['price']} with strength {nearest_resistance['strength_score']:.1f}"
+                    })
+            
+            # Signal 3: Depth Imbalance Signal
+            imbalance_ratio = depth_analysis.get('imbalance_ratio', 0)
+            if imbalance_ratio > 0.3:
+                signals.append({
+                    'type': 'DEPTH_IMBALANCE',
+                    'direction': 'BULLISH',
+                    'signal_strength': min(10, abs(imbalance_ratio) * 20),
+                    'action': 'BUY_ON_STRENGTH',
+                    'reason': f"Strong bid dominance: {imbalance_ratio:.2%} imbalance"
+                })
+            elif imbalance_ratio < -0.3:
+                signals.append({
+                    'type': 'DEPTH_IMBALANCE',
+                    'direction': 'BEARISH',
+                    'signal_strength': min(10, abs(imbalance_ratio) * 20),
+                    'action': 'SELL_ON_WEAKNESS',
+                    'reason': f"Strong ask dominance: {abs(imbalance_ratio):.2%} imbalance"
+                })
+            
+            # Sort signals by strength
+            signals.sort(key=lambda x: x['signal_strength'], reverse=True)
+            
+            return signals[:3]  # Return top 3 signals
+            
+        except Exception as e:
+            st.error(f"Error generating depth signals: {e}")
+            return []
 
 class PivotIndicator:
     """Higher Timeframe Pivot Support/Resistance Indicator"""
@@ -601,20 +1021,14 @@ def calculate_net_delta_gamma_exposure(option_chain_df, spot_price):
     """
     try:
         df = option_chain_df.copy()
-        # Initialize columns for contribution
         df['delta_contribution'] = 0.0
         df['gamma_contribution'] = 0.0
         
-        # Loop through each strike to calculate its contribution to market exposure
         for idx, row in df.iterrows():
-            strike = row['strikePrice']
             ce_oi = row.get('openInterest_CE', 0)
             pe_oi = row.get('openInterest_PE', 0)
             
-            # Delta Contribution
             delta_contrib = (-row.get('Delta_CE', 0) * ce_oi) + (row.get('Delta_PE', 0) * pe_oi)
-            
-            # Gamma Contribution
             gamma_contrib = (-row.get('Gamma_CE', 0) * ce_oi) + (-row.get('Gamma_PE', 0) * pe_oi)
             
             df.at[idx, 'delta_contribution'] = delta_contrib
@@ -623,7 +1037,6 @@ def calculate_net_delta_gamma_exposure(option_chain_df, spot_price):
         net_delta_exposure = df['delta_contribution'].sum()
         net_gamma_exposure = df['gamma_contribution'].sum()
         
-        # Normalize by total OI for a relative view
         total_oi = df['openInterest_CE'].sum() + df['openInterest_PE'].sum()
         norm_nde = (net_delta_exposure / total_oi * 10000) if total_oi > 0 else 0
         norm_nge = (net_gamma_exposure / total_oi * 10000) if total_oi > 0 else 0
@@ -651,10 +1064,7 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
         if len(oi_series) < 5:
             return walls
         
-        # Calculate z-score of OI to find statistically significant outliers
         oi_zscore = np.abs(stats.zscore(oi_series.fillna(0)))
-        
-        # A 'wall' is a strike where OI is high (top 20%) and significantly above local mean
         high_oi_threshold = np.percentile(oi_series, 80)
         
         for i in range(2, len(oi_series)-2):
@@ -677,21 +1087,18 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
     call_oi_column = None
     put_oi_column = None
     
-    # Find open interest column in df_ce
     possible_ce_columns = ['openInterest_CE', 'openInterest', 'oi']
     for col in possible_ce_columns:
         if col in df_ce.columns:
             call_oi_column = col
             break
     
-    # Find open interest column in df_pe  
     possible_pe_columns = ['openInterest_PE', 'openInterest', 'oi']
     for col in possible_pe_columns:
         if col in df_pe.columns:
             put_oi_column = col
             break
     
-    # If columns not found, return empty results
     if not call_oi_column or not put_oi_column:
         return {
             'call_walls': [],
@@ -703,7 +1110,6 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
     call_walls = find_walls(df_ce[call_oi_column], df_ce['strikePrice'], 'CE')
     put_walls = find_walls(df_pe[put_oi_column], df_pe['strikePrice'], 'PE')
     
-    # Generate seller's bias from walls
     seller_bias = "NEUTRAL"
     reasoning = []
     
@@ -719,7 +1125,6 @@ def calculate_oi_concentration_bias(df_ce, df_pe, spot_price):
             seller_bias = "BULLISH_SUPPORT"
             reasoning.append(f"Strong put wall at {nearest_put['strike']} (support)")
     
-    # If both strong walls are close, market is likely range-bound
     if (call_walls and put_walls and 
         abs(call_walls[0]['distance_pct']) < 3 and 
         abs(put_walls[0]['distance_pct']) < 3):
@@ -744,10 +1149,8 @@ def calculate_volatility_regime_bias(current_atm_iv, historical_iv_data):
     iv_rank = ((current_atm_iv - min(historical_iv_data)) / 
                (max(historical_iv_data) - min(historical_iv_data)) * 100)
     
-    # IV Percentile: % of days where IV was below current
     iv_percentile = sum(1 for iv in historical_iv_data if iv < current_atm_iv) / len(historical_iv_data) * 100
     
-    # Regime determination for SELLERS
     if iv_rank > 70 or iv_percentile > 70:
         regime = "HIGH_VOLATILITY"
         action = "OPTIMAL FOR SELLING PREMIUM"
@@ -763,17 +1166,27 @@ def calculate_volatility_regime_bias(current_atm_iv, historical_iv_data):
     
     return regime, action, round(iv_rank, 1), round(iv_percentile, 1), color
 
-def generate_seller_recommendation(exposure_data, vol_regime, oi_bias_data, spot_price, df):
+def generate_seller_recommendation(exposure_data, vol_regime, oi_bias_data, spot_price, df, depth_analysis=None):
     """Generates specific option selling strategies based on current market biases."""
     
-    # Base recommendation
     recommendation = {
         'action': 'WAIT_FOR_BETTER_SETUP',
         'strikes': '',
-        'rationale': []
+        'rationale': [],
+        'depth_influenced': False
     }
     
-    # Check Volatility Regime First - Most Important Filter
+    # Incorporate depth analysis if available
+    if depth_analysis and 'depth_bias' in depth_analysis:
+        depth_bias = depth_analysis['depth_bias']
+        if depth_bias == "BEARISH_PRESSURE":
+            recommendation['rationale'].append("Depth shows selling pressure")
+            recommendation['depth_influenced'] = True
+        elif depth_bias == "BULLISH_PRESSURE":
+            recommendation['rationale'].append("Depth shows buying pressure")
+            recommendation['depth_influenced'] = True
+    
+    # Check Volatility Regime First
     if "HIGH" in vol_regime:
         recommendation['rationale'].append("High IV regime optimal for selling")
         
@@ -817,7 +1230,7 @@ def generate_seller_recommendation(exposure_data, vol_regime, oi_bias_data, spot
     recommendation['rationale'] = " | ".join(recommendation['rationale'])
     return recommendation
 
-def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5):
+def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5, depth_signals=None):
     """Trading signal detection with Normal Bias OR OI Dominance."""
     if df.empty or option_data is None or len(option_data) == 0 or not current_price:
         return
@@ -879,6 +1292,13 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                 conditions_text = "\n".join([f"✅ {k}" for k, v in bullish_conditions.items() if v])
                 price_diff = current_price - pivot_level['value']
                 
+                # Add depth confirmation if available
+                depth_confirmation = ""
+                if depth_signals:
+                    for signal in depth_signals:
+                        if signal['direction'] == 'BULLISH':
+                            depth_confirmation = f"\n📊 Depth Confirmation: {signal['reason']}"
+                
                 message = f"""
 🚨 <b>NIFTY CALL SIGNAL ALERT</b> 🚨
 
@@ -891,6 +1311,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
 
 ⚡ <b>{trigger_type}</b>
 ⚡ <b>OI:</b> CE ChgOI {ce_chg_oi:,} vs PE ChgOI {pe_chg_oi:,}
+{depth_confirmation}
 
 📋 <b>SUGGESTED REVIEW:</b>
 • Strike: {atm_strike} CE
@@ -913,6 +1334,13 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                 trigger_type = "📊 Normal Bias Trigger" if not bearish_oi_confirm else "🔥 OI Dominance Trigger"
                 conditions_text = "\n".join([f"🔴 {k}" for k, v in bearish_conditions.items() if v])
                 price_diff = current_price - pivot_level['value']
+                
+                # Add depth confirmation if available
+                depth_confirmation = ""
+                if depth_signals:
+                    for signal in depth_signals:
+                        if signal['direction'] == 'BEARISH':
+                            depth_confirmation = f"\n📊 Depth Confirmation: {signal['reason']}"
 
                 message = f"""
 🔴 <b>NIFTY PUT SIGNAL ALERT</b> 🔴
@@ -926,6 +1354,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
 
 ⚡ <b>{trigger_type}</b>
 ⚡ <b>OI:</b> PE ChgOI {pe_chg_oi:,} vs CE ChgOI {ce_chg_oi:,}
+{depth_confirmation}
 
 📋 <b>SUGGESTED REVIEW:</b>
 • Strike: {atm_strike} PE
@@ -949,26 +1378,23 @@ def calculate_exact_time_to_expiry(expiry_date_str):
         now = datetime.now(pytz.timezone('Asia/Kolkata'))
         time_diff = expiry_date - now
         
-        # Convert to years (more precise calculation)
         total_seconds = time_diff.total_seconds()
         total_days = total_seconds / (24 * 3600)
         years = total_days / 365.25
         
-        return max(years, 1/365.25)  # Minimum 1 day
+        return max(years, 1/365.25)
     except:
         return 1/365.25
 
 def get_iv_fallback(df, strike_price):
     """Get IV fallback using nearest strike average instead of fixed value"""
     try:
-        # Find strikes within ±100 points of current strike
         nearby_strikes = df[abs(df['strikePrice'] - strike_price) <= 100]
         
         if not nearby_strikes.empty:
             iv_ce_avg = nearby_strikes['impliedVolatility_CE'].mean()
             iv_pe_avg = nearby_strikes['impliedVolatility_PE'].mean()
             
-            # Fill NaN with overall average
             if pd.isna(iv_ce_avg):
                 iv_ce_avg = df['impliedVolatility_CE'].mean()
             if pd.isna(iv_pe_avg):
@@ -1079,6 +1505,17 @@ def color_seller_bias(val):
     else:
         return ''
 
+def color_depth_bias(val):
+    """Color code for depth bias"""
+    if val == "BULLISH_PRESSURE":
+        return 'background-color: #004d00; color: white; font-weight: bold'
+    elif val == "BEARISH_PRESSURE":
+        return 'background-color: #660000; color: white; font-weight: bold'
+    elif val == "BALANCED":
+        return 'background-color: #4d4d00; color: white; font-weight: bold'
+    else:
+        return ''
+
 def process_candle_data(data, interval):
     """Process API response into DataFrame"""
     if not data or 'open' not in data:
@@ -1098,8 +1535,8 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None):
-    """Create TradingView-style candlestick chart with optional pivot levels"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, depth_sr=None):
+    """Create TradingView-style candlestick chart with optional pivot levels and depth-based S/R"""
     if df.empty:
         return go.Figure()
     
@@ -1127,6 +1564,39 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         ),
         row=1, col=1
     )
+    
+    # Add depth-based support/resistance if available
+    if depth_sr and 'strongest_support' in depth_sr and 'strongest_resistance' in depth_sr:
+        try:
+            # Add support levels (green dashed lines)
+            for support in depth_sr['strongest_support'][:2]:  # Top 2 supports
+                if 'price' in support:
+                    fig.add_hline(
+                        y=support['price'],
+                        line_dash="dash",
+                        line_color="green",
+                        opacity=0.7,
+                        row=1, col=1,
+                        annotation_text=f"S: {support['price']:.0f}",
+                        annotation_position="top right",
+                        annotation_font_size=10
+                    )
+            
+            # Add resistance levels (red dashed lines)
+            for resistance in depth_sr['strongest_resistance'][:2]:  # Top 2 resistances
+                if 'price' in resistance:
+                    fig.add_hline(
+                        y=resistance['price'],
+                        line_dash="dash",
+                        line_color="red",
+                        opacity=0.7,
+                        row=1, col=1,
+                        annotation_text=f"R: {resistance['price']:.0f}",
+                        annotation_position="top right",
+                        annotation_font_size=10
+                    )
+        except Exception as e:
+            st.warning(f"Could not add depth S/R levels: {str(e)}")
     
     if show_pivots and len(df) > 50:
         try:
@@ -1254,7 +1724,7 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
     
     return fig
 
-def display_metrics(ltp_data, df, db, symbol="NIFTY50"):
+def display_metrics(ltp_data, df, db, symbol="NIFTY50", depth_analysis=None):
     """Display price metrics and save analytics"""
     if ltp_data and 'data' in ltp_data and not df.empty:
         current_price = None
@@ -1288,20 +1758,29 @@ def display_metrics(ltp_data, df, db, symbol="NIFTY50"):
                 'price_change_pct': float(change_pct)
             }
             
-            # Try to save analytics, but continue if it fails
             try:
                 db.save_market_analytics(symbol, analytics_data)
             except Exception as e:
                 st.warning(f"Could not save analytics: {e}")
             
+            # Display metrics with depth information if available
             col1, col2, col3, col4, col5 = st.columns(5)
             
             with col1:
                 color = "price-up" if change >= 0 else "price-down"
+                depth_info = ""
+                if depth_analysis and 'depth_bias' in depth_analysis:
+                    depth_bias = depth_analysis['depth_bias']
+                    if depth_bias == "BULLISH_PRESSURE":
+                        depth_info = "<br><small>📊 Depth: Bullish</small>"
+                    elif depth_bias == "BEARISH_PRESSURE":
+                        depth_info = "<br><small>📊 Depth: Bearish</small>"
+                
                 st.markdown(f"""
                 <div class="metric-container">
                     <h4>Current Price</h4>
                     <h2 class="{color}">₹{current_price:,.2f}</h2>
+                    {depth_info}
                 </div>
                 """, unsafe_allow_html=True)
             
@@ -1332,10 +1811,18 @@ def display_metrics(ltp_data, df, db, symbol="NIFTY50"):
                 """, unsafe_allow_html=True)
             
             with col5:
+                # Add depth imbalance info if available
+                depth_volume = ""
+                if depth_analysis and 'bid_ask_imbalance' in depth_analysis:
+                    imbalance = depth_analysis['bid_ask_imbalance']
+                    imbalance_sign = "+" if imbalance > 0 else ""
+                    depth_volume = f"<br><small>Depth Imbalance: {imbalance_sign}{imbalance:,.0f}</small>"
+                
                 st.markdown(f"""
                 <div class="metric-container">
                     <h4>Volume</h4>
                     <h3>{volume:,.0f}</h3>
+                    {depth_volume}
                 </div>
                 """, unsafe_allow_html=True)
 
@@ -1384,7 +1871,7 @@ def analyze_option_chain(selected_expiry=None):
     """Enhanced options chain analysis with SELLER'S EDGE dashboard."""
     now = datetime.now(timezone("Asia/Kolkata"))
     
-    # Get expiry list - use cached version for performance
+    # Get expiry list
     expiry_data = get_dhan_expiry_list_cached(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG)
     if not expiry_data or 'data' not in expiry_data:
         st.error("Failed to get expiry list from Dhan API")
@@ -1395,7 +1882,6 @@ def analyze_option_chain(selected_expiry=None):
         st.error("No expiry dates available")
         return None, None, []
     
-    # Use selected expiry or default to first
     expiry = selected_expiry if selected_expiry else expiry_dates[0]
 
     option_chain_data = get_dhan_option_chain(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG, expiry)
@@ -1421,12 +1907,10 @@ def analyze_option_chain(selected_expiry=None):
     df_ce = pd.DataFrame(calls)
     df_pe = pd.DataFrame(puts)
     
-    # Debug to see column names
     if df_ce.empty:
         st.error("No call data available")
         return None, None, expiry_dates
     
-    # Create a mapping function for Dhan API field names
     def map_dhan_fields(df, suffix):
         """Map Dhan API field names to our expected column names"""
         column_mapping = {
@@ -1440,12 +1924,10 @@ def analyze_option_chain(selected_expiry=None):
             'changein_oi': f'changeinOpenInterest_{suffix}'
         }
         
-        # Apply mapping only if column exists
         for old_col, new_col in column_mapping.items():
             if old_col in df.columns:
                 df.rename(columns={old_col: new_col}, inplace=True)
         
-        # Ensure required columns exist
         required_cols = [
             f'openInterest_{suffix}',
             f'impliedVolatility_{suffix}',
@@ -1462,31 +1944,25 @@ def analyze_option_chain(selected_expiry=None):
         
         return df
     
-    # Map field names for calls and puts
     df_ce = map_dhan_fields(df_ce, 'CE')
     df_pe = map_dhan_fields(df_pe, 'PE')
     
-    # Merge the dataframes
     df = pd.merge(df_ce, df_pe, on='strikePrice', how='outer').sort_values('strikePrice')
     
-    # Fill NaN values with 0 for numerical columns
     numeric_cols = [col for col in df.columns if col not in ['strikePrice']]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = df[col].fillna(0)
     
-    # Enhanced Greeks calculation with exact time-to-expiry
     T = calculate_exact_time_to_expiry(expiry)
     r = 0.06
     
-    # Check if impliedVolatility columns exist, create them if not
     if 'impliedVolatility_CE' not in df.columns:
         df['impliedVolatility_CE'] = 15
     
     if 'impliedVolatility_PE' not in df.columns:
         df['impliedVolatility_PE'] = 15
     
-    # Also check for openInterest columns
     if 'openInterest_CE' not in df.columns:
         df['openInterest_CE'] = 0
     
@@ -1496,11 +1972,9 @@ def analyze_option_chain(selected_expiry=None):
     for idx, row in df.iterrows():
         strike = row['strikePrice']
         
-        # Get IV values
         iv_ce = row.get('impliedVolatility_CE', 15)
         iv_pe = row.get('impliedVolatility_PE', 15)
         
-        # Use fallback if IV is 0 or NaN
         if pd.isna(iv_ce) or iv_ce == 0:
             iv_ce, _ = get_iv_fallback(df, strike)
         if pd.isna(iv_pe) or iv_pe == 0:
@@ -1509,7 +1983,6 @@ def analyze_option_chain(selected_expiry=None):
         iv_ce = iv_ce or 15
         iv_pe = iv_pe or 15
         
-        # Calculate Greeks
         greeks_ce = calculate_greeks('CE', underlying, strike, T, r, iv_ce / 100)
         greeks_pe = calculate_greeks('PE', underlying, strike, T, r, iv_pe / 100)
         
@@ -1518,7 +1991,6 @@ def analyze_option_chain(selected_expiry=None):
 
     atm_strike = min(df['strikePrice'], key=lambda x: abs(x - underlying))
     
-    # Limit to ATM ± 2 strikes for faster UI (performance optimization)
     atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]
     if not atm_plus_minus_2.empty:
         df = atm_plus_minus_2.copy()
@@ -1569,7 +2041,6 @@ def analyze_option_chain(selected_expiry=None):
 
     df_summary = pd.DataFrame(bias_results)
     
-    # Ensure we have the required columns for merging
     required_summary_cols = ['strikePrice', 'openInterest_CE', 'openInterest_PE']
     available_cols = [col for col in required_summary_cols if col in df.columns]
     
@@ -1580,7 +2051,6 @@ def analyze_option_chain(selected_expiry=None):
             left_on='Strike', right_on='strikePrice', how='left'
         )
     else:
-        # Add dummy columns if they don't exist
         df_summary['openInterest_CE'] = 0
         df_summary['openInterest_PE'] = 0
 
@@ -1588,7 +2058,6 @@ def analyze_option_chain(selected_expiry=None):
     df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
     df_summary['PCR'] = df_summary['PCR'].round(2)
     
-    # Fixed: Correct PCR interpretation for sellers
     df_summary['PCR_Signal'] = np.where(
         df_summary['PCR'] > 1.2, "BEARISH_SENTIMENT",
         np.where(df_summary['PCR'] < 0.7, "BULLISH_SENTIMENT", "NEUTRAL")
@@ -1596,7 +2065,6 @@ def analyze_option_chain(selected_expiry=None):
 
     st.markdown("## Option Chain Bias Summary")
     
-    # Enhanced styling with ATM highlighting
     styled_df = df_summary.style\
         .applymap(color_pcr, subset=['PCR'])\
         .applymap(color_pressure, subset=['BidAskPressure'])\
@@ -1604,7 +2072,6 @@ def analyze_option_chain(selected_expiry=None):
     
     st.dataframe(styled_df, use_container_width=True)
     
-    # Add download button for CSV
     csv_data = create_csv_download(df_summary)
     st.download_button(
         label="📥 Download Summary as CSV",
@@ -1612,113 +2079,6 @@ def analyze_option_chain(selected_expiry=None):
         file_name=f"nifty_options_summary_{expiry}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
         mime="text/csv"
     )
-
-    # === NEW: SELLER'S EDGE DASHBOARD ===
-    st.markdown("---")
-    st.subheader("📊 SELLER'S EDGE DASHBOARD")
-    
-    # Create 4 columns for key metrics
-    col1, col2, col3, col4 = st.columns(4)
-    
-    with col1:
-        # 1. DELTA/GAMMA EXPOSURE
-        exposure = calculate_net_delta_gamma_exposure(df, underlying)
-        st.metric("Net Delta Exposure", f"{exposure['norm_delta']:+.1f}",
-                 delta=f"Raw: {exposure['net_delta']:+.0f}",
-                 help="Positive = Net long delta exposure in market | Negative = Net short delta exposure")
-        st.metric("Net Gamma Exposure", f"{exposure['norm_gamma']:+.1f}",
-                 delta=f"Raw: {exposure['net_gamma']:+.0f}", 
-                 help="Negative Gamma = Market makers short gamma = hedging can amplify moves")
-    
-    with col2:
-        # 2. VOLATILITY REGIME
-        historical_iv = []  # Placeholder - would need historical data
-        try:
-            # Get current ATM IV
-            atm_data = df[df['Zone'] == 'ATM']
-            if not atm_data.empty:
-                current_atm_iv = atm_data['impliedVolatility_CE'].iloc[0] if 'impliedVolatility_CE' in atm_data.columns else 15
-            else:
-                current_atm_iv = df['impliedVolatility_CE'].mean() if 'impliedVolatility_CE' in df.columns else 15
-        except:
-            current_atm_iv = 15
-        
-        regime, action, iv_rank, iv_perc, color = calculate_volatility_regime_bias(
-            current_atm_iv,
-            historical_iv
-        )
-        st.metric("Volatility Regime", f"{color} {regime}",
-                 delta=f"IV Rank: {iv_rank}%")
-        st.caption(f"**Action:** {action}")
-    
-    with col3:
-        # 3. OI CONCENTRATION BIAS
-        oi_bias_data = calculate_oi_concentration_bias(df_ce, df_pe, underlying)
-        st.metric("OI Structure Bias", oi_bias_data['seller_bias'])
-        
-        # Display nearest walls
-        if oi_bias_data['call_walls']:
-            nearest_call = min(oi_bias_data['call_walls'], key=lambda x: abs(x['strike'] - underlying))
-            st.caption(f"Nearest Call Wall: **{nearest_call['strike']}** ({nearest_call['strength']})")
-        if oi_bias_data['put_walls']:
-            nearest_put = min(oi_bias_data['put_walls'], key=lambda x: abs(x['strike'] - underlying))
-            st.caption(f"Nearest Put Wall: **{nearest_put['strike']}** ({nearest_put['strength']})")
-    
-    with col4:
-        # 4. SELLER'S STRATEGY RECOMMENDATION
-        recommendation = generate_seller_recommendation(
-            exposure, regime, oi_bias_data, underlying, df
-        )
-        st.metric("Recommended Action", recommendation['action'])
-        st.caption(f"**Strikes:** {recommendation.get('strikes', 'N/A')}")
-        st.caption(f"**Rationale:** {recommendation.get('rationale', '')}")
-
-    # Detailed OI Walls Visualization
-    with st.expander("🔍 Detailed OI Walls Analysis"):
-        col_a, col_b = st.columns(2)
-        with col_a:
-            if oi_bias_data['call_walls']:
-                st.write("**Top Call Walls (Resistance)**")
-                for wall in oi_bias_data['call_walls'][:3]:
-                    st.write(f"{wall['strike']}: {wall['oi']:,} OI ({wall['strength']}) - {wall['distance_pct']:.1f}% from spot")
-        
-        with col_b:
-            if oi_bias_data['put_walls']:
-                st.write("**Top Put Walls (Support)**")
-                for wall in oi_bias_data['put_walls'][:3]:
-                    st.write(f"{wall['strike']}: {wall['oi']:,} OI ({wall['strength']}) - {wall['distance_pct']:.1f}% from spot")
-    
-    # Delta-Gamma Exposure Visualization - FIXED VERSION
-    with st.expander("📉 Delta-Gamma Exposure Heatmap"):
-        # Calculate exposure contributions for visualization
-        exposure_df = df[['strikePrice']].copy()
-        
-        # Add Greek columns if they exist
-        greek_cols = ['Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'openInterest_CE', 'openInterest_PE']
-        for col in greek_cols:
-            if col in df.columns:
-                exposure_df[col] = df[col]
-            else:
-                exposure_df[col] = 0
-        
-        exposure_df['delta_contribution'] = (-exposure_df['Delta_CE'] * exposure_df['openInterest_CE']) + (exposure_df['Delta_PE'] * exposure_df['openInterest_PE'])
-        exposure_df['gamma_contribution'] = (-exposure_df['Gamma_CE'] * exposure_df['openInterest_CE']) + (-exposure_df['Gamma_PE'] * exposure_df['openInterest_PE'])
-        exposure_df['abs_delta_impact'] = abs(exposure_df['delta_contribution'])
-        exposure_df['abs_gamma_impact'] = abs(exposure_df['gamma_contribution'])
-        
-        # FIX: Use simpler styling to avoid matplotlib dependency issues
-        try:
-            # Try to use background gradient if available
-            styled_exposure = exposure_df.style\
-                .background_gradient(subset=['abs_delta_impact'], cmap='Reds', axis=None)\
-                .background_gradient(subset=['abs_gamma_impact'], cmap='Blues', axis=None)
-            st.dataframe(styled_exposure, use_container_width=True, height=300)
-        except Exception as e:
-            # Fallback to simpler styling
-            st.warning("Using simplified heatmap due to styling limitations")
-            st.dataframe(exposure_df, use_container_width=True, height=300)
-        
-        st.caption("Red: Delta Exposure Intensity | Blue: Gamma Exposure Intensity")
 
     return underlying, df_summary, expiry_dates
 
@@ -1833,7 +2193,6 @@ def main():
         
         st.sidebar.success("API credentials processed")
         
-        # Check Telegram configuration
         if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
             st.sidebar.success("Telegram notifications enabled")
         else:
@@ -1907,11 +2266,15 @@ def main():
             'show_3m': False, 'show_5m': False, 'show_10m': False, 'show_15m': False
         }
     
+    # Market Depth Settings
+    st.sidebar.header("📊 Market Depth Settings")
+    show_market_depth = st.sidebar.checkbox("Show Market Depth Analysis", value=True, help="Display order book depth analysis")
+    depth_price_range = st.sidebar.slider("Depth Analysis Range (%)", 1, 5, 2, help="Price range for depth-based S/R analysis")
+    
     # Trading signal settings
     st.sidebar.header("🔔 Trading Signals")
     enable_signals = st.sidebar.checkbox("Enable Telegram Signals", value=True, help="Send notifications when conditions are met")
     
-    # Configurable pivot proximity with both positive and negative values
     pivot_proximity = st.sidebar.slider(
         "Pivot Proximity (± Points)", 
         min_value=1, 
@@ -1926,7 +2289,6 @@ def main():
     # Options expiry selection
     st.sidebar.header("📅 Options Settings")
     
-    # Get available expiry dates
     expiry_data = get_dhan_expiry_list_cached(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG)
     expiry_dates = []
     if expiry_data and 'data' in expiry_data:
@@ -1966,8 +2328,6 @@ def main():
         success, message = test_telegram_connection()
         if success:
             st.sidebar.success(message)
-            
-            # Send a test message
             test_msg = "🔔 Nifty Analyzer - Test message successful! ✅"
             send_telegram_message_sync(test_msg)
             st.sidebar.success("Test message sent to Telegram!")
@@ -1979,7 +2339,7 @@ def main():
         db.save_user_preferences(user_id, interval, auto_refresh, days_back, pivot_settings, pivot_proximity)
         st.sidebar.success("Preferences saved!")
     
-    # Manual refresh button - INCREMENT REFRESH COUNTER
+    # Manual refresh button
     if st.sidebar.button("🔄 Refresh Now"):
         st.session_state.refresh_counter += 1
         st.rerun()
@@ -1997,7 +2357,7 @@ def main():
     # Initialize API
     api = DhanAPI(access_token, client_id)
     
-    # Main layout - Trading chart and Options analysis side by side
+    # Main layout
     col1, col2 = st.columns([2, 1])
     
     with col1:
@@ -2006,11 +2366,13 @@ def main():
         # Data fetching strategy
         df = pd.DataFrame()
         current_price = None
+        depth_analysis = None
+        depth_sr_analysis = None
+        depth_signals = []
         
         if use_cache:
             df = db.get_candle_data("NIFTY50", "IDX_I", interval, hours_back=days_back*24)
             
-            # Force refresh if data is stale or refresh counter has changed
             if df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_convert(pytz.UTC)).total_seconds() > 300:
                 with st.spinner("Fetching latest data from API..."):
                     data = api.get_intraday_data(
@@ -2028,7 +2390,6 @@ def main():
                         except Exception as e:
                             st.warning(f"Could not save candle data: {e}")
         else:
-            # Always fetch fresh data when not using cache
             with st.spinner("Fetching fresh data from API..."):
                 data = api.get_intraday_data(
                     security_id="13",
@@ -2056,9 +2417,31 @@ def main():
         if current_price is None and not df.empty:
             current_price = df['close'].iloc[-1]
         
-        # Display metrics
+        # Get Market Depth if enabled
+        if show_market_depth and current_price:
+            with st.spinner("Fetching market depth..."):
+                depth_data = api.get_market_depth("13", "IDX_I")
+                if depth_data:
+                    depth_analyzer = MarketDepthAnalyzer()
+                    depth_analysis = depth_analyzer.analyze_depth_structure(depth_data, current_price)
+                    
+                    if 'error' not in depth_analysis:
+                        # Calculate depth-based support/resistance
+                        depth_sr_analysis = depth_analyzer.calculate_depth_based_support_resistance(
+                            depth_analysis, 
+                            depth_price_range
+                        )
+                        
+                        # Generate depth trading signals
+                        depth_signals = depth_analyzer.generate_depth_trading_signals(
+                            depth_analysis, 
+                            None,  # Option data can be added later
+                            current_price
+                        )
+        
+        # Display metrics with depth info
         if not df.empty:
-            display_metrics(ltp_data, df, db)
+            display_metrics(ltp_data, df, db, depth_analysis=depth_analysis)
         
         # Create and display chart
         if not df.empty:
@@ -2067,7 +2450,8 @@ def main():
                 f"Nifty 50 - {selected_timeframe} Chart {'with Pivot Levels' if show_pivots else ''}", 
                 interval,
                 show_pivots=show_pivots,
-                pivot_settings=pivot_settings
+                pivot_settings=pivot_settings,
+                depth_sr=depth_sr_analysis
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -2097,6 +2481,116 @@ def main():
                 """)
         else:
             st.error("No data available. Please check your API credentials and try again.")
+        
+        # Display Market Depth Analysis if enabled
+        if show_market_depth and depth_analysis and 'error' not in depth_analysis:
+            st.markdown("---")
+            st.subheader("📊 Market Depth Analysis")
+            
+            # Create tabs for different depth views
+            depth_tab1, depth_tab2, depth_tab3 = st.tabs(["📈 Order Book", "🎯 Support/Resistance", "📊 Depth Metrics"])
+            
+            with depth_tab1:
+                # Display market depth visualization
+                depth_fig = MarketDepthAnalyzer.visualize_market_depth(
+                    depth_analysis, 
+                    title="Nifty 50 Market Depth"
+                )
+                if depth_fig:
+                    st.plotly_chart(depth_fig, use_container_width=True)
+            
+            with depth_tab2:
+                # Display depth-based support/resistance
+                if depth_sr_analysis and 'error' not in depth_sr_analysis:
+                    col1_sr, col2_sr = st.columns(2)
+                    
+                    with col1_sr:
+                        st.markdown("**Strongest Support Levels**")
+                        if depth_sr_analysis['strongest_support']:
+                            for i, support in enumerate(depth_sr_analysis['strongest_support'][:3], 1):
+                                distance_color = "green" if abs(support['distance_pct']) < 1 else "yellow"
+                                st.markdown(f"""
+                                <div class="depth-support">
+                                    <b>#{i}: ₹{support['price']:.0f}</b><br>
+                                    Strength: {support['strength_score']:.1f}<br>
+                                    Distance: {support['distance_pct']:.2f}%<br>
+                                    Quantity: {support['total_quantity']:,}
+                                </div>
+                                """, unsafe_allow_html=True)
+                        else:
+                            st.info("No significant support levels found")
+                    
+                    with col2_sr:
+                        st.markdown("**Strongest Resistance Levels**")
+                        if depth_sr_analysis['strongest_resistance']:
+                            for i, resistance in enumerate(depth_sr_analysis['strongest_resistance'][:3], 1):
+                                distance_color = "red" if abs(resistance['distance_pct']) < 1 else "yellow"
+                                st.markdown(f"""
+                                <div class="depth-resistance">
+                                    <b>#{i}: ₹{resistance['price']:.0f}</b><br>
+                                    Strength: {resistance['strength_score']:.1f}<br>
+                                    Distance: {resistance['distance_pct']:.2f}%<br>
+                                    Quantity: {resistance['total_quantity']:,}
+                                </div>
+                                """, unsafe_allow_html=True)
+                        else:
+                            st.info("No significant resistance levels found")
+                    
+                    # Display price targets
+                    if depth_sr_analysis['price_targets']:
+                        st.markdown("**Depth-Based Price Targets**")
+                        targets = depth_sr_analysis['price_targets']
+                        col_t1, col_t2, col_t3, col_t4 = st.columns(4)
+                        
+                        with col_t1:
+                            if targets['immediate_support']:
+                                st.metric("Immediate Support", f"₹{targets['immediate_support']:.0f}")
+                        
+                        with col_t2:
+                            if targets['immediate_resistance']:
+                                st.metric("Immediate Resistance", f"₹{targets['immediate_resistance']:.0f}")
+                        
+                        with col_t3:
+                            if targets['next_support']:
+                                st.metric("Next Support", f"₹{targets['next_support']:.0f}")
+                        
+                        with col_t4:
+                            if targets['next_resistance']:
+                                st.metric("Next Resistance", f"₹{targets['next_resistance']:.0f}")
+            
+            with depth_tab3:
+                # Display depth metrics
+                col_m1, col_m2, col_m3, col_m4 = st.columns(4)
+                
+                with col_m1:
+                    total_bid = depth_analysis.get('total_bid_qty', 0)
+                    st.metric("Total Bid Qty", f"{total_bid:,}")
+                
+                with col_m2:
+                    total_ask = depth_analysis.get('total_ask_qty', 0)
+                    st.metric("Total Ask Qty", f"{total_ask:,}")
+                
+                with col_m3:
+                    imbalance = depth_analysis.get('bid_ask_imbalance', 0)
+                    st.metric("Depth Imbalance", f"{imbalance:+,}")
+                
+                with col_m4:
+                    depth_bias = depth_analysis.get('depth_bias', 'NEUTRAL')
+                    st.metric("Depth Bias", depth_bias)
+                
+                # Display depth signals
+                if depth_signals:
+                    st.markdown("**Depth Trading Signals**")
+                    for signal in depth_signals:
+                        signal_color = "green" if signal['direction'] == 'BULLISH' else "red"
+                        st.markdown(f"""
+                        <div style="border-left: 4px solid {signal_color}; padding: 10px; margin: 5px 0; background-color: #2a2a2a;">
+                            <b>{signal['type']}</b> - {signal['direction']}<br>
+                            <small>Action: {signal['action']}</small><br>
+                            <small>Strength: {signal['signal_strength']}/10</small><br>
+                            <small>{signal['reason']}</small>
+                        </div>
+                        """, unsafe_allow_html=True)
     
     with col2:
         st.header("📊 Options Analysis")
@@ -2108,9 +2602,85 @@ def main():
             if underlying_price:
                 st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
                 
+                # Display SELLER'S EDGE DASHBOARD
+                st.markdown("---")
+                st.subheader("📊 SELLER'S EDGE DASHBOARD")
+                
+                # Get option chain data for exposure calculation
+                option_chain_data = get_dhan_option_chain(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG, selected_expiry or available_expiries[0])
+                if option_chain_data and 'data' in option_chain_data:
+                    data = option_chain_data['data']
+                    oc_data = data['oc']
+                    calls, puts = [], []
+                    
+                    for strike, strike_data in oc_data.items():
+                        if 'ce' in strike_data:
+                            ce_data = strike_data['ce']
+                            ce_data['strikePrice'] = float(strike)
+                            calls.append(ce_data)
+                        if 'pe' in strike_data:
+                            pe_data = strike_data['pe']
+                            pe_data['strikePrice'] = float(strike)
+                            puts.append(pe_data)
+                    
+                    df_ce = pd.DataFrame(calls)
+                    df_pe = pd.DataFrame(puts)
+                    
+                    # Calculate exposures and biases
+                    exposure = calculate_net_delta_gamma_exposure(
+                        pd.merge(df_ce, df_pe, on='strikePrice', how='outer').sort_values('strikePrice'),
+                        underlying_price
+                    )
+                    
+                    oi_bias_data = calculate_oi_concentration_bias(df_ce, df_pe, underlying_price)
+                    
+                    # Get volatility regime
+                    historical_iv = []  # Placeholder
+                    current_atm_iv = 15  # Default
+                    regime, action, iv_rank, iv_perc, color = calculate_volatility_regime_bias(
+                        current_atm_iv,
+                        historical_iv
+                    )
+                    
+                    # Generate seller recommendation with depth analysis
+                    recommendation = generate_seller_recommendation(
+                        exposure, 
+                        regime, 
+                        oi_bias_data, 
+                        underlying_price, 
+                        df_summary,
+                        depth_analysis
+                    )
+                    
+                    # Display seller metrics
+                    col_s1, col_s2, col_s3, col_s4 = st.columns(4)
+                    
+                    with col_s1:
+                        st.metric("Delta Exposure", f"{exposure['norm_delta']:+.1f}",
+                                 delta=f"Raw: {exposure['net_delta']:+.0f}")
+                        st.metric("Gamma Exposure", f"{exposure['norm_gamma']:+.1f}",
+                                 delta=f"Raw: {exposure['net_gamma']:+.0f}")
+                    
+                    with col_s2:
+                        st.metric("Volatility Regime", f"{color} {regime}",
+                                 delta=f"IV Rank: {iv_rank}%")
+                        st.caption(f"**Action:** {action}")
+                    
+                    with col_s3:
+                        st.metric("OI Structure Bias", oi_bias_data['seller_bias'])
+                        if depth_analysis and 'depth_bias' in depth_analysis:
+                            st.metric("Depth Bias", depth_analysis['depth_bias'])
+                    
+                    with col_s4:
+                        st.metric("Recommended Action", recommendation['action'])
+                        if recommendation.get('depth_influenced', False):
+                            st.caption("✅ Depth-influenced recommendation")
+                        st.caption(f"**Strikes:** {recommendation.get('strikes', 'N/A')}")
+                
                 # Check for trading signals if enabled
                 if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
-                    check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
+                    check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity, depth_signals)
+                    
         except Exception as e:
             st.error(f"Error analyzing option chain: {str(e)}")
             st.info("Please check your Dhan API credentials and try again.")
