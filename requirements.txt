@@ -10,4 +10,4 @@ openpyxl>=3.1.0
 supabase>=1.0.3
 dhanhq>=2.0.2
 yfinance>=0.2.28
-pandas_ta
+pandas_ta>=0.3.14
