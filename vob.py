@@ -9,7 +9,6 @@ import pytz
 import time
 from datetime import datetime, timedelta
 import json
-from supabase import create_client, Client
 import hashlib
 import numpy as np
 import math
@@ -85,6 +84,31 @@ st.markdown("""
         background-color: rgba(100, 100, 0, 0.3) !important;
         border-left: 3px solid yellow !important;
     }
+    .market-insights {
+        background-color: #1a1a2e;
+        padding: 20px;
+        border-radius: 10px;
+        margin: 15px 0;
+        border-left: 4px solid #4d4dff;
+    }
+    .insight-header {
+        color: #4d4dff;
+        font-size: 1.2em;
+        font-weight: bold;
+        margin-bottom: 10px;
+    }
+    .insight-point {
+        margin: 8px 0;
+        padding-left: 10px;
+        border-left: 2px solid #333;
+    }
+    .trap-indicator {
+        background-color: #2a2a4d;
+        padding: 15px;
+        border-radius: 8px;
+        margin: 10px 0;
+        border: 1px solid #4d4dff;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -98,9 +122,6 @@ try:
     if not DHAN_ACCESS_TOKEN:
         DHAN_ACCESS_TOKEN = st.secrets.get("dhan", {}).get("access_token", "")
         
-    supabase_url = st.secrets.get("supabase", {}).get("url", "")
-    supabase_key = st.secrets.get("supabase", {}).get("anon_key", "")
-    
     # Enhanced Telegram Configuration
     try:
         TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "")
@@ -129,8 +150,6 @@ try:
 except Exception:
     DHAN_CLIENT_ID = ""
     DHAN_ACCESS_TOKEN = ""
-    supabase_url = ""
-    supabase_key = ""
     TELEGRAM_BOT_TOKEN = ""
     TELEGRAM_CHAT_ID = ""
 
@@ -197,212 +216,6 @@ def test_telegram_connection():
             
     except Exception as e:
         return False, f"❌ Telegram connection failed: {str(e)}"
-
-class SupabaseDB:
-    def __init__(self, url, key):
-        self.client: Client = create_client(url, key)
-    
-    def create_tables(self):
-        """Create necessary tables if they don't exist"""
-        try:
-            self.client.table('candle_data').select('id').limit(1).execute()
-        except Exception as e:
-            st.warning("Database tables may need to be created. Please run the SQL setup first.")
-    
-    def save_candle_data(self, symbol, exchange, timeframe, df):
-        """Save candle data to Supabase"""
-        if df.empty:
-            return
-        
-        try:
-            records = []
-            for _, row in df.iterrows():
-                record = {
-                    'symbol': symbol,
-                    'exchange': exchange,
-                    'timeframe': timeframe,
-                    'timestamp': int(row['timestamp']),
-                    'datetime': row['datetime'].isoformat(),
-                    'open': float(row['open']),
-                    'high': float(row['high']),
-                    'low': float(row['low']),
-                    'close': float(row['close']),
-                    'volume': int(row['volume'])
-                }
-                records.append(record)
-            
-            self.client.table('candle_data').upsert(
-                records, 
-                on_conflict="symbol,exchange,timeframe,timestamp"
-            ).execute()
-            
-        except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving candle data: {str(e)}")
-    
-    def get_candle_data(self, symbol, exchange, timeframe, hours_back=24):
-        """Retrieve candle data from Supabase"""
-        try:
-            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours_back)
-            
-            result = self.client.table('candle_data')\
-                .select('*')\
-                .eq('symbol', symbol)\
-                .eq('exchange', exchange)\
-                .eq('timeframe', timeframe)\
-                .gte('datetime', cutoff_time.isoformat())\
-                .order('timestamp', desc=False)\
-                .execute()
-            
-            if result.data:
-                df = pd.DataFrame(result.data)
-                df['datetime'] = pd.to_datetime(df['datetime'])
-                return df
-            else:
-                return pd.DataFrame()
-                
-        except Exception as e:
-            if "column" in str(e) and "does not exist" in str(e):
-                return pd.DataFrame()
-            st.error(f"Error retrieving candle data: {str(e)}")
-            return pd.DataFrame()
-    
-    def clear_old_candle_data(self, days_old=7):
-        """Clear candle data older than specified days"""
-        try:
-            cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days_old)
-            
-            result = self.client.table('candle_data')\
-                .delete()\
-                .lt('datetime', cutoff_date.isoformat())\
-                .execute()
-            
-            return len(result.data) if result.data else 0
-        except Exception as e:
-            st.error(f"Error clearing old data: {str(e)}")
-            return 0
-    
-    def save_user_preferences(self, user_id, timeframe, auto_refresh, days_back, pivot_settings, pivot_proximity=5):
-        """Save user preferences"""
-        try:
-            data = {
-                'user_id': user_id,
-                'timeframe': timeframe,
-                'auto_refresh': auto_refresh,
-                'days_back': days_back,
-                'pivot_settings': json.dumps(pivot_settings),
-                'pivot_proximity': pivot_proximity,
-                'updated_at': datetime.now(pytz.UTC).isoformat()
-            }
-            
-            self.client.table('user_preferences').upsert(
-                data, 
-                on_conflict="user_id"
-            ).execute()
-            
-        except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving preferences: {str(e)}")
-    
-    def get_user_preferences(self, user_id):
-        """Get user preferences"""
-        try:
-            result = self.client.table('user_preferences')\
-                .select('*')\
-                .eq('user_id', user_id)\
-                .execute()
-            
-            if result.data:
-                prefs = result.data[0]
-                if 'pivot_settings' in prefs and prefs['pivot_settings']:
-                    prefs['pivot_settings'] = json.loads(prefs['pivot_settings'])
-                else:
-                    prefs['pivot_settings'] = {
-                        'show_3m': True, 'show_5m': True, 'show_10m': True, 'show_15m': True
-                    }
-                return prefs
-            else:
-                return {
-                    'timeframe': '5',
-                    'auto_refresh': True,
-                    'days_back': 1,
-                    'pivot_proximity': 5,
-                    'pivot_settings': {
-                        'show_3m': True, 'show_5m': True, 'show_10m': True, 'show_15m': True
-                    }
-                }
-                
-        except Exception as e:
-            if "relation" in str(e) and "does not exist" in str(e):
-                return {
-                    'timeframe': '5', 
-                    'auto_refresh': True, 
-                    'days_back': 1,
-                    'pivot_proximity': 5,
-                    'pivot_settings': {
-                        'show_3m': True, 'show_5m': True, 'show_10m': True, 'show_15m': True
-                    }
-                }
-            st.error(f"Error retrieving preferences: {str(e)}")
-            return {
-                'timeframe': '5', 
-                'auto_refresh': True, 
-                'days_back': 1,
-                'pivot_proximity': 5,
-                'pivot_settings': {
-                    'show_3m': True, 'show_5m': True, 'show_10m': True, 'show_15m': True
-                }
-            }
-    
-    def save_market_analytics(self, symbol, analytics_data):
-        """Save daily market analytics"""
-        try:
-            today = datetime.now(pytz.timezone('Asia/Kolkata')).date()
-            
-            data = {
-                'symbol': symbol,
-                'date': today.isoformat(),
-                'day_high': analytics_data['day_high'],
-                'day_low': analytics_data['day_low'],
-                'day_open': analytics_data['day_open'],
-                'day_close': analytics_data['day_close'],
-                'total_volume': analytics_data['total_volume'],
-                'avg_price': analytics_data['avg_price'],
-                'price_change': analytics_data['price_change'],
-                'price_change_pct': analytics_data['price_change_pct']
-            }
-            
-            self.client.table('market_analytics').upsert(
-                data, 
-                on_conflict="symbol,date"
-            ).execute()
-            
-        except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving analytics: {str(e)}")
-    
-    def get_market_analytics(self, symbol, days_back=30):
-        """Get historical market analytics"""
-        try:
-            cutoff_date = datetime.now().date() - timedelta(days=days_back)
-            
-            result = self.client.table('market_analytics')\
-                .select('*')\
-                .eq('symbol', symbol)\
-                .gte('date', cutoff_date.isoformat())\
-                .order('date', desc=False)\
-                .execute()
-            
-            if result.data:
-                return pd.DataFrame(result.data)
-            else:
-                return pd.DataFrame()
-                
-        except Exception as e:
-            if "relation" in str(e) and "does not exist" in str(e):
-                return pd.DataFrame()
-            st.error(f"Error retrieving analytics: {str(e)}")
-            return pd.DataFrame()
 
 class DhanAPI:
     def __init__(self, access_token, client_id):
@@ -2064,8 +1877,8 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
     
     return fig
 
-def display_metrics(ltp_data, df, db, symbol="NIFTY50", depth_analysis=None):
-    """Display price metrics and save analytics"""
+def display_metrics(ltp_data, df, depth_analysis=None):
+    """Display price metrics"""
     if ltp_data and 'data' in ltp_data and not df.empty:
         current_price = None
         for exchange, data in ltp_data['data'].items():
@@ -2085,23 +1898,6 @@ def display_metrics(ltp_data, df, db, symbol="NIFTY50", depth_analysis=None):
             day_low = df['low'].min()
             day_open = df['open'].iloc[0]
             volume = df['volume'].sum()
-            avg_price = df['close'].mean()
-            
-            analytics_data = {
-                'day_high': float(day_high),
-                'day_low': float(day_low),
-                'day_open': float(day_open),
-                'day_close': float(current_price),
-                'total_volume': int(volume),
-                'avg_price': float(avg_price),
-                'price_change': float(change),
-                'price_change_pct': float(change_pct)
-            }
-            
-            try:
-                db.save_market_analytics(symbol, analytics_data)
-            except Exception as e:
-                st.warning(f"Could not save analytics: {e}")
             
             # Display metrics with depth information if available
             col1, col2, col3, col4, col5 = st.columns(5)
@@ -2407,13 +2203,14 @@ def analyze_option_chain(selected_expiry=None, use_cache=True):
         df_summary['openInterest_CE'] = 0
         df_summary['openInterest_PE'] = 0
 
+    # Updated PCR logic
     df_summary['PCR'] = df_summary['openInterest_PE'] / df_summary['openInterest_CE']
     df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
     df_summary['PCR'] = df_summary['PCR'].round(2)
     
     df_summary['PCR_Signal'] = np.where(
-        df_summary['PCR'] > 1.2, "BEARISH_SENTIMENT",
-        np.where(df_summary['PCR'] < 0.7, "BULLISH_SENTIMENT", "NEUTRAL")
+        df_summary['PCR'] > 1.2, "BULLISH_SENTIMENT",
+        np.where(df_summary['PCR'] < 0.7, "BEARISH_SENTIMENT", "NEUTRAL")
     )
 
     st.markdown("## Option Chain Bias Summary")
@@ -2525,100 +2322,136 @@ def create_fallback_option_chain(expiry):
     df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
     df_summary['PCR'] = df_summary['PCR'].round(2)
     
+    # Updated PCR logic for fallback
     df_summary['PCR_Signal'] = np.where(
-        df_summary['PCR'] > 1.2, "BEARISH_SENTIMENT",
-        np.where(df_summary['PCR'] < 0.7, "BULLISH_SENTIMENT", "NEUTRAL")
+        df_summary['PCR'] > 1.2, "BULLISH_SENTIMENT",
+        np.where(df_summary['PCR'] < 0.7, "BEARISH_SENTIMENT", "NEUTRAL")
     )
     
     st.warning("⚠️ Using fallback option chain data for demonstration")
     
     return underlying, df_summary, [expiry]
 
-def display_analytics_dashboard(db, symbol="NIFTY50"):
-    """Display analytics dashboard"""
-    st.subheader("Market Analytics Dashboard")
+def display_market_insights(option_data, current_price, depth_analysis=None):
+    """Display advanced market insights and trap detection"""
+    st.markdown("---")
+    st.subheader("🧠 Advanced Market Insights")
     
-    analytics_df = db.get_market_analytics(symbol, days_back=30)
+    # Market Insight Panel
+    st.markdown("""
+    <div class="market-insights">
+        <div class="insight-header">🎯 REAL Option Chain Logic (This matters)</div>
+        <div class="insight-point">📊 <b>OI is useless without "WHY":</b> Instead of "CE OI high → resistance", ask "Is this OI defensive, aggressive, or trapped?"</div>
+        <div class="insight-point">⚡ <b>Change in OI > Total OI:</b> Total OI is history. Change in OI is intent. Sudden +OI in ATM in 5–15 mins = active positioning</div>
+        <div class="insight-point">🎯 <b>ATM is the battlefield:</b> Most people stare at far OTM like fools. Reality: ATM options control intraday direction</div>
+        <div class="insight-point">💰 <b>Premium behavior > OI:</b> CE OI ↑ but CE premium ↑ → Writer in trouble (short covering coming)</div>
+        <div class="insight-point">🔄 <b>Volatility tells the truth:</b> IV rising while price flat → Big move loading. IV falling while price moving → Move is ending</div>
+    </div>
+    """, unsafe_allow_html=True)
     
-    if not analytics_df.empty:
-        col1, col2 = st.columns(2)
+    if option_data is not None and current_price:
+        # Calculate trap indicators
+        atm_data = option_data[option_data['Zone'] == 'ATM']
         
-        with col1:
-            fig_price = go.Figure()
-            fig_price.add_trace(go.Scatter(
-                x=pd.to_datetime(analytics_df['date']),
-                y=analytics_df['day_close'],
-                mode='lines+markers',
-                name='Close Price',
-                line=dict(color='#00ff88', width=2)
-            ))
+        if not atm_data.empty:
+            row = atm_data.iloc[0]
             
-            fig_price.update_layout(
-                title="30-Day Price Trend",
-                template='plotly_dark',
-                height=300,
-                margin=dict(l=0, r=0, t=30, b=0)
-            )
-            st.plotly_chart(fig_price, use_container_width=True)
-        
-        with col2:
-            fig_volume = go.Figure()
-            fig_volume.add_trace(go.Bar(
-                x=pd.to_datetime(analytics_df['date']),
-                y=analytics_df['total_volume'],
-                name='Volume',
-                marker_color='#4444ff'
-            ))
+            # Check for traps based on OI and price relationship
+            ce_oi = row.get('openInterest_CE', 0)
+            pe_oi = row.get('openInterest_PE', 0)
+            ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
+            pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
             
-            fig_volume.update_layout(
-                title="30-Day Volume Trend",
-                template='plotly_dark',
-                height=300,
-                margin=dict(l=0, r=0, t=30, b=0)
-            )
-            st.plotly_chart(fig_volume, use_container_width=True)
-        
-        st.subheader("30-Day Summary")
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
-            avg_price = analytics_df['day_close'].mean()
-            st.metric("Average Price", f"₹{avg_price:,.2f}")
-        
-        with col2:
-            volatility = analytics_df['price_change_pct'].std()
-            st.metric("Volatility (σ)", f"{volatility:.2f}%")
-        
-        with col3:
-            max_gain = analytics_df['price_change_pct'].max()
-            st.metric("Max Daily Gain", f"{max_gain:.2f}%")
-        
-        with col4:
-            max_loss = analytics_df['price_change_pct'].min()
-            st.metric("Max Daily Loss", f"{max_loss:.2f}%")
+            # Trap detection logic
+            traps = []
+            
+            # Call trap detection
+            if ce_oi > pe_oi * 1.5 and ce_chg_oi > 0 and current_price < row['Strike']:
+                traps.append({
+                    'type': 'CALL_TRAP',
+                    'description': 'Heavy call writing with price below strike',
+                    'implication': 'If price rises, call writers will be forced to hedge → potential squeeze'
+                })
+            
+            # Put trap detection
+            if pe_oi > ce_oi * 1.5 and pe_chg_oi > 0 and current_price > row['Strike']:
+                traps.append({
+                    'type': 'PUT_TRAP',
+                    'description': 'Heavy put writing with price above strike',
+                    'implication': 'If price falls, put writers will be forced to hedge → potential breakdown'
+                })
+            
+            # Premium decay trap
+            ce_price = row.get('lastPrice_CE', 0)
+            pe_price = row.get('lastPrice_PE', 0)
+            
+            if ce_price > 0 and pe_price > 0:
+                premium_ratio = ce_price / pe_price
+                if 0.8 < premium_ratio < 1.2:  # Balanced premiums
+                    traps.append({
+                        'type': 'VOLATILITY_COMPRESSION',
+                        'description': 'Balanced ATM premiums',
+                        'implication': 'Volatility expansion likely - big move coming'
+                    })
+            
+            # Depth-based trap detection
+            if depth_analysis and 'depth_bias' in depth_analysis:
+                depth_bias = depth_analysis['depth_bias']
+                if depth_bias == "BEARISH_PRESSURE" and ce_oi > pe_oi:
+                    traps.append({
+                        'type': 'DEPTH_PRESSURE_TRAP',
+                        'description': 'Depth shows selling pressure but OI shows call dominance',
+                        'implication': 'Contradiction suggests potential reversal'
+                    })
+            
+            # Display trap indicators
+            if traps:
+                st.markdown("### ⚠️ Trap Indicators Detected")
+                for trap in traps:
+                    st.markdown(f"""
+                    <div class="trap-indicator">
+                        <b>{trap['type']}</b><br>
+                        {trap['description']}<br>
+                        <small>{trap['implication']}</small>
+                    </div>
+                    """, unsafe_allow_html=True)
+            
+            # Display key ATM insights
+            st.markdown("### 🎯 ATM Zone Insights")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                pcr = row.get('PCR', 1)
+                pcr_color = "green" if pcr > 1.2 else "red" if pcr < 0.7 else "yellow"
+                st.metric("ATM PCR", f"{pcr:.2f}", delta="Bullish" if pcr > 1.2 else "Bearish" if pcr < 0.7 else "Neutral")
+            
+            with col2:
+                oi_ratio = ce_oi / pe_oi if pe_oi > 0 else 99
+                st.metric("CE/PE OI Ratio", f"{oi_ratio:.2f}")
+            
+            with col3:
+                chg_oi_ratio = ce_chg_oi / pe_chg_oi if pe_chg_oi != 0 else 99
+                trend = "Bullish Flow" if pe_chg_oi > ce_chg_oi else "Bearish Flow" if ce_chg_oi > pe_chg_oi else "Neutral"
+                st.metric("ChgOI Trend", trend)
+            
+            # Quick assessment
+            st.markdown("### 📊 Quick Assessment")
+            
+            if pcr > 1.2:
+                st.success("✅ PCR > 1.2: Market sentiment is **BULLISH** (more puts being bought for protection)")
+            elif pcr < 0.7:
+                st.warning("⚠️ PCR < 0.7: Market sentiment is **BEARISH** (more calls being bought for speculation)")
+            else:
+                st.info("📊 PCR 0.7-1.2: Market sentiment is **NEUTRAL**")
+            
+            if abs(oi_ratio - 1) > 0.3:
+                if oi_ratio > 1.3:
+                    st.warning("⚠️ High CE/PE OI Ratio: **Resistance building** at current levels")
+                else:
+                    st.success("✅ Low CE/PE OI Ratio: **Support building** at current levels")
 
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
-    
-    # Initialize Supabase
-    try:
-        if not supabase_url or not supabase_key:
-            st.error("Please configure your Supabase credentials in Streamlit secrets")
-            st.info("""
-            Add the following to your Streamlit secrets:
-            ```
-            [supabase]
-            url = "your_supabase_url"
-            anon_key = "your_supabase_anon_key"
-            ```
-            """)
-            return
-        
-        db = SupabaseDB(supabase_url, supabase_key)
-        db.create_tables()
-    except Exception as e:
-        st.error(f"Database connection error: {str(e)}")
-        return
     
     # Initialize API credentials
     try:
@@ -2654,9 +2487,8 @@ def main():
         st.error(f"Credential validation error: {str(e)}")
         return
     
-    # Get user ID and preferences
+    # Get user ID
     user_id = get_user_id()
-    user_prefs = db.get_user_preferences(user_id)
     
     # Sidebar for configuration
     st.sidebar.header("Configuration")
@@ -2670,7 +2502,7 @@ def main():
         "15 min": "15"
     }
     
-    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "5 min")
+    default_timeframe = "5 min"
     selected_timeframe = st.sidebar.selectbox(
         "Select Timeframe",
         list(timeframes.keys()),
@@ -2687,15 +2519,17 @@ def main():
     if show_pivots:
         st.sidebar.subheader("Toggle Individual Pivot Levels")
         
-        if 'pivot_settings' not in user_prefs:
-            user_prefs['pivot_settings'] = {
-                'show_3m': True, 'show_5m': True, 'show_10m': True, 'show_15m': True
-            }
+        pivot_settings = {
+            'show_3m': True,
+            'show_5m': True,
+            'show_10m': True,
+            'show_15m': True
+        }
         
-        show_3m = st.sidebar.checkbox("3 Minute Pivots", value=user_prefs['pivot_settings'].get('show_3m', True), help="🟢 Green lines")
-        show_5m = st.sidebar.checkbox("5 Minute Pivots", value=user_prefs['pivot_settings'].get('show_5m', True), help="🟠 Orange lines")
-        show_10m = st.sidebar.checkbox("10 Minute Pivots", value=user_prefs['pivot_settings'].get('show_10m', True), help="🟣 Pink lines")
-        show_15m = st.sidebar.checkbox("15 Minute Pivots", value=user_prefs['pivot_settings'].get('show_15m', True), help="🔵 Blue lines")
+        show_3m = st.sidebar.checkbox("3 Minute Pivots", value=pivot_settings.get('show_3m', True), help="🟢 Green lines")
+        show_5m = st.sidebar.checkbox("5 Minute Pivots", value=pivot_settings.get('show_5m', True), help="🟠 Orange lines")
+        show_10m = st.sidebar.checkbox("10 Minute Pivots", value=pivot_settings.get('show_10m', True), help="🟣 Pink lines")
+        show_15m = st.sidebar.checkbox("15 Minute Pivots", value=pivot_settings.get('show_15m', True), help="🔵 Blue lines")
         
         pivot_settings = {
             'show_3m': show_3m,
@@ -2732,7 +2566,7 @@ def main():
         "Pivot Proximity (± Points)", 
         min_value=1, 
         max_value=20, 
-        value=user_prefs.get('pivot_proximity', 5),
+        value=5,
         help="Distance from pivot levels to trigger signals (both above and below)"
     )
     
@@ -2767,21 +2601,13 @@ def main():
         selected_expiry = expiry_dates[selected_expiry_idx]
     
     # Auto-refresh settings
-    auto_refresh = st.sidebar.checkbox("Auto Refresh (2 min)", value=user_prefs['auto_refresh'])
+    auto_refresh = st.sidebar.checkbox("Auto Refresh (2 min)", value=True)
     
     # Days back for data
-    days_back = st.sidebar.slider("Days of Historical Data", 1, 5, user_prefs['days_back'])
+    days_back = st.sidebar.slider("Days of Historical Data", 1, 5, 1)
     
     # Data source preference
-    use_cache = st.sidebar.checkbox("Use Cached Data", value=True, help="Use database cache for faster loading")
-    
-    # Database management
-    st.sidebar.header("🗑️ Database Management")
-    cleanup_days = st.sidebar.selectbox("Clear History Older Than", [7, 14, 30], index=0)
-    
-    if st.sidebar.button("🗑 Clear History"):
-        deleted_count = db.clear_old_candle_data(cleanup_days)
-        st.sidebar.success(f"Deleted {deleted_count} old records")
+    use_cache = st.sidebar.checkbox("Use Cached Data", value=True, help="Use session cache for faster loading")
     
     # Connection Test Section
     st.sidebar.header("🔧 Connection Test")
@@ -2796,11 +2622,6 @@ def main():
         else:
             st.sidebar.error(message)
     
-    # Save preferences
-    if st.sidebar.button("💾 Save Preferences"):
-        db.save_user_preferences(user_id, interval, auto_refresh, days_back, pivot_settings, pivot_proximity)
-        st.sidebar.success("Preferences saved!")
-    
     # Manual refresh button
     if st.sidebar.button("🔄 Refresh Now"):
         st.session_state.refresh_counter += 1
@@ -2813,8 +2634,8 @@ def main():
         st.session_state.api_cache = {}
         st.sidebar.success("API cache cleared!")
     
-    # Show analytics dashboard
-    show_analytics = st.sidebar.checkbox("Show Analytics Dashboard", value=False)
+    # Show market insights
+    show_insights = st.sidebar.checkbox("Show Market Insights", value=True)
     
     # Debug info
     st.sidebar.subheader("🔧 Debug Info")
@@ -2838,41 +2659,17 @@ def main():
         depth_sr_analysis = None
         depth_signals = []
         
-        if use_cache:
-            df = db.get_candle_data("NIFTY50", "IDX_I", interval, hours_back=days_back*24)
+        with st.spinner("Fetching latest data from API..."):
+            data = api.get_intraday_data(
+                security_id="13",
+                exchange_segment="IDX_I", 
+                instrument="INDEX",
+                interval=interval,
+                days_back=days_back
+            )
             
-            if df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_convert(pytz.UTC)).total_seconds() > 300:
-                with st.spinner("Fetching latest data from API..."):
-                    data = api.get_intraday_data(
-                        security_id="13",
-                        exchange_segment="IDX_I", 
-                        instrument="INDEX",
-                        interval=interval,
-                        days_back=days_back
-                    )
-                    
-                    if data:
-                        df = process_candle_data(data, interval)
-                        try:
-                            db.save_candle_data("NIFTY50", "IDX_I", interval, df)
-                        except Exception as e:
-                            st.warning(f"Could not save candle data: {e}")
-        else:
-            with st.spinner("Fetching fresh data from API..."):
-                data = api.get_intraday_data(
-                    security_id="13",
-                    exchange_segment="IDX_I", 
-                    instrument="INDEX",
-                    interval=interval,
-                    days_back=days_back
-                )
-                
-                if data:
-                    df = process_candle_data(data, interval)
-                    try:
-                        db.save_candle_data("NIFTY50", "IDX_I", interval, df)
-                    except Exception as e:
-                        st.warning(f"Could not save candle data: {e}")
+            if data:
+                df = process_candle_data(data, interval)
         
         # Get LTP data and current price
         ltp_data = api.get_ltp_data("13", "IDX_I")
@@ -2919,7 +2716,7 @@ def main():
         
         # Display metrics with depth info
         if not df.empty:
-            display_metrics(ltp_data, df, db, depth_analysis=depth_analysis)
+            display_metrics(ltp_data, df, depth_analysis=depth_analysis)
         
         # Create and display chart
         if not df.empty:
@@ -2941,9 +2738,6 @@ def main():
                 latest_time = df['datetime'].max().strftime("%Y-%m-%d %H:%M:%S IST")
                 st.info(f"🕐 Latest: {latest_time}")
             with col3_info:
-                data_source = "Database Cache" if use_cache else "Live API"
-                st.info(f"📡 Source: {data_source}")
-            with col4_info:
                 pivot_status = "✅ Enabled" if show_pivots else "❌ Disabled"
                 st.info(f"📈 Pivots: {pivot_status}")
             
@@ -3086,9 +2880,6 @@ def main():
                 st.markdown("---")
                 st.subheader("📊 SELLER'S EDGE DASHBOARD")
                 
-                # Get option chain data for exposure calculation
-                option_chain_data = get_dhan_option_chain(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG, selected_expiry or available_expiries[0])
-                
                 # Calculate exposures and biases
                 exposure = calculate_net_delta_gamma_exposure(
                     pd.DataFrame(),  # Empty dataframe for fallback
@@ -3152,10 +2943,10 @@ def main():
             st.error(f"Error analyzing option chain: {str(e)}")
             st.info("Please check your Dhan API credentials and try again.")
     
-    # Analytics dashboard below
-    if show_analytics:
+    # Market Insights below
+    if show_insights and df_summary is not None and current_price:
         st.markdown("---")
-        display_analytics_dashboard(db)
+        display_market_insights(df_summary, current_price, depth_analysis)
     
     # Show current time
     ist = pytz.timezone('Asia/Kolkata')
