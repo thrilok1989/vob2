@@ -885,13 +885,11 @@ def analyze():
         now = datetime.now(timezone("Asia/Kolkata"))
         current_day = now.weekday()
         current_time = now.time()
-        market_start = datetime.strptime("08:00", "%H:%M").time()
-        market_end = datetime.strptime("23:40", "%H:%M").time()
-
-        if current_day >= 5 or not (market_start <= current_time <= market_end):
-            st.warning("⏳ Market Closed (Mon-Fri 9:00-15:40)")
-            return
-
+        
+        # Show current time but don't block execution
+        st.info(f"🕒 Current time: {now.strftime('%A, %H:%M:%S')} IST")
+        st.info("Running in continuous mode (market hours check disabled)")
+        
         # Get expiry list from Dhan API
         expiry_data = get_dhan_expiry_list(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG)
         if not expiry_data or 'data' not in expiry_data:
