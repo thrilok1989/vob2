@@ -24,6 +24,7 @@ import os
 import pandas_ta as ta
 import warnings
 warnings.filterwarnings('ignore')
+from functools import wraps
 
 # ============================================================================
 # PAGE CONFIGURATION
@@ -147,6 +148,30 @@ NIFTY_UNDERLYING_SEG = "IDX_I"
 NIFTY_SYMBOL = "NIFTY50"
 
 # ============================================================================
+# RATE LIMITING DECORATOR
+# ============================================================================
+def rate_limit(seconds=2):
+    """Rate limiting decorator for API calls"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            if 'last_call_time' not in wrapper.__dict__:
+                wrapper.last_call_time = 0
+            
+            current_time = time.time()
+            elapsed = current_time - wrapper.last_call_time
+            
+            if elapsed < seconds:
+                sleep_time = seconds - elapsed
+                time.sleep(sleep_time)
+            
+            wrapper.last_call_time = time.time()
+            return func(*args, **kwargs)
+        
+        return wrapper
+    return decorator
+
+# ============================================================================
 # DATABASE SETUP & TABLE CREATION
 # ============================================================================
 def create_candle_data_table_if_not_exists(db_client):
@@ -175,19 +200,20 @@ def create_candle_data_table_if_not_exists(db_client):
         ON candle_data(symbol, exchange, timeframe, datetime DESC);
         """
         
-        # Execute the SQL using Supabase's RPC or direct SQL execution
-        # Note: Supabase Python client doesn't have direct SQL execution
-        # We'll handle this differently - check if table exists by trying to query it
-        
         # Try to query the table to see if it exists
         try:
             db_client.table('candle_data').select('id').limit(1).execute()
             st.sidebar.success("✅ Database table exists")
             return True
         except Exception as e:
-            st.sidebar.warning(f"Table may not exist. Run this SQL in Supabase SQL Editor:\n\n{create_table_sql}")
-            return False
-            
+            error_msg = str(e)
+            if "does not exist" in error_msg.lower():
+                st.sidebar.warning(f"Table may not exist. Run this SQL in Supabase SQL Editor:\n\n{create_table_sql}")
+                return False
+            else:
+                st.sidebar.success("✅ Database table exists")
+                return True
+                
     except Exception as e:
         st.error(f"Error checking/creating table: {str(e)}")
         return False
@@ -211,8 +237,12 @@ def create_user_preferences_table_if_not_exists(db_client):
             db_client.table('user_preferences').select('user_id').limit(1).execute()
             return True
         except Exception as e:
-            st.sidebar.warning(f"user_preferences table may not exist. Run this SQL:\n\n{create_table_sql}")
-            return False
+            error_msg = str(e)
+            if "does not exist" in error_msg.lower():
+                st.sidebar.warning(f"user_preferences table may not exist. Run this SQL:\n\n{create_table_sql}")
+                return False
+            else:
+                return True
             
     except Exception as e:
         st.error(f"Error checking user_preferences table: {str(e)}")
@@ -628,6 +658,7 @@ class DhanAPI:
 # ============================================================================
 # OPTION CHAIN FUNCTIONS
 # ============================================================================
+@rate_limit(2)
 def get_dhan_option_chain(underlying_scrip: str, underlying_seg: str, expiry: str):
     """Get option chain data from Dhan API"""
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
@@ -667,6 +698,7 @@ def get_dhan_option_chain(underlying_scrip: str, underlying_seg: str, expiry: st
         st.error(f"Error fetching option chain: {e}")
         return None
 
+@rate_limit(2)
 def get_dhan_expiry_list(underlying_scrip: str, underlying_seg: str):
     """Get expiry list from Dhan API"""
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
@@ -771,10 +803,6 @@ class ICCMarketStructure:
         self.resistance_start_bars = []
         self.MAX_HIST_ZONES = 10
         self.prev_profile = profile
-    
-    # ... [ICC Methods - Keep all your existing ICC methods as they are] ...
-    # Due to character limits, I'm keeping the ICC methods concise
-    # Your existing ICC implementation should work fine
     
     def get_profiled_swing_length(self, current_tf_minutes):
         if self.profile == 'Entry':
@@ -2186,7 +2214,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
             st.dataframe(sample_summary.style.apply(highlight_atm_row, axis=1))
     
     # ============================================================================
-    # ICC ANALYSIS SECTION
+    # ICC ANALYSIS SECTION - FIXED VERSION
     # ============================================================================
     if not df.empty:
         st.header("📊 ICC Market Structure Analysis")
@@ -2228,7 +2256,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
         # Get ICC summary
         icc_summary = icc.update_structure(df, timeframe_minutes)
         
-        # Display ICC Dashboard
+        # Display ICC Dashboard - FIXED VERSION
         col1_icc, col2_icc, col3_icc, col4_icc = st.columns(4)
         
         phase_color = icc.get_phase_color()
@@ -2245,11 +2273,14 @@ CREATE TABLE IF NOT EXISTS user_preferences (
         with col2_icc:
             ind_type = icc_summary.get('indication_type', 'None')
             ind_color = '#00ff88' if ind_type == 'bullish' else '#ff4444' if ind_type == 'bearish' else '#888888'
+            indication_level = icc_summary.get('indication_level', 'None')
+            level_display = f"{indication_level:.2f}" if indication_level != 'None' and indication_level is not None else 'None'
+            
             st.markdown(f"""
             <div class="phase-box" style="border-left-color: {ind_color};">
                 <h4 style="margin: 0; color: #ffffff;">Indication</h4>
                 <h3 style="margin: 5px 0; color: {ind_color};">{ind_type.title() if ind_type else 'None'}</h3>
-                <p style="margin: 0; color: #aaaaaa;">Level: {icc_summary.get('indication_level', 'None'):.2f if icc_summary.get('indication_level') else 'None'}</p>
+                <p style="margin: 0; color: #aaaaaa;">Level: {level_display}</p>
             </div>
             """, unsafe_allow_html=True)
         
@@ -2275,7 +2306,7 @@ CREATE TABLE IF NOT EXISTS user_preferences (
             </div>
             """, unsafe_allow_html=True)
         
-        # Detailed ICC Analysis
+        # Detailed ICC Analysis - FIXED VERSION
         with st.expander("📋 ICC Detailed Analysis", expanded=False):
             col_det1, col_det2, col_det3 = st.columns(3)
             
@@ -2299,11 +2330,15 @@ CREATE TABLE IF NOT EXISTS user_preferences (
             
             with col_det3:
                 st.markdown("**Indication & Signals**")
+                indication_level_display = f"{icc_summary['indication_level']:.2f}" if icc_summary['indication_level'] is not None else 'None'
+                correction_low = f"{icc_summary['correction_range_low']:.2f}" if icc_summary['correction_range_low'] is not None else 'None'
+                correction_high = f"{icc_summary['correction_range_high']:.2f}" if icc_summary['correction_range_high'] is not None else 'None'
+                
                 st.info(f"""
                 - Type: {icc_summary['indication_type'] or 'None'}
-                - Level: {icc_summary['indication_level'] or 'None'}
+                - Level: {indication_level_display}
                 - Last Signal: {icc_summary['last_entry_type'] or 'None'}
-                - Correction Range: {icc_summary['correction_range_low'] or 'None'} - {icc_summary['correction_range_high'] or 'None'}
+                - Correction Range: {correction_low} - {correction_high}
                 """)
 
 # ============================================================================
