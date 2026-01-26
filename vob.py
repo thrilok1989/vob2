@@ -1784,6 +1784,8 @@ def analyze_option_chain(selected_expiry=None):
             "Strike": row['strikePrice'],
             "Zone": row['Zone'],
             "Level": row['Level'],
+            "openInterest_CE": row.get('openInterest_CE', 0),
+            "openInterest_PE": row.get('openInterest_PE', 0),
             "ChgOI_Bias": "Bullish" if row.get('changeinOpenInterest_CE', 0) < row.get('changeinOpenInterest_PE', 0) else "Bearish",
             "Volume_Bias": "Bullish" if row.get('totalTradedVolume_CE', 0) < row.get('totalTradedVolume_PE', 0) else "Bearish",
             "AskQty_Bias": "Bullish" if row.get('askQty_PE', 0) > row.get('askQty_CE', 0) else "Bearish",
@@ -1807,10 +1809,13 @@ def analyze_option_chain(selected_expiry=None):
     df_summary = pd.DataFrame(bias_results)
     
     # Add PCR
-    if 'openInterest_CE' in df.columns and 'openInterest_PE' in df.columns:
-        df_summary['PCR'] = df_summary['openInterest_PE'] / df_summary['openInterest_CE']
-        df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
-        df_summary['PCR'] = df_summary['PCR'].round(2)
+    if 'openInterest_CE' in df_summary.columns and 'openInterest_PE' in df_summary.columns:
+        df_summary['PCR'] = np.where(
+            df_summary['openInterest_CE'] == 0,
+            0,
+            df_summary['openInterest_PE'] / df_summary['openInterest_CE'].replace(0, np.nan)
+        )
+        df_summary['PCR'] = df_summary['PCR'].fillna(0).round(2)
         df_summary['PCR_Signal'] = np.where(
             df_summary['PCR'] > 1.2, "Bullish",
             np.where(df_summary['PCR'] < 0.7, "Bearish", "Neutral")
