@@ -575,6 +575,342 @@ class PivotIndicator:
         
         return all_pivots
 
+
+class ReversalDetector:
+    """
+    Intraday Reversal Detection System based on Price Action Theory.
+
+    Implements the following conditions:
+    A) Selling pressure exhaustion (no new lows)
+    B) Institutional buying (volume clues)
+    C) Short covering (sudden strong recovery)
+    D) Support level respected
+
+    Entry Rules:
+    1) Don't chase first green candle
+    2) Structure: No new low + Higher low + Strong bullish candle
+    3) Volume must support the move
+    4) Safe CE entry: Price above VWAP or breaks recent high
+    """
+
+    @staticmethod
+    def calculate_vwap(df):
+        """Calculate VWAP (Volume Weighted Average Price)"""
+        if df.empty or 'volume' not in df.columns:
+            return pd.Series(dtype=float)
+
+        df = df.copy()
+        df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3
+        df['tp_volume'] = df['typical_price'] * df['volume']
+        df['cumulative_tp_vol'] = df['tp_volume'].cumsum()
+        df['cumulative_vol'] = df['volume'].cumsum()
+        df['vwap'] = df['cumulative_tp_vol'] / df['cumulative_vol']
+        return df['vwap']
+
+    @staticmethod
+    def detect_higher_low(df, lookback=5):
+        """
+        Detect Higher Low formation.
+        Returns True if current low is higher than previous swing low.
+        """
+        if len(df) < lookback + 1:
+            return False, None, None
+
+        recent = df.tail(lookback + 1)
+        lows = recent['low'].values
+
+        # Find the minimum in the lookback period (excluding last candle)
+        prev_min_idx = lows[:-1].argmin()
+        prev_min = lows[prev_min_idx]
+
+        # Check if current low is higher than previous minimum
+        current_low = lows[-1]
+
+        # Also check if we have a swing low pattern (V shape)
+        if len(lows) >= 3:
+            for i in range(1, len(lows) - 1):
+                if lows[i] < lows[i-1] and lows[i] < lows[i+1]:
+                    swing_low = lows[i]
+                    if current_low > swing_low:
+                        return True, swing_low, current_low
+
+        return current_low > prev_min, prev_min, current_low
+
+    @staticmethod
+    def detect_no_new_low(df, lookback=10):
+        """
+        Detect if price has stopped making new lows.
+        Returns True if no new low made in recent candles.
+        """
+        if len(df) < lookback:
+            return False, None
+
+        recent = df.tail(lookback)
+        lows = recent['low'].values
+
+        # Find where the lowest low occurred
+        min_idx = lows.argmin()
+
+        # If minimum is not in the last 2 candles, selling pressure may be exhausted
+        selling_exhausted = min_idx < lookback - 2
+
+        return selling_exhausted, lows.min()
+
+    @staticmethod
+    def detect_strong_bullish_candle(df, threshold=0.5):
+        """
+        Detect strong bullish candle:
+        - Close > Open (green candle)
+        - Body > threshold * total range
+        - Close above previous candle's high
+        """
+        if len(df) < 2:
+            return False, {}
+
+        current = df.iloc[-1]
+        previous = df.iloc[-2]
+
+        is_green = current['close'] > current['open']
+        body = abs(current['close'] - current['open'])
+        total_range = current['high'] - current['low']
+
+        body_ratio = body / total_range if total_range > 0 else 0
+        strong_body = body_ratio >= threshold
+
+        closes_above_prev_high = current['close'] > previous['high']
+
+        is_strong = is_green and strong_body and closes_above_prev_high
+
+        details = {
+            'is_green': is_green,
+            'body_ratio': round(body_ratio, 2),
+            'strong_body': strong_body,
+            'closes_above_prev_high': closes_above_prev_high,
+            'current_close': current['close'],
+            'prev_high': previous['high']
+        }
+
+        return is_strong, details
+
+    @staticmethod
+    def detect_volume_confirmation(df, lookback=5):
+        """
+        Check if current up candle has supporting volume.
+        - Up candle + volume > average = Real buying
+        - Up candle + volume < average = Fake bounce
+        """
+        if len(df) < lookback:
+            return False, "Insufficient Data", {}
+
+        current = df.iloc[-1]
+        avg_volume = df.tail(lookback)['volume'].mean()
+
+        is_up_candle = current['close'] > current['open']
+        current_volume = current['volume']
+
+        volume_ratio = current_volume / avg_volume if avg_volume > 0 else 0
+
+        if is_up_candle:
+            if volume_ratio >= 1.2:
+                signal = "Strong Buying"
+                confirmed = True
+            elif volume_ratio >= 0.8:
+                signal = "Normal Buying"
+                confirmed = True
+            else:
+                signal = "Weak/Fake Bounce"
+                confirmed = False
+        else:
+            signal = "Down Candle"
+            confirmed = False
+
+        details = {
+            'current_volume': current_volume,
+            'avg_volume': round(avg_volume, 0),
+            'volume_ratio': round(volume_ratio, 2),
+            'is_up_candle': is_up_candle
+        }
+
+        return confirmed, signal, details
+
+    @staticmethod
+    def check_vwap_position(df):
+        """
+        Check if price is above VWAP.
+        Price above VWAP = Bullish bias
+        """
+        if len(df) < 2:
+            return False, None, None
+
+        vwap = ReversalDetector.calculate_vwap(df)
+        if vwap.empty:
+            return False, None, None
+
+        current_price = df.iloc[-1]['close']
+        current_vwap = vwap.iloc[-1]
+
+        above_vwap = current_price > current_vwap
+
+        return above_vwap, current_price, current_vwap
+
+    @staticmethod
+    def detect_support_respect(df, pivot_lows, proximity_pct=0.3):
+        """
+        Check if price is respecting a support level.
+        Returns True if price bounced from near a support level.
+        """
+        if len(df) < 3 or not pivot_lows:
+            return False, None, None
+
+        current_low = df.iloc[-1]['low']
+        recent_low = df.tail(5)['low'].min()
+
+        # Find nearest support
+        nearest_support = None
+        min_distance = float('inf')
+
+        for support in pivot_lows:
+            distance = abs(recent_low - support)
+            pct_distance = (distance / support) * 100 if support > 0 else float('inf')
+
+            if pct_distance < min_distance and pct_distance <= proximity_pct:
+                min_distance = pct_distance
+                nearest_support = support
+
+        if nearest_support:
+            # Check if price bounced (current close > recent low)
+            bounced = df.iloc[-1]['close'] > recent_low
+            return bounced, nearest_support, recent_low
+
+        return False, None, recent_low
+
+    @staticmethod
+    def calculate_reversal_score(df, pivot_lows=None, lookback=10):
+        """
+        Calculate comprehensive reversal score based on all conditions.
+
+        Returns:
+        - score: -5 to +5 (positive = bullish reversal, negative = bearish)
+        - signals: dict with individual signal details
+        - verdict: Overall recommendation
+        """
+        signals = {}
+        score = 0
+
+        # 1. Check selling pressure exhaustion (no new low)
+        no_new_low, swing_low = ReversalDetector.detect_no_new_low(df, lookback)
+        signals['Selling_Exhausted'] = "Yes ✅" if no_new_low else "No ❌"
+        if no_new_low:
+            score += 1
+
+        # 2. Check higher low formation
+        higher_low, prev_low, curr_low = ReversalDetector.detect_higher_low(df, lookback // 2)
+        signals['Higher_Low'] = "Yes ✅" if higher_low else "No ❌"
+        if higher_low:
+            score += 1.5
+
+        # 3. Check strong bullish candle
+        strong_candle, candle_details = ReversalDetector.detect_strong_bullish_candle(df)
+        signals['Strong_Bullish_Candle'] = "Yes ✅" if strong_candle else "No ❌"
+        if strong_candle:
+            score += 1.5
+
+        # 4. Check volume confirmation
+        vol_confirmed, vol_signal, vol_details = ReversalDetector.detect_volume_confirmation(df)
+        signals['Volume_Signal'] = vol_signal
+        if vol_confirmed:
+            score += 1
+        elif vol_signal == "Weak/Fake Bounce":
+            score -= 0.5
+
+        # 5. Check VWAP position
+        above_vwap, price, vwap = ReversalDetector.check_vwap_position(df)
+        signals['Above_VWAP'] = "Yes ✅" if above_vwap else "No ❌"
+        if above_vwap:
+            score += 1
+
+        # 6. Check support respect (if pivot lows provided)
+        if pivot_lows:
+            support_held, support_level, low = ReversalDetector.detect_support_respect(df, pivot_lows)
+            signals['Support_Respected'] = "Yes ✅" if support_held else "No ❌"
+            if support_held:
+                score += 1
+                signals['Support_Level'] = support_level
+
+        # Calculate entry signal
+        signals['Reversal_Score'] = round(score, 1)
+
+        # Determine verdict
+        if score >= 4:
+            verdict = "🟢 STRONG BUY SIGNAL"
+            entry_type = "Safe CE Entry"
+        elif score >= 2.5:
+            verdict = "🟡 MODERATE BUY SIGNAL"
+            entry_type = "Wait for Confirmation"
+        elif score >= 1:
+            verdict = "⚪ WEAK SIGNAL"
+            entry_type = "No Entry"
+        elif score <= -2:
+            verdict = "🔴 BEARISH - AVOID CE"
+            entry_type = "Consider PE"
+        else:
+            verdict = "⚪ NEUTRAL"
+            entry_type = "No Trade"
+
+        signals['Verdict'] = verdict
+        signals['Entry_Type'] = entry_type
+
+        # Add price context
+        if len(df) > 0:
+            signals['Current_Price'] = df.iloc[-1]['close']
+            signals['Day_Low'] = df['low'].min()
+            signals['Day_High'] = df['high'].max()
+            if vwap:
+                signals['VWAP'] = round(vwap, 2)
+
+        return score, signals, verdict
+
+    @staticmethod
+    def get_entry_rules(signals, score):
+        """
+        Generate specific entry rules based on current conditions.
+        """
+        rules = []
+
+        # Rule 1: Don't chase first green candle
+        if signals.get('Strong_Bullish_Candle') == "Yes ✅":
+            if signals.get('Higher_Low') != "Yes ✅":
+                rules.append("⚠️ First green candle - Wait for higher low confirmation")
+            else:
+                rules.append("✅ Structure confirmed - Entry possible")
+
+        # Rule 2: Volume check
+        vol_signal = signals.get('Volume_Signal', '')
+        if 'Weak' in vol_signal or 'Fake' in vol_signal:
+            rules.append("⚠️ Low volume - Possible fake bounce")
+        elif 'Strong' in vol_signal:
+            rules.append("✅ Strong volume - Real buying detected")
+
+        # Rule 3: VWAP position
+        if signals.get('Above_VWAP') == "Yes ✅":
+            rules.append("✅ Price above VWAP - Bullish bias")
+        else:
+            rules.append("⚠️ Price below VWAP - Wait for VWAP reclaim")
+
+        # Rule 4: Entry recommendation
+        if score >= 4:
+            rules.append("🎯 ENTRY: Buy CE at current level")
+            rules.append(f"🛑 SL: Below higher low ({signals.get('Day_Low', 'N/A')})")
+            rules.append("🎯 Target: Previous high / Nearest resistance")
+        elif score >= 2.5:
+            rules.append("⏳ WAIT: Confirmation pending")
+            rules.append("📋 Checklist: Higher Low + Strong Candle + Volume")
+        else:
+            rules.append("❌ NO ENTRY: Conditions not met")
+
+        return rules
+
+
 def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5):
     """Trading signal detection with Normal Bias OR OI Dominance (both require full ATM bias alignment)."""
     if df.empty or option_data is None or len(option_data) == 0 or not current_price:
@@ -1010,8 +1346,26 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         
         except Exception as e:
             st.warning(f"Error adding pivot levels: {str(e)}")
-    
-    volume_colors = ['#00ff88' if close >= open else '#ff4444' 
+
+    # Add VWAP line
+    try:
+        vwap = ReversalDetector.calculate_vwap(df)
+        if not vwap.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=df['datetime'],
+                    y=vwap,
+                    mode='lines',
+                    name='VWAP',
+                    line=dict(color='#FFD700', width=2, dash='dot'),
+                    opacity=0.8
+                ),
+                row=1, col=1
+            )
+    except Exception as e:
+        pass  # VWAP calculation failed, skip it
+
+    volume_colors = ['#00ff88' if close >= open else '#ff4444'
                     for close, open in zip(df['close'], df['open'])]
     
     fig.add_trace(
@@ -1865,12 +2219,78 @@ def main():
                 st.markdown("""
                 **Pivot Levels Legend:**
                 - 🟢 **3M Levels**: 3-minute timeframe support/resistance
-                - 🟠 **5M Levels**: 5-minute timeframe swing points  
+                - 🟠 **5M Levels**: 5-minute timeframe swing points
                 - 🟣 **10M Levels**: 10-minute support/resistance zones
                 - 🔵 **15M Levels**: 15-minute major support/resistance levels
-                
+                - 🟡 **VWAP**: Volume Weighted Average Price (dotted line)
+
                 *R = Resistance (Price ceiling), S = Support (Price floor)*
                 """)
+
+            # Reversal Detector Analysis
+            st.markdown("---")
+            st.markdown("## 🔄 Intraday Reversal Detector")
+
+            try:
+                # Get pivot lows for support detection
+                pivot_lows = []
+                if show_pivots and len(df) > 50:
+                    df_json = df.to_json()
+                    pivots = cached_pivot_calculation(df_json, pivot_settings or {})
+                    pivot_lows = [p['value'] for p in pivots if p['type'] == 'low']
+
+                # Calculate reversal score
+                score, signals, verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
+
+                # Display verdict prominently
+                if "STRONG BUY" in verdict:
+                    st.success(f"**{verdict}**")
+                elif "MODERATE BUY" in verdict:
+                    st.warning(f"**{verdict}**")
+                elif "BEARISH" in verdict:
+                    st.error(f"**{verdict}**")
+                else:
+                    st.info(f"**{verdict}**")
+
+                # Display signals in columns
+                col_s1, col_s2, col_s3 = st.columns(3)
+
+                with col_s1:
+                    st.markdown("**📊 Structure Analysis**")
+                    st.markdown(f"- Selling Exhausted: {signals.get('Selling_Exhausted', 'N/A')}")
+                    st.markdown(f"- Higher Low: {signals.get('Higher_Low', 'N/A')}")
+                    st.markdown(f"- Strong Candle: {signals.get('Strong_Bullish_Candle', 'N/A')}")
+
+                with col_s2:
+                    st.markdown("**📈 Confirmation Signals**")
+                    st.markdown(f"- Volume: {signals.get('Volume_Signal', 'N/A')}")
+                    st.markdown(f"- Above VWAP: {signals.get('Above_VWAP', 'N/A')}")
+                    st.markdown(f"- Support Held: {signals.get('Support_Respected', 'N/A')}")
+
+                with col_s3:
+                    st.markdown("**🎯 Entry Details**")
+                    st.markdown(f"- Score: **{signals.get('Reversal_Score', 0)}/6**")
+                    st.markdown(f"- Entry Type: {signals.get('Entry_Type', 'N/A')}")
+                    if signals.get('VWAP'):
+                        st.markdown(f"- VWAP: ₹{signals.get('VWAP')}")
+
+                # Entry Rules Expander
+                with st.expander("📋 Entry Rules & Recommendations"):
+                    entry_rules = ReversalDetector.get_entry_rules(signals, score)
+                    for rule in entry_rules:
+                        st.markdown(f"- {rule}")
+
+                    st.markdown("---")
+                    st.markdown("**🧠 Trading Psychology:**")
+                    st.markdown("> *Missing a trade is 100x better than entering a wrong trade.*")
+                    st.markdown("- Trade only after structure forms")
+                    st.markdown("- No emotional entries")
+                    st.markdown("- Fixed SL, fixed target")
+                    st.markdown("- If trade missed → day closed")
+
+            except Exception as e:
+                st.warning(f"Reversal analysis unavailable: {str(e)}")
+
         else:
             st.error("No data available. Please check your API credentials and try again.")
     
