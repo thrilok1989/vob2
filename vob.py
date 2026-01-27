@@ -791,10 +791,16 @@ def calculate_bid_ask_pressure(call_bid_qty, call_ask_qty, put_bid_qty, put_ask_
     return pressure, bias
 
 weights = {
+    "LTP_Bias": 1,
+    "OI_Bias": 2,
     "ChgOI_Bias": 2,
     "Volume_Bias": 1,
+    "Delta_Bias": 1,
+    "Gamma_Bias": 1,
     "AskQty_Bias": 1,
     "BidQty_Bias": 1,
+    "AskBid_Bias": 1,
+    "IV_Bias": 1,
     "DVP_Bias": 1,
     "PressureBias": 1,
 }
@@ -824,6 +830,67 @@ def color_pcr(val):
         return 'background-color: #FFB6C1; color: black'
     else:
         return 'background-color: #FFFFE0; color: black'
+
+def color_bias(val):
+    """Color bias cells: Green for Bullish, Red for Bearish, Yellow for Neutral"""
+    if val == "Bullish":
+        return 'background-color: #90EE90; color: black'
+    elif val == "Bearish":
+        return 'background-color: #FFB6C1; color: black'
+    else:
+        return 'background-color: #FFFFE0; color: black'
+
+def color_verdict(val):
+    """Color verdict cells based on strength"""
+    if "Strong Bullish" in str(val):
+        return 'background-color: #228B22; color: white'
+    elif "Bullish" in str(val):
+        return 'background-color: #90EE90; color: black'
+    elif "Strong Bearish" in str(val):
+        return 'background-color: #DC143C; color: white'
+    elif "Bearish" in str(val):
+        return 'background-color: #FFB6C1; color: black'
+    else:
+        return 'background-color: #FFFFE0; color: black'
+
+def color_entry(val):
+    """Color operator entry signals"""
+    if "Bull" in str(val):
+        return 'background-color: #90EE90; color: black'
+    elif "Bear" in str(val):
+        return 'background-color: #FFB6C1; color: black'
+    else:
+        return 'background-color: #F5F5F5; color: black'
+
+def color_fakereal(val):
+    """Color fake/real move signals"""
+    if "Real Up" in str(val):
+        return 'background-color: #228B22; color: white'
+    elif "Fake Up" in str(val):
+        return 'background-color: #98FB98; color: black'
+    elif "Real Down" in str(val):
+        return 'background-color: #DC143C; color: white'
+    elif "Fake Down" in str(val):
+        return 'background-color: #FFC0CB; color: black'
+    else:
+        return 'background-color: #F5F5F5; color: black'
+
+def color_score(val):
+    """Color score based on value"""
+    try:
+        score = float(val)
+        if score >= 4:
+            return 'background-color: #228B22; color: white'
+        elif score >= 2:
+            return 'background-color: #90EE90; color: black'
+        elif score <= -4:
+            return 'background-color: #DC143C; color: white'
+        elif score <= -2:
+            return 'background-color: #FFB6C1; color: black'
+        else:
+            return 'background-color: #FFFFE0; color: black'
+    except:
+        return ''
 
 def highlight_atm_row(row):
     """Highlight ATM row in the dataframe"""
@@ -1243,30 +1310,129 @@ def analyze_option_chain(selected_expiry=None):
             "Strike": row['strikePrice'],
             "Zone": row['Zone'],
             "Level": row['Level'],
-            "ChgOI_Bias": "Bullish" if row.get('changeinOpenInterest_CE', 0) < row.get('changeinOpenInterest_PE', 0) else "Bearish",
-            "Volume_Bias": "Bullish" if row.get('totalTradedVolume_CE', 0) < row.get('totalTradedVolume_PE', 0) else "Bearish",
-            "AskQty_Bias": "Bullish" if row.get('askQty_PE', 0) > row.get('askQty_CE', 0) else "Bearish",
-            "BidQty_Bias": "Bearish" if row.get('bidQty_PE', 0) > row.get('bidQty_CE', 0) else "Bullish",
-            "DVP_Bias": delta_volume_bias(
-                row.get('lastPrice_CE', 0) - row.get('lastPrice_PE', 0),
-                row.get('totalTradedVolume_CE', 0) - row.get('totalTradedVolume_PE', 0),
-                row.get('changeinOpenInterest_CE', 0) - row.get('changeinOpenInterest_PE', 0)
-            ),
-            "BidAskPressure": bid_ask_pressure,
-            "PressureBias": pressure_bias
         }
+
+        # ===== Core Bias Calculations =====
+        # LTP Bias: Higher CE LTP = Bullish (CE demand higher)
+        row_data["LTP_Bias"] = "Bullish" if row.get('lastPrice_CE', 0) > row.get('lastPrice_PE', 0) else "Bearish"
+
+        # OI Bias: Higher CE OI = Bearish (more call writing = resistance)
+        row_data["OI_Bias"] = "Bearish" if row.get('openInterest_CE', 0) > row.get('openInterest_PE', 0) else "Bullish"
+
+        # ChgOI Bias: Higher CE ChgOI = Bearish (new call writing)
+        row_data["ChgOI_Bias"] = "Bearish" if row.get('changeinOpenInterest_CE', 0) > row.get('changeinOpenInterest_PE', 0) else "Bullish"
+
+        # Volume Bias: Higher CE Volume = Bullish (more CE buying activity)
+        row_data["Volume_Bias"] = "Bullish" if row.get('totalTradedVolume_CE', 0) > row.get('totalTradedVolume_PE', 0) else "Bearish"
+
+        # ===== Greeks-Based Bias =====
+        # Delta Bias: Higher CE Delta = Bullish
+        row_data["Delta_Bias"] = "Bullish" if row.get('Delta_CE', 0) > abs(row.get('Delta_PE', 0)) else "Bearish"
+
+        # Gamma Bias: Higher CE Gamma = Bullish
+        row_data["Gamma_Bias"] = "Bullish" if row.get('Gamma_CE', 0) > row.get('Gamma_PE', 0) else "Bearish"
+
+        # ===== Order Flow Bias =====
+        # AskQty Bias: Higher PE Ask = Bullish (more PE sellers)
+        row_data["AskQty_Bias"] = "Bullish" if row.get('askQty_PE', 0) > row.get('askQty_CE', 0) else "Bearish"
+
+        # BidQty Bias: Higher PE Bid = Bearish (more PE buyers)
+        row_data["BidQty_Bias"] = "Bearish" if row.get('bidQty_PE', 0) > row.get('bidQty_CE', 0) else "Bullish"
+
+        # AskBid Bias (CE side): More bids than asks on CE = Bullish
+        row_data["AskBid_Bias"] = "Bullish" if row.get('bidQty_CE', 0) > row.get('askQty_CE', 0) else "Bearish"
+
+        # ===== Volatility Bias =====
+        # IV Bias: Higher CE IV = Bullish (more CE demand driving IV up)
+        row_data["IV_Bias"] = "Bullish" if row.get('impliedVolatility_CE', 0) > row.get('impliedVolatility_PE', 0) else "Bearish"
+
+        # ===== Exposure Calculations =====
+        delta_exp_ce = row.get('Delta_CE', 0) * row.get('openInterest_CE', 0)
+        delta_exp_pe = row.get('Delta_PE', 0) * row.get('openInterest_PE', 0)
+        gamma_exp_ce = row.get('Gamma_CE', 0) * row.get('openInterest_CE', 0)
+        gamma_exp_pe = row.get('Gamma_PE', 0) * row.get('openInterest_PE', 0)
+
+        row_data["DeltaExp"] = "Bullish" if delta_exp_ce > abs(delta_exp_pe) else "Bearish"
+        row_data["GammaExp"] = "Bullish" if gamma_exp_ce > gamma_exp_pe else "Bearish"
+
+        # ===== DVP (Delta-Volume-Price) Bias =====
+        row_data["DVP_Bias"] = delta_volume_bias(
+            row.get('lastPrice_CE', 0) - row.get('lastPrice_PE', 0),
+            row.get('totalTradedVolume_CE', 0) - row.get('totalTradedVolume_PE', 0),
+            row.get('changeinOpenInterest_CE', 0) - row.get('changeinOpenInterest_PE', 0)
+        )
+
+        # ===== Bid-Ask Pressure =====
+        row_data["BidAskPressure"] = bid_ask_pressure
+        row_data["PressureBias"] = pressure_bias
+
+        # ===== Score Calculation =====
+        # Count all bias columns for scoring
         for k in row_data:
-            if "_Bias" in k:
-                bias = row_data[k]
-                score += weights.get(k, 1) if bias == "Bullish" else -weights.get(k, 1)
+            if "_Bias" in k or k in ["DeltaExp", "GammaExp"]:
+                bias_val = row_data[k]
+                if bias_val == "Bullish":
+                    score += 1
+                elif bias_val == "Bearish":
+                    score -= 1
+
         row_data["BiasScore"] = score
         row_data["Verdict"] = final_verdict(score)
+
+        # ===== Trading Signals =====
+        # Operator Entry: Both OI and ChgOI aligned
+        if row_data['OI_Bias'] == "Bullish" and row_data['ChgOI_Bias'] == "Bullish":
+            row_data["Operator_Entry"] = "Entry Bull"
+        elif row_data['OI_Bias'] == "Bearish" and row_data['ChgOI_Bias'] == "Bearish":
+            row_data["Operator_Entry"] = "Entry Bear"
+        else:
+            row_data["Operator_Entry"] = "No Entry"
+
+        # Scalp/Momentum: Based on score strength
+        if score >= 4:
+            row_data["Scalp_Moment"] = "Scalp Bull"
+        elif score >= 2:
+            row_data["Scalp_Moment"] = "Moment Bull"
+        elif score <= -4:
+            row_data["Scalp_Moment"] = "Scalp Bear"
+        elif score <= -2:
+            row_data["Scalp_Moment"] = "Moment Bear"
+        else:
+            row_data["Scalp_Moment"] = "No Signal"
+
+        # FakeReal: Distinguish real moves from fake
+        if score >= 4:
+            row_data["FakeReal"] = "Real Up"
+        elif 1 <= score < 4:
+            row_data["FakeReal"] = "Fake Up"
+        elif score <= -4:
+            row_data["FakeReal"] = "Real Down"
+        elif -4 < score <= -1:
+            row_data["FakeReal"] = "Fake Down"
+        else:
+            row_data["FakeReal"] = "No Move"
+
+        # ===== Comparison Strings for Display =====
+        chg_oi_ce = row.get('changeinOpenInterest_CE', 0)
+        chg_oi_pe = row.get('changeinOpenInterest_PE', 0)
+        oi_ce = row.get('openInterest_CE', 0)
+        oi_pe = row.get('openInterest_PE', 0)
+
+        chg_oi_cmp = '>' if chg_oi_ce > chg_oi_pe else ('<' if chg_oi_ce < chg_oi_pe else '≈')
+        row_data["ChgOI_Cmp"] = f"{int(chg_oi_ce/1000)}K {chg_oi_cmp} {int(chg_oi_pe/1000)}K"
+
+        oi_cmp = '>' if oi_ce > oi_pe else ('<' if oi_ce < oi_pe else '≈')
+        row_data["OI_Cmp"] = f"{round(oi_ce/1e6, 2)}M {oi_cmp} {round(oi_pe/1e6, 2)}M"
+
         bias_results.append(row_data)
 
     df_summary = pd.DataFrame(bias_results)
     df_summary = pd.merge(
         df_summary,
-        df[['strikePrice', 'openInterest_CE', 'openInterest_PE']],
+        df[['strikePrice', 'openInterest_CE', 'openInterest_PE', 'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
+            'lastPrice_CE', 'lastPrice_PE', 'totalTradedVolume_CE', 'totalTradedVolume_PE',
+            'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'Vega_CE', 'Vega_PE', 'Theta_CE', 'Theta_PE',
+            'impliedVolatility_CE', 'impliedVolatility_PE', 'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']],
         left_on='Strike', right_on='strikePrice', how='left'
     )
 
@@ -1279,15 +1445,46 @@ def analyze_option_chain(selected_expiry=None):
     )
 
     st.markdown("## Option Chain Bias Summary")
-    
-    # Enhanced styling with ATM highlighting
-    styled_df = df_summary.style\
-        .applymap(color_pcr, subset=['PCR'])\
-        .applymap(color_pressure, subset=['BidAskPressure'])\
+
+    # Define columns for display (select key columns to avoid clutter)
+    display_cols = ['Strike', 'Zone', 'Level', 'LTP_Bias', 'OI_Bias', 'ChgOI_Bias', 'Volume_Bias',
+                    'Delta_Bias', 'Gamma_Bias', 'AskQty_Bias', 'BidQty_Bias', 'AskBid_Bias', 'IV_Bias',
+                    'DeltaExp', 'GammaExp', 'DVP_Bias', 'PressureBias', 'BidAskPressure',
+                    'BiasScore', 'Verdict', 'Operator_Entry', 'Scalp_Moment', 'FakeReal',
+                    'ChgOI_Cmp', 'OI_Cmp', 'PCR', 'PCR_Signal']
+
+    # Filter to only existing columns
+    display_cols = [col for col in display_cols if col in df_summary.columns]
+    df_display = df_summary[display_cols].copy()
+
+    # Define bias columns for styling
+    bias_cols = [col for col in display_cols if '_Bias' in col or col in ['DeltaExp', 'GammaExp', 'PCR_Signal']]
+
+    # Enhanced styling with ATM highlighting and bias coloring
+    styled_df = df_display.style\
+        .applymap(color_bias, subset=bias_cols)\
+        .applymap(color_pcr, subset=['PCR'] if 'PCR' in display_cols else [])\
+        .applymap(color_pressure, subset=['BidAskPressure'] if 'BidAskPressure' in display_cols else [])\
+        .applymap(color_verdict, subset=['Verdict'] if 'Verdict' in display_cols else [])\
+        .applymap(color_entry, subset=['Operator_Entry'] if 'Operator_Entry' in display_cols else [])\
+        .applymap(color_fakereal, subset=['FakeReal'] if 'FakeReal' in display_cols else [])\
+        .applymap(color_score, subset=['BiasScore'] if 'BiasScore' in display_cols else [])\
         .apply(highlight_atm_row, axis=1)
-    
+
     st.dataframe(styled_df, use_container_width=True)
-    
+
+    # Expandable section for detailed Greeks and raw values
+    with st.expander("📊 Detailed Greeks & Raw Values"):
+        detail_cols = ['Strike', 'Zone', 'lastPrice_CE', 'lastPrice_PE',
+                       'openInterest_CE', 'openInterest_PE', 'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
+                       'totalTradedVolume_CE', 'totalTradedVolume_PE',
+                       'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'Vega_CE', 'Vega_PE', 'Theta_CE', 'Theta_PE',
+                       'impliedVolatility_CE', 'impliedVolatility_PE',
+                       'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']
+        detail_cols = [col for col in detail_cols if col in df_summary.columns]
+        if detail_cols:
+            st.dataframe(df_summary[detail_cols].style.apply(highlight_atm_row, axis=1), use_container_width=True)
+
     # Add download button for CSV
     csv_data = create_csv_download(df_summary)
     st.download_button(
