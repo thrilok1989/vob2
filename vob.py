@@ -915,12 +915,16 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
     """Trading signal detection with Normal Bias OR OI Dominance (both require full ATM bias alignment)."""
     if df.empty or option_data is None or len(option_data) == 0 or not current_price:
         return
-    
+
     try:
         df_json = df.to_json()
         pivots = cached_pivot_calculation(df_json, pivot_settings)
     except:
         pivots = PivotIndicator.get_all_pivots(df, pivot_settings)
+
+    # Calculate Reversal Detector signals
+    pivot_lows = [p['value'] for p in pivots if p['type'] == 'low']
+    reversal_score, reversal_signals, reversal_verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
     
     near_pivot = False
     pivot_level = None
@@ -978,6 +982,17 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                 conditions_text = "\n".join([f"✅ {k}" for k, v in bullish_conditions.items() if v])
                 price_diff = current_price - pivot_level['value']
                 
+                # Build reversal analysis text
+                reversal_text = f"""
+🔄 <b>REVERSAL DETECTOR:</b>
+• Score: {reversal_signals.get('Reversal_Score', 0)}/6
+• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
+• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
+• Strong Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
+• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
+• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
+• {reversal_verdict}"""
+
                 message = f"""
 🚨 <b>NIFTY CALL SIGNAL ALERT</b> 🚨
 
@@ -990,6 +1005,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
 
 ⚡ <b>{trigger_type}</b>
 ⚡ <b>OI:</b> PE ChgOI {pe_chg_oi:,} vs CE ChgOI {ce_chg_oi:,}
+{reversal_text}
 
 📋 <b>SUGGESTED REVIEW:</b>
 • Strike: {atm_strike} CE
@@ -1013,6 +1029,17 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                 conditions_text = "\n".join([f"🔴 {k}" for k, v in bearish_conditions.items() if v])
                 price_diff = current_price - pivot_level['value']
                 
+                # Build reversal analysis text for bearish
+                reversal_text = f"""
+🔄 <b>REVERSAL DETECTOR:</b>
+• Score: {reversal_signals.get('Reversal_Score', 0)}/6
+• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
+• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
+• Strong Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
+• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
+• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
+• {reversal_verdict}"""
+
                 message = f"""
 🔴 <b>NIFTY PUT SIGNAL ALERT</b> 🔴
 
@@ -1025,6 +1052,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
 
 ⚡ <b>{trigger_type}</b>
 ⚡ <b>OI:</b> CE ChgOI {ce_chg_oi:,} vs PE ChgOI {pe_chg_oi:,}
+{reversal_text}
 
 📋 <b>SUGGESTED REVIEW:</b>
 • Strike: {atm_strike} PE
@@ -1038,6 +1066,49 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                     st.success("🔴 Bearish signal notification sent!")
                 except Exception as e:
                     st.error(f"Failed to send notification: {e}")
+
+    # Standalone Reversal Signal Alert (triggers independently when score >= 4)
+    if reversal_score >= 4:
+        # Get entry rules
+        entry_rules = ReversalDetector.get_entry_rules(reversal_signals, reversal_score)
+        rules_text = "\n".join([f"• {rule}" for rule in entry_rules[:5]])
+
+        vwap_text = f"₹{reversal_signals.get('VWAP', 'N/A')}" if reversal_signals.get('VWAP') else "N/A"
+
+        reversal_message = f"""
+🔄 <b>REVERSAL SIGNAL DETECTED</b> 🔄
+
+📍 <b>Spot Price:</b> ₹{current_price:.2f}
+📊 <b>Reversal Score:</b> {reversal_score}/6 ⭐
+
+<b>✅ STRUCTURE CONFIRMED:</b>
+• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
+• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
+• Strong Bullish Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
+
+<b>📈 CONFIRMATION:</b>
+• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
+• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
+• VWAP Level: {vwap_text}
+• Support Held: {reversal_signals.get('Support_Respected', 'N/A')}
+
+<b>🎯 {reversal_verdict}</b>
+Entry Type: {reversal_signals.get('Entry_Type', 'N/A')}
+
+<b>📋 ENTRY RULES:</b>
+{rules_text}
+
+<b>🧠 REMINDER:</b>
+<i>Missing a trade is 100x better than wrong entry</i>
+
+🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
+"""
+        try:
+            send_telegram_message_sync(reversal_message)
+            st.success("🔄 Reversal signal notification sent!")
+        except Exception as e:
+            st.warning(f"Failed to send reversal notification: {e}")
+
 
 def calculate_exact_time_to_expiry(expiry_date_str):
     """Calculate exact time to expiry in years (days + hours)"""
