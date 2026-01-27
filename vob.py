@@ -1884,10 +1884,89 @@ def analyze_option_chain(selected_expiry=None):
         df_summary['PCR'] = 0
         df_summary['PCR_Signal'] = "N/A"
 
+    # ===== GAMMA EXPOSURE SUPPORT/RESISTANCE =====
+    # Calculate Gamma Exposure for each strike
+    if 'Gamma_CE' in df_summary.columns and 'openInterest_CE' in df_summary.columns:
+        df_summary['GammaExp_CE'] = df_summary['Gamma_CE'] * df_summary['openInterest_CE']
+        df_summary['GammaExp_PE'] = df_summary['Gamma_PE'] * df_summary['openInterest_PE']
+        df_summary['GammaExp_Net'] = df_summary['GammaExp_CE'] - df_summary['GammaExp_PE']
+
+        # Max Gamma CE = Resistance, Max Gamma PE = Support
+        max_gamma_ce_strike = df_summary.loc[df_summary['GammaExp_CE'].idxmax(), 'Strike'] if not df_summary['GammaExp_CE'].isna().all() else None
+        max_gamma_pe_strike = df_summary.loc[df_summary['GammaExp_PE'].idxmax(), 'Strike'] if not df_summary['GammaExp_PE'].isna().all() else None
+
+        df_summary['Gamma_SR'] = df_summary['Strike'].apply(
+            lambda x: '🔴 Γ-Resist' if x == max_gamma_ce_strike else ('🟢 Γ-Support' if x == max_gamma_pe_strike else '-')
+        )
+    else:
+        df_summary['Gamma_SR'] = '-'
+
+    # ===== DELTA EXPOSURE SUPPORT/RESISTANCE =====
+    if 'Delta_CE' in df_summary.columns and 'openInterest_CE' in df_summary.columns:
+        df_summary['DeltaExp_CE'] = df_summary['Delta_CE'] * df_summary['openInterest_CE']
+        df_summary['DeltaExp_PE'] = abs(df_summary['Delta_PE'] * df_summary['openInterest_PE'])
+        df_summary['DeltaExp_Net'] = df_summary['DeltaExp_CE'] - df_summary['DeltaExp_PE']
+
+        # Max Delta CE = Resistance, Max Delta PE = Support
+        max_delta_ce_strike = df_summary.loc[df_summary['DeltaExp_CE'].idxmax(), 'Strike'] if not df_summary['DeltaExp_CE'].isna().all() else None
+        max_delta_pe_strike = df_summary.loc[df_summary['DeltaExp_PE'].idxmax(), 'Strike'] if not df_summary['DeltaExp_PE'].isna().all() else None
+
+        df_summary['Delta_SR'] = df_summary['Strike'].apply(
+            lambda x: '🔴 Δ-Resist' if x == max_delta_ce_strike else ('🟢 Δ-Support' if x == max_delta_pe_strike else '-')
+        )
+    else:
+        df_summary['Delta_SR'] = '-'
+
+    # ===== MARKET DEPTH SUPPORT/RESISTANCE =====
+    # Based on Bid/Ask quantities - High Bid = Support, High Ask = Resistance
+    if 'bidQty_CE' in df_summary.columns and 'askQty_CE' in df_summary.columns:
+        df_summary['Depth_CE'] = df_summary['bidQty_CE'] + df_summary['askQty_CE']
+        df_summary['Depth_PE'] = df_summary['bidQty_PE'] + df_summary['askQty_PE']
+
+        # Max bid on PE side = Support (buyers defending), Max ask on CE side = Resistance (sellers defending)
+        max_bid_pe_strike = df_summary.loc[df_summary['bidQty_PE'].idxmax(), 'Strike'] if not df_summary['bidQty_PE'].isna().all() else None
+        max_ask_ce_strike = df_summary.loc[df_summary['askQty_CE'].idxmax(), 'Strike'] if not df_summary['askQty_CE'].isna().all() else None
+
+        df_summary['Depth_SR'] = df_summary['Strike'].apply(
+            lambda x: '🔴 Depth-R' if x == max_ask_ce_strike else ('🟢 Depth-S' if x == max_bid_pe_strike else '-')
+        )
+    else:
+        df_summary['Depth_SR'] = '-'
+
+    # ===== OI WALL SUPPORT/RESISTANCE =====
+    # Highest OI CE = Resistance Wall, Highest OI PE = Support Wall
+    if 'openInterest_CE' in df_summary.columns and 'openInterest_PE' in df_summary.columns:
+        max_oi_ce_strike = df_summary.loc[df_summary['openInterest_CE'].idxmax(), 'Strike'] if not df_summary['openInterest_CE'].isna().all() else None
+        max_oi_pe_strike = df_summary.loc[df_summary['openInterest_PE'].idxmax(), 'Strike'] if not df_summary['openInterest_PE'].isna().all() else None
+
+        # Also find 2nd highest for additional levels
+        oi_ce_sorted = df_summary.nlargest(2, 'openInterest_CE')['Strike'].tolist()
+        oi_pe_sorted = df_summary.nlargest(2, 'openInterest_PE')['Strike'].tolist()
+
+        def get_oi_wall(strike):
+            labels = []
+            if strike == max_oi_ce_strike:
+                labels.append('🔴 OI-Wall-R1')
+            elif strike in oi_ce_sorted:
+                labels.append('🟠 OI-Wall-R2')
+            if strike == max_oi_pe_strike:
+                labels.append('🟢 OI-Wall-S1')
+            elif strike in oi_pe_sorted:
+                labels.append('🟡 OI-Wall-S2')
+            return ' | '.join(labels) if labels else '-'
+
+        df_summary['OI_Wall'] = df_summary['Strike'].apply(get_oi_wall)
+    else:
+        df_summary['OI_Wall'] = '-'
+
     st.markdown("## Option Chain Bias Summary")
 
     # Define columns for display (select key columns to avoid clutter)
-    display_cols = ['Strike', 'Zone', 'Level', 'LTP_Bias', 'OI_Bias', 'ChgOI_Bias', 'Volume_Bias',
+    display_cols = ['Strike', 'Zone', 'Level',
+                    # Support/Resistance Levels
+                    'Gamma_SR', 'Delta_SR', 'Depth_SR', 'OI_Wall',
+                    # Bias columns
+                    'LTP_Bias', 'OI_Bias', 'ChgOI_Bias', 'Volume_Bias',
                     'Delta_Bias', 'Gamma_Bias', 'AskQty_Bias', 'BidQty_Bias', 'AskBid_Bias', 'IV_Bias',
                     'DeltaExp', 'GammaExp', 'DVP_Bias', 'PressureBias', 'BidAskPressure',
                     'BiasScore', 'Verdict', 'Operator_Entry', 'Scalp_Moment', 'FakeReal',
