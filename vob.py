@@ -1245,7 +1245,8 @@ def analyze_option_chain(selected_expiry=None):
         'previous_oi': 'previousOpenInterest',
         'top_ask_quantity': 'askQty',
         'top_bid_quantity': 'bidQty',
-        'volume': 'totalTradedVolume'
+        'volume': 'totalTradedVolume',
+        'iv': 'impliedVolatility'
     }
     for old_col, new_col in column_mapping.items():
         if f"{old_col}_CE" in df.columns:
@@ -1427,22 +1428,32 @@ def analyze_option_chain(selected_expiry=None):
         bias_results.append(row_data)
 
     df_summary = pd.DataFrame(bias_results)
+
+    # Define columns to merge, filtering to only those that exist in df
+    merge_cols = ['strikePrice', 'openInterest_CE', 'openInterest_PE', 'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
+                  'lastPrice_CE', 'lastPrice_PE', 'totalTradedVolume_CE', 'totalTradedVolume_PE',
+                  'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'Vega_CE', 'Vega_PE', 'Theta_CE', 'Theta_PE',
+                  'impliedVolatility_CE', 'impliedVolatility_PE', 'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']
+    merge_cols = [col for col in merge_cols if col in df.columns]
+
     df_summary = pd.merge(
         df_summary,
-        df[['strikePrice', 'openInterest_CE', 'openInterest_PE', 'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
-            'lastPrice_CE', 'lastPrice_PE', 'totalTradedVolume_CE', 'totalTradedVolume_PE',
-            'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'Vega_CE', 'Vega_PE', 'Theta_CE', 'Theta_PE',
-            'impliedVolatility_CE', 'impliedVolatility_PE', 'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']],
+        df[merge_cols],
         left_on='Strike', right_on='strikePrice', how='left'
     )
 
-    df_summary['PCR'] = df_summary['openInterest_PE'] / df_summary['openInterest_CE']
-    df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
-    df_summary['PCR'] = df_summary['PCR'].round(2)
-    df_summary['PCR_Signal'] = np.where(
-        df_summary['PCR'] > 1.2, "Bullish",
-        np.where(df_summary['PCR'] < 0.7, "Bearish", "Neutral")
-    )
+    # Calculate PCR if the required columns exist
+    if 'openInterest_CE' in df_summary.columns and 'openInterest_PE' in df_summary.columns:
+        df_summary['PCR'] = df_summary['openInterest_PE'] / df_summary['openInterest_CE']
+        df_summary['PCR'] = np.where(df_summary['openInterest_CE'] == 0, 0, df_summary['PCR'])
+        df_summary['PCR'] = df_summary['PCR'].round(2)
+        df_summary['PCR_Signal'] = np.where(
+            df_summary['PCR'] > 1.2, "Bullish",
+            np.where(df_summary['PCR'] < 0.7, "Bearish", "Neutral")
+        )
+    else:
+        df_summary['PCR'] = 0
+        df_summary['PCR_Signal'] = "N/A"
 
     st.markdown("## Option Chain Bias Summary")
 
