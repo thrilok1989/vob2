@@ -910,6 +910,246 @@ class ReversalDetector:
 
         return rules
 
+    @staticmethod
+    def detect_lower_high(df, lookback=5):
+        """
+        Detect Lower High formation (bearish pattern).
+        Returns True if current high is lower than previous swing high.
+        """
+        if len(df) < lookback + 1:
+            return False, None, None
+
+        recent = df.tail(lookback + 1)
+        highs = recent['high'].values
+
+        # Find the maximum in the lookback period (excluding last candle)
+        prev_max_idx = highs[:-1].argmax()
+        prev_max = highs[prev_max_idx]
+
+        current_high = highs[-1]
+
+        # Check if we have a swing high pattern (inverted V shape)
+        if len(highs) >= 3:
+            for i in range(1, len(highs) - 1):
+                if highs[i] > highs[i-1] and highs[i] > highs[i+1]:
+                    swing_high = highs[i]
+                    if current_high < swing_high:
+                        return True, swing_high, current_high
+
+        return current_high < prev_max, prev_max, current_high
+
+    @staticmethod
+    def detect_no_new_high(df, lookback=10):
+        """
+        Detect if price has stopped making new highs (buying exhausted).
+        Returns True if no new high made in recent candles.
+        """
+        if len(df) < lookback:
+            return False, None
+
+        recent = df.tail(lookback)
+        highs = recent['high'].values
+
+        # Find where the highest high occurred
+        max_idx = highs.argmax()
+
+        # If maximum is not in the last 2 candles, buying pressure may be exhausted
+        buying_exhausted = max_idx < lookback - 2
+
+        return buying_exhausted, highs.max()
+
+    @staticmethod
+    def detect_strong_bearish_candle(df, threshold=0.5):
+        """
+        Detect strong bearish candle:
+        - Close < Open (red candle)
+        - Body > threshold * total range
+        - Close below previous candle's low
+        """
+        if len(df) < 2:
+            return False, {}
+
+        current = df.iloc[-1]
+        previous = df.iloc[-2]
+
+        is_red = current['close'] < current['open']
+        body = abs(current['close'] - current['open'])
+        total_range = current['high'] - current['low']
+
+        body_ratio = body / total_range if total_range > 0 else 0
+        strong_body = body_ratio >= threshold
+
+        closes_below_prev_low = current['close'] < previous['low']
+
+        is_strong = is_red and strong_body and closes_below_prev_low
+
+        details = {
+            'is_red': is_red,
+            'body_ratio': round(body_ratio, 2),
+            'strong_body': strong_body,
+            'closes_below_prev_low': closes_below_prev_low,
+            'current_close': current['close'],
+            'prev_low': previous['low']
+        }
+
+        return is_strong, details
+
+    @staticmethod
+    def calculate_bearish_reversal_score(df, pivot_highs=None, lookback=10):
+        """
+        Calculate comprehensive BEARISH reversal score based on all conditions.
+
+        Returns:
+        - score: -6 to 0 (more negative = stronger bearish reversal)
+        - signals: dict with individual signal details
+        - verdict: Overall recommendation
+        """
+        signals = {}
+        score = 0
+
+        # 1. Check buying pressure exhaustion (no new high)
+        no_new_high, swing_high = ReversalDetector.detect_no_new_high(df, lookback)
+        signals['Buying_Exhausted'] = "Yes ✅" if no_new_high else "No ❌"
+        if no_new_high:
+            score -= 1
+
+        # 2. Check lower high formation
+        lower_high, prev_high, curr_high = ReversalDetector.detect_lower_high(df, lookback // 2)
+        signals['Lower_High'] = "Yes ✅" if lower_high else "No ❌"
+        if lower_high:
+            score -= 1.5
+
+        # 3. Check strong bearish candle
+        strong_candle, candle_details = ReversalDetector.detect_strong_bearish_candle(df)
+        signals['Strong_Bearish_Candle'] = "Yes ✅" if strong_candle else "No ❌"
+        if strong_candle:
+            score -= 1.5
+
+        # 4. Check volume confirmation (selling volume)
+        vol_confirmed, vol_signal, vol_details = ReversalDetector.detect_volume_confirmation(df)
+        # For bearish, we want down candle with volume
+        current = df.iloc[-1]
+        is_down = current['close'] < current['open']
+        if is_down and vol_details.get('volume_ratio', 0) >= 1.2:
+            signals['Volume_Signal'] = "Strong Selling"
+            score -= 1
+        elif is_down and vol_details.get('volume_ratio', 0) >= 0.8:
+            signals['Volume_Signal'] = "Normal Selling"
+            score -= 0.5
+        else:
+            signals['Volume_Signal'] = vol_signal
+
+        # 5. Check VWAP position (below VWAP = bearish)
+        above_vwap, price, vwap = ReversalDetector.check_vwap_position(df)
+        signals['Below_VWAP'] = "Yes ✅" if not above_vwap else "No ❌"
+        if not above_vwap:
+            score -= 1
+
+        # 6. Check resistance respect (if pivot highs provided)
+        if pivot_highs:
+            # Similar logic to support but for resistance
+            recent_high = df.tail(5)['high'].max()
+            nearest_resistance = None
+            for resistance in pivot_highs:
+                pct_distance = abs(recent_high - resistance) / resistance * 100 if resistance > 0 else float('inf')
+                if pct_distance <= 0.3:
+                    nearest_resistance = resistance
+                    break
+            if nearest_resistance:
+                rejected = df.iloc[-1]['close'] < recent_high
+                signals['Resistance_Rejected'] = "Yes ✅" if rejected else "No ❌"
+                if rejected:
+                    score -= 1
+                    signals['Resistance_Level'] = nearest_resistance
+            else:
+                signals['Resistance_Rejected'] = "N/A"
+        else:
+            signals['Resistance_Rejected'] = "N/A"
+
+        signals['Bearish_Score'] = round(score, 1)
+
+        # Determine verdict
+        if score <= -4:
+            verdict = "🔴 STRONG SELL SIGNAL"
+            entry_type = "Safe PE Entry"
+        elif score <= -2.5:
+            verdict = "🟠 MODERATE SELL SIGNAL"
+            entry_type = "Wait for Confirmation"
+        elif score <= -1:
+            verdict = "⚪ WEAK BEARISH"
+            entry_type = "No Entry"
+        else:
+            verdict = "⚪ NEUTRAL"
+            entry_type = "No Trade"
+
+        signals['Bearish_Verdict'] = verdict
+        signals['Bearish_Entry_Type'] = entry_type
+
+        # Add price context
+        if len(df) > 0:
+            signals['Current_Price'] = df.iloc[-1]['close']
+            signals['Day_High'] = df['high'].max()
+            if vwap:
+                signals['VWAP'] = round(vwap, 2)
+
+        return score, signals, verdict
+
+
+def calculate_max_pain(df_options, spot_price):
+    """
+    Calculate Max Pain - the strike price where option buyers lose the most money.
+
+    Max Pain = Strike where total value of options expiring worthless is maximum
+
+    For each strike:
+    - CE pain = Sum of (strike - K) * OI for all strikes K < strike
+    - PE pain = Sum of (K - strike) * OI for all strikes K > strike
+    - Total pain = CE pain + PE pain
+
+    Returns: max_pain_strike, pain_data
+    """
+    if df_options.empty:
+        return None, None
+
+    strikes = df_options['Strike'].unique()
+    pain_data = []
+
+    for strike in strikes:
+        ce_pain = 0
+        pe_pain = 0
+
+        for _, row in df_options.iterrows():
+            k = row['Strike']
+            ce_oi = row.get('openInterest_CE', 0) or 0
+            pe_oi = row.get('openInterest_PE', 0) or 0
+
+            # CE buyers lose if spot < strike
+            if strike < k:
+                ce_pain += (k - strike) * ce_oi
+
+            # PE buyers lose if spot > strike
+            if strike > k:
+                pe_pain += (strike - k) * pe_oi
+
+        total_pain = ce_pain + pe_pain
+        pain_data.append({
+            'Strike': strike,
+            'CE_Pain': ce_pain,
+            'PE_Pain': pe_pain,
+            'Total_Pain': total_pain
+        })
+
+    pain_df = pd.DataFrame(pain_data)
+
+    if pain_df.empty:
+        return None, None
+
+    # Max pain is where total pain is MAXIMUM (option buyers lose most)
+    max_pain_idx = pain_df['Total_Pain'].idxmax()
+    max_pain_strike = pain_df.loc[max_pain_idx, 'Strike']
+
+    return max_pain_strike, pain_df
+
 
 def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5):
     """Trading signal detection with Normal Bias OR OI Dominance (both require full ATM bias alignment)."""
@@ -1109,9 +1349,52 @@ Entry Type: {reversal_signals.get('Entry_Type', 'N/A')}
 """
         try:
             send_telegram_message_sync(reversal_message)
-            st.success("🔄 Reversal signal notification sent!")
+            st.success("🔄 Bullish Reversal signal notification sent!")
         except Exception as e:
             st.warning(f"Failed to send reversal notification: {e}")
+
+    # Standalone BEARISH Reversal Signal Alert (triggers independently when score <= -4)
+    pivot_highs = [p['value'] for p in pivots if p['type'] == 'high']
+    bear_score, bear_signals, bear_verdict = ReversalDetector.calculate_bearish_reversal_score(df, pivot_highs)
+
+    if bear_score <= -4:
+        vwap_text = f"₹{bear_signals.get('VWAP', 'N/A')}" if bear_signals.get('VWAP') else "N/A"
+
+        bearish_reversal_message = f"""
+🔴 <b>BEARISH REVERSAL DETECTED</b> 🔴
+
+📍 <b>Spot Price:</b> ₹{current_price:.2f}
+📊 <b>Bearish Score:</b> {bear_score}/6 ⭐
+
+<b>🔻 STRUCTURE CONFIRMED:</b>
+• Buying Exhausted: {bear_signals.get('Buying_Exhausted', 'N/A')}
+• Lower High: {bear_signals.get('Lower_High', 'N/A')}
+• Strong Bearish Candle: {bear_signals.get('Strong_Bearish_Candle', 'N/A')}
+
+<b>📉 CONFIRMATION:</b>
+• Volume: {bear_signals.get('Volume_Signal', 'N/A')}
+• Below VWAP: {bear_signals.get('Below_VWAP', 'N/A')}
+• VWAP Level: {vwap_text}
+• Resistance Rejected: {bear_signals.get('Resistance_Rejected', 'N/A')}
+
+<b>🎯 {bear_verdict}</b>
+Entry Type: {bear_signals.get('Bearish_Entry_Type', 'N/A')}
+
+<b>📋 ENTRY RULES:</b>
+• 🎯 ENTRY: Buy PE at current level
+• 🛑 SL: Above recent high ({bear_signals.get('Day_High', 'N/A')})
+• 🎯 Target: Previous low / Nearest support
+
+<b>🧠 REMINDER:</b>
+<i>Missing a trade is 100x better than wrong entry</i>
+
+🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
+"""
+        try:
+            send_telegram_message_sync(bearish_reversal_message)
+            st.success("🔴 Bearish Reversal signal notification sent!")
+        except Exception as e:
+            st.warning(f"Failed to send bearish reversal notification: {e}")
 
 
 def calculate_exact_time_to_expiry(expiry_date_str):
@@ -1959,12 +2242,60 @@ def analyze_option_chain(selected_expiry=None):
     else:
         df_summary['OI_Wall'] = '-'
 
+    # ===== CHANGE IN OI WALL (FRESH BUILDUP/UNWINDING) =====
+    # Positive ChgOI = Fresh Buildup, Negative ChgOI = Unwinding
+    if 'changeinOpenInterest_CE' in df_summary.columns and 'changeinOpenInterest_PE' in df_summary.columns:
+        # Find max positive ChgOI (fresh buildup)
+        max_chgoi_ce_idx = df_summary['changeinOpenInterest_CE'].idxmax()
+        max_chgoi_pe_idx = df_summary['changeinOpenInterest_PE'].idxmax()
+        max_chgoi_ce_strike = df_summary.loc[max_chgoi_ce_idx, 'Strike'] if df_summary.loc[max_chgoi_ce_idx, 'changeinOpenInterest_CE'] > 0 else None
+        max_chgoi_pe_strike = df_summary.loc[max_chgoi_pe_idx, 'Strike'] if df_summary.loc[max_chgoi_pe_idx, 'changeinOpenInterest_PE'] > 0 else None
+
+        # Find max negative ChgOI (unwinding)
+        min_chgoi_ce_idx = df_summary['changeinOpenInterest_CE'].idxmin()
+        min_chgoi_pe_idx = df_summary['changeinOpenInterest_PE'].idxmin()
+        unwind_ce_strike = df_summary.loc[min_chgoi_ce_idx, 'Strike'] if df_summary.loc[min_chgoi_ce_idx, 'changeinOpenInterest_CE'] < 0 else None
+        unwind_pe_strike = df_summary.loc[min_chgoi_pe_idx, 'Strike'] if df_summary.loc[min_chgoi_pe_idx, 'changeinOpenInterest_PE'] < 0 else None
+
+        def get_chgoi_wall(strike):
+            labels = []
+            # Fresh CE buildup = Resistance forming
+            if strike == max_chgoi_ce_strike:
+                chgoi_val = df_summary.loc[df_summary['Strike'] == strike, 'changeinOpenInterest_CE'].values[0]
+                labels.append(f'🔴 CE+{int(chgoi_val/1000)}K')
+            # Fresh PE buildup = Support forming
+            if strike == max_chgoi_pe_strike:
+                chgoi_val = df_summary.loc[df_summary['Strike'] == strike, 'changeinOpenInterest_PE'].values[0]
+                labels.append(f'🟢 PE+{int(chgoi_val/1000)}K')
+            # CE unwinding = Resistance weakening
+            if strike == unwind_ce_strike:
+                chgoi_val = df_summary.loc[df_summary['Strike'] == strike, 'changeinOpenInterest_CE'].values[0]
+                labels.append(f'⚪ CE{int(chgoi_val/1000)}K')
+            # PE unwinding = Support weakening
+            if strike == unwind_pe_strike:
+                chgoi_val = df_summary.loc[df_summary['Strike'] == strike, 'changeinOpenInterest_PE'].values[0]
+                labels.append(f'⚪ PE{int(chgoi_val/1000)}K')
+            return ' | '.join(labels) if labels else '-'
+
+        df_summary['ChgOI_Wall'] = df_summary['Strike'].apply(get_chgoi_wall)
+    else:
+        df_summary['ChgOI_Wall'] = '-'
+
+    # ===== MAX PAIN CALCULATION =====
+    max_pain_strike, pain_df = calculate_max_pain(df_summary, underlying)
+    if max_pain_strike:
+        df_summary['Max_Pain'] = df_summary['Strike'].apply(
+            lambda x: '🎯 MAX PAIN' if x == max_pain_strike else '-'
+        )
+    else:
+        df_summary['Max_Pain'] = '-'
+
     st.markdown("## Option Chain Bias Summary")
 
     # Define columns for display (select key columns to avoid clutter)
-    display_cols = ['Strike', 'Zone', 'Level',
+    display_cols = ['Strike', 'Zone', 'Level', 'Max_Pain',
                     # Support/Resistance Levels
-                    'Gamma_SR', 'Delta_SR', 'Depth_SR', 'OI_Wall',
+                    'Gamma_SR', 'Delta_SR', 'Depth_SR', 'OI_Wall', 'ChgOI_Wall',
                     # Bias columns
                     'LTP_Bias', 'OI_Bias', 'ChgOI_Bias', 'Volume_Bias',
                     'Delta_Bias', 'Gamma_Bias', 'AskQty_Bias', 'BidQty_Bias', 'AskBid_Bias', 'IV_Bias',
@@ -2386,53 +2717,81 @@ def main():
             st.markdown("## 🔄 Intraday Reversal Detector")
 
             try:
-                # Get pivot lows for support detection
+                # Get pivot lows and highs for S/R detection
                 pivot_lows = []
+                pivot_highs = []
                 if show_pivots and len(df) > 50:
                     df_json = df.to_json()
                     pivots = cached_pivot_calculation(df_json, pivot_settings or {})
                     pivot_lows = [p['value'] for p in pivots if p['type'] == 'low']
+                    pivot_highs = [p['value'] for p in pivots if p['type'] == 'high']
 
-                # Calculate reversal score
-                score, signals, verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
+                # Calculate BULLISH reversal score
+                bull_score, bull_signals, bull_verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
 
-                # Display verdict prominently
-                if "STRONG BUY" in verdict:
-                    st.success(f"**{verdict}**")
-                elif "MODERATE BUY" in verdict:
-                    st.warning(f"**{verdict}**")
-                elif "BEARISH" in verdict:
-                    st.error(f"**{verdict}**")
-                else:
-                    st.info(f"**{verdict}**")
+                # Calculate BEARISH reversal score
+                bear_score, bear_signals, bear_verdict = ReversalDetector.calculate_bearish_reversal_score(df, pivot_highs)
 
-                # Display signals in columns
-                col_s1, col_s2, col_s3 = st.columns(3)
+                # Display both verdicts side by side
+                col_bull, col_bear = st.columns(2)
 
-                with col_s1:
-                    st.markdown("**📊 Structure Analysis**")
-                    st.markdown(f"- Selling Exhausted: {signals.get('Selling_Exhausted', 'N/A')}")
-                    st.markdown(f"- Higher Low: {signals.get('Higher_Low', 'N/A')}")
-                    st.markdown(f"- Strong Candle: {signals.get('Strong_Bullish_Candle', 'N/A')}")
+                with col_bull:
+                    st.markdown("### 🟢 Bullish Reversal")
+                    if "STRONG BUY" in bull_verdict:
+                        st.success(f"**{bull_verdict}**")
+                    elif "MODERATE BUY" in bull_verdict:
+                        st.warning(f"**{bull_verdict}**")
+                    else:
+                        st.info(f"**{bull_verdict}**")
 
-                with col_s2:
-                    st.markdown("**📈 Confirmation Signals**")
-                    st.markdown(f"- Volume: {signals.get('Volume_Signal', 'N/A')}")
-                    st.markdown(f"- Above VWAP: {signals.get('Above_VWAP', 'N/A')}")
-                    st.markdown(f"- Support Held: {signals.get('Support_Respected', 'N/A')}")
+                    st.markdown(f"**Score: {bull_signals.get('Reversal_Score', 0)}/6**")
+                    st.markdown(f"- Selling Exhausted: {bull_signals.get('Selling_Exhausted', 'N/A')}")
+                    st.markdown(f"- Higher Low: {bull_signals.get('Higher_Low', 'N/A')}")
+                    st.markdown(f"- Strong Bullish Candle: {bull_signals.get('Strong_Bullish_Candle', 'N/A')}")
+                    st.markdown(f"- Volume: {bull_signals.get('Volume_Signal', 'N/A')}")
+                    st.markdown(f"- Above VWAP: {bull_signals.get('Above_VWAP', 'N/A')}")
 
-                with col_s3:
-                    st.markdown("**🎯 Entry Details**")
-                    st.markdown(f"- Score: **{signals.get('Reversal_Score', 0)}/6**")
-                    st.markdown(f"- Entry Type: {signals.get('Entry_Type', 'N/A')}")
-                    if signals.get('VWAP'):
-                        st.markdown(f"- VWAP: ₹{signals.get('VWAP')}")
+                with col_bear:
+                    st.markdown("### 🔴 Bearish Reversal")
+                    if "STRONG SELL" in bear_verdict:
+                        st.error(f"**{bear_verdict}**")
+                    elif "MODERATE SELL" in bear_verdict:
+                        st.warning(f"**{bear_verdict}**")
+                    else:
+                        st.info(f"**{bear_verdict}**")
+
+                    st.markdown(f"**Score: {bear_signals.get('Bearish_Score', 0)}/6**")
+                    st.markdown(f"- Buying Exhausted: {bear_signals.get('Buying_Exhausted', 'N/A')}")
+                    st.markdown(f"- Lower High: {bear_signals.get('Lower_High', 'N/A')}")
+                    st.markdown(f"- Strong Bearish Candle: {bear_signals.get('Strong_Bearish_Candle', 'N/A')}")
+                    st.markdown(f"- Volume: {bear_signals.get('Volume_Signal', 'N/A')}")
+                    st.markdown(f"- Below VWAP: {bear_signals.get('Below_VWAP', 'N/A')}")
+
+                # VWAP display
+                if bull_signals.get('VWAP'):
+                    st.info(f"📊 **VWAP:** ₹{bull_signals.get('VWAP')} | **Day High:** ₹{bull_signals.get('Day_High', 'N/A')} | **Day Low:** ₹{bull_signals.get('Day_Low', 'N/A')}")
 
                 # Entry Rules Expander
                 with st.expander("📋 Entry Rules & Recommendations"):
-                    entry_rules = ReversalDetector.get_entry_rules(signals, score)
-                    for rule in entry_rules:
-                        st.markdown(f"- {rule}")
+                    col_r1, col_r2 = st.columns(2)
+
+                    with col_r1:
+                        st.markdown("**🟢 Bullish Entry Rules:**")
+                        entry_rules = ReversalDetector.get_entry_rules(bull_signals, bull_score)
+                        for rule in entry_rules:
+                            st.markdown(f"- {rule}")
+
+                    with col_r2:
+                        st.markdown("**🔴 Bearish Entry Rules:**")
+                        if bear_score <= -4:
+                            st.markdown("- 🎯 ENTRY: Buy PE at current level")
+                            st.markdown(f"- 🛑 SL: Above recent high ({bear_signals.get('Day_High', 'N/A')})")
+                            st.markdown("- 🎯 Target: Previous low / Nearest support")
+                        elif bear_score <= -2.5:
+                            st.markdown("- ⏳ WAIT: Confirmation pending")
+                            st.markdown("- 📋 Checklist: Lower High + Strong Bearish Candle + Volume")
+                        else:
+                            st.markdown("- ❌ NO ENTRY: Bearish conditions not met")
 
                     st.markdown("---")
                     st.markdown("**🧠 Trading Psychology:**")
