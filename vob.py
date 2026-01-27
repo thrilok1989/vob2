@@ -943,23 +943,27 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
         if not atm_data.empty:
             row = atm_data.iloc[0]
             
-            # Bias checks
+            # Bias checks (including DeltaExp and GammaExp)
             bullish_conditions = {
                 'Support Level': row.get('Level') == 'Support',
                 'ChgOI Bias': row.get('ChgOI_Bias') == 'Bullish',
                 'Volume Bias': row.get('Volume_Bias') == 'Bullish',
                 'AskQty Bias': row.get('AskQty_Bias') == 'Bullish',
                 'BidQty Bias': row.get('BidQty_Bias') == 'Bullish',
-                'Pressure Bias': row.get('PressureBias') == 'Bullish'
+                'Pressure Bias': row.get('PressureBias') == 'Bullish',
+                'Delta Exposure': row.get('DeltaExp') == 'Bullish',
+                'Gamma Exposure': row.get('GammaExp') == 'Bullish'
             }
-            
+
             bearish_conditions = {
                 'Resistance Level': row.get('Level') == 'Resistance',
                 'ChgOI Bias': row.get('ChgOI_Bias') == 'Bearish',
                 'Volume Bias': row.get('Volume_Bias') == 'Bearish',
                 'AskQty Bias': row.get('AskQty_Bias') == 'Bearish',
                 'BidQty Bias': row.get('BidQty_Bias') == 'Bearish',
-                'Pressure Bias': row.get('PressureBias') == 'Bearish'
+                'Pressure Bias': row.get('PressureBias') == 'Bearish',
+                'Delta Exposure': row.get('DeltaExp') == 'Bearish',
+                'Gamma Exposure': row.get('GammaExp') == 'Bearish'
             }
             
             atm_strike = row['Strike']
