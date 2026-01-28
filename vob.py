@@ -488,6 +488,7 @@ class PivotIndicator:
             "5": "5min",
             "10": "10min",
             "15": "15min",
+            "60": "60min",
             "D": "1D",
             "W": "1W"
         }
@@ -540,6 +541,7 @@ class PivotIndicator:
             ("5", 4, "#ff9900", "5M", pivot_settings.get('show_5m', True)),
             ("10", 4, "#ff44ff", "10M", pivot_settings.get('show_10m', True)),
             ("15", 4, "#4444ff", "15M", pivot_settings.get('show_15m', True)),
+            ("60", 5, "#ff0000", "1H", pivot_settings.get('show_1h', True)),
         ]
         
         all_pivots = []
@@ -1824,8 +1826,8 @@ def create_csv_download(df_summary):
     return output.getvalue()
 
 
-def analyze_option_chain(selected_expiry=None):
-    """Enhanced options chain analysis with expiry selection"""
+def analyze_option_chain(selected_expiry=None, pivot_data=None):
+    """Enhanced options chain analysis with expiry selection and HTF pivot data"""
     now = datetime.now(timezone("Asia/Kolkata"))
     
     # Get expiry list - use cached version for performance
@@ -2380,6 +2382,82 @@ def analyze_option_chain(selected_expiry=None):
             'Signal': 'Sellers actively defending'
         })
 
+    # ===== HTF PIVOT-BASED SUPPORT/RESISTANCE (5M, 15M, 1H) =====
+    if pivot_data:
+        # Group pivots by timeframe
+        tf_pivots = {}
+        for pivot in pivot_data:
+            tf = pivot['timeframe']
+            if tf not in tf_pivots:
+                tf_pivots[tf] = {'highs': [], 'lows': []}
+            if pivot['type'] == 'high':
+                tf_pivots[tf]['highs'].append(pivot['value'])
+            else:
+                tf_pivots[tf]['lows'].append(pivot['value'])
+
+        # Add 5M pivots
+        if '5M' in tf_pivots:
+            if tf_pivots['5M']['lows']:
+                latest_5m_support = max(tf_pivots['5M']['lows'])  # Nearest support
+                sr_data.append({
+                    'Type': '🟢 5M Pivot Support',
+                    'Level': f"₹{latest_5m_support:.0f}",
+                    'Source': '5-Min Timeframe',
+                    'Strength': 'Intraday',
+                    'Signal': 'Short-term support level'
+                })
+            if tf_pivots['5M']['highs']:
+                latest_5m_resist = min(tf_pivots['5M']['highs'])  # Nearest resistance
+                sr_data.append({
+                    'Type': '🔴 5M Pivot Resistance',
+                    'Level': f"₹{latest_5m_resist:.0f}",
+                    'Source': '5-Min Timeframe',
+                    'Strength': 'Intraday',
+                    'Signal': 'Short-term resistance level'
+                })
+
+        # Add 15M pivots
+        if '15M' in tf_pivots:
+            if tf_pivots['15M']['lows']:
+                latest_15m_support = max(tf_pivots['15M']['lows'])
+                sr_data.append({
+                    'Type': '🟢 15M Pivot Support',
+                    'Level': f"₹{latest_15m_support:.0f}",
+                    'Source': '15-Min Timeframe',
+                    'Strength': 'Swing',
+                    'Signal': 'Key intraday support'
+                })
+            if tf_pivots['15M']['highs']:
+                latest_15m_resist = min(tf_pivots['15M']['highs'])
+                sr_data.append({
+                    'Type': '🔴 15M Pivot Resistance',
+                    'Level': f"₹{latest_15m_resist:.0f}",
+                    'Source': '15-Min Timeframe',
+                    'Strength': 'Swing',
+                    'Signal': 'Key intraday resistance'
+                })
+
+        # Add 1H pivots
+        if '1H' in tf_pivots:
+            if tf_pivots['1H']['lows']:
+                latest_1h_support = max(tf_pivots['1H']['lows'])
+                sr_data.append({
+                    'Type': '🟢 1H Pivot Support',
+                    'Level': f"₹{latest_1h_support:.0f}",
+                    'Source': '1-Hour Timeframe',
+                    'Strength': 'Major',
+                    'Signal': 'Strong hourly support - watch closely'
+                })
+            if tf_pivots['1H']['highs']:
+                latest_1h_resist = min(tf_pivots['1H']['highs'])
+                sr_data.append({
+                    'Type': '🔴 1H Pivot Resistance',
+                    'Level': f"₹{latest_1h_resist:.0f}",
+                    'Source': '1-Hour Timeframe',
+                    'Strength': 'Major',
+                    'Signal': 'Strong hourly resistance - watch closely'
+                })
+
     # Display HTF S/R Table
     if sr_data:
         sr_df = pd.DataFrame(sr_data)
@@ -2697,6 +2775,9 @@ def main():
     
     # Main layout - Trading chart and Options analysis side by side
     col1, col2 = st.columns([2, 1])
+
+    # Initialize pivots variable (will be populated in col1, used in col2)
+    pivots = None
     
     with col1:
         st.header("📈 Trading Chart")
@@ -2885,8 +2966,8 @@ def main():
     with col2:
         st.header("📊 Options Analysis")
         
-        # Options chain analysis with expiry selection
-        underlying_price, df_summary, available_expiries = analyze_option_chain(selected_expiry)
+        # Options chain analysis with expiry selection (pass pivot data for HTF S/R table)
+        underlying_price, df_summary, available_expiries = analyze_option_chain(selected_expiry, pivots)
         
         if underlying_price:
             st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
