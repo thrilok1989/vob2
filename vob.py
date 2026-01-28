@@ -488,6 +488,7 @@ class PivotIndicator:
             "5": "5min",
             "10": "10min",
             "15": "15min",
+            "60": "60min",
             "D": "1D",
             "W": "1W"
         }
@@ -540,6 +541,7 @@ class PivotIndicator:
             ("5", 4, "#ff9900", "5M", pivot_settings.get('show_5m', True)),
             ("10", 4, "#ff44ff", "10M", pivot_settings.get('show_10m', True)),
             ("15", 4, "#4444ff", "15M", pivot_settings.get('show_15m', True)),
+            ("60", 5, "#ff0000", "1H", pivot_settings.get('show_1h', True)),
         ]
         
         all_pivots = []
@@ -1311,91 +1313,6 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                 except Exception as e:
                     st.error(f"Failed to send notification: {e}")
 
-    # Standalone Reversal Signal Alert (triggers independently when score >= 4)
-    if reversal_score >= 4:
-        # Get entry rules
-        entry_rules = ReversalDetector.get_entry_rules(reversal_signals, reversal_score)
-        rules_text = "\n".join([f"• {rule}" for rule in entry_rules[:5]])
-
-        vwap_text = f"₹{reversal_signals.get('VWAP', 'N/A')}" if reversal_signals.get('VWAP') else "N/A"
-
-        reversal_message = f"""
-🔄 <b>REVERSAL SIGNAL DETECTED</b> 🔄
-
-📍 <b>Spot Price:</b> ₹{current_price:.2f}
-📊 <b>Reversal Score:</b> {reversal_score}/6 ⭐
-
-<b>✅ STRUCTURE CONFIRMED:</b>
-• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
-• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
-• Strong Bullish Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
-
-<b>📈 CONFIRMATION:</b>
-• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
-• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
-• VWAP Level: {vwap_text}
-• Support Held: {reversal_signals.get('Support_Respected', 'N/A')}
-
-<b>🎯 {reversal_verdict}</b>
-Entry Type: {reversal_signals.get('Entry_Type', 'N/A')}
-
-<b>📋 ENTRY RULES:</b>
-{rules_text}
-
-<b>🧠 REMINDER:</b>
-<i>Missing a trade is 100x better than wrong entry</i>
-
-🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
-"""
-        try:
-            send_telegram_message_sync(reversal_message)
-            st.success("🔄 Bullish Reversal signal notification sent!")
-        except Exception as e:
-            st.warning(f"Failed to send reversal notification: {e}")
-
-    # Standalone BEARISH Reversal Signal Alert (triggers independently when score <= -4)
-    pivot_highs = [p['value'] for p in pivots if p['type'] == 'high']
-    bear_score, bear_signals, bear_verdict = ReversalDetector.calculate_bearish_reversal_score(df, pivot_highs)
-
-    if bear_score <= -4:
-        vwap_text = f"₹{bear_signals.get('VWAP', 'N/A')}" if bear_signals.get('VWAP') else "N/A"
-
-        bearish_reversal_message = f"""
-🔴 <b>BEARISH REVERSAL DETECTED</b> 🔴
-
-📍 <b>Spot Price:</b> ₹{current_price:.2f}
-📊 <b>Bearish Score:</b> {bear_score}/6 ⭐
-
-<b>🔻 STRUCTURE CONFIRMED:</b>
-• Buying Exhausted: {bear_signals.get('Buying_Exhausted', 'N/A')}
-• Lower High: {bear_signals.get('Lower_High', 'N/A')}
-• Strong Bearish Candle: {bear_signals.get('Strong_Bearish_Candle', 'N/A')}
-
-<b>📉 CONFIRMATION:</b>
-• Volume: {bear_signals.get('Volume_Signal', 'N/A')}
-• Below VWAP: {bear_signals.get('Below_VWAP', 'N/A')}
-• VWAP Level: {vwap_text}
-• Resistance Rejected: {bear_signals.get('Resistance_Rejected', 'N/A')}
-
-<b>🎯 {bear_verdict}</b>
-Entry Type: {bear_signals.get('Bearish_Entry_Type', 'N/A')}
-
-<b>📋 ENTRY RULES:</b>
-• 🎯 ENTRY: Buy PE at current level
-• 🛑 SL: Above recent high ({bear_signals.get('Day_High', 'N/A')})
-• 🎯 Target: Previous low / Nearest support
-
-<b>🧠 REMINDER:</b>
-<i>Missing a trade is 100x better than wrong entry</i>
-
-🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
-"""
-        try:
-            send_telegram_message_sync(bearish_reversal_message)
-            st.success("🔴 Bearish Reversal signal notification sent!")
-        except Exception as e:
-            st.warning(f"Failed to send bearish reversal notification: {e}")
-
 
 def calculate_exact_time_to_expiry(expiry_date_str):
     """Calculate exact time to expiry in years (days + hours)"""
@@ -1909,8 +1826,8 @@ def create_csv_download(df_summary):
     return output.getvalue()
 
 
-def analyze_option_chain(selected_expiry=None):
-    """Enhanced options chain analysis with expiry selection"""
+def analyze_option_chain(selected_expiry=None, pivot_data=None):
+    """Enhanced options chain analysis with expiry selection and HTF pivot data"""
     now = datetime.now(timezone("Asia/Kolkata"))
     
     # Get expiry list - use cached version for performance
@@ -2323,6 +2240,242 @@ def analyze_option_chain(selected_expiry=None):
 
     st.dataframe(styled_df, use_container_width=True)
 
+    # ===== HTF SUPPORT/RESISTANCE SUMMARY TABLE =====
+    st.markdown("### 📊 HTF Support & Resistance Levels")
+
+    # Collect all S/R data
+    sr_data = []
+
+    # Max Pain
+    if max_pain_strike:
+        sr_data.append({
+            'Type': '🎯 Max Pain',
+            'Level': f"₹{max_pain_strike:.0f}",
+            'Source': 'Options OI',
+            'Strength': 'High',
+            'Signal': 'Price magnet at expiry'
+        })
+
+    # OI Wall Support (Max PE OI)
+    if 'openInterest_PE' in df_summary.columns:
+        max_pe_oi_idx = df_summary['openInterest_PE'].idxmax()
+        max_pe_oi_strike = df_summary.loc[max_pe_oi_idx, 'Strike']
+        max_pe_oi_val = df_summary.loc[max_pe_oi_idx, 'openInterest_PE']
+        sr_data.append({
+            'Type': '🟢 OI Wall Support',
+            'Level': f"₹{max_pe_oi_strike:.0f}",
+            'Source': f"PE OI: {max_pe_oi_val/100000:.1f}L",
+            'Strength': 'High',
+            'Signal': 'Strong support - PE writers defending'
+        })
+
+    # OI Wall Resistance (Max CE OI)
+    if 'openInterest_CE' in df_summary.columns:
+        max_ce_oi_idx = df_summary['openInterest_CE'].idxmax()
+        max_ce_oi_strike = df_summary.loc[max_ce_oi_idx, 'Strike']
+        max_ce_oi_val = df_summary.loc[max_ce_oi_idx, 'openInterest_CE']
+        sr_data.append({
+            'Type': '🔴 OI Wall Resistance',
+            'Level': f"₹{max_ce_oi_strike:.0f}",
+            'Source': f"CE OI: {max_ce_oi_val/100000:.1f}L",
+            'Strength': 'High',
+            'Signal': 'Strong resistance - CE writers defending'
+        })
+
+    # Gamma Exposure Support
+    if 'GammaExp_PE' in df_summary.columns:
+        max_gamma_pe_idx = df_summary['GammaExp_PE'].idxmax()
+        max_gamma_pe_strike = df_summary.loc[max_gamma_pe_idx, 'Strike']
+        sr_data.append({
+            'Type': '🟢 Gamma Support',
+            'Level': f"₹{max_gamma_pe_strike:.0f}",
+            'Source': 'Gamma Exposure PE',
+            'Strength': 'Medium',
+            'Signal': 'Dealers hedge here - price sticky'
+        })
+
+    # Gamma Exposure Resistance
+    if 'GammaExp_CE' in df_summary.columns:
+        max_gamma_ce_idx = df_summary['GammaExp_CE'].idxmax()
+        max_gamma_ce_strike = df_summary.loc[max_gamma_ce_idx, 'Strike']
+        sr_data.append({
+            'Type': '🔴 Gamma Resistance',
+            'Level': f"₹{max_gamma_ce_strike:.0f}",
+            'Source': 'Gamma Exposure CE',
+            'Strength': 'Medium',
+            'Signal': 'Dealers hedge here - price sticky'
+        })
+
+    # Delta Exposure Support
+    if 'DeltaExp_PE' in df_summary.columns:
+        max_delta_pe_idx = df_summary['DeltaExp_PE'].idxmax()
+        max_delta_pe_strike = df_summary.loc[max_delta_pe_idx, 'Strike']
+        sr_data.append({
+            'Type': '🟢 Delta Support',
+            'Level': f"₹{max_delta_pe_strike:.0f}",
+            'Source': 'Delta Exposure PE',
+            'Strength': 'Medium',
+            'Signal': 'Directional bias support'
+        })
+
+    # Delta Exposure Resistance
+    if 'DeltaExp_CE' in df_summary.columns:
+        max_delta_ce_idx = df_summary['DeltaExp_CE'].idxmax()
+        max_delta_ce_strike = df_summary.loc[max_delta_ce_idx, 'Strike']
+        sr_data.append({
+            'Type': '🔴 Delta Resistance',
+            'Level': f"₹{max_delta_ce_strike:.0f}",
+            'Source': 'Delta Exposure CE',
+            'Strength': 'Medium',
+            'Signal': 'Directional bias resistance'
+        })
+
+    # ChgOI Fresh Buildup Support
+    if 'changeinOpenInterest_PE' in df_summary.columns:
+        max_chgoi_pe_idx = df_summary['changeinOpenInterest_PE'].idxmax()
+        if df_summary.loc[max_chgoi_pe_idx, 'changeinOpenInterest_PE'] > 0:
+            fresh_pe_strike = df_summary.loc[max_chgoi_pe_idx, 'Strike']
+            fresh_pe_val = df_summary.loc[max_chgoi_pe_idx, 'changeinOpenInterest_PE']
+            sr_data.append({
+                'Type': '🟢 Fresh PE Buildup',
+                'Level': f"₹{fresh_pe_strike:.0f}",
+                'Source': f"ChgOI: +{fresh_pe_val/1000:.0f}K",
+                'Strength': 'Fresh',
+                'Signal': 'New support forming today'
+            })
+
+    # ChgOI Fresh Buildup Resistance
+    if 'changeinOpenInterest_CE' in df_summary.columns:
+        max_chgoi_ce_idx = df_summary['changeinOpenInterest_CE'].idxmax()
+        if df_summary.loc[max_chgoi_ce_idx, 'changeinOpenInterest_CE'] > 0:
+            fresh_ce_strike = df_summary.loc[max_chgoi_ce_idx, 'Strike']
+            fresh_ce_val = df_summary.loc[max_chgoi_ce_idx, 'changeinOpenInterest_CE']
+            sr_data.append({
+                'Type': '🔴 Fresh CE Buildup',
+                'Level': f"₹{fresh_ce_strike:.0f}",
+                'Source': f"ChgOI: +{fresh_ce_val/1000:.0f}K",
+                'Strength': 'Fresh',
+                'Signal': 'New resistance forming today'
+            })
+
+    # Market Depth Support
+    if 'bidQty_PE' in df_summary.columns:
+        max_bid_pe_idx = df_summary['bidQty_PE'].idxmax()
+        max_bid_pe_strike = df_summary.loc[max_bid_pe_idx, 'Strike']
+        sr_data.append({
+            'Type': '🟢 Depth Support',
+            'Level': f"₹{max_bid_pe_strike:.0f}",
+            'Source': 'Max PE Bid Qty',
+            'Strength': 'Real-time',
+            'Signal': 'Buyers actively defending'
+        })
+
+    # Market Depth Resistance
+    if 'askQty_CE' in df_summary.columns:
+        max_ask_ce_idx = df_summary['askQty_CE'].idxmax()
+        max_ask_ce_strike = df_summary.loc[max_ask_ce_idx, 'Strike']
+        sr_data.append({
+            'Type': '🔴 Depth Resistance',
+            'Level': f"₹{max_ask_ce_strike:.0f}",
+            'Source': 'Max CE Ask Qty',
+            'Strength': 'Real-time',
+            'Signal': 'Sellers actively defending'
+        })
+
+    # ===== HTF PIVOT-BASED SUPPORT/RESISTANCE (5M, 15M, 1H) =====
+    if pivot_data:
+        # Group pivots by timeframe
+        tf_pivots = {}
+        for pivot in pivot_data:
+            tf = pivot['timeframe']
+            if tf not in tf_pivots:
+                tf_pivots[tf] = {'highs': [], 'lows': []}
+            if pivot['type'] == 'high':
+                tf_pivots[tf]['highs'].append(pivot['value'])
+            else:
+                tf_pivots[tf]['lows'].append(pivot['value'])
+
+        # Add 5M pivots
+        if '5M' in tf_pivots:
+            if tf_pivots['5M']['lows']:
+                latest_5m_support = max(tf_pivots['5M']['lows'])  # Nearest support
+                sr_data.append({
+                    'Type': '🟢 5M Pivot Support',
+                    'Level': f"₹{latest_5m_support:.0f}",
+                    'Source': '5-Min Timeframe',
+                    'Strength': 'Intraday',
+                    'Signal': 'Short-term support level'
+                })
+            if tf_pivots['5M']['highs']:
+                latest_5m_resist = min(tf_pivots['5M']['highs'])  # Nearest resistance
+                sr_data.append({
+                    'Type': '🔴 5M Pivot Resistance',
+                    'Level': f"₹{latest_5m_resist:.0f}",
+                    'Source': '5-Min Timeframe',
+                    'Strength': 'Intraday',
+                    'Signal': 'Short-term resistance level'
+                })
+
+        # Add 15M pivots
+        if '15M' in tf_pivots:
+            if tf_pivots['15M']['lows']:
+                latest_15m_support = max(tf_pivots['15M']['lows'])
+                sr_data.append({
+                    'Type': '🟢 15M Pivot Support',
+                    'Level': f"₹{latest_15m_support:.0f}",
+                    'Source': '15-Min Timeframe',
+                    'Strength': 'Swing',
+                    'Signal': 'Key intraday support'
+                })
+            if tf_pivots['15M']['highs']:
+                latest_15m_resist = min(tf_pivots['15M']['highs'])
+                sr_data.append({
+                    'Type': '🔴 15M Pivot Resistance',
+                    'Level': f"₹{latest_15m_resist:.0f}",
+                    'Source': '15-Min Timeframe',
+                    'Strength': 'Swing',
+                    'Signal': 'Key intraday resistance'
+                })
+
+        # Add 1H pivots
+        if '1H' in tf_pivots:
+            if tf_pivots['1H']['lows']:
+                latest_1h_support = max(tf_pivots['1H']['lows'])
+                sr_data.append({
+                    'Type': '🟢 1H Pivot Support',
+                    'Level': f"₹{latest_1h_support:.0f}",
+                    'Source': '1-Hour Timeframe',
+                    'Strength': 'Major',
+                    'Signal': 'Strong hourly support - watch closely'
+                })
+            if tf_pivots['1H']['highs']:
+                latest_1h_resist = min(tf_pivots['1H']['highs'])
+                sr_data.append({
+                    'Type': '🔴 1H Pivot Resistance',
+                    'Level': f"₹{latest_1h_resist:.0f}",
+                    'Source': '1-Hour Timeframe',
+                    'Strength': 'Major',
+                    'Signal': 'Strong hourly resistance - watch closely'
+                })
+
+    # Display HTF S/R Table
+    if sr_data:
+        sr_df = pd.DataFrame(sr_data)
+        st.dataframe(sr_df, use_container_width=True, hide_index=True)
+
+        # Quick summary
+        supports = [d['Level'] for d in sr_data if '🟢' in d['Type']]
+        resistances = [d['Level'] for d in sr_data if '🔴' in d['Type']]
+
+        col_sr1, col_sr2, col_sr3 = st.columns(3)
+        with col_sr1:
+            st.success(f"**Key Supports:** {', '.join(supports[:3])}")
+        with col_sr2:
+            st.error(f"**Key Resistances:** {', '.join(resistances[:3])}")
+        with col_sr3:
+            if max_pain_strike:
+                st.info(f"**Max Pain:** ₹{max_pain_strike:.0f}")
+
     # Expandable section for detailed Greeks and raw values
     with st.expander("📊 Detailed Greeks & Raw Values"):
         detail_cols = ['Strike', 'Zone', 'lastPrice_CE', 'lastPrice_PE',
@@ -2622,6 +2775,9 @@ def main():
     
     # Main layout - Trading chart and Options analysis side by side
     col1, col2 = st.columns([2, 1])
+
+    # Initialize pivots variable (will be populated in col1, used in col2)
+    pivots = None
     
     with col1:
         st.header("📈 Trading Chart")
@@ -2810,8 +2966,8 @@ def main():
     with col2:
         st.header("📊 Options Analysis")
         
-        # Options chain analysis with expiry selection
-        underlying_price, df_summary, available_expiries = analyze_option_chain(selected_expiry)
+        # Options chain analysis with expiry selection (pass pivot data for HTF S/R table)
+        underlying_price, df_summary, available_expiries = analyze_option_chain(selected_expiry, pivots)
         
         if underlying_price:
             st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
