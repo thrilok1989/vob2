@@ -1834,20 +1834,20 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None):
     expiry_data = get_dhan_expiry_list_cached(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG)
     if not expiry_data or 'data' not in expiry_data:
         st.error("Failed to get expiry list from Dhan API")
-        return None, None, []
-    
+        return None
+
     expiry_dates = expiry_data['data']
     if not expiry_dates:
         st.error("No expiry dates available")
-        return None, None, []
-    
+        return None
+
     # Use selected expiry or default to first
     expiry = selected_expiry if selected_expiry else expiry_dates[0]
 
     option_chain_data = get_dhan_option_chain(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG, expiry)
     if not option_chain_data or 'data' not in option_chain_data:
         st.error("Failed to get option chain from Dhan API")
-        return None, None, expiry_dates
+        return {'underlying': None, 'df_summary': None, 'expiry_dates': expiry_dates, 'expiry': None, 'sr_data': [], 'max_pain_strike': None, 'styled_df': None, 'df_display': None, 'display_cols': [], 'bias_cols': [], 'total_ce_change': 0, 'total_pe_change': 0}
     
     data = option_chain_data['data']
     underlying = data['last_price']
@@ -1921,13 +1921,6 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None):
 
     total_ce_change = df['changeinOpenInterest_CE'].sum() / 100000
     total_pe_change = df['changeinOpenInterest_PE'].sum() / 100000
-    
-    st.markdown("## Open Interest Change (in Lakhs)")
-    col1, col2 = st.columns(2)
-    with col1:
-        st.metric("CALL ΔOI", f"{total_ce_change:+.1f}L", delta_color="inverse")
-    with col2:
-        st.metric("PUT ΔOI", f"{total_pe_change:+.1f}L", delta_color="normal")
 
     bias_results = []
     for _, row in df.iterrows():
@@ -2207,8 +2200,6 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None):
     else:
         df_summary['Max_Pain'] = '-'
 
-    st.markdown("## Option Chain Bias Summary")
-
     # Define columns for display (select key columns to avoid clutter)
     display_cols = ['Strike', 'Zone', 'Level', 'Max_Pain',
                     # Support/Resistance Levels
@@ -2238,11 +2229,7 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None):
         .applymap(color_score, subset=['BiasScore'] if 'BiasScore' in display_cols else [])\
         .apply(highlight_atm_row, axis=1)
 
-    st.dataframe(styled_df, use_container_width=True)
-
-    # ===== HTF SUPPORT/RESISTANCE SUMMARY TABLE =====
-    st.markdown("### 📊 HTF Support & Resistance Levels")
-
+    # ===== HTF SUPPORT/RESISTANCE DATA COLLECTION =====
     # Collect all S/R data
     sr_data = []
 
@@ -2458,46 +2445,21 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None):
                     'Signal': 'Strong hourly resistance - watch closely'
                 })
 
-    # Display HTF S/R Table
-    if sr_data:
-        sr_df = pd.DataFrame(sr_data)
-        st.dataframe(sr_df, use_container_width=True, hide_index=True)
-
-        # Quick summary
-        supports = [d['Level'] for d in sr_data if '🟢' in d['Type']]
-        resistances = [d['Level'] for d in sr_data if '🔴' in d['Type']]
-
-        col_sr1, col_sr2, col_sr3 = st.columns(3)
-        with col_sr1:
-            st.success(f"**Key Supports:** {', '.join(supports[:3])}")
-        with col_sr2:
-            st.error(f"**Key Resistances:** {', '.join(resistances[:3])}")
-        with col_sr3:
-            if max_pain_strike:
-                st.info(f"**Max Pain:** ₹{max_pain_strike:.0f}")
-
-    # Expandable section for detailed Greeks and raw values
-    with st.expander("📊 Detailed Greeks & Raw Values"):
-        detail_cols = ['Strike', 'Zone', 'lastPrice_CE', 'lastPrice_PE',
-                       'openInterest_CE', 'openInterest_PE', 'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
-                       'totalTradedVolume_CE', 'totalTradedVolume_PE',
-                       'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'Vega_CE', 'Vega_PE', 'Theta_CE', 'Theta_PE',
-                       'impliedVolatility_CE', 'impliedVolatility_PE',
-                       'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']
-        detail_cols = [col for col in detail_cols if col in df_summary.columns]
-        if detail_cols:
-            st.dataframe(df_summary[detail_cols].style.apply(highlight_atm_row, axis=1), use_container_width=True)
-
-    # Add download button for CSV
-    csv_data = create_csv_download(df_summary)
-    st.download_button(
-        label="📥 Download Summary as CSV",
-        data=csv_data,
-        file_name=f"nifty_options_summary_{expiry}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-        mime="text/csv"
-    )
-
-    return underlying, df_summary, expiry_dates
+    # Return all data for external display
+    return {
+        'underlying': underlying,
+        'df_summary': df_summary,
+        'expiry_dates': expiry_dates,
+        'expiry': expiry,
+        'sr_data': sr_data,
+        'max_pain_strike': max_pain_strike,
+        'styled_df': styled_df,
+        'df_display': df_display,
+        'display_cols': display_cols,
+        'bias_cols': bias_cols,
+        'total_ce_change': total_ce_change,
+        'total_pe_change': total_pe_change
+    }
 
 def display_analytics_dashboard(db, symbol="NIFTY50"):
     """Display analytics dashboard"""
@@ -2965,17 +2927,95 @@ def main():
     
     with col2:
         st.header("📊 Options Analysis")
-        
+
         # Options chain analysis with expiry selection (pass pivot data for HTF S/R table)
-        underlying_price, df_summary, available_expiries = analyze_option_chain(selected_expiry, pivots)
-        
-        if underlying_price:
+        option_data = analyze_option_chain(selected_expiry, pivots)
+
+        if option_data and option_data.get('underlying'):
+            underlying_price = option_data['underlying']
+            df_summary = option_data['df_summary']
             st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
-            
+
             # Check for trading signals if enabled
             if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
                 check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
-    
+        else:
+            option_data = None
+
+    # ===== OPTIONS CHAIN AND HTF S/R TABLES BELOW CHART =====
+    if option_data and option_data.get('underlying'):
+        st.markdown("---")
+        st.header("📊 Options Chain Analysis")
+
+        # OI Change metrics
+        st.markdown("## Open Interest Change (in Lakhs)")
+        oi_col1, oi_col2 = st.columns(2)
+        with oi_col1:
+            st.metric("CALL ΔOI", f"{option_data['total_ce_change']:+.1f}L", delta_color="inverse")
+        with oi_col2:
+            st.metric("PUT ΔOI", f"{option_data['total_pe_change']:+.1f}L", delta_color="normal")
+
+        # Option Chain Bias Summary Table
+        st.markdown("## Option Chain Bias Summary")
+        if option_data.get('styled_df') is not None:
+            st.dataframe(option_data['styled_df'], use_container_width=True)
+
+        # ===== HTF SUPPORT & RESISTANCE TABLES (SPLIT) =====
+        st.markdown("---")
+        st.markdown("## 📈 HTF Support & Resistance Levels")
+
+        sr_data = option_data.get('sr_data', [])
+        max_pain_strike = option_data.get('max_pain_strike')
+
+        if sr_data:
+            # Split into Support and Resistance
+            support_data = [d for d in sr_data if '🟢' in d['Type'] or '🎯' in d['Type']]
+            resistance_data = [d for d in sr_data if '🔴' in d['Type']]
+
+            sr_col1, sr_col2 = st.columns(2)
+
+            with sr_col1:
+                st.markdown("### 🟢 SUPPORT LEVELS")
+                if support_data:
+                    support_df = pd.DataFrame(support_data)
+                    st.dataframe(support_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No support levels identified")
+
+            with sr_col2:
+                st.markdown("### 🔴 RESISTANCE LEVELS")
+                if resistance_data:
+                    resistance_df = pd.DataFrame(resistance_data)
+                    st.dataframe(resistance_df, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No resistance levels identified")
+
+            # Max Pain summary
+            if max_pain_strike:
+                st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
+
+        # Expandable section for detailed Greeks and raw values
+        with st.expander("📊 Detailed Greeks & Raw Values"):
+            df_summary = option_data['df_summary']
+            detail_cols = ['Strike', 'Zone', 'lastPrice_CE', 'lastPrice_PE',
+                           'openInterest_CE', 'openInterest_PE', 'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
+                           'totalTradedVolume_CE', 'totalTradedVolume_PE',
+                           'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'Vega_CE', 'Vega_PE', 'Theta_CE', 'Theta_PE',
+                           'impliedVolatility_CE', 'impliedVolatility_PE',
+                           'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']
+            detail_cols = [col for col in detail_cols if col in df_summary.columns]
+            if detail_cols:
+                st.dataframe(df_summary[detail_cols].style.apply(highlight_atm_row, axis=1), use_container_width=True)
+
+        # Add download button for CSV
+        csv_data = create_csv_download(option_data['df_summary'])
+        st.download_button(
+            label="📥 Download Summary as CSV",
+            data=csv_data,
+            file_name=f"nifty_options_summary_{option_data['expiry']}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv"
+        )
+
     # Analytics dashboard below
     if show_analytics:
         st.markdown("---")
