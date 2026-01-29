@@ -3353,13 +3353,17 @@ def main():
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
 
-        # ===== PCR GRAPH FOR ATM ± 2 STRIKES =====
+        # ===== PCR TIME-SERIES GRAPH FOR ATM ± 2 STRIKES =====
         st.markdown("---")
-        st.markdown("## 📊 PCR Analysis (ATM ± 2 Strikes)")
+        st.markdown("## 📊 PCR Analysis (ATM ± 2 Strikes) - Time Series")
 
         df_summary = option_data['df_summary']
         if 'Zone' in df_summary.columns and 'PCR' in df_summary.columns:
             try:
+                # Initialize PCR history in session state
+                if 'pcr_history' not in st.session_state:
+                    st.session_state.pcr_history = []
+
                 # Find ATM index
                 atm_idx = df_summary[df_summary['Zone'] == 'ATM'].index
                 if len(atm_idx) > 0:
@@ -3373,68 +3377,107 @@ def main():
                                                                    'openInterest_CE', 'openInterest_PE']].copy()
 
                     if not pcr_df.empty:
-                        # Create PCR bar chart
-                        fig_pcr = go.Figure()
+                        # Get current time
+                        ist = pytz.timezone('Asia/Kolkata')
+                        current_time = datetime.now(ist)
 
-                        # Color bars based on PCR value
-                        colors = []
-                        for pcr in pcr_df['PCR']:
-                            if pcr > 1.2:
-                                colors.append('#00ff88')  # Bullish - Green
-                            elif pcr < 0.7:
-                                colors.append('#ff4444')  # Bearish - Red
-                            else:
-                                colors.append('#ffaa00')  # Neutral - Orange
+                        # Add current PCR data to history
+                        pcr_entry = {'time': current_time}
+                        for _, row in pcr_df.iterrows():
+                            strike_label = f"{int(row['Strike'])} ({row['Zone']})"
+                            pcr_entry[strike_label] = row['PCR']
 
-                        # Add PCR bars
-                        fig_pcr.add_trace(go.Bar(
-                            x=pcr_df['Strike'].astype(str) + '<br>' + pcr_df['Zone'],
-                            y=pcr_df['PCR'],
-                            marker_color=colors,
-                            text=pcr_df['PCR'].round(2),
-                            textposition='outside',
-                            name='PCR'
-                        ))
+                        # Check if we should add new entry (avoid duplicates within 30 seconds)
+                        should_add = True
+                        if st.session_state.pcr_history:
+                            last_entry = st.session_state.pcr_history[-1]
+                            time_diff = (current_time - last_entry['time']).total_seconds()
+                            if time_diff < 30:
+                                should_add = False
 
-                        # Add reference lines
-                        fig_pcr.add_hline(y=1.0, line_dash="dash", line_color="white",
-                                         annotation_text="Neutral (1.0)", annotation_position="right")
-                        fig_pcr.add_hline(y=1.2, line_dash="dot", line_color="#00ff88",
-                                         annotation_text="Bullish (1.2)", annotation_position="right")
-                        fig_pcr.add_hline(y=0.7, line_dash="dot", line_color="#ff4444",
-                                         annotation_text="Bearish (0.7)", annotation_position="right")
+                        if should_add:
+                            st.session_state.pcr_history.append(pcr_entry)
+                            # Keep only last 100 entries (approx 50 minutes of data at 30s intervals)
+                            if len(st.session_state.pcr_history) > 100:
+                                st.session_state.pcr_history = st.session_state.pcr_history[-100:]
 
-                        fig_pcr.update_layout(
-                            title="Put-Call Ratio by Strike",
-                            template='plotly_dark',
-                            height=350,
-                            showlegend=False,
-                            margin=dict(l=0, r=100, t=40, b=0),
-                            xaxis_title="Strike Price",
-                            yaxis_title="PCR (PE OI / CE OI)",
-                            plot_bgcolor='#1e1e1e',
-                            paper_bgcolor='#1e1e1e'
-                        )
+                        # Create time-series line chart
+                        if len(st.session_state.pcr_history) > 0:
+                            fig_pcr = go.Figure()
 
-                        st.plotly_chart(fig_pcr, use_container_width=True)
+                            # Get all strike columns (excluding 'time')
+                            history_df = pd.DataFrame(st.session_state.pcr_history)
+                            strike_cols = [col for col in history_df.columns if col != 'time']
 
-                        # Show PCR data table
-                        pcr_display = pcr_df[['Strike', 'Zone', 'PCR', 'PCR_Signal']].copy()
-                        pcr_display['CE OI (L)'] = (pcr_df['openInterest_CE'] / 100000).round(2)
-                        pcr_display['PE OI (L)'] = (pcr_df['openInterest_PE'] / 100000).round(2)
+                            # Color palette for different strikes
+                            colors = ['#00ff88', '#ffaa00', '#ff4444', '#00aaff', '#ff44ff']
 
-                        st.dataframe(pcr_display, use_container_width=True, hide_index=True)
+                            for i, strike_col in enumerate(strike_cols):
+                                color = colors[i % len(colors)]
+                                # Highlight ATM with thicker line
+                                line_width = 3 if '(ATM)' in strike_col else 2
 
-                        # PCR interpretation
-                        atm_pcr = pcr_df[pcr_df['Zone'] == 'ATM']['PCR'].values
-                        if len(atm_pcr) > 0:
-                            atm_pcr_val = atm_pcr[0]
-                            if atm_pcr_val > 1.2:
-                                st.success(f"🟢 **ATM PCR: {atm_pcr_val:.2f}** - Bullish bias (PE writers dominating)")
-                            elif atm_pcr_val < 0.7:
-                                st.error(f"🔴 **ATM PCR: {atm_pcr_val:.2f}** - Bearish bias (CE writers dominating)")
-                            else:
-                                st.warning(f"🟡 **ATM PCR: {atm_pcr_val:.2f}** - Neutral (Range-bound expected)")
+                                fig_pcr.add_trace(go.Scatter(
+                                    x=history_df['time'],
+                                    y=history_df[strike_col],
+                                    mode='lines+markers',
+                                    name=strike_col,
+                                    line=dict(color=color, width=line_width),
+                                    marker=dict(size=4)
+                                ))
+
+                            # Add reference lines
+                            fig_pcr.add_hline(y=1.0, line_dash="dash", line_color="white",
+                                             annotation_text="Neutral (1.0)", annotation_position="right")
+                            fig_pcr.add_hline(y=1.2, line_dash="dot", line_color="#00ff88",
+                                             annotation_text="Bullish (1.2)", annotation_position="right")
+                            fig_pcr.add_hline(y=0.7, line_dash="dot", line_color="#ff4444",
+                                             annotation_text="Bearish (0.7)", annotation_position="right")
+
+                            fig_pcr.update_layout(
+                                title="PCR Time Series by Strike (ATM ± 2)",
+                                template='plotly_dark',
+                                height=400,
+                                showlegend=True,
+                                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                                margin=dict(l=0, r=100, t=60, b=0),
+                                xaxis_title="Time (IST)",
+                                yaxis_title="PCR (PE OI / CE OI)",
+                                plot_bgcolor='#1e1e1e',
+                                paper_bgcolor='#1e1e1e',
+                                xaxis=dict(tickformat='%H:%M:%S')
+                            )
+
+                            st.plotly_chart(fig_pcr, use_container_width=True)
+
+                            # Show current PCR data table
+                            st.markdown("### Current PCR Values")
+                            pcr_display = pcr_df[['Strike', 'Zone', 'PCR', 'PCR_Signal']].copy()
+                            pcr_display['CE OI (L)'] = (pcr_df['openInterest_CE'] / 100000).round(2)
+                            pcr_display['PE OI (L)'] = (pcr_df['openInterest_PE'] / 100000).round(2)
+
+                            st.dataframe(pcr_display, use_container_width=True, hide_index=True)
+
+                            # PCR interpretation
+                            atm_pcr = pcr_df[pcr_df['Zone'] == 'ATM']['PCR'].values
+                            if len(atm_pcr) > 0:
+                                atm_pcr_val = atm_pcr[0]
+                                if atm_pcr_val > 1.2:
+                                    st.success(f"🟢 **ATM PCR: {atm_pcr_val:.2f}** - Bullish bias (PE writers dominating)")
+                                elif atm_pcr_val < 0.7:
+                                    st.error(f"🔴 **ATM PCR: {atm_pcr_val:.2f}** - Bearish bias (CE writers dominating)")
+                                else:
+                                    st.warning(f"🟡 **ATM PCR: {atm_pcr_val:.2f}** - Neutral (Range-bound expected)")
+
+                            # Show data points count
+                            st.caption(f"📈 Tracking {len(st.session_state.pcr_history)} data points | Auto-refresh builds history")
+
+                            # Clear history button
+                            if st.button("🗑️ Clear PCR History"):
+                                st.session_state.pcr_history = []
+                                st.rerun()
+                        else:
+                            st.info("PCR history will build up as the app refreshes. Please wait...")
                 else:
                     st.info("ATM strike not found for PCR analysis")
             except Exception as e:
