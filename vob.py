@@ -3353,6 +3353,93 @@ def main():
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
 
+        # ===== PCR GRAPH FOR ATM ± 2 STRIKES =====
+        st.markdown("---")
+        st.markdown("## 📊 PCR Analysis (ATM ± 2 Strikes)")
+
+        df_summary = option_data['df_summary']
+        if 'Zone' in df_summary.columns and 'PCR' in df_summary.columns:
+            try:
+                # Find ATM index
+                atm_idx = df_summary[df_summary['Zone'] == 'ATM'].index
+                if len(atm_idx) > 0:
+                    atm_pos = df_summary.index.get_loc(atm_idx[0])
+
+                    # Get ATM ± 2 strikes
+                    start_idx = max(0, atm_pos - 2)
+                    end_idx = min(len(df_summary), atm_pos + 3)
+
+                    pcr_df = df_summary.iloc[start_idx:end_idx][['Strike', 'Zone', 'PCR', 'PCR_Signal',
+                                                                   'openInterest_CE', 'openInterest_PE']].copy()
+
+                    if not pcr_df.empty:
+                        # Create PCR bar chart
+                        fig_pcr = go.Figure()
+
+                        # Color bars based on PCR value
+                        colors = []
+                        for pcr in pcr_df['PCR']:
+                            if pcr > 1.2:
+                                colors.append('#00ff88')  # Bullish - Green
+                            elif pcr < 0.7:
+                                colors.append('#ff4444')  # Bearish - Red
+                            else:
+                                colors.append('#ffaa00')  # Neutral - Orange
+
+                        # Add PCR bars
+                        fig_pcr.add_trace(go.Bar(
+                            x=pcr_df['Strike'].astype(str) + '<br>' + pcr_df['Zone'],
+                            y=pcr_df['PCR'],
+                            marker_color=colors,
+                            text=pcr_df['PCR'].round(2),
+                            textposition='outside',
+                            name='PCR'
+                        ))
+
+                        # Add reference lines
+                        fig_pcr.add_hline(y=1.0, line_dash="dash", line_color="white",
+                                         annotation_text="Neutral (1.0)", annotation_position="right")
+                        fig_pcr.add_hline(y=1.2, line_dash="dot", line_color="#00ff88",
+                                         annotation_text="Bullish (1.2)", annotation_position="right")
+                        fig_pcr.add_hline(y=0.7, line_dash="dot", line_color="#ff4444",
+                                         annotation_text="Bearish (0.7)", annotation_position="right")
+
+                        fig_pcr.update_layout(
+                            title="Put-Call Ratio by Strike",
+                            template='plotly_dark',
+                            height=350,
+                            showlegend=False,
+                            margin=dict(l=0, r=100, t=40, b=0),
+                            xaxis_title="Strike Price",
+                            yaxis_title="PCR (PE OI / CE OI)",
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e'
+                        )
+
+                        st.plotly_chart(fig_pcr, use_container_width=True)
+
+                        # Show PCR data table
+                        pcr_display = pcr_df[['Strike', 'Zone', 'PCR', 'PCR_Signal']].copy()
+                        pcr_display['CE OI (L)'] = (pcr_df['openInterest_CE'] / 100000).round(2)
+                        pcr_display['PE OI (L)'] = (pcr_df['openInterest_PE'] / 100000).round(2)
+
+                        st.dataframe(pcr_display, use_container_width=True, hide_index=True)
+
+                        # PCR interpretation
+                        atm_pcr = pcr_df[pcr_df['Zone'] == 'ATM']['PCR'].values
+                        if len(atm_pcr) > 0:
+                            atm_pcr_val = atm_pcr[0]
+                            if atm_pcr_val > 1.2:
+                                st.success(f"🟢 **ATM PCR: {atm_pcr_val:.2f}** - Bullish bias (PE writers dominating)")
+                            elif atm_pcr_val < 0.7:
+                                st.error(f"🔴 **ATM PCR: {atm_pcr_val:.2f}** - Bearish bias (CE writers dominating)")
+                            else:
+                                st.warning(f"🟡 **ATM PCR: {atm_pcr_val:.2f}** - Neutral (Range-bound expected)")
+                else:
+                    st.info("ATM strike not found for PCR analysis")
+            except Exception as e:
+                st.warning(f"PCR graph unavailable: {str(e)}")
+
         # Expandable section for detailed Greeks and raw values
         with st.expander("📊 Detailed Greeks & Raw Values"):
             df_summary = option_data['df_summary']
