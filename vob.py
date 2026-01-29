@@ -1,4 +1,4 @@
-import streamlit as st
+import stre amlit as st
 from streamlit_autorefresh import st_autorefresh
 import requests
 import pandas as pd
