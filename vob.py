@@ -578,6 +578,257 @@ class PivotIndicator:
         return all_pivots
 
 
+class VolumeOrderBlocks:
+    """
+    Volume Order Blocks Indicator - Converted from Pine Script [BigBeluga]
+
+    Detects bullish and bearish order blocks based on EMA crossovers with volume analysis.
+    - Bullish VOB: EMA cross up -> finds lowest point as support zone
+    - Bearish VOB: EMA cross down -> finds highest point as resistance zone
+    - Tracks volume collected and percentage distribution for each block
+    """
+
+    def __init__(self, sensitivity=5):
+        """
+        Initialize VOB detector
+
+        Args:
+            sensitivity: Detection sensitivity (default 5, maps to length1 in Pine Script)
+        """
+        self.length1 = sensitivity
+        self.length2 = sensitivity + 13
+        self.max_blocks = 15  # Maximum blocks to track
+
+    @staticmethod
+    def calculate_ema(series, period):
+        """Calculate Exponential Moving Average"""
+        return series.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def calculate_atr(df, period=200):
+        """Calculate Average True Range"""
+        high = df['high']
+        low = df['low']
+        close = df['close'].shift(1)
+
+        tr1 = high - low
+        tr2 = abs(high - close)
+        tr3 = abs(low - close)
+
+        tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        atr = tr.rolling(window=period).mean()
+        return atr
+
+    def detect_blocks(self, df):
+        """
+        Detect Volume Order Blocks from OHLCV data
+
+        Args:
+            df: DataFrame with columns ['datetime', 'open', 'high', 'low', 'close', 'volume']
+
+        Returns:
+            dict with 'bullish' and 'bearish' lists of order blocks
+        """
+        if df.empty or len(df) < self.length2 + 10:
+            return {'bullish': [], 'bearish': []}
+
+        df = df.copy().reset_index(drop=True)
+
+        # Calculate EMAs
+        ema_fast = self.calculate_ema(df['close'], self.length1)
+        ema_slow = self.calculate_ema(df['close'], self.length2)
+
+        # Calculate ATR for minimum zone size
+        atr = self.calculate_atr(df)
+        max_atr = atr.rolling(window=200, min_periods=1).max()
+        atr_threshold = max_atr * 2  # atr1 in Pine Script
+        overlap_threshold = max_atr * 3  # atr in Pine Script for overlap check
+
+        # Detect crossovers
+        cross_up = (ema_fast > ema_slow) & (ema_fast.shift(1) <= ema_slow.shift(1))
+        cross_down = (ema_fast < ema_slow) & (ema_fast.shift(1) >= ema_slow.shift(1))
+
+        bullish_blocks = []
+        bearish_blocks = []
+
+        # Process bullish crossovers (support zones)
+        for idx in df[cross_up].index:
+            if idx < self.length2:
+                continue
+
+            # Find lowest low in lookback period
+            lookback_start = max(0, idx - self.length2)
+            lookback_df = df.loc[lookback_start:idx]
+
+            lowest_idx = lookback_df['low'].idxmin()
+            lowest = df.loc[lowest_idx, 'low']
+
+            # Calculate volume from lowest to crossover
+            vol = df.loc[lowest_idx:idx, 'volume'].sum()
+
+            # Get upper bound (min of open/close at the lowest candle)
+            upper = min(df.loc[lowest_idx, 'open'], df.loc[lowest_idx, 'close'])
+
+            # Ensure minimum zone size
+            if idx < len(atr_threshold) and not pd.isna(atr_threshold.iloc[idx]):
+                min_size = atr_threshold.iloc[idx] * 0.5
+                if (upper - lowest) < min_size:
+                    upper = lowest + min_size
+
+            mid = (upper + lowest) / 2
+
+            bullish_blocks.append({
+                'index': lowest_idx,
+                'datetime': df.loc[lowest_idx, 'datetime'] if 'datetime' in df.columns else None,
+                'upper': upper,
+                'lower': lowest,
+                'mid': mid,
+                'volume': vol,
+                'type': 'bullish'
+            })
+
+        # Process bearish crossovers (resistance zones)
+        for idx in df[cross_down].index:
+            if idx < self.length2:
+                continue
+
+            # Find highest high in lookback period
+            lookback_start = max(0, idx - self.length2)
+            lookback_df = df.loc[lookback_start:idx]
+
+            highest_idx = lookback_df['high'].idxmax()
+            highest = df.loc[highest_idx, 'high']
+
+            # Calculate volume from highest to crossover
+            vol = df.loc[highest_idx:idx, 'volume'].sum()
+
+            # Get lower bound (max of open/close at the highest candle)
+            lower = max(df.loc[highest_idx, 'open'], df.loc[highest_idx, 'close'])
+
+            # Ensure minimum zone size
+            if idx < len(atr_threshold) and not pd.isna(atr_threshold.iloc[idx]):
+                min_size = atr_threshold.iloc[idx] * 0.5
+                if (highest - lower) < min_size:
+                    lower = highest - min_size
+
+            mid = (highest + lower) / 2
+
+            bearish_blocks.append({
+                'index': highest_idx,
+                'datetime': df.loc[highest_idx, 'datetime'] if 'datetime' in df.columns else None,
+                'upper': highest,
+                'lower': lower,
+                'mid': mid,
+                'volume': vol,
+                'type': 'bearish'
+            })
+
+        # Remove overlapping blocks and broken blocks
+        current_close = df['close'].iloc[-1]
+
+        # Filter bullish blocks - remove if price closed below lower
+        bullish_blocks = [b for b in bullish_blocks if current_close >= b['lower']]
+
+        # Filter bearish blocks - remove if price closed above upper
+        bearish_blocks = [b for b in bearish_blocks if current_close <= b['upper']]
+
+        # Remove overlapping blocks (keep the one with more volume)
+        bullish_blocks = self._remove_overlaps(bullish_blocks, overlap_threshold.iloc[-1] if len(overlap_threshold) > 0 else 50)
+        bearish_blocks = self._remove_overlaps(bearish_blocks, overlap_threshold.iloc[-1] if len(overlap_threshold) > 0 else 50)
+
+        # Keep only most recent blocks
+        bullish_blocks = bullish_blocks[-self.max_blocks:]
+        bearish_blocks = bearish_blocks[-self.max_blocks:]
+
+        # Calculate volume percentages
+        total_bull_vol = sum(b['volume'] for b in bullish_blocks) if bullish_blocks else 1
+        total_bear_vol = sum(b['volume'] for b in bearish_blocks) if bearish_blocks else 1
+
+        for b in bullish_blocks:
+            b['volume_pct'] = (b['volume'] / total_bull_vol * 100) if total_bull_vol > 0 else 0
+
+        for b in bearish_blocks:
+            b['volume_pct'] = (b['volume'] / total_bear_vol * 100) if total_bear_vol > 0 else 0
+
+        return {'bullish': bullish_blocks, 'bearish': bearish_blocks}
+
+    def _remove_overlaps(self, blocks, threshold):
+        """Remove overlapping blocks, keeping the one with higher volume"""
+        if len(blocks) < 2:
+            return blocks
+
+        # Sort by mid price
+        blocks = sorted(blocks, key=lambda x: x['mid'])
+
+        filtered = []
+        for block in blocks:
+            overlap = False
+            for existing in filtered:
+                if abs(block['mid'] - existing['mid']) < threshold:
+                    # Overlap detected - keep the one with more volume
+                    if block['volume'] > existing['volume']:
+                        filtered.remove(existing)
+                        filtered.append(block)
+                    overlap = True
+                    break
+            if not overlap:
+                filtered.append(block)
+
+        return filtered
+
+    @staticmethod
+    def format_volume(vol):
+        """Format volume for display (e.g., 1.5M, 500K)"""
+        if vol >= 1_000_000:
+            return f"{vol/1_000_000:.1f}M"
+        elif vol >= 1_000:
+            return f"{vol/1_000:.0f}K"
+        else:
+            return str(int(vol))
+
+    def get_sr_levels(self, df):
+        """
+        Get support/resistance levels from VOB for integration with S/R table
+
+        Returns:
+            list of dicts compatible with sr_data format
+        """
+        blocks = self.detect_blocks(df)
+        sr_levels = []
+
+        # Add bullish blocks as support levels
+        for i, block in enumerate(blocks['bullish']):
+            sr_levels.append({
+                'Type': '🟢 VOB Support',
+                'Level': f"₹{block['mid']:.0f}",
+                'Source': f"Vol: {self.format_volume(block['volume'])} ({block['volume_pct']:.1f}%)",
+                'Strength': 'VOB Zone',
+                'Signal': f"Range: ₹{block['lower']:.0f} - ₹{block['upper']:.0f}",
+                'upper': block['upper'],
+                'lower': block['lower'],
+                'mid': block['mid'],
+                'volume': block['volume'],
+                'volume_pct': block['volume_pct']
+            })
+
+        # Add bearish blocks as resistance levels
+        for i, block in enumerate(blocks['bearish']):
+            sr_levels.append({
+                'Type': '🔴 VOB Resistance',
+                'Level': f"₹{block['mid']:.0f}",
+                'Source': f"Vol: {self.format_volume(block['volume'])} ({block['volume_pct']:.1f}%)",
+                'Strength': 'VOB Zone',
+                'Signal': f"Range: ₹{block['lower']:.0f} - ₹{block['upper']:.0f}",
+                'upper': block['upper'],
+                'lower': block['lower'],
+                'mid': block['mid'],
+                'volume': block['volume'],
+                'volume_pct': block['volume_pct']
+            })
+
+        return sr_levels, blocks
+
+
 class ReversalDetector:
     """
     Intraday Reversal Detection System based on Price Action Theory.
@@ -1528,8 +1779,8 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None):
-    """Create TradingView-style candlestick chart with optional pivot levels"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None):
+    """Create TradingView-style candlestick chart with optional pivot levels and VOB zones"""
     if df.empty:
         return go.Figure()
     
@@ -1639,6 +1890,74 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
             )
     except Exception as e:
         pass  # VWAP calculation failed, skip it
+
+    # Add Volume Order Blocks (VOB) zones
+    if vob_blocks:
+        try:
+            x_start = df['datetime'].min()
+            x_end = df['datetime'].max()
+
+            # Draw bullish VOB zones (support - green)
+            for block in vob_blocks.get('bullish', [])[-5:]:  # Last 5 bullish zones
+                fig.add_shape(
+                    type="rect",
+                    x0=x_start, x1=x_end,
+                    y0=block['lower'], y1=block['upper'],
+                    fillcolor="rgba(38, 186, 159, 0.15)",  # Teal with transparency
+                    line=dict(color="#26ba9f", width=2),
+                    row=1, col=1
+                )
+                # Add midline
+                fig.add_shape(
+                    type="line",
+                    x0=x_start, x1=x_end,
+                    y0=block['mid'], y1=block['mid'],
+                    line=dict(color="#26ba9f", width=1, dash="dash"),
+                    row=1, col=1
+                )
+                # Add volume annotation
+                vol_text = VolumeOrderBlocks.format_volume(block['volume'])
+                fig.add_annotation(
+                    x=x_end,
+                    y=block['mid'],
+                    text=f"VOB↑ {vol_text} ({block['volume_pct']:.0f}%)",
+                    showarrow=False,
+                    font=dict(color="#26ba9f", size=9),
+                    xanchor="left",
+                    row=1, col=1
+                )
+
+            # Draw bearish VOB zones (resistance - purple)
+            for block in vob_blocks.get('bearish', [])[-5:]:  # Last 5 bearish zones
+                fig.add_shape(
+                    type="rect",
+                    x0=x_start, x1=x_end,
+                    y0=block['lower'], y1=block['upper'],
+                    fillcolor="rgba(102, 38, 186, 0.15)",  # Purple with transparency
+                    line=dict(color="#6626ba", width=2),
+                    row=1, col=1
+                )
+                # Add midline
+                fig.add_shape(
+                    type="line",
+                    x0=x_start, x1=x_end,
+                    y0=block['mid'], y1=block['mid'],
+                    line=dict(color="#6626ba", width=1, dash="dash"),
+                    row=1, col=1
+                )
+                # Add volume annotation
+                vol_text = VolumeOrderBlocks.format_volume(block['volume'])
+                fig.add_annotation(
+                    x=x_end,
+                    y=block['mid'],
+                    text=f"VOB↓ {vol_text} ({block['volume_pct']:.0f}%)",
+                    showarrow=False,
+                    font=dict(color="#6626ba", size=9),
+                    xanchor="left",
+                    row=1, col=1
+                )
+        except Exception as e:
+            pass  # VOB drawing failed, skip it
 
     volume_colors = ['#00ff88' if close >= open else '#ff4444'
                     for close, open in zip(df['close'], df['open'])]
@@ -1826,8 +2145,8 @@ def create_csv_download(df_summary):
     return output.getvalue()
 
 
-def analyze_option_chain(selected_expiry=None, pivot_data=None):
-    """Enhanced options chain analysis with expiry selection and HTF pivot data"""
+def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
+    """Enhanced options chain analysis with expiry selection, HTF pivot data, and VOB data"""
     now = datetime.now(timezone("Asia/Kolkata"))
     
     # Get expiry list - use cached version for performance
@@ -2445,6 +2764,22 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None):
                     'Signal': 'Strong hourly resistance - watch closely'
                 })
 
+    # ===== VOLUME ORDER BLOCKS (VOB) SUPPORT/RESISTANCE =====
+    vob_blocks = None
+    if vob_data:
+        vob_sr_levels = vob_data.get('sr_levels', [])
+        vob_blocks = vob_data.get('blocks', None)
+
+        # Add VOB levels to sr_data
+        for vob_level in vob_sr_levels:
+            sr_data.append({
+                'Type': vob_level['Type'],
+                'Level': vob_level['Level'],
+                'Source': vob_level['Source'],
+                'Strength': vob_level['Strength'],
+                'Signal': vob_level['Signal']
+            })
+
     # Return all data for external display
     return {
         'underlying': underlying,
@@ -2458,7 +2793,8 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None):
         'display_cols': display_cols,
         'bias_cols': bias_cols,
         'total_ce_change': total_ce_change,
-        'total_pe_change': total_pe_change
+        'total_pe_change': total_pe_change,
+        'vob_blocks': vob_blocks
     }
 
 def display_analytics_dashboard(db, symbol="NIFTY50"):
@@ -2740,7 +3076,9 @@ def main():
 
     # Initialize pivots variable (will be populated in col1, used in col2)
     pivots = None
-    
+    # Initialize VOB data (will be populated in col1, used in col2 for S/R tables)
+    vob_data = None
+
     with col1:
         st.header("📈 Trading Chart")
         
@@ -2792,15 +3130,25 @@ def main():
         # Display metrics
         if not df.empty:
             display_metrics(ltp_data, df, db)
-        
+
+        # Calculate Volume Order Blocks (VOB) early for chart display
+        vob_blocks_for_chart = None
+        if not df.empty and len(df) > 30:
+            try:
+                vob_detector = VolumeOrderBlocks(sensitivity=5)
+                _, vob_blocks_for_chart = vob_detector.get_sr_levels(df)
+            except Exception:
+                vob_blocks_for_chart = None
+
         # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
-                df, 
-                f"Nifty 50 - {selected_timeframe} Chart {'with Pivot Levels' if show_pivots else ''}", 
+                df,
+                f"Nifty 50 - {selected_timeframe} Chart {'with Pivot Levels' if show_pivots else ''}",
                 interval,
                 show_pivots=show_pivots,
-                pivot_settings=pivot_settings
+                pivot_settings=pivot_settings,
+                vob_blocks=vob_blocks_for_chart
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -2826,8 +3174,11 @@ def main():
                 - 🟣 **10M Levels**: 10-minute support/resistance zones
                 - 🔵 **15M Levels**: 15-minute major support/resistance levels
                 - 🟡 **VWAP**: Volume Weighted Average Price (dotted line)
+                - 🟩 **VOB↑ (Teal)**: Bullish Volume Order Blocks (Support zones)
+                - 🟪 **VOB↓ (Purple)**: Bearish Volume Order Blocks (Resistance zones)
 
                 *R = Resistance (Price ceiling), S = Support (Price floor)*
+                *VOB zones show volume-backed order flow areas with % distribution*
                 """)
 
             # Reversal Detector Analysis
@@ -2843,6 +3194,19 @@ def main():
                     pivots = cached_pivot_calculation(df_json, pivot_settings or {})
                     pivot_lows = [p['value'] for p in pivots if p['type'] == 'low']
                     pivot_highs = [p['value'] for p in pivots if p['type'] == 'high']
+
+                # Calculate Volume Order Blocks (VOB) for S/R integration
+                if len(df) > 30:
+                    try:
+                        vob_detector = VolumeOrderBlocks(sensitivity=5)
+                        vob_sr_levels, vob_blocks = vob_detector.get_sr_levels(df)
+                        vob_data = {
+                            'sr_levels': vob_sr_levels,
+                            'blocks': vob_blocks
+                        }
+                    except Exception as e:
+                        st.warning(f"VOB calculation error: {str(e)}")
+                        vob_data = None
 
                 # Calculate BULLISH reversal score
                 bull_score, bull_signals, bull_verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
@@ -2928,8 +3292,8 @@ def main():
     with col2:
         st.header("📊 Options Analysis")
 
-        # Options chain analysis with expiry selection (pass pivot data for HTF S/R table)
-        option_data = analyze_option_chain(selected_expiry, pivots)
+        # Options chain analysis with expiry selection (pass pivot data and VOB data for HTF S/R table)
+        option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
 
         if option_data and option_data.get('underlying'):
             underlying_price = option_data['underlying']
