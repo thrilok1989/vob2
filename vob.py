@@ -51,10 +51,6 @@ st.markdown("""
     .price-down {
         color: #ff4444;
     }
-    .atm-row {
-        background-color: #FFD700 !important;
-        font-weight: bold !important;
-    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -1755,9 +1751,8 @@ def color_score(val):
         return ''
 
 def highlight_atm_row(row):
-    """Highlight ATM row in the dataframe"""
-    if row['Zone'] == 'ATM':
-        return ['background-color: #FFD700; font-weight: bold'] * len(row)
+    """Highlight ATM row in the dataframe - disabled"""
+    # ATM yellow highlight removed per user request
     return [''] * len(row)
 
 def process_candle_data(data, interval):
