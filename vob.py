@@ -2858,7 +2858,14 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
 
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
-    
+
+    # Initialize session state for PCR history (EARLY - before any potential failures)
+    # This ensures history persists even when API fetches fail
+    if 'pcr_history' not in st.session_state:
+        st.session_state.pcr_history = []
+    if 'pcr_last_valid_data' not in st.session_state:
+        st.session_state.pcr_last_valid_data = None
+
     # Initialize Supabase
     try:
         if not supabase_url or not supabase_key:
@@ -3358,13 +3365,54 @@ def main():
         st.markdown("---")
         st.markdown("## 📊 PCR Analysis - Time Series (ATM ± 1)")
 
-        df_summary = option_data['df_summary']
-        if 'Zone' in df_summary.columns and 'PCR' in df_summary.columns:
-            try:
-                # Initialize PCR history in session state
-                if 'pcr_history' not in st.session_state:
-                    st.session_state.pcr_history = []
+        # Helper function to create PCR chart (defined outside try block for reuse)
+        def create_pcr_chart(history_df, col_name, color, title_prefix):
+            """Helper to create individual PCR chart"""
+            if col_name and col_name in history_df.columns:
+                strike_val = col_name.split('_')[0]
+                zone = col_name.split('_')[1]
 
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=history_df['time'],
+                    y=history_df[col_name],
+                    mode='lines+markers',
+                    name=f'{strike_val}',
+                    line=dict(color=color, width=2),
+                    marker=dict(size=4),
+                    fill='tozeroy',
+                    fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.1])}'
+                ))
+
+                # Reference lines
+                fig.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
+                fig.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
+                fig.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+
+                # Get current PCR value
+                current_pcr = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
+
+                fig.update_layout(
+                    title=f"{title_prefix}<br>₹{strike_val} ({zone})<br>PCR: {current_pcr:.2f}",
+                    template='plotly_dark',
+                    height=280,
+                    showlegend=False,
+                    margin=dict(l=10, r=10, t=70, b=30),
+                    xaxis=dict(tickformat='%H:%M', title=''),
+                    yaxis=dict(title='PCR'),
+                    plot_bgcolor='#1e1e1e',
+                    paper_bgcolor='#1e1e1e'
+                )
+                return fig, current_pcr
+            return None, 0
+
+        # Try to get new data and add to history
+        pcr_data_available = False
+        pcr_df = None
+
+        df_summary = option_data.get('df_summary') if option_data else None
+        if df_summary is not None and 'Zone' in df_summary.columns and 'PCR' in df_summary.columns:
+            try:
                 # Find ATM index
                 atm_idx = df_summary[df_summary['Zone'] == 'ATM'].index
                 if len(atm_idx) > 0:
@@ -3378,6 +3426,10 @@ def main():
                                                                    'openInterest_CE', 'openInterest_PE']].copy()
 
                     if not pcr_df.empty:
+                        pcr_data_available = True
+                        # Save as last valid data
+                        st.session_state.pcr_last_valid_data = pcr_df.copy()
+
                         # Get current time
                         ist = pytz.timezone('Asia/Kolkata')
                         current_time = datetime.now(ist)
@@ -3387,8 +3439,6 @@ def main():
                         for _, row in pcr_df.iterrows():
                             strike_label = f"{int(row['Strike'])}_{row['Zone']}"
                             pcr_entry[strike_label] = row['PCR']
-                            pcr_entry[f"{strike_label}_strike"] = int(row['Strike'])
-                            pcr_entry[f"{strike_label}_zone"] = row['Zone']
 
                         # Check if we should add new entry (avoid duplicates within 30 seconds)
                         should_add = True
@@ -3400,132 +3450,98 @@ def main():
 
                         if should_add:
                             st.session_state.pcr_history.append(pcr_entry)
-                            # Keep only last 100 entries
-                            if len(st.session_state.pcr_history) > 100:
-                                st.session_state.pcr_history = st.session_state.pcr_history[-100:]
+                            # Keep only last 200 entries (longer history)
+                            if len(st.session_state.pcr_history) > 200:
+                                st.session_state.pcr_history = st.session_state.pcr_history[-200:]
 
-                        # Create separate graphs for each strike
-                        if len(st.session_state.pcr_history) > 0:
-                            history_df = pd.DataFrame(st.session_state.pcr_history)
-
-                            # Identify strike columns (those without _strike or _zone suffix)
-                            strike_cols = [col for col in history_df.columns
-                                          if col != 'time' and '_strike' not in col and '_zone' not in col]
-
-                            # Separate by zone: OTM, ATM, ITM
-                            otm_col = None
-                            atm_col = None
-                            itm_col = None
-
-                            for col in strike_cols:
-                                if '_OTM' in col:
-                                    otm_col = col
-                                elif '_ATM' in col:
-                                    atm_col = col
-                                elif '_ITM' in col:
-                                    itm_col = col
-
-                            # Create 3 columns for side-by-side display
-                            pcr_col1, pcr_col2, pcr_col3 = st.columns(3)
-
-                            def create_pcr_chart(col_name, color, title_prefix):
-                                """Helper to create individual PCR chart"""
-                                if col_name and col_name in history_df.columns:
-                                    strike_val = col_name.split('_')[0]
-                                    zone = col_name.split('_')[1]
-
-                                    fig = go.Figure()
-                                    fig.add_trace(go.Scatter(
-                                        x=history_df['time'],
-                                        y=history_df[col_name],
-                                        mode='lines+markers',
-                                        name=f'{strike_val}',
-                                        line=dict(color=color, width=2),
-                                        marker=dict(size=4),
-                                        fill='tozeroy',
-                                        fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.1])}'
-                                    ))
-
-                                    # Reference lines
-                                    fig.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
-                                    fig.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
-                                    fig.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
-
-                                    # Get current PCR value
-                                    current_pcr = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
-
-                                    fig.update_layout(
-                                        title=f"{title_prefix}<br>₹{strike_val} ({zone})<br>PCR: {current_pcr:.2f}",
-                                        template='plotly_dark',
-                                        height=280,
-                                        showlegend=False,
-                                        margin=dict(l=10, r=10, t=70, b=30),
-                                        xaxis=dict(tickformat='%H:%M', title=''),
-                                        yaxis=dict(title='PCR'),
-                                        plot_bgcolor='#1e1e1e',
-                                        paper_bgcolor='#1e1e1e'
-                                    )
-                                    return fig, current_pcr
-                                return None, 0
-
-                            # OTM Strike (Left) - Higher strike
-                            with pcr_col1:
-                                fig_otm, pcr_otm = create_pcr_chart(otm_col, '#00aaff', '🔵 OTM')
-                                if fig_otm:
-                                    st.plotly_chart(fig_otm, use_container_width=True)
-                                    if pcr_otm > 1.2:
-                                        st.success("Bullish")
-                                    elif pcr_otm < 0.7:
-                                        st.error("Bearish")
-                                    else:
-                                        st.warning("Neutral")
-
-                            # ATM Strike (Middle)
-                            with pcr_col2:
-                                fig_atm, pcr_atm = create_pcr_chart(atm_col, '#ffaa00', '🟡 ATM')
-                                if fig_atm:
-                                    st.plotly_chart(fig_atm, use_container_width=True)
-                                    if pcr_atm > 1.2:
-                                        st.success("Bullish")
-                                    elif pcr_atm < 0.7:
-                                        st.error("Bearish")
-                                    else:
-                                        st.warning("Neutral")
-
-                            # ITM Strike (Right) - Lower strike
-                            with pcr_col3:
-                                fig_itm, pcr_itm = create_pcr_chart(itm_col, '#ff44ff', '🟣 ITM')
-                                if fig_itm:
-                                    st.plotly_chart(fig_itm, use_container_width=True)
-                                    if pcr_itm > 1.2:
-                                        st.success("Bullish")
-                                    elif pcr_itm < 0.7:
-                                        st.error("Bearish")
-                                    else:
-                                        st.warning("Neutral")
-
-                            # Show current PCR data table
-                            st.markdown("### Current PCR Values")
-                            pcr_display = pcr_df[['Strike', 'Zone', 'PCR', 'PCR_Signal']].copy()
-                            pcr_display['CE OI (L)'] = (pcr_df['openInterest_CE'] / 100000).round(2)
-                            pcr_display['PE OI (L)'] = (pcr_df['openInterest_PE'] / 100000).round(2)
-
-                            st.dataframe(pcr_display, use_container_width=True, hide_index=True)
-
-                            # Show data points count and clear button
-                            col_info1, col_info2 = st.columns([3, 1])
-                            with col_info1:
-                                st.caption(f"📈 Tracking {len(st.session_state.pcr_history)} data points | Auto-refresh builds history")
-                            with col_info2:
-                                if st.button("🗑️ Clear History"):
-                                    st.session_state.pcr_history = []
-                                    st.rerun()
-                        else:
-                            st.info("PCR history will build up as the app refreshes. Please wait...")
-                else:
-                    st.info("ATM strike not found for PCR analysis")
             except Exception as e:
-                st.warning(f"PCR graph unavailable: {str(e)}")
+                st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
+
+        # ALWAYS try to display the graph if we have history (even if current fetch failed)
+        if len(st.session_state.pcr_history) > 0:
+            try:
+                history_df = pd.DataFrame(st.session_state.pcr_history)
+
+                # Identify strike columns
+                strike_cols = [col for col in history_df.columns
+                              if col != 'time' and '_strike' not in col and '_zone' not in col]
+
+                # Separate by zone: OTM, ATM, ITM
+                otm_col = None
+                atm_col = None
+                itm_col = None
+
+                for col in strike_cols:
+                    if '_OTM' in col:
+                        otm_col = col
+                    elif '_ATM' in col:
+                        atm_col = col
+                    elif '_ITM' in col:
+                        itm_col = col
+
+                # Create 3 columns for side-by-side display
+                pcr_col1, pcr_col2, pcr_col3 = st.columns(3)
+
+                # OTM Strike (Left) - Higher strike
+                with pcr_col1:
+                    fig_otm, pcr_otm = create_pcr_chart(history_df, otm_col, '#00aaff', '🔵 OTM')
+                    if fig_otm:
+                        st.plotly_chart(fig_otm, use_container_width=True)
+                        if pcr_otm > 1.2:
+                            st.success("Bullish")
+                        elif pcr_otm < 0.7:
+                            st.error("Bearish")
+                        else:
+                            st.warning("Neutral")
+
+                # ATM Strike (Middle)
+                with pcr_col2:
+                    fig_atm, pcr_atm = create_pcr_chart(history_df, atm_col, '#ffaa00', '🟡 ATM')
+                    if fig_atm:
+                        st.plotly_chart(fig_atm, use_container_width=True)
+                        if pcr_atm > 1.2:
+                            st.success("Bullish")
+                        elif pcr_atm < 0.7:
+                            st.error("Bearish")
+                        else:
+                            st.warning("Neutral")
+
+                # ITM Strike (Right) - Lower strike
+                with pcr_col3:
+                    fig_itm, pcr_itm = create_pcr_chart(history_df, itm_col, '#ff44ff', '🟣 ITM')
+                    if fig_itm:
+                        st.plotly_chart(fig_itm, use_container_width=True)
+                        if pcr_itm > 1.2:
+                            st.success("Bullish")
+                        elif pcr_itm < 0.7:
+                            st.error("Bearish")
+                        else:
+                            st.warning("Neutral")
+
+                # Show current PCR data table (use last valid if current not available)
+                st.markdown("### Current PCR Values")
+                display_df = pcr_df if pcr_df is not None else st.session_state.pcr_last_valid_data
+                if display_df is not None:
+                    pcr_display = display_df[['Strike', 'Zone', 'PCR', 'PCR_Signal']].copy()
+                    pcr_display['CE OI (L)'] = (display_df['openInterest_CE'] / 100000).round(2)
+                    pcr_display['PE OI (L)'] = (display_df['openInterest_PE'] / 100000).round(2)
+                    st.dataframe(pcr_display, use_container_width=True, hide_index=True)
+
+                # Show status and clear button
+                col_info1, col_info2 = st.columns([3, 1])
+                with col_info1:
+                    status = "🟢 Live" if pcr_data_available else "🟡 Using cached history"
+                    st.caption(f"{status} | 📈 {len(st.session_state.pcr_history)} data points | History preserved on refresh failures")
+                with col_info2:
+                    if st.button("🗑️ Clear History"):
+                        st.session_state.pcr_history = []
+                        st.session_state.pcr_last_valid_data = None
+                        st.rerun()
+
+            except Exception as e:
+                st.warning(f"Error displaying PCR charts: {str(e)}")
+        else:
+            st.info("📊 PCR history will build up as the app refreshes. Please wait for data collection...")
 
         # Expandable section for detailed Greeks and raw values
         with st.expander("📊 Detailed Greeks & Raw Values"):
