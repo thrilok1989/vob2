@@ -2180,7 +2180,8 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     
     df_ce = pd.DataFrame(calls)
     df_pe = pd.DataFrame(puts)
-    df = pd.merge(df_ce, df_pe, on='strikePrice', suffixes=('_CE', '_PE')).sort_values('strikePrice')
+    # Sort descending: OTM (higher strikes) at top, ITM (lower strikes) at bottom
+    df = pd.merge(df_ce, df_pe, on='strikePrice', suffixes=('_CE', '_PE')).sort_values('strikePrice', ascending=False)
 
     column_mapping = {
         'last_price': 'lastPrice',
