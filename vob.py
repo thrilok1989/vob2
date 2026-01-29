@@ -2859,6 +2859,30 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
+    # Check if within market hours (8:30 AM to 3:45 PM IST)
+    ist = pytz.timezone('Asia/Kolkata')
+    current_time = datetime.now(ist)
+    market_open = current_time.replace(hour=8, minute=30, second=0, microsecond=0)
+    market_close = current_time.replace(hour=15, minute=45, second=0, microsecond=0)
+
+    is_market_hours = market_open <= current_time <= market_close
+    is_weekday = current_time.weekday() < 5  # Monday = 0, Friday = 4
+
+    if not (is_market_hours and is_weekday):
+        st.warning("⏰ **Market is Closed**")
+        if not is_weekday:
+            st.info(f"📅 Today is {current_time.strftime('%A')}. Markets are closed on weekends.")
+        else:
+            st.info(f"""
+            🕐 **Current Time:** {current_time.strftime('%H:%M:%S IST')}
+
+            📊 **Market Hours:** 8:30 AM - 3:45 PM IST (Monday to Friday)
+
+            The app will be fully functional during market hours.
+            """)
+        st.caption("You can still view cached data if available.")
+        # Don't return - allow viewing cached data, but skip live fetching
+
     # Initialize session state for PCR history (EARLY - before any potential failures)
     # This ensures history persists even when API fetches fail
     if 'pcr_history' not in st.session_state:
