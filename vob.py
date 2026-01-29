@@ -2514,16 +2514,16 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     else:
         df_summary['Max_Pain'] = '-'
 
-    # Define columns for display (select key columns to avoid clutter)
-    display_cols = ['Strike', 'Zone', 'Level', 'Max_Pain',
+    # Define columns for display (ordered as per user preference for entry judgment)
+    display_cols = ['Strike', 'PCR', 'Verdict', 'ChgOI_Bias', 'Volume_Bias', 'Max_Pain',
                     # Support/Resistance Levels
                     'Gamma_SR', 'Delta_SR', 'Depth_SR', 'OI_Wall', 'ChgOI_Wall',
-                    # Bias columns
-                    'LTP_Bias', 'OI_Bias', 'ChgOI_Bias', 'Volume_Bias',
-                    'Delta_Bias', 'Gamma_Bias', 'AskQty_Bias', 'BidQty_Bias', 'AskBid_Bias', 'IV_Bias',
+                    # Bias columns for analysis
+                    'Delta_Bias', 'Gamma_Bias', 'AskQty_Bias', 'BidQty_Bias', 'IV_Bias',
                     'DeltaExp', 'GammaExp', 'DVP_Bias', 'PressureBias', 'BidAskPressure',
-                    'BiasScore', 'Verdict', 'Operator_Entry', 'Scalp_Moment', 'FakeReal',
-                    'ChgOI_Cmp', 'OI_Cmp', 'PCR', 'PCR_Signal']
+                    # Decision columns
+                    'BiasScore', 'Operator_Entry', 'Scalp_Moment', 'FakeReal',
+                    'ChgOI_Cmp', 'OI_Cmp', 'LTP_Bias', 'PCR_Signal', 'Zone', 'OI_Bias']
 
     # Filter to only existing columns
     display_cols = [col for col in display_cols if col in df_summary.columns]
