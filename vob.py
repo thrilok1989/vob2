@@ -27,7 +27,7 @@ st.set_page_config(
 )
 
 # Auto-refresh every 80 seconds - MOVE THIS RIGHT AFTER PAGE CONFIG
-st_autorefresh(interval=80000, key="datarefresh")
+st_autorefresh(interval=30000, key="datarefresh")
 
 # Custom CSS for TradingView-like appearance + ATM highlighting
 st.markdown("""
