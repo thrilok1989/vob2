@@ -416,7 +416,7 @@ class DhanAPI:
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
     return get_dhan_expiry_list(underlying_scrip, underlying_seg)
 
-def get_dhan_option_chain(underlying_scrip: int, underlying_seg: str, expiry: str):
+def get_dhan_option_chain(underlying_scrip: int, underlying_seg: str, expiry: str, max_retries: int = 4):
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
         st.error("Dhan API credentials not configured")
         return None
@@ -431,15 +431,40 @@ def get_dhan_option_chain(underlying_scrip: int, underlying_seg: str, expiry: st
         "UnderlyingSeg": underlying_seg,
         "Expiry": expiry
     }
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error fetching Dhan option chain: {e}")
-        return None
 
-def get_dhan_expiry_list(underlying_scrip: int, underlying_seg: str):
+    # Retry logic with exponential backoff for rate limiting (429 errors)
+    import time
+    retry_delays = [2, 4, 8, 16]  # Exponential backoff: 2s, 4s, 8s, 16s
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+
+            # Handle rate limiting (429) with retry
+            if response.status_code == 429:
+                if attempt < max_retries:
+                    delay = retry_delays[attempt] if attempt < len(retry_delays) else retry_delays[-1]
+                    st.warning(f"⏳ Rate limited by Dhan API. Retrying in {delay}s... (Attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    st.error("❌ Rate limit exceeded after multiple retries. Please wait a moment and refresh.")
+                    return None
+
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries and "429" in str(e):
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else retry_delays[-1]
+                st.warning(f"⏳ Rate limited. Retrying in {delay}s... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            st.error(f"Error fetching Dhan option chain: {e}")
+            return None
+
+    return None
+
+def get_dhan_expiry_list(underlying_scrip: int, underlying_seg: str, max_retries: int = 4):
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
         st.error("Dhan API credentials not configured")
         return None
@@ -453,13 +478,38 @@ def get_dhan_expiry_list(underlying_scrip: int, underlying_seg: str):
         "UnderlyingScrip": underlying_scrip,
         "UnderlyingSeg": underlying_seg
     }
-    try:
-        response = requests.post(url, headers=headers, json=payload)
-        response.raise_for_status()
-        return response.json()
-    except requests.exceptions.RequestException as e:
-        st.error(f"Error fetching Dhan expiry list: {e}")
-        return None
+
+    # Retry logic with exponential backoff for rate limiting (429 errors)
+    import time
+    retry_delays = [2, 4, 8, 16]  # Exponential backoff: 2s, 4s, 8s, 16s
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.post(url, headers=headers, json=payload)
+
+            # Handle rate limiting (429) with retry
+            if response.status_code == 429:
+                if attempt < max_retries:
+                    delay = retry_delays[attempt] if attempt < len(retry_delays) else retry_delays[-1]
+                    st.warning(f"⏳ Rate limited by Dhan API. Retrying in {delay}s... (Attempt {attempt + 1}/{max_retries})")
+                    time.sleep(delay)
+                    continue
+                else:
+                    st.error("❌ Rate limit exceeded after multiple retries. Please wait a moment and refresh.")
+                    return None
+
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            if attempt < max_retries and "429" in str(e):
+                delay = retry_delays[attempt] if attempt < len(retry_delays) else retry_delays[-1]
+                st.warning(f"⏳ Rate limited. Retrying in {delay}s... (Attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+                continue
+            st.error(f"Error fetching Dhan expiry list: {e}")
+            return None
+
+    return None
 
 class PivotIndicator:
     """Higher Timeframe Pivot Support/Resistance Indicator"""
@@ -3484,9 +3534,9 @@ def main():
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
 
-        # ===== PCR TIME-SERIES GRAPHS FOR ATM ± 1 STRIKES (SIDE BY SIDE) =====
+        # ===== PCR TIME-SERIES GRAPHS FOR ATM ± 2 STRIKES (SIDE BY SIDE) =====
         st.markdown("---")
-        st.markdown("## 📊 PCR Analysis - Time Series (ATM ± 1)")
+        st.markdown("## 📊 PCR Analysis - Time Series (ATM ± 2)")
 
         # Helper function to create PCR chart (defined outside try block for reuse)
         def create_pcr_chart(history_df, col_name, color, title_prefix):
@@ -3541,9 +3591,9 @@ def main():
                 if len(atm_idx) > 0:
                     atm_pos = df_summary.index.get_loc(atm_idx[0])
 
-                    # Get ATM ± 1 strikes (3 strikes total)
-                    start_idx = max(0, atm_pos - 1)
-                    end_idx = min(len(df_summary), atm_pos + 2)
+                    # Get ATM ± 2 strikes (5 strikes total)
+                    start_idx = max(0, atm_pos - 2)
+                    end_idx = min(len(df_summary), atm_pos + 3)
 
                     pcr_df = df_summary.iloc[start_idx:end_idx][['Strike', 'Zone', 'PCR', 'PCR_Signal',
                                                                    'openInterest_CE', 'openInterest_PE']].copy()
@@ -3589,57 +3639,74 @@ def main():
                 strike_cols = [col for col in history_df.columns
                               if col != 'time' and '_strike' not in col and '_zone' not in col]
 
-                # Separate by zone: OTM, ATM, ITM
-                otm_col = None
+                # Separate by zone: OTM (multiple), ATM, ITM (multiple)
+                otm_cols = []
                 atm_col = None
-                itm_col = None
+                itm_cols = []
 
                 for col in strike_cols:
                     if '_OTM' in col:
-                        otm_col = col
+                        otm_cols.append(col)
                     elif '_ATM' in col:
                         atm_col = col
                     elif '_ITM' in col:
-                        itm_col = col
+                        itm_cols.append(col)
 
-                # Create 3 columns for side-by-side display
-                pcr_col1, pcr_col2, pcr_col3 = st.columns(3)
+                # Sort OTM by strike (descending - higher strikes first)
+                otm_cols.sort(key=lambda x: int(x.split('_')[0]), reverse=True)
+                # Sort ITM by strike (descending - higher strikes first)
+                itm_cols.sort(key=lambda x: int(x.split('_')[0]), reverse=True)
 
-                # OTM Strike (Left) - Higher strike
-                with pcr_col1:
-                    fig_otm, pcr_otm = create_pcr_chart(history_df, otm_col, '#00aaff', '🔵 OTM')
-                    if fig_otm:
-                        st.plotly_chart(fig_otm, use_container_width=True)
-                        if pcr_otm > 1.2:
-                            st.success("Bullish")
-                        elif pcr_otm < 0.7:
-                            st.error("Bearish")
+                # Create 5 columns for side-by-side display (ITM-2, ITM-1, ATM, OTM+1, OTM+2)
+                pcr_col1, pcr_col2, pcr_col3, pcr_col4, pcr_col5 = st.columns(5)
+
+                # Helper to display chart with signal
+                def display_pcr_with_signal(container, fig, pcr_val):
+                    if fig:
+                        container.plotly_chart(fig, use_container_width=True)
+                        if pcr_val > 1.2:
+                            container.success("Bullish")
+                        elif pcr_val < 0.7:
+                            container.error("Bearish")
                         else:
-                            st.warning("Neutral")
+                            container.warning("Neutral")
+
+                # ITM-2 Strike (Leftmost) - Lowest strike
+                with pcr_col1:
+                    if len(itm_cols) >= 2:
+                        fig_itm2, pcr_itm2 = create_pcr_chart(history_df, itm_cols[1], '#ff44ff', '🟣 ITM-2')
+                        display_pcr_with_signal(st, fig_itm2, pcr_itm2)
+                    else:
+                        st.info("ITM-2 N/A")
+
+                # ITM-1 Strike
+                with pcr_col2:
+                    if len(itm_cols) >= 1:
+                        fig_itm1, pcr_itm1 = create_pcr_chart(history_df, itm_cols[0], '#cc44cc', '🟣 ITM-1')
+                        display_pcr_with_signal(st, fig_itm1, pcr_itm1)
+                    else:
+                        st.info("ITM-1 N/A")
 
                 # ATM Strike (Middle)
-                with pcr_col2:
-                    fig_atm, pcr_atm = create_pcr_chart(history_df, atm_col, '#ffaa00', '🟡 ATM')
-                    if fig_atm:
-                        st.plotly_chart(fig_atm, use_container_width=True)
-                        if pcr_atm > 1.2:
-                            st.success("Bullish")
-                        elif pcr_atm < 0.7:
-                            st.error("Bearish")
-                        else:
-                            st.warning("Neutral")
-
-                # ITM Strike (Right) - Lower strike
                 with pcr_col3:
-                    fig_itm, pcr_itm = create_pcr_chart(history_df, itm_col, '#ff44ff', '🟣 ITM')
-                    if fig_itm:
-                        st.plotly_chart(fig_itm, use_container_width=True)
-                        if pcr_itm > 1.2:
-                            st.success("Bullish")
-                        elif pcr_itm < 0.7:
-                            st.error("Bearish")
-                        else:
-                            st.warning("Neutral")
+                    fig_atm, pcr_atm = create_pcr_chart(history_df, atm_col, '#ffaa00', '🟡 ATM')
+                    display_pcr_with_signal(st, fig_atm, pcr_atm)
+
+                # OTM+1 Strike
+                with pcr_col4:
+                    if len(otm_cols) >= 1:
+                        fig_otm1, pcr_otm1 = create_pcr_chart(history_df, otm_cols[-1], '#00aaff', '🔵 OTM+1')
+                        display_pcr_with_signal(st, fig_otm1, pcr_otm1)
+                    else:
+                        st.info("OTM+1 N/A")
+
+                # OTM+2 Strike (Rightmost) - Highest strike
+                with pcr_col5:
+                    if len(otm_cols) >= 2:
+                        fig_otm2, pcr_otm2 = create_pcr_chart(history_df, otm_cols[-2], '#0088dd', '🔵 OTM+2')
+                        display_pcr_with_signal(st, fig_otm2, pcr_otm2)
+                    else:
+                        st.info("OTM+2 N/A")
 
                 # Show current PCR data table (use last valid if current not available)
                 st.markdown("### Current PCR Values")
