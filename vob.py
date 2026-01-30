@@ -1800,6 +1800,7 @@ weights = {
     "Volume_Bias": 1,
     "Delta_Bias": 1,
     "Gamma_Bias": 1,
+    "Theta_Bias": 1,
     "AskQty_Bias": 1,
     "BidQty_Bias": 1,
     "AskBid_Bias": 1,
@@ -2415,6 +2416,9 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         # Gamma Bias: Higher CE Gamma = Bullish
         row_data["Gamma_Bias"] = "Bullish" if row.get('Gamma_CE', 0) > row.get('Gamma_PE', 0) else "Bearish"
 
+        # Theta Bias: Higher CE Theta (less negative) = Bullish (CE decays slower)
+        row_data["Theta_Bias"] = "Bullish" if row.get('Theta_CE', 0) > row.get('Theta_PE', 0) else "Bearish"
+
         # ===== Order Flow Bias =====
         # AskQty Bias: Higher PE Ask = Bullish (more PE sellers)
         row_data["AskQty_Bias"] = "Bullish" if row.get('askQty_PE', 0) > row.get('askQty_CE', 0) else "Bearish"
@@ -2665,7 +2669,7 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
                     # Support/Resistance Levels
                     'Gamma_SR', 'Delta_SR', 'Depth_SR', 'OI_Wall', 'ChgOI_Wall',
                     # Bias columns for analysis
-                    'Delta_Bias', 'Gamma_Bias', 'AskQty_Bias', 'BidQty_Bias', 'IV_Bias',
+                    'Delta_Bias', 'Gamma_Bias', 'Theta_Bias', 'AskQty_Bias', 'BidQty_Bias', 'IV_Bias',
                     'DeltaExp', 'GammaExp', 'DVP_Bias', 'PressureBias', 'BidAskPressure',
                     # Decision columns
                     'BiasScore', 'Operator_Entry', 'Scalp_Moment', 'FakeReal',
