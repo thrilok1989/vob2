@@ -1561,6 +1561,101 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                     st.error(f"Failed to send notification: {e}")
 
 
+def check_atm_verdict_alert(df_summary, underlying_price):
+    """Send Telegram alert when ATM strike verdict is Strong Bullish or Strong Bearish."""
+    if df_summary is None or len(df_summary) == 0 or not underlying_price:
+        return
+
+    # Find ATM strike row
+    atm_data = df_summary[df_summary['Zone'] == 'ATM']
+    if atm_data.empty:
+        return
+
+    row = atm_data.iloc[0]
+    verdict = row.get('Verdict', 'Neutral')
+    atm_strike = row.get('Strike', 0)
+    bias_score = row.get('BiasScore', 0)
+
+    # Only alert for Strong Bullish or Strong Bearish
+    if verdict not in ['Strong Bullish', 'Strong Bearish']:
+        return
+
+    # Avoid duplicate alerts using session state
+    alert_key = f"atm_verdict_{atm_strike}_{verdict}"
+    if 'last_atm_verdict_alert' not in st.session_state:
+        st.session_state.last_atm_verdict_alert = None
+
+    # Check if this is a new alert (different from last sent)
+    if st.session_state.last_atm_verdict_alert == alert_key:
+        return  # Same alert already sent, skip
+
+    # Get additional bias details
+    oi_bias = row.get('OI_Bias', 'N/A')
+    chgoi_bias = row.get('ChgOI_Bias', 'N/A')
+    volume_bias = row.get('Volume_Bias', 'N/A')
+    delta_exp = row.get('DeltaExp', 'N/A')
+    gamma_exp = row.get('GammaExp', 'N/A')
+    pressure_bias = row.get('PressureBias', 'N/A')
+    operator_entry = row.get('Operator_Entry', 'N/A')
+    scalp_moment = row.get('Scalp_Moment', 'N/A')
+
+    # Get OI and ChgOI values
+    ce_oi = row.get('openInterest_CE', 0)
+    pe_oi = row.get('openInterest_PE', 0)
+    ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
+    pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
+
+    # Build the message
+    if verdict == 'Strong Bullish':
+        emoji = "🟢🟢🟢"
+        direction = "BULLISH"
+        suggested_option = "CE"
+    else:
+        emoji = "🔴🔴🔴"
+        direction = "BEARISH"
+        suggested_option = "PE"
+
+    message = f"""
+{emoji} <b>ATM STRIKE STRONG {direction} ALERT</b> {emoji}
+
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+🎯 <b>ATM Strike:</b> {atm_strike}
+📊 <b>Verdict:</b> {verdict} (Score: {bias_score})
+
+<b>📈 BIAS BREAKDOWN:</b>
+• OI Bias: {oi_bias}
+• ChgOI Bias: {chgoi_bias}
+• Volume Bias: {volume_bias}
+• Delta Exp: {delta_exp}
+• Gamma Exp: {gamma_exp}
+• Pressure: {pressure_bias}
+
+<b>📊 OI DATA:</b>
+• CE OI: {ce_oi/100000:.1f}L | PE OI: {pe_oi/100000:.1f}L
+• CE ΔOI: {ce_chg_oi/1000:.1f}K | PE ΔOI: {pe_chg_oi/1000:.1f}K
+
+<b>⚡ SIGNALS:</b>
+• Operator Entry: {operator_entry}
+• Scalp/Momentum: {scalp_moment}
+
+📋 <b>SUGGESTED REVIEW:</b>
+• Strike: {atm_strike} {suggested_option}
+• Manual verification required
+
+🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
+"""
+
+    try:
+        send_telegram_message_sync(message)
+        st.session_state.last_atm_verdict_alert = alert_key
+        if verdict == 'Strong Bullish':
+            st.success(f"🟢 ATM Strong Bullish alert sent for strike {atm_strike}!")
+        else:
+            st.success(f"🔴 ATM Strong Bearish alert sent for strike {atm_strike}!")
+    except Exception as e:
+        st.error(f"Failed to send ATM verdict alert: {e}")
+
+
 def calculate_exact_time_to_expiry(expiry_date_str):
     """Calculate exact time to expiry in years (days + hours)"""
     try:
@@ -3330,6 +3425,10 @@ def main():
             # Check for trading signals if enabled
             if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
                 check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
+
+            # Check ATM strike verdict for Strong Bullish/Bearish alerts
+            if df_summary is not None and len(df_summary) > 0:
+                check_atm_verdict_alert(df_summary, underlying_price)
         else:
             option_data = None
 
