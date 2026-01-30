@@ -2416,8 +2416,8 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         # Gamma Bias: Higher CE Gamma = Bullish
         row_data["Gamma_Bias"] = "Bullish" if row.get('Gamma_CE', 0) > row.get('Gamma_PE', 0) else "Bearish"
 
-        # Theta Bias: Higher CE Theta (less negative) = Bullish (CE decays slower)
-        row_data["Theta_Bias"] = "Bullish" if row.get('Theta_CE', 0) > row.get('Theta_PE', 0) else "Bearish"
+        # Theta Bias: Lower CE Theta (more negative) = Bullish
+        row_data["Theta_Bias"] = "Bullish" if row.get('Theta_CE', 0) < row.get('Theta_PE', 0) else "Bearish"
 
         # ===== Order Flow Bias =====
         # AskQty Bias: Higher PE Ask = Bullish (more PE sellers)
