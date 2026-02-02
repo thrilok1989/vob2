@@ -3547,6 +3547,16 @@ def main():
             """Helper to create individual PCR chart - col_name is now just strike price"""
             if col_name and col_name in history_df.columns:
                 strike_val = col_name  # Column name is now just the strike price
+                pcr_values = history_df[col_name].dropna()
+
+                # Calculate dynamic y-axis range based on PCR values (±0.5)
+                if len(pcr_values) > 0:
+                    pcr_min = pcr_values.min()
+                    pcr_max = pcr_values.max()
+                    y_min = max(0, pcr_min - 0.5)  # Don't go below 0
+                    y_max = pcr_max + 0.5
+                else:
+                    y_min, y_max = 0.5, 1.5  # Default range
 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
@@ -3555,15 +3565,16 @@ def main():
                     mode='lines+markers',
                     name=f'₹{strike_val}',
                     line=dict(color=color, width=2),
-                    marker=dict(size=4),
-                    fill='tozeroy',
-                    fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.1])}'
+                    marker=dict(size=4)
                 ))
 
-                # Reference lines
-                fig.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
-                fig.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
-                fig.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+                # Reference lines (only show if within y-axis range)
+                if y_min <= 1.0 <= y_max:
+                    fig.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
+                if y_min <= 1.2 <= y_max:
+                    fig.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
+                if y_min <= 0.7 <= y_max:
+                    fig.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
 
                 # Get current PCR value
                 current_pcr = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
@@ -3575,7 +3586,7 @@ def main():
                     showlegend=False,
                     margin=dict(l=10, r=10, t=70, b=30),
                     xaxis=dict(tickformat='%H:%M', title=''),
-                    yaxis=dict(title='PCR'),
+                    yaxis=dict(title='PCR', range=[y_min, y_max]),
                     plot_bgcolor='#1e1e1e',
                     paper_bgcolor='#1e1e1e'
                 )
