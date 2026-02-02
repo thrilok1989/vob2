@@ -3544,17 +3544,16 @@ def main():
 
         # Helper function to create PCR chart (defined outside try block for reuse)
         def create_pcr_chart(history_df, col_name, color, title_prefix):
-            """Helper to create individual PCR chart"""
+            """Helper to create individual PCR chart - col_name is now just strike price"""
             if col_name and col_name in history_df.columns:
-                strike_val = col_name.split('_')[0]
-                zone = col_name.split('_')[1]
+                strike_val = col_name  # Column name is now just the strike price
 
                 fig = go.Figure()
                 fig.add_trace(go.Scatter(
                     x=history_df['time'],
                     y=history_df[col_name],
                     mode='lines+markers',
-                    name=f'{strike_val}',
+                    name=f'₹{strike_val}',
                     line=dict(color=color, width=2),
                     marker=dict(size=4),
                     fill='tozeroy',
@@ -3570,7 +3569,7 @@ def main():
                 current_pcr = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
 
                 fig.update_layout(
-                    title=f"{title_prefix}<br>₹{strike_val} ({zone})<br>PCR: {current_pcr:.2f}",
+                    title=f"{title_prefix}<br>₹{strike_val}<br>PCR: {current_pcr:.2f}",
                     template='plotly_dark',
                     height=280,
                     showlegend=False,
@@ -3611,11 +3610,16 @@ def main():
                         ist = pytz.timezone('Asia/Kolkata')
                         current_time = datetime.now(ist)
 
-                        # Add current PCR data to history
+                        # Add current PCR data to history - store by STRIKE PRICE ONLY (not zone)
+                        # This preserves history even when strikes change zone (OTM->ATM->ITM)
                         pcr_entry = {'time': current_time}
                         for _, row in pcr_df.iterrows():
-                            strike_label = f"{int(row['Strike'])}_{row['Zone']}"
+                            strike_label = str(int(row['Strike']))  # Store by strike only
                             pcr_entry[strike_label] = row['PCR']
+
+                        # Store current ATM ±2 strike positions for display
+                        current_strikes = pcr_df['Strike'].tolist()
+                        st.session_state.pcr_current_strikes = [int(s) for s in current_strikes]
 
                         # Check if we should add new entry (avoid duplicates within 30 seconds)
                         should_add = True
@@ -3639,27 +3643,15 @@ def main():
             try:
                 history_df = pd.DataFrame(st.session_state.pcr_history)
 
-                # Identify strike columns
-                strike_cols = [col for col in history_df.columns
-                              if col != 'time' and '_strike' not in col and '_zone' not in col]
+                # Get current ATM ±2 strikes (stored by strike price only)
+                current_strikes = getattr(st.session_state, 'pcr_current_strikes', [])
 
-                # Separate by zone: OTM (multiple), ATM, ITM (multiple)
-                otm_cols = []
-                atm_col = None
-                itm_cols = []
+                # If no current strikes available, try to get from last valid data
+                if not current_strikes and st.session_state.pcr_last_valid_data is not None:
+                    current_strikes = [int(s) for s in st.session_state.pcr_last_valid_data['Strike'].tolist()]
 
-                for col in strike_cols:
-                    if '_OTM' in col:
-                        otm_cols.append(col)
-                    elif '_ATM' in col:
-                        atm_col = col
-                    elif '_ITM' in col:
-                        itm_cols.append(col)
-
-                # Sort OTM by strike (descending - higher strikes first)
-                otm_cols.sort(key=lambda x: int(x.split('_')[0]), reverse=True)
-                # Sort ITM by strike (descending - higher strikes first)
-                itm_cols.sort(key=lambda x: int(x.split('_')[0]), reverse=True)
+                # Sort strikes (ascending: ITM-2, ITM-1, ATM, OTM+1, OTM+2)
+                current_strikes = sorted(current_strikes)
 
                 # Create 5 columns for side-by-side display (ITM-2, ITM-1, ATM, OTM+1, OTM+2)
                 pcr_col1, pcr_col2, pcr_col3, pcr_col4, pcr_col5 = st.columns(5)
@@ -3675,42 +3667,32 @@ def main():
                         else:
                             container.warning("Neutral")
 
-                # ITM-2 Strike (Leftmost) - Lowest strike
-                with pcr_col1:
-                    if len(itm_cols) >= 2:
-                        fig_itm2, pcr_itm2 = create_pcr_chart(history_df, itm_cols[1], '#ff44ff', '🟣 ITM-2')
-                        display_pcr_with_signal(st, fig_itm2, pcr_itm2)
-                    else:
-                        st.info("ITM-2 N/A")
+                # Get current zone info from pcr_df or last valid data
+                zone_info = {}
+                zone_df = pcr_df if pcr_df is not None else st.session_state.pcr_last_valid_data
+                if zone_df is not None:
+                    for _, row in zone_df.iterrows():
+                        zone_info[int(row['Strike'])] = row['Zone']
 
-                # ITM-1 Strike
-                with pcr_col2:
-                    if len(itm_cols) >= 1:
-                        fig_itm1, pcr_itm1 = create_pcr_chart(history_df, itm_cols[0], '#cc44cc', '🟣 ITM-1')
-                        display_pcr_with_signal(st, fig_itm1, pcr_itm1)
-                    else:
-                        st.info("ITM-1 N/A")
+                # Display 5 strikes: position 0=ITM-2, 1=ITM-1, 2=ATM, 3=OTM+1, 4=OTM+2
+                position_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+                position_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+                columns = [pcr_col1, pcr_col2, pcr_col3, pcr_col4, pcr_col5]
 
-                # ATM Strike (Middle)
-                with pcr_col3:
-                    fig_atm, pcr_atm = create_pcr_chart(history_df, atm_col, '#ffaa00', '🟡 ATM')
-                    display_pcr_with_signal(st, fig_atm, pcr_atm)
+                for i, col in enumerate(columns):
+                    with col:
+                        if i < len(current_strikes):
+                            strike = current_strikes[i]
+                            strike_col = str(strike)
+                            zone = zone_info.get(strike, position_labels[i].split()[-1])
 
-                # OTM+1 Strike
-                with pcr_col4:
-                    if len(otm_cols) >= 1:
-                        fig_otm1, pcr_otm1 = create_pcr_chart(history_df, otm_cols[-1], '#00aaff', '🔵 OTM+1')
-                        display_pcr_with_signal(st, fig_otm1, pcr_otm1)
-                    else:
-                        st.info("OTM+1 N/A")
-
-                # OTM+2 Strike (Rightmost) - Highest strike
-                with pcr_col5:
-                    if len(otm_cols) >= 2:
-                        fig_otm2, pcr_otm2 = create_pcr_chart(history_df, otm_cols[-2], '#0088dd', '🔵 OTM+2')
-                        display_pcr_with_signal(st, fig_otm2, pcr_otm2)
-                    else:
-                        st.info("OTM+2 N/A")
+                            if strike_col in history_df.columns:
+                                fig, pcr_val = create_pcr_chart(history_df, strike_col, position_colors[i], f'{position_labels[i]}')
+                                display_pcr_with_signal(st, fig, pcr_val)
+                            else:
+                                st.info(f"₹{strike} - Building history...")
+                        else:
+                            st.info(f"{position_labels[i]} N/A")
 
                 # Show current PCR data table (use last valid if current not available)
                 st.markdown("### Current PCR Values")
