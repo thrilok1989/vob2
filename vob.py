@@ -3344,11 +3344,13 @@ def main():
 
     # Initialize session state for GEX (Gamma Exposure) tracking
     if 'gex_history' not in st.session_state:
-        st.session_state.gex_history = []
+        st.session_state.gex_history = []  # Per-strike GEX history like PCR
     if 'gex_last_valid_data' not in st.session_state:
         st.session_state.gex_last_valid_data = None
     if 'last_gex_alert' not in st.session_state:
         st.session_state.last_gex_alert = None
+    if 'gex_current_strikes' not in st.session_state:
+        st.session_state.gex_current_strikes = []
 
     # Initialize Supabase
     try:
@@ -4252,45 +4254,165 @@ def main():
                         - **Gamma Flip**: Level where dealers switch from long to short gamma
                         """)
 
-                    # ===== GEX Time Series (if history available) =====
-                    if len(st.session_state.gex_history) > 1:
-                        st.markdown("### 📈 GEX Time Series")
+                    # ===== GEX TIME-SERIES PER STRIKE (Like PCR - 5 columns) =====
+                    st.markdown("### 📈 GEX Time Series (ATM ± 2 Strikes)")
 
-                        gex_history_df = pd.DataFrame(st.session_state.gex_history)
+                    # Store GEX per strike in history (like PCR)
+                    ist = pytz.timezone('Asia/Kolkata')
+                    current_time = datetime.now(ist)
 
-                        fig_gex_ts = go.Figure()
+                    # Build GEX entry with per-strike values
+                    gex_entry = {'time': current_time, 'total_gex': gex_data['total_gex']}
+                    for _, row in gex_df.iterrows():
+                        strike_label = str(int(row['Strike']))
+                        gex_entry[strike_label] = row['Net_GEX']
 
-                        fig_gex_ts.add_trace(go.Scatter(
-                            x=gex_history_df['time'],
-                            y=gex_history_df['total_gex'],
-                            mode='lines+markers',
-                            name='Total GEX',
-                            line=dict(color='#00aaff', width=2),
-                            fill='tozeroy',
-                            fillcolor='rgba(0, 170, 255, 0.1)'
-                        ))
+                    # Store current strikes for display
+                    current_gex_strikes = [int(row['Strike']) for _, row in gex_df.iterrows()]
+                    st.session_state.gex_current_strikes = sorted(current_gex_strikes)
 
-                        # Add zero line
-                        fig_gex_ts.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                    # Check if we should add new entry (avoid duplicates within 30 seconds)
+                    should_add_gex = True
+                    if st.session_state.gex_history:
+                        last_gex_entry = st.session_state.gex_history[-1]
+                        time_diff = (current_time - last_gex_entry['time']).total_seconds()
+                        if time_diff < 30:
+                            should_add_gex = False
 
-                        fig_gex_ts.update_layout(
-                            title="Total GEX Over Time",
-                            template='plotly_dark',
-                            height=300,
-                            showlegend=False,
-                            xaxis=dict(tickformat='%H:%M', title='Time'),
-                            yaxis_title="Net GEX (Lakhs)",
-                            plot_bgcolor='#1e1e1e',
-                            paper_bgcolor='#1e1e1e'
-                        )
+                    if should_add_gex:
+                        st.session_state.gex_history.append(gex_entry)
+                        # Keep only last 200 entries
+                        if len(st.session_state.gex_history) > 200:
+                            st.session_state.gex_history = st.session_state.gex_history[-200:]
 
-                        st.plotly_chart(fig_gex_ts, use_container_width=True)
+                    # Helper function to create individual GEX chart (like PCR)
+                    def create_gex_chart(history_df, col_name, color, title_prefix):
+                        """Helper to create individual GEX chart per strike"""
+                        if col_name and col_name in history_df.columns:
+                            strike_val = col_name
 
-                        # Clear GEX history button
-                        if st.button("🗑️ Clear GEX History"):
-                            st.session_state.gex_history = []
-                            st.session_state.gex_last_valid_data = None
-                            st.rerun()
+                            fig = go.Figure()
+                            fig.add_trace(go.Scatter(
+                                x=history_df['time'],
+                                y=history_df[col_name],
+                                mode='lines+markers',
+                                name=f'₹{strike_val}',
+                                line=dict(color=color, width=2),
+                                marker=dict(size=4),
+                                fill='tozeroy',
+                                fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.15])}'
+                            ))
+
+                            # Reference line at zero (critical for GEX interpretation)
+                            fig.add_hline(y=0, line_dash="dash", line_color="white", line_width=2)
+                            # Positive threshold (pinning zone)
+                            fig.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1)
+                            # Negative threshold (acceleration zone)
+                            fig.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1)
+
+                            # Get current GEX value
+                            current_gex = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
+
+                            fig.update_layout(
+                                title=f"{title_prefix}<br>₹{strike_val}<br>GEX: {current_gex:+.1f}L",
+                                template='plotly_dark',
+                                height=280,
+                                showlegend=False,
+                                margin=dict(l=10, r=10, t=70, b=30),
+                                xaxis=dict(tickformat='%H:%M', title=''),
+                                yaxis=dict(title='GEX (L)'),
+                                plot_bgcolor='#1e1e1e',
+                                paper_bgcolor='#1e1e1e'
+                            )
+                            return fig, current_gex
+                        return None, 0
+
+                    # Display GEX charts if we have history
+                    if len(st.session_state.gex_history) > 0:
+                        try:
+                            gex_history_df = pd.DataFrame(st.session_state.gex_history)
+
+                            # Get current strikes
+                            current_strikes = st.session_state.gex_current_strikes
+                            if not current_strikes:
+                                current_strikes = sorted([int(row['Strike']) for _, row in gex_df.iterrows()])
+
+                            # Create 5 columns for side-by-side display
+                            gex_col1, gex_col2, gex_col3, gex_col4, gex_col5 = st.columns(5)
+
+                            # Helper to display chart with signal
+                            def display_gex_with_signal(container, fig, gex_val):
+                                if fig:
+                                    container.plotly_chart(fig, use_container_width=True)
+                                    if gex_val > 10:
+                                        container.success("📍 Pin Zone")
+                                    elif gex_val < -10:
+                                        container.error("⚡ Accel Zone")
+                                    else:
+                                        container.warning("➡️ Neutral")
+
+                            # Get zone info from gex_df
+                            zone_info = {}
+                            for _, row in gex_df.iterrows():
+                                zone_info[int(row['Strike'])] = row['Zone']
+
+                            # Display 5 strikes: ITM-2, ITM-1, ATM, OTM+1, OTM+2
+                            position_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+                            position_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+                            columns = [gex_col1, gex_col2, gex_col3, gex_col4, gex_col5]
+
+                            for i, col in enumerate(columns):
+                                with col:
+                                    if i < len(current_strikes):
+                                        strike = current_strikes[i]
+                                        strike_col = str(strike)
+
+                                        if strike_col in gex_history_df.columns:
+                                            fig, gex_val = create_gex_chart(gex_history_df, strike_col, position_colors[i], f'{position_labels[i]}')
+                                            display_gex_with_signal(st, fig, gex_val)
+                                        else:
+                                            st.info(f"₹{strike} - Building history...")
+                                    else:
+                                        st.info(f"{position_labels[i]} N/A")
+
+                            # Show current GEX data table
+                            st.markdown("### Current GEX Values")
+                            gex_display = gex_df[['Strike', 'Zone', 'Call_GEX', 'Put_GEX', 'Net_GEX']].copy()
+                            gex_display['Strike'] = gex_display['Strike'].apply(lambda x: f"₹{x:.0f}")
+
+                            # Color coding for table
+                            def style_gex_val(val):
+                                try:
+                                    v = float(val)
+                                    if v > 10:
+                                        return 'background-color: #00ff8840; color: white'
+                                    elif v > 0:
+                                        return 'background-color: #00ff8820; color: white'
+                                    elif v < -10:
+                                        return 'background-color: #ff444440; color: white'
+                                    elif v < 0:
+                                        return 'background-color: #ff444420; color: white'
+                                    return ''
+                                except:
+                                    return ''
+
+                            styled_gex_table = gex_display.style.applymap(style_gex_val, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
+                            st.dataframe(styled_gex_table, use_container_width=True, hide_index=True)
+
+                            # Show status and clear button
+                            gex_info1, gex_info2 = st.columns([3, 1])
+                            with gex_info1:
+                                st.caption(f"🟢 Live | 📈 {len(st.session_state.gex_history)} data points | GEX > 10 = Pin Zone | GEX < -10 = Acceleration Zone")
+                            with gex_info2:
+                                if st.button("🗑️ Clear GEX History"):
+                                    st.session_state.gex_history = []
+                                    st.session_state.gex_last_valid_data = None
+                                    st.rerun()
+
+                        except Exception as e:
+                            st.warning(f"Error displaying GEX charts: {str(e)}")
+                    else:
+                        st.info("📊 GEX history will build up as the app refreshes. Please wait for data collection...")
 
                 else:
                     st.warning("Unable to calculate GEX. Check option chain data.")
