@@ -1706,6 +1706,309 @@ def check_atm_verdict_alert(df_summary, underlying_price):
         st.error(f"Failed to send ATM verdict alert: {e}")
 
 
+def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
+    """
+    Calculate Net Gamma Exposure (GEX) from dealer's perspective.
+
+    Dealers are SHORT options (they sell to retail) so their gamma exposure is INVERTED.
+    - Dealer SHORT Call = NEGATIVE gamma exposure (dealers sell into rallies)
+    - Dealer SHORT Put = POSITIVE gamma exposure (dealers buy into selloffs)
+
+    Net GEX = (CE_Gamma × CE_OI × -1) + (PE_Gamma × PE_OI × 1)
+            = -GammaExp_CE + GammaExp_PE
+
+    Positive Net GEX = Dealers long gamma = Price tends to PIN/REVERT (chop day)
+    Negative Net GEX = Dealers short gamma = Price tends to ACCELERATE (trend day)
+
+    Returns: dict with gex_data, gamma_flip_level, total_gex, gex_interpretation
+    """
+    if df_summary is None or df_summary.empty:
+        return None
+
+    try:
+        gex_data = []
+
+        for _, row in df_summary.iterrows():
+            strike = row.get('Strike', 0)
+            gamma_ce = row.get('Gamma_CE', 0) or 0
+            gamma_pe = row.get('Gamma_PE', 0) or 0
+            oi_ce = row.get('openInterest_CE', 0) or 0
+            oi_pe = row.get('openInterest_PE', 0) or 0
+
+            # Dealer's perspective: Short options
+            # When dealer is short call, price rise = dealer sells (negative gamma effect)
+            # When dealer is short put, price drop = dealer buys (positive gamma effect)
+            call_gex = -1 * gamma_ce * oi_ce * contract_multiplier * spot_price / 100000  # in Lakhs
+            put_gex = gamma_pe * oi_pe * contract_multiplier * spot_price / 100000  # in Lakhs
+            net_gex = call_gex + put_gex
+
+            gex_data.append({
+                'Strike': strike,
+                'Call_GEX': round(call_gex, 2),
+                'Put_GEX': round(put_gex, 2),
+                'Net_GEX': round(net_gex, 2),
+                'Zone': row.get('Zone', '-')
+            })
+
+        gex_df = pd.DataFrame(gex_data)
+
+        # Calculate total Net GEX
+        total_gex = gex_df['Net_GEX'].sum()
+
+        # Find Gamma Flip Level (where Net GEX crosses zero)
+        # Sort by strike price
+        gex_df_sorted = gex_df.sort_values('Strike')
+        gamma_flip_level = None
+        gamma_flip_direction = None
+
+        for i in range(len(gex_df_sorted) - 1):
+            current_gex = gex_df_sorted.iloc[i]['Net_GEX']
+            next_gex = gex_df_sorted.iloc[i + 1]['Net_GEX']
+            current_strike = gex_df_sorted.iloc[i]['Strike']
+            next_strike = gex_df_sorted.iloc[i + 1]['Strike']
+
+            # Check for sign change
+            if current_gex * next_gex < 0:
+                # Linear interpolation to find exact flip level
+                gamma_flip_level = current_strike + (next_strike - current_strike) * abs(current_gex) / (abs(current_gex) + abs(next_gex))
+                gamma_flip_direction = "Positive above" if current_gex < 0 else "Negative above"
+                break
+
+        # GEX Interpretation
+        if total_gex > 50:
+            gex_interpretation = "STRONG PIN - Dealers long gamma, price likely to revert/chop"
+            gex_signal = "Pin/Chop"
+            gex_color = "#00ff88"  # Green
+        elif total_gex > 0:
+            gex_interpretation = "MILD PIN - Slight mean reversion tendency"
+            gex_signal = "Range"
+            gex_color = "#90EE90"  # Light green
+        elif total_gex > -50:
+            gex_interpretation = "MILD TREND - Slight directional bias possible"
+            gex_signal = "Trending"
+            gex_color = "#FFD700"  # Yellow
+        else:
+            gex_interpretation = "STRONG TREND - Dealers short gamma, violent moves possible"
+            gex_signal = "Breakout"
+            gex_color = "#ff4444"  # Red
+
+        # Find max positive and negative GEX strikes (magnets and repellers)
+        max_positive_idx = gex_df['Net_GEX'].idxmax()
+        max_negative_idx = gex_df['Net_GEX'].idxmin()
+
+        gex_magnet = gex_df.loc[max_positive_idx, 'Strike'] if gex_df.loc[max_positive_idx, 'Net_GEX'] > 0 else None
+        gex_repeller = gex_df.loc[max_negative_idx, 'Strike'] if gex_df.loc[max_negative_idx, 'Net_GEX'] < 0 else None
+
+        return {
+            'gex_df': gex_df,
+            'total_gex': round(total_gex, 2),
+            'gamma_flip_level': round(gamma_flip_level, 2) if gamma_flip_level else None,
+            'gamma_flip_direction': gamma_flip_direction,
+            'gex_interpretation': gex_interpretation,
+            'gex_signal': gex_signal,
+            'gex_color': gex_color,
+            'gex_magnet': gex_magnet,
+            'gex_repeller': gex_repeller,
+            'spot_vs_flip': "Above Gamma Flip" if gamma_flip_level and spot_price > gamma_flip_level else "Below Gamma Flip" if gamma_flip_level else "N/A"
+        }
+
+    except Exception as e:
+        return None
+
+
+def check_gex_alert(gex_data, df_summary, underlying_price):
+    """
+    Send Telegram alert when GEX changes significantly (ΔGEX alert).
+    Triggers on:
+    1. Total GEX sign flip (positive to negative or vice versa)
+    2. Large GEX change (>30% in 5 minutes)
+    3. Price crosses Gamma Flip level
+    """
+    if gex_data is None or 'gex_history' not in st.session_state:
+        return
+
+    try:
+        ist = pytz.timezone('Asia/Kolkata')
+        current_time = datetime.now(ist)
+
+        # Store current GEX in history
+        gex_entry = {
+            'time': current_time,
+            'total_gex': gex_data['total_gex'],
+            'gamma_flip': gex_data['gamma_flip_level'],
+            'spot': underlying_price,
+            'signal': gex_data['gex_signal']
+        }
+
+        # Check if we should add (avoid duplicates within 30 seconds)
+        should_add = True
+        if st.session_state.gex_history:
+            last_entry = st.session_state.gex_history[-1]
+            time_diff = (current_time - last_entry['time']).total_seconds()
+            if time_diff < 30:
+                should_add = False
+
+        if should_add:
+            st.session_state.gex_history.append(gex_entry)
+            # Keep only last 100 entries
+            if len(st.session_state.gex_history) > 100:
+                st.session_state.gex_history = st.session_state.gex_history[-100:]
+
+        # Need at least 2 entries to detect change
+        if len(st.session_state.gex_history) < 2:
+            return
+
+        prev_entry = st.session_state.gex_history[-2]
+
+        # Calculate ΔGEX (change in GEX)
+        delta_gex = gex_data['total_gex'] - prev_entry['total_gex']
+        gex_pct_change = abs(delta_gex / prev_entry['total_gex'] * 100) if prev_entry['total_gex'] != 0 else 0
+
+        # Detect alert conditions
+        alert_triggered = False
+        alert_type = None
+        alert_message = None
+
+        # Condition 1: GEX sign flip
+        if prev_entry['total_gex'] * gex_data['total_gex'] < 0:
+            alert_triggered = True
+            alert_type = "GEX SIGN FLIP"
+            flip_direction = "Positive → Negative" if prev_entry['total_gex'] > 0 else "Negative → Positive"
+            alert_message = f"""
+🔄 <b>GEX SIGN FLIP ALERT</b> 🔄
+
+📊 <b>Gamma Exposure Flipped:</b> {flip_direction}
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+
+<b>Previous GEX:</b> {prev_entry['total_gex']:.2f}L ({prev_entry['signal']})
+<b>Current GEX:</b> {gex_data['total_gex']:.2f}L ({gex_data['gex_signal']})
+<b>ΔGEX:</b> {delta_gex:+.2f}L
+
+<b>🎯 Market Implication:</b>
+{gex_data['gex_interpretation']}
+
+⚡ <b>ACTION:</b> {'Expect acceleration/trend moves!' if gex_data['total_gex'] < 0 else 'Expect mean reversion/pin!'}
+
+🕐 Time: {current_time.strftime('%H:%M:%S IST')}
+"""
+
+        # Condition 2: Large GEX change (>30%)
+        elif gex_pct_change > 30:
+            alert_triggered = True
+            alert_type = "LARGE ΔGEX"
+            alert_message = f"""
+⚡ <b>LARGE ΔGEX ALERT</b> ⚡
+
+📊 <b>Gamma Exposure Changed Significantly!</b>
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+
+<b>Previous GEX:</b> {prev_entry['total_gex']:.2f}L
+<b>Current GEX:</b> {gex_data['total_gex']:.2f}L
+<b>ΔGEX:</b> {delta_gex:+.2f}L ({gex_pct_change:.1f}%)
+
+<b>🎯 Market Regime:</b> {gex_data['gex_signal']}
+{gex_data['gex_interpretation']}
+
+🕐 Time: {current_time.strftime('%H:%M:%S IST')}
+"""
+
+        # Condition 3: Price crosses Gamma Flip level
+        elif gex_data['gamma_flip_level'] and prev_entry.get('gamma_flip'):
+            prev_above_flip = prev_entry['spot'] > prev_entry['gamma_flip']
+            curr_above_flip = underlying_price > gex_data['gamma_flip_level']
+
+            if prev_above_flip != curr_above_flip:
+                alert_triggered = True
+                alert_type = "GAMMA FLIP CROSSED"
+                cross_direction = "Crossed ABOVE" if curr_above_flip else "Crossed BELOW"
+                alert_message = f"""
+🎯 <b>GAMMA FLIP LEVEL CROSSED</b> 🎯
+
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+📊 <b>Gamma Flip Level:</b> ₹{gex_data['gamma_flip_level']:.2f}
+🔀 <b>Direction:</b> {cross_direction}
+
+<b>Current GEX:</b> {gex_data['total_gex']:.2f}L ({gex_data['gex_signal']})
+
+<b>🎯 Implication:</b>
+{'Above flip = More pinning/mean reversion' if curr_above_flip else 'Below flip = More trending/acceleration'}
+
+🕐 Time: {current_time.strftime('%H:%M:%S IST')}
+"""
+
+        # Send alert if triggered and not duplicate
+        if alert_triggered:
+            alert_key = f"{alert_type}_{current_time.strftime('%Y%m%d_%H%M')}"
+
+            if st.session_state.last_gex_alert != alert_key:
+                send_telegram_message_sync(alert_message)
+                st.session_state.last_gex_alert = alert_key
+                st.success(f"📊 {alert_type} alert sent!")
+
+    except Exception as e:
+        pass  # Silently fail GEX alerts
+
+
+def calculate_pcr_gex_confluence(pcr_value, gex_data, zone='ATM'):
+    """
+    Calculate PCR × GEX Confluence Badge.
+
+    Combines positioning bias (PCR) with dealer hedging pressure (GEX) for stronger signals.
+
+    Confluence Matrix:
+    - Bullish PCR (>1.2) + Negative GEX = STRONG BULLISH (upside acceleration)
+    - Bearish PCR (<0.7) + Positive GEX = STRONG BEARISH (downside acceleration)
+    - Bullish PCR + Positive GEX = BULLISH RANGE (support with chop)
+    - Bearish PCR + Negative GEX = BEARISH RANGE (resistance with chop)
+    - Neutral = Mixed signals
+
+    Returns: confluence_badge, confluence_signal, confluence_strength
+    """
+    if gex_data is None:
+        return "⚪ N/A", "No GEX Data", 0
+
+    net_gex = gex_data.get('total_gex', 0)
+    gex_signal = gex_data.get('gex_signal', 'Unknown')
+
+    # PCR interpretation
+    if pcr_value > 1.2:
+        pcr_signal = "Bullish"
+    elif pcr_value < 0.7:
+        pcr_signal = "Bearish"
+    else:
+        pcr_signal = "Neutral"
+
+    # GEX interpretation for confluence
+    gex_negative = net_gex < -10  # Strong negative gamma
+    gex_positive = net_gex > 10   # Strong positive gamma
+
+    # Confluence logic
+    if pcr_signal == "Bullish" and gex_negative:
+        # Best bullish setup: Put heavy + dealers short gamma = violent upside
+        return "🟢🔥 STRONG BULL", "Bullish + Breakout", 3
+
+    elif pcr_signal == "Bearish" and gex_positive:
+        # Best bearish setup: Call heavy + dealers long gamma = strong pin/rejection
+        return "🔴🔥 STRONG BEAR", "Bearish + Pin", 3
+
+    elif pcr_signal == "Bullish" and gex_positive:
+        # Bullish bias but pinning action
+        return "🟢📍 BULL RANGE", "Bullish + Chop", 2
+
+    elif pcr_signal == "Bearish" and gex_negative:
+        # Bearish bias with acceleration risk
+        return "🔴⚡ BEAR TREND", "Bearish + Accel", 2
+
+    elif pcr_signal == "Bullish":
+        return "🟢 BULLISH", "Bullish PCR", 1
+
+    elif pcr_signal == "Bearish":
+        return "🔴 BEARISH", "Bearish PCR", 1
+
+    else:
+        return "⚪ NEUTRAL", "Mixed Signals", 0
+
+
 def calculate_exact_time_to_expiry(expiry_date_str):
     """Calculate exact time to expiry in years (days + hours)"""
     try:
@@ -3039,6 +3342,14 @@ def main():
     if 'pcr_last_valid_data' not in st.session_state:
         st.session_state.pcr_last_valid_data = None
 
+    # Initialize session state for GEX (Gamma Exposure) tracking
+    if 'gex_history' not in st.session_state:
+        st.session_state.gex_history = []
+    if 'gex_last_valid_data' not in st.session_state:
+        st.session_state.gex_last_valid_data = None
+    if 'last_gex_alert' not in st.session_state:
+        st.session_state.last_gex_alert = None
+
     # Initialize Supabase
     try:
         if not supabase_url or not supabase_key:
@@ -3718,6 +4029,274 @@ def main():
                 st.warning(f"Error displaying PCR charts: {str(e)}")
         else:
             st.info("📊 PCR history will build up as the app refreshes. Please wait for data collection...")
+
+        # ===== GEX (GAMMA EXPOSURE) ANALYSIS SECTION =====
+        st.markdown("---")
+        st.markdown("## 📊 Gamma Exposure (GEX) Analysis - Dealer Hedging Flow")
+
+        try:
+            df_summary = option_data.get('df_summary')
+            underlying_price = option_data.get('underlying')
+
+            if df_summary is not None and underlying_price:
+                # Calculate GEX
+                gex_data = calculate_dealer_gex(df_summary, underlying_price)
+
+                if gex_data:
+                    gex_df = gex_data['gex_df']
+
+                    # Save last valid GEX data
+                    st.session_state.gex_last_valid_data = gex_data
+
+                    # Check for GEX alerts
+                    check_gex_alert(gex_data, df_summary, underlying_price)
+
+                    # ===== GEX Summary Cards =====
+                    gex_col1, gex_col2, gex_col3, gex_col4 = st.columns(4)
+
+                    with gex_col1:
+                        gex_color = gex_data['gex_color']
+                        st.markdown(f"""
+                        <div style="background-color: {gex_color}20; padding: 15px; border-radius: 10px; border: 2px solid {gex_color};">
+                            <h4 style="color: {gex_color}; margin: 0;">Net GEX</h4>
+                            <h2 style="color: {gex_color}; margin: 5px 0;">{gex_data['total_gex']:+.2f}L</h2>
+                            <p style="color: white; margin: 0; font-size: 12px;">{gex_data['gex_signal']}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with gex_col2:
+                        if gex_data['gamma_flip_level']:
+                            flip_color = "#00ff88" if underlying_price > gex_data['gamma_flip_level'] else "#ff4444"
+                            st.markdown(f"""
+                            <div style="background-color: {flip_color}20; padding: 15px; border-radius: 10px; border: 2px solid {flip_color};">
+                                <h4 style="color: {flip_color}; margin: 0;">Gamma Flip</h4>
+                                <h2 style="color: {flip_color}; margin: 5px 0;">₹{gex_data['gamma_flip_level']:.0f}</h2>
+                                <p style="color: white; margin: 0; font-size: 12px;">{gex_data['spot_vs_flip']}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            st.markdown("""
+                            <div style="background-color: #33333380; padding: 15px; border-radius: 10px; border: 2px solid #666;">
+                                <h4 style="color: #999; margin: 0;">Gamma Flip</h4>
+                                <h2 style="color: #999; margin: 5px 0;">N/A</h2>
+                                <p style="color: #666; margin: 0; font-size: 12px;">No flip detected</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    with gex_col3:
+                        if gex_data['gex_magnet']:
+                            st.markdown(f"""
+                            <div style="background-color: #00ff8820; padding: 15px; border-radius: 10px; border: 2px solid #00ff88;">
+                                <h4 style="color: #00ff88; margin: 0;">GEX Magnet</h4>
+                                <h2 style="color: #00ff88; margin: 5px 0;">₹{gex_data['gex_magnet']:.0f}</h2>
+                                <p style="color: white; margin: 0; font-size: 12px;">Price attracted here</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            st.markdown("""
+                            <div style="background-color: #33333380; padding: 15px; border-radius: 10px; border: 2px solid #666;">
+                                <h4 style="color: #999; margin: 0;">GEX Magnet</h4>
+                                <h2 style="color: #999; margin: 5px 0;">N/A</h2>
+                                <p style="color: #666; margin: 0; font-size: 12px;">No magnet</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    with gex_col4:
+                        if gex_data['gex_repeller']:
+                            st.markdown(f"""
+                            <div style="background-color: #ff444420; padding: 15px; border-radius: 10px; border: 2px solid #ff4444;">
+                                <h4 style="color: #ff4444; margin: 0;">GEX Repeller</h4>
+                                <h2 style="color: #ff4444; margin: 5px 0;">₹{gex_data['gex_repeller']:.0f}</h2>
+                                <p style="color: white; margin: 0; font-size: 12px;">Price accelerates here</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                        else:
+                            st.markdown("""
+                            <div style="background-color: #33333380; padding: 15px; border-radius: 10px; border: 2px solid #666;">
+                                <h4 style="color: #999; margin: 0;">GEX Repeller</h4>
+                                <h2 style="color: #999; margin: 5px 0;">N/A</h2>
+                                <p style="color: #666; margin: 0; font-size: 12px;">No repeller</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                    # ===== GEX Interpretation Box =====
+                    st.markdown(f"""
+                    <div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; border-left: 4px solid {gex_data['gex_color']}; margin: 10px 0;">
+                        <b style="color: {gex_data['gex_color']};">Market Regime:</b> {gex_data['gex_interpretation']}
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # ===== PCR × GEX Confluence Badge =====
+                    st.markdown("### 🎯 PCR × GEX Confluence")
+
+                    # Get ATM PCR for confluence
+                    atm_data = df_summary[df_summary['Zone'] == 'ATM']
+                    if not atm_data.empty:
+                        atm_pcr = atm_data.iloc[0].get('PCR', 1.0)
+                        confluence_badge, confluence_signal, confluence_strength = calculate_pcr_gex_confluence(atm_pcr, gex_data)
+
+                        conf_col1, conf_col2 = st.columns([1, 3])
+                        with conf_col1:
+                            # Color based on signal
+                            if "BULL" in confluence_badge:
+                                badge_color = "#00ff88"
+                            elif "BEAR" in confluence_badge:
+                                badge_color = "#ff4444"
+                            else:
+                                badge_color = "#FFD700"
+
+                            st.markdown(f"""
+                            <div style="background-color: {badge_color}30; padding: 20px; border-radius: 15px; border: 3px solid {badge_color}; text-align: center;">
+                                <h2 style="color: {badge_color}; margin: 0; font-size: 24px;">{confluence_badge}</h2>
+                                <p style="color: white; margin: 5px 0; font-size: 14px;">{confluence_signal}</p>
+                                <p style="color: #888; margin: 0; font-size: 12px;">Strength: {'★' * confluence_strength}{'☆' * (3 - confluence_strength)}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                        with conf_col2:
+                            st.markdown("""
+                            **Confluence Matrix:**
+                            - 🟢🔥 **STRONG BULL**: Bullish PCR + Negative GEX = Violent upside potential
+                            - 🔴🔥 **STRONG BEAR**: Bearish PCR + Positive GEX = Strong rejection/pin down
+                            - 🟢📍 **BULL RANGE**: Bullish PCR + Positive GEX = Support with chop
+                            - 🔴⚡ **BEAR TREND**: Bearish PCR + Negative GEX = Downside acceleration
+                            """)
+
+                    # ===== Net GEX Histogram =====
+                    st.markdown("### 📊 Net GEX by Strike (Dealer Hedging Pressure)")
+
+                    fig_gex = go.Figure()
+
+                    # Add bars for Net GEX
+                    colors = ['#00ff88' if x >= 0 else '#ff4444' for x in gex_df['Net_GEX']]
+
+                    fig_gex.add_trace(go.Bar(
+                        x=gex_df['Strike'],
+                        y=gex_df['Net_GEX'],
+                        marker_color=colors,
+                        name='Net GEX',
+                        text=[f"{x:.1f}L" for x in gex_df['Net_GEX']],
+                        textposition='outside',
+                        textfont=dict(size=10)
+                    ))
+
+                    # Add zero line
+                    fig_gex.add_hline(y=0, line_dash="dash", line_color="white", line_width=2)
+
+                    # Add gamma flip line if exists
+                    if gex_data['gamma_flip_level']:
+                        fig_gex.add_vline(
+                            x=gex_data['gamma_flip_level'],
+                            line_dash="dot",
+                            line_color="#FFD700",
+                            line_width=2,
+                            annotation_text=f"Gamma Flip: ₹{gex_data['gamma_flip_level']:.0f}",
+                            annotation_position="top"
+                        )
+
+                    # Add spot price line
+                    fig_gex.add_vline(
+                        x=underlying_price,
+                        line_dash="solid",
+                        line_color="#00aaff",
+                        line_width=3,
+                        annotation_text=f"Spot: ₹{underlying_price:.0f}",
+                        annotation_position="bottom"
+                    )
+
+                    fig_gex.update_layout(
+                        title=f"Net GEX by Strike | Total: {gex_data['total_gex']:+.2f}L",
+                        template='plotly_dark',
+                        height=400,
+                        showlegend=False,
+                        xaxis_title="Strike Price",
+                        yaxis_title="Net GEX (Lakhs)",
+                        plot_bgcolor='#1e1e1e',
+                        paper_bgcolor='#1e1e1e',
+                        margin=dict(l=50, r=50, t=60, b=50)
+                    )
+
+                    st.plotly_chart(fig_gex, use_container_width=True)
+
+                    # ===== GEX Breakdown Table =====
+                    with st.expander("📋 GEX Breakdown by Strike"):
+                        gex_display = gex_df.copy()
+                        gex_display['Strike'] = gex_display['Strike'].apply(lambda x: f"₹{x:.0f}")
+
+                        # Style the dataframe
+                        def color_gex(val):
+                            try:
+                                v = float(val)
+                                if v > 10:
+                                    return 'background-color: #00ff8840; color: white'
+                                elif v > 0:
+                                    return 'background-color: #00ff8820; color: white'
+                                elif v < -10:
+                                    return 'background-color: #ff444440; color: white'
+                                elif v < 0:
+                                    return 'background-color: #ff444420; color: white'
+                                else:
+                                    return ''
+                            except:
+                                return ''
+
+                        styled_gex = gex_display.style.applymap(color_gex, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
+                        st.dataframe(styled_gex, use_container_width=True, hide_index=True)
+
+                        st.markdown("""
+                        **GEX Interpretation:**
+                        - **Positive Net GEX (Green)**: Dealers LONG gamma → Price tends to PIN/REVERT
+                        - **Negative Net GEX (Red)**: Dealers SHORT gamma → Price tends to ACCELERATE
+                        - **GEX Magnet**: Strike with highest positive GEX (price attracted)
+                        - **GEX Repeller**: Strike with most negative GEX (price accelerates away)
+                        - **Gamma Flip**: Level where dealers switch from long to short gamma
+                        """)
+
+                    # ===== GEX Time Series (if history available) =====
+                    if len(st.session_state.gex_history) > 1:
+                        st.markdown("### 📈 GEX Time Series")
+
+                        gex_history_df = pd.DataFrame(st.session_state.gex_history)
+
+                        fig_gex_ts = go.Figure()
+
+                        fig_gex_ts.add_trace(go.Scatter(
+                            x=gex_history_df['time'],
+                            y=gex_history_df['total_gex'],
+                            mode='lines+markers',
+                            name='Total GEX',
+                            line=dict(color='#00aaff', width=2),
+                            fill='tozeroy',
+                            fillcolor='rgba(0, 170, 255, 0.1)'
+                        ))
+
+                        # Add zero line
+                        fig_gex_ts.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+
+                        fig_gex_ts.update_layout(
+                            title="Total GEX Over Time",
+                            template='plotly_dark',
+                            height=300,
+                            showlegend=False,
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis_title="Net GEX (Lakhs)",
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e'
+                        )
+
+                        st.plotly_chart(fig_gex_ts, use_container_width=True)
+
+                        # Clear GEX history button
+                        if st.button("🗑️ Clear GEX History"):
+                            st.session_state.gex_history = []
+                            st.session_state.gex_last_valid_data = None
+                            st.rerun()
+
+                else:
+                    st.warning("Unable to calculate GEX. Check option chain data.")
+
+        except Exception as e:
+            st.warning(f"GEX analysis unavailable: {str(e)}")
 
         # Expandable section for detailed Greeks and raw values
         with st.expander("📊 Detailed Greeks & Raw Values"):
