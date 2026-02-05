@@ -4291,7 +4291,18 @@ def main():
                         if col_name and col_name in history_df.columns:
                             strike_val = col_name
 
+                            # Get data for this strike
+                            gex_values = history_df[col_name].dropna()
+
+                            # Calculate symmetric y-axis range (0 in middle)
+                            max_abs = 20  # Default
+                            if len(gex_values) > 0:
+                                max_abs = max(abs(gex_values.max()), abs(gex_values.min()), 15)  # Min range of ±15
+                            y_range = [-max_abs * 1.1, max_abs * 1.1]  # Add 10% padding
+
                             fig = go.Figure()
+
+                            # Split into positive and negative for different colors
                             fig.add_trace(go.Scatter(
                                 x=history_df['time'],
                                 y=history_df[col_name],
@@ -4303,12 +4314,14 @@ def main():
                                 fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.15])}'
                             ))
 
-                            # Reference line at zero (critical for GEX interpretation)
-                            fig.add_hline(y=0, line_dash="dash", line_color="white", line_width=2)
-                            # Positive threshold (pinning zone)
-                            fig.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1)
-                            # Negative threshold (acceleration zone)
-                            fig.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1)
+                            # Reference line at zero (critical - in the MIDDLE)
+                            fig.add_hline(y=0, line_dash="solid", line_color="white", line_width=2)
+                            # Positive threshold (pinning zone) - ABOVE zero
+                            fig.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1,
+                                         annotation_text="+10", annotation_position="right")
+                            # Negative threshold (acceleration zone) - BELOW zero
+                            fig.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1,
+                                         annotation_text="-10", annotation_position="right")
 
                             # Get current GEX value
                             current_gex = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
@@ -4316,11 +4329,19 @@ def main():
                             fig.update_layout(
                                 title=f"{title_prefix}<br>₹{strike_val}<br>GEX: {current_gex:+.1f}L",
                                 template='plotly_dark',
-                                height=280,
+                                height=300,
                                 showlegend=False,
                                 margin=dict(l=10, r=10, t=70, b=30),
                                 xaxis=dict(tickformat='%H:%M', title=''),
-                                yaxis=dict(title='GEX (L)'),
+                                yaxis=dict(
+                                    title='GEX (L)',
+                                    range=y_range,  # Symmetric range with 0 in middle
+                                    zeroline=True,
+                                    zerolinecolor='white',
+                                    zerolinewidth=2,
+                                    tickmode='array',
+                                    tickvals=[-20, -10, 0, 10, 20] if max_abs <= 25 else None
+                                ),
                                 plot_bgcolor='#1e1e1e',
                                 paper_bgcolor='#1e1e1e'
                             )
