@@ -888,7 +888,7 @@ class TriplePOC:
     often acting as support/resistance.
     """
 
-    def __init__(self, period1=25, period2=40, period3=100, bins=25):
+    def __init__(self, period1=10, period2=25, period3=70, bins=25):
         """
         Initialize Triple POC calculator.
 
@@ -4162,7 +4162,7 @@ def main():
         poc_data_for_chart = None
         if not df.empty and len(df) > 100:
             try:
-                poc_calculator = TriplePOC(period1=25, period2=40, period3=100)
+                poc_calculator = TriplePOC(period1=10, period2=25, period3=70)
                 poc_data_for_chart = poc_calculator.calculate_all_pocs(df)
             except Exception:
                 poc_data_for_chart = None
