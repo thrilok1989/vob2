@@ -875,6 +875,401 @@ class VolumeOrderBlocks:
         return sr_levels, blocks
 
 
+class TriplePOC:
+    """
+    Triple Point of Control (POC) Indicator - Converted from Pine Script [BigBeluga]
+
+    Calculates POC (price level with highest volume) for 3 different periods:
+    - POC 1: Short-term (default 25 periods)
+    - POC 2: Medium-term (default 40 periods)
+    - POC 3: Long-term (default 100 periods)
+
+    POC represents the price level where most trading activity occurred,
+    often acting as support/resistance.
+    """
+
+    def __init__(self, period1=25, period2=40, period3=100, bins=25):
+        """
+        Initialize Triple POC calculator.
+
+        Args:
+            period1: Lookback for POC 1 (short-term)
+            period2: Lookback for POC 2 (medium-term)
+            period3: Lookback for POC 3 (long-term)
+            bins: Number of price bins for volume distribution
+        """
+        self.period1 = period1
+        self.period2 = period2
+        self.period3 = period3
+        self.bins = bins
+
+    def calculate_poc(self, df, period):
+        """
+        Calculate Point of Control for a given period.
+
+        Args:
+            df: DataFrame with OHLCV data
+            period: Lookback period
+
+        Returns:
+            dict with poc, upper_poc, lower_poc, volume, high, low
+        """
+        if df.empty or len(df) < period:
+            return None
+
+        # Get last 'period' bars
+        recent_df = df.tail(period).copy()
+
+        H = recent_df['high'].max()
+        L = recent_df['low'].min()
+
+        if H == L:
+            return {
+                'poc': H,
+                'upper_poc': H,
+                'lower_poc': L,
+                'volume': 0,
+                'high': H,
+                'low': L
+            }
+
+        step = (H - L) / self.bins
+
+        # Initialize volume bins
+        vol_bins = [0.0] * self.bins
+        level_mids = []
+
+        for k in range(self.bins):
+            l = L + k * step
+            mid = l + step / 2
+            level_mids.append(mid)
+
+        # Distribute volume across bins
+        for _, row in recent_df.iterrows():
+            c = row['close']
+            v = row.get('volume', 1)  # Default volume if not available
+
+            for k in range(len(level_mids)):
+                mid = level_mids[k]
+                if abs(c - mid) <= step:
+                    vol_bins[k] += v
+
+        # Find POC (price level with max volume)
+        max_vol_idx = vol_bins.index(max(vol_bins))
+        poc = level_mids[max_vol_idx]
+        max_volume = vol_bins[max_vol_idx]
+
+        # Upper and lower POC boundaries (±2 steps)
+        upper_poc = poc + step * 2
+        lower_poc = poc - step * 2
+
+        return {
+            'poc': round(poc, 2),
+            'upper_poc': round(upper_poc, 2),
+            'lower_poc': round(lower_poc, 2),
+            'volume': max_volume,
+            'high': H,
+            'low': L,
+            'step': step
+        }
+
+    def calculate_all_pocs(self, df):
+        """
+        Calculate all three POCs.
+
+        Args:
+            df: DataFrame with OHLCV data
+
+        Returns:
+            dict with poc1, poc2, poc3 data
+        """
+        poc1 = self.calculate_poc(df, self.period1)
+        poc2 = self.calculate_poc(df, self.period2)
+        poc3 = self.calculate_poc(df, self.period3)
+
+        return {
+            'poc1': poc1,
+            'poc2': poc2,
+            'poc3': poc3,
+            'periods': {
+                'poc1': self.period1,
+                'poc2': self.period2,
+                'poc3': self.period3
+            }
+        }
+
+    def get_price_position(self, current_price, poc_data):
+        """
+        Determine price position relative to POC channels.
+
+        Returns:
+            'above' if price above POC channel
+            'below' if price below POC channel
+            'inside' if price inside POC channel
+        """
+        if poc_data is None:
+            return 'unknown'
+
+        if current_price > poc_data['upper_poc']:
+            return 'above'
+        elif current_price < poc_data['lower_poc']:
+            return 'below'
+        else:
+            return 'inside'
+
+
+class FutureSwing:
+    """
+    Future Swing Projection Indicator - Converted from Pine Script [BigBeluga]
+
+    Detects swing highs and lows, then projects future swing targets
+    based on historical swing percentages.
+
+    Key concepts:
+    - Swing High: Highest point before price reverses down
+    - Swing Low: Lowest point before price reverses up
+    - Future projection: Based on average/median/mode of historical swings
+    """
+
+    def __init__(self, swing_length=30, projection_offset=10, history_samples=5, calc_type='Average'):
+        """
+        Initialize Future Swing calculator.
+
+        Args:
+            swing_length: Bars to detect swing highs/lows
+            projection_offset: How far to project into future
+            history_samples: Number of historical swings to use
+            calc_type: 'Average', 'Median', or 'Mode'
+        """
+        self.swing_length = swing_length
+        self.projection_offset = projection_offset
+        self.history_samples = history_samples
+        self.calc_type = calc_type
+
+    def detect_swings(self, df):
+        """
+        Detect swing highs and lows in the data.
+
+        Args:
+            df: DataFrame with OHLCV data
+
+        Returns:
+            dict with swing_highs, swing_lows, and current direction
+        """
+        if df.empty or len(df) < self.swing_length + 1:
+            return None
+
+        df = df.copy().reset_index(drop=True)
+
+        swing_highs = []
+        swing_lows = []
+
+        # Calculate rolling high and low
+        df['rolling_high'] = df['high'].rolling(window=self.swing_length, min_periods=1).max()
+        df['rolling_low'] = df['low'].rolling(window=self.swing_length, min_periods=1).min()
+
+        # Detect swing points
+        for i in range(self.swing_length, len(df) - 1):
+            # Swing High: current high equals rolling high and next bar starts moving down
+            if df.loc[i, 'high'] == df.loc[i, 'rolling_high']:
+                # Check if this is a confirmed swing high (price moved away)
+                if i + 1 < len(df) and df.loc[i + 1, 'high'] < df.loc[i, 'rolling_high']:
+                    swing_highs.append({
+                        'index': i,
+                        'value': df.loc[i, 'high'],
+                        'datetime': df.loc[i, 'datetime'] if 'datetime' in df.columns else None
+                    })
+
+            # Swing Low: current low equals rolling low and next bar starts moving up
+            if df.loc[i, 'low'] == df.loc[i, 'rolling_low']:
+                # Check if this is a confirmed swing low (price moved away)
+                if i + 1 < len(df) and df.loc[i + 1, 'low'] > df.loc[i, 'rolling_low']:
+                    swing_lows.append({
+                        'index': i,
+                        'value': df.loc[i, 'low'],
+                        'datetime': df.loc[i, 'datetime'] if 'datetime' in df.columns else None
+                    })
+
+        # Determine current direction
+        last_high_idx = swing_highs[-1]['index'] if swing_highs else 0
+        last_low_idx = swing_lows[-1]['index'] if swing_lows else 0
+
+        # Direction: True = bearish (last swing was high), False = bullish (last swing was low)
+        direction = 'bearish' if last_high_idx > last_low_idx else 'bullish'
+
+        return {
+            'swing_highs': swing_highs[-self.history_samples:] if swing_highs else [],
+            'swing_lows': swing_lows[-self.history_samples:] if swing_lows else [],
+            'direction': direction,
+            'last_swing_high': swing_highs[-1] if swing_highs else None,
+            'last_swing_low': swing_lows[-1] if swing_lows else None
+        }
+
+    def calculate_swing_percentages(self, swing_data):
+        """
+        Calculate percentage moves between swing highs and lows.
+
+        Returns:
+            list of swing percentages
+        """
+        if swing_data is None:
+            return []
+
+        swing_highs = swing_data['swing_highs']
+        swing_lows = swing_data['swing_lows']
+
+        if not swing_highs or not swing_lows:
+            return []
+
+        percentages = []
+
+        # Combine and sort all swings by index
+        all_swings = []
+        for sh in swing_highs:
+            all_swings.append({'type': 'high', **sh})
+        for sl in swing_lows:
+            all_swings.append({'type': 'low', **sl})
+
+        all_swings.sort(key=lambda x: x['index'])
+
+        # Calculate percentage moves between consecutive swings
+        for i in range(1, len(all_swings)):
+            prev = all_swings[i - 1]
+            curr = all_swings[i]
+
+            if prev['type'] == 'low' and curr['type'] == 'high':
+                # Bullish swing: low to high
+                pct = (curr['value'] - prev['value']) / prev['value'] * 100
+                percentages.append(pct)
+            elif prev['type'] == 'high' and curr['type'] == 'low':
+                # Bearish swing: high to low
+                pct = (curr['value'] - prev['value']) / prev['value'] * 100
+                percentages.append(pct)
+
+        return percentages[-self.history_samples:]
+
+    def project_future_swing(self, swing_data, percentages):
+        """
+        Project future swing target based on historical percentages.
+
+        Returns:
+            dict with projected target and calculation details
+        """
+        if not percentages or swing_data is None:
+            return None
+
+        abs_percentages = [abs(p) for p in percentages]
+
+        # Calculate swing value based on method
+        if self.calc_type == 'Average':
+            swing_val = sum(abs_percentages) / len(abs_percentages)
+        elif self.calc_type == 'Median':
+            sorted_pct = sorted(abs_percentages)
+            mid = len(sorted_pct) // 2
+            swing_val = sorted_pct[mid] if len(sorted_pct) % 2 == 1 else (sorted_pct[mid-1] + sorted_pct[mid]) / 2
+        else:  # Mode
+            from collections import Counter
+            rounded = [round(p, 1) for p in abs_percentages]
+            counter = Counter(rounded)
+            swing_val = counter.most_common(1)[0][0]
+
+        direction = swing_data['direction']
+        last_high = swing_data['last_swing_high']
+        last_low = swing_data['last_swing_low']
+
+        if direction == 'bearish' and last_high:
+            # Project downward from last high
+            target = last_high['value'] - (last_high['value'] * (swing_val / 100))
+            return {
+                'direction': 'bearish',
+                'from_value': last_high['value'],
+                'target': round(target, 2),
+                'swing_pct': round(swing_val, 2),
+                'sign': '-'
+            }
+        elif direction == 'bullish' and last_low:
+            # Project upward from last low
+            target = last_low['value'] + (last_low['value'] * (swing_val / 100))
+            return {
+                'direction': 'bullish',
+                'from_value': last_low['value'],
+                'target': round(target, 2),
+                'swing_pct': round(swing_val, 2),
+                'sign': '+'
+            }
+
+        return None
+
+    def calculate_volume_delta(self, df, swing_data):
+        """
+        Calculate buy/sell volume delta for current swing leg.
+
+        Returns:
+            dict with buy_volume, sell_volume, delta
+        """
+        if df.empty or swing_data is None:
+            return {'buy_volume': 0, 'sell_volume': 0, 'delta': 0, 'total': 0}
+
+        last_high = swing_data['last_swing_high']
+        last_low = swing_data['last_swing_low']
+
+        if not last_high or not last_low:
+            return {'buy_volume': 0, 'sell_volume': 0, 'delta': 0, 'total': 0}
+
+        # Get starting index for volume calculation
+        start_idx = min(last_high['index'], last_low['index'])
+
+        df = df.copy().reset_index(drop=True)
+        recent_df = df.iloc[start_idx:]
+
+        buy_volume = 0
+        sell_volume = 0
+
+        for _, row in recent_df.iterrows():
+            v = row.get('volume', 0)
+            if row['close'] > row['open']:
+                buy_volume += v
+            else:
+                sell_volume += v
+
+        return {
+            'buy_volume': buy_volume,
+            'sell_volume': sell_volume,
+            'delta': buy_volume - sell_volume,
+            'total': buy_volume + sell_volume
+        }
+
+    def analyze(self, df):
+        """
+        Perform complete swing analysis.
+
+        Args:
+            df: DataFrame with OHLCV data
+
+        Returns:
+            Complete analysis dict
+        """
+        swing_data = self.detect_swings(df)
+        if swing_data is None:
+            return None
+
+        percentages = self.calculate_swing_percentages(swing_data)
+        projection = self.project_future_swing(swing_data, percentages)
+        volume_delta = self.calculate_volume_delta(df, swing_data)
+
+        return {
+            'swings': swing_data,
+            'percentages': percentages,
+            'projection': projection,
+            'volume': volume_delta,
+            'settings': {
+                'swing_length': self.swing_length,
+                'history_samples': self.history_samples,
+                'calc_type': self.calc_type
+            }
+        }
+
+
 class ReversalDetector:
     """
     Intraday Reversal Detection System based on Price Action Theory.
@@ -2223,8 +2618,8 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None):
-    """Create TradingView-style candlestick chart with optional pivot levels and VOB zones"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None):
+    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, and Swing data"""
     if df.empty:
         return go.Figure()
     
@@ -2402,6 +2797,140 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
                 )
         except Exception as e:
             pass  # VOB drawing failed, skip it
+
+    # Add Triple POC lines if provided
+    if poc_data:
+        try:
+            x_start = df['datetime'].min()
+            x_end = df['datetime'].max()
+
+            poc_colors = {
+                'poc1': '#e91e63',  # Pink - Short-term
+                'poc2': '#2196f3',  # Blue - Medium-term
+                'poc3': '#4caf50'   # Green - Long-term
+            }
+
+            for poc_key in ['poc1', 'poc2', 'poc3']:
+                poc = poc_data.get(poc_key)
+                if poc and poc.get('poc'):
+                    color = poc_colors[poc_key]
+                    period = poc_data.get('periods', {}).get(poc_key, '')
+
+                    # POC main line
+                    fig.add_shape(
+                        type="line",
+                        x0=x_start, x1=x_end,
+                        y0=poc['poc'], y1=poc['poc'],
+                        line=dict(color=color, width=2),
+                        row=1, col=1
+                    )
+
+                    # POC annotation
+                    fig.add_annotation(
+                        x=x_end,
+                        y=poc['poc'],
+                        text=f"POC{poc_key[-1]} ({period}): ₹{poc['poc']:.0f}",
+                        showarrow=False,
+                        font=dict(color=color, size=10),
+                        xanchor="left",
+                        row=1, col=1
+                    )
+
+        except Exception as e:
+            pass  # POC drawing failed, skip it
+
+    # Add Future Swing data if provided
+    if swing_data and swing_data.get('swings'):
+        try:
+            swings = swing_data['swings']
+            projection = swing_data.get('projection')
+
+            x_end = df['datetime'].max()
+
+            # Draw swing high zone
+            last_high = swings.get('last_swing_high')
+            if last_high and last_high.get('value'):
+                atr_estimate = (df['high'].max() - df['low'].min()) * 0.02  # Rough ATR estimate
+
+                fig.add_shape(
+                    type="rect",
+                    x0=df['datetime'].iloc[last_high['index']] if last_high['index'] < len(df) else x_end,
+                    x1=x_end,
+                    y0=last_high['value'],
+                    y1=last_high['value'] + atr_estimate,
+                    fillcolor="rgba(235, 117, 20, 0.2)",
+                    line=dict(color="#eb7514", width=1),
+                    row=1, col=1
+                )
+
+                fig.add_annotation(
+                    x=x_end,
+                    y=last_high['value'],
+                    text=f"Swing H: ₹{last_high['value']:.0f}",
+                    showarrow=False,
+                    font=dict(color="#eb7514", size=9),
+                    xanchor="left",
+                    row=1, col=1
+                )
+
+            # Draw swing low zone
+            last_low = swings.get('last_swing_low')
+            if last_low and last_low.get('value'):
+                atr_estimate = (df['high'].max() - df['low'].min()) * 0.02
+
+                fig.add_shape(
+                    type="rect",
+                    x0=df['datetime'].iloc[last_low['index']] if last_low['index'] < len(df) else x_end,
+                    x1=x_end,
+                    y0=last_low['value'] - atr_estimate,
+                    y1=last_low['value'],
+                    fillcolor="rgba(21, 221, 124, 0.2)",
+                    line=dict(color="#15dd7c", width=1),
+                    row=1, col=1
+                )
+
+                fig.add_annotation(
+                    x=x_end,
+                    y=last_low['value'],
+                    text=f"Swing L: ₹{last_low['value']:.0f}",
+                    showarrow=False,
+                    font=dict(color="#15dd7c", size=9),
+                    xanchor="left",
+                    row=1, col=1
+                )
+
+            # Draw future projection line
+            if projection:
+                from_value = projection['from_value']
+                target = projection['target']
+                direction = projection['direction']
+
+                proj_color = "#15dd7c" if direction == 'bullish' else "#eb7514"
+
+                fig.add_shape(
+                    type="line",
+                    x0=x_end,
+                    x1=x_end,
+                    y0=from_value,
+                    y1=target,
+                    line=dict(color=proj_color, width=2, dash="dash"),
+                    row=1, col=1
+                )
+
+                fig.add_annotation(
+                    x=x_end,
+                    y=target,
+                    text=f"Target: {projection['sign']}{projection['swing_pct']:.1f}% → ₹{target:.0f}",
+                    showarrow=True,
+                    arrowhead=2,
+                    arrowcolor=proj_color,
+                    font=dict(color=proj_color, size=10),
+                    xanchor="left",
+                    row=1, col=1
+                )
+
+        except Exception as e:
+            pass  # Swing drawing failed, skip it
 
     volume_colors = ['#00ff88' if close >= open else '#ff4444'
                     for close, open in zip(df['close'], df['open'])]
@@ -3629,6 +4158,24 @@ def main():
             except Exception:
                 vob_blocks_for_chart = None
 
+        # Calculate Triple POC for chart display
+        poc_data_for_chart = None
+        if not df.empty and len(df) > 100:
+            try:
+                poc_calculator = TriplePOC(period1=25, period2=40, period3=100)
+                poc_data_for_chart = poc_calculator.calculate_all_pocs(df)
+            except Exception:
+                poc_data_for_chart = None
+
+        # Calculate Future Swing for chart display
+        swing_data_for_chart = None
+        if not df.empty and len(df) > 50:
+            try:
+                swing_calculator = FutureSwing(swing_length=30, history_samples=5, calc_type='Average')
+                swing_data_for_chart = swing_calculator.analyze(df)
+            except Exception:
+                swing_data_for_chart = None
+
         # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
@@ -3637,7 +4184,9 @@ def main():
                 interval,
                 show_pivots=show_pivots,
                 pivot_settings=pivot_settings,
-                vob_blocks=vob_blocks_for_chart
+                vob_blocks=vob_blocks_for_chart,
+                poc_data=poc_data_for_chart,
+                swing_data=swing_data_for_chart
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -3774,6 +4323,172 @@ def main():
 
             except Exception as e:
                 st.warning(f"Reversal analysis unavailable: {str(e)}")
+
+            # ===== TRIPLE POC + FUTURE SWING ANALYSIS =====
+            st.markdown("---")
+            st.markdown("## 📊 Triple POC + Future Swing Analysis")
+
+            # Triple POC Table
+            if poc_data_for_chart:
+                st.markdown("### 🎯 Triple Point of Control (POC)")
+
+                poc_table_data = []
+                current_price_for_poc = df['close'].iloc[-1] if not df.empty else 0
+
+                for poc_key, period_key in [('poc1', 'poc1'), ('poc2', 'poc2'), ('poc3', 'poc3')]:
+                    poc = poc_data_for_chart.get(poc_key)
+                    period = poc_data_for_chart.get('periods', {}).get(period_key, '')
+
+                    if poc:
+                        # Determine position relative to POC
+                        if current_price_for_poc > poc.get('upper_poc', 0):
+                            position = "🟢 Above"
+                            signal = "Bullish"
+                        elif current_price_for_poc < poc.get('lower_poc', 0):
+                            position = "🔴 Below"
+                            signal = "Bearish"
+                        else:
+                            position = "🟡 Inside"
+                            signal = "Neutral"
+
+                        poc_table_data.append({
+                            'POC': f"POC {poc_key[-1]} ({period})",
+                            'Value': f"₹{poc.get('poc', 0):.2f}",
+                            'Upper': f"₹{poc.get('upper_poc', 0):.2f}",
+                            'Lower': f"₹{poc.get('lower_poc', 0):.2f}",
+                            'Range': f"₹{poc.get('high', 0):.0f} - ₹{poc.get('low', 0):.0f}",
+                            'Position': position,
+                            'Signal': signal
+                        })
+
+                if poc_table_data:
+                    poc_df = pd.DataFrame(poc_table_data)
+
+                    # Style the table
+                    def style_poc_signal(val):
+                        if val == 'Bullish':
+                            return 'background-color: #00ff8840; color: white'
+                        elif val == 'Bearish':
+                            return 'background-color: #ff444440; color: white'
+                        else:
+                            return 'background-color: #FFD70040; color: white'
+
+                    styled_poc = poc_df.style.applymap(style_poc_signal, subset=['Signal'])
+                    st.dataframe(styled_poc, use_container_width=True, hide_index=True)
+
+                    st.markdown("""
+                    **POC Interpretation:**
+                    - **POC 1 (25)**: Short-term volume profile - intraday support/resistance
+                    - **POC 2 (40)**: Medium-term volume profile - swing trading levels
+                    - **POC 3 (100)**: Long-term volume profile - major support/resistance
+                    - **Above POC**: Bullish bias - POC acts as support
+                    - **Below POC**: Bearish bias - POC acts as resistance
+                    - **Inside POC**: Neutral - price consolidating at high-volume zone
+                    """)
+
+            # Future Swing Table
+            if swing_data_for_chart:
+                st.markdown("### 🔄 Future Swing Projection")
+
+                swings = swing_data_for_chart.get('swings', {})
+                projection = swing_data_for_chart.get('projection')
+                volume = swing_data_for_chart.get('volume', {})
+                percentages = swing_data_for_chart.get('percentages', [])
+
+                # Swing Summary
+                swing_col1, swing_col2, swing_col3 = st.columns(3)
+
+                with swing_col1:
+                    direction = swings.get('direction', 'Unknown')
+                    dir_color = "#15dd7c" if direction == 'bullish' else "#eb7514"
+                    dir_icon = "🟢" if direction == 'bullish' else "🔴"
+                    st.markdown(f"""
+                    <div style="background-color: {dir_color}20; padding: 15px; border-radius: 10px; border: 2px solid {dir_color};">
+                        <h4 style="color: {dir_color}; margin: 0;">Current Direction</h4>
+                        <h2 style="color: {dir_color}; margin: 5px 0;">{dir_icon} {direction.upper()}</h2>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with swing_col2:
+                    if projection:
+                        target_color = "#15dd7c" if projection['direction'] == 'bullish' else "#eb7514"
+                        st.markdown(f"""
+                        <div style="background-color: {target_color}20; padding: 15px; border-radius: 10px; border: 2px solid {target_color};">
+                            <h4 style="color: {target_color}; margin: 0;">Projected Target</h4>
+                            <h2 style="color: {target_color}; margin: 5px 0;">₹{projection['target']:.0f}</h2>
+                            <p style="color: white; margin: 0;">{projection['sign']}{projection['swing_pct']:.1f}%</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    else:
+                        st.info("Projection not available")
+
+                with swing_col3:
+                    delta = volume.get('delta', 0)
+                    delta_color = "#15dd7c" if delta > 0 else "#eb7514"
+                    delta_icon = "🟢" if delta > 0 else "🔴"
+                    st.markdown(f"""
+                    <div style="background-color: {delta_color}20; padding: 15px; border-radius: 10px; border: 2px solid {delta_color};">
+                        <h4 style="color: {delta_color}; margin: 0;">Volume Delta</h4>
+                        <h2 style="color: {delta_color}; margin: 5px 0;">{delta_icon} {delta:+,.0f}</h2>
+                        <p style="color: white; margin: 0;">Buy: {volume.get('buy_volume', 0):,.0f} | Sell: {volume.get('sell_volume', 0):,.0f}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # Swing Percentages Table
+                if percentages:
+                    st.markdown("### 📈 Historical Swing Percentages")
+
+                    swing_pct_data = []
+                    for i, pct in enumerate(percentages):
+                        swing_pct_data.append({
+                            'Swing': f"Swing {i+1}",
+                            'Percentage': f"{pct:+.2f}%",
+                            'Type': '🟢 Bullish' if pct > 0 else '🔴 Bearish'
+                        })
+
+                    # Add average
+                    avg_pct = sum(abs(p) for p in percentages) / len(percentages) if percentages else 0
+                    swing_pct_data.append({
+                        'Swing': '📊 Average',
+                        'Percentage': f"{avg_pct:.2f}%",
+                        'Type': 'Used for projection'
+                    })
+
+                    swing_pct_df = pd.DataFrame(swing_pct_data)
+                    st.dataframe(swing_pct_df, use_container_width=True, hide_index=True)
+
+                # Swing Levels Table
+                st.markdown("### 📍 Swing Levels")
+
+                swing_levels_data = []
+                last_high = swings.get('last_swing_high')
+                last_low = swings.get('last_swing_low')
+
+                if last_high:
+                    swing_levels_data.append({
+                        'Type': '🔴 Swing High',
+                        'Value': f"₹{last_high['value']:.2f}",
+                        'Index': last_high['index']
+                    })
+
+                if last_low:
+                    swing_levels_data.append({
+                        'Type': '🟢 Swing Low',
+                        'Value': f"₹{last_low['value']:.2f}",
+                        'Index': last_low['index']
+                    })
+
+                if swing_levels_data:
+                    swing_levels_df = pd.DataFrame(swing_levels_data)
+                    st.dataframe(swing_levels_df, use_container_width=True, hide_index=True)
+
+                st.markdown("""
+                **Swing Analysis Interpretation:**
+                - **Swing High**: Resistance level where price reversed down
+                - **Swing Low**: Support level where price reversed up
+                - **Volume Delta**: Positive = more buying, Negative = more selling
+                - **Projected Target**: Based on average of historical swing percentages
+                """)
 
         else:
             st.error("No data available. Please check your API credentials and try again.")
