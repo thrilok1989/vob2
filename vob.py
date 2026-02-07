@@ -1789,6 +1789,353 @@ class ReversalDetector:
         return score, signals, verdict
 
 
+class AetherFlowEngine:
+    """
+    Compression -> Ignition -> Expansion Decision Engine.
+
+    5-Step institutional entry system combining:
+      Step 1: GEX Big Move Warning (MANDATORY gate)
+      Step 2: Triple POC Compression (confirmation)
+      Step 3: Future Swing Alignment (probability filter)
+      Step 4: PCR + Positioning Check (trap detection)
+      Step 5: Structural Timing Trigger (entry only here)
+
+    Returns a single ENTRY_READY boolean with full reasoning chain.
+    """
+
+    # Configurable thresholds
+    DEFAULT_CONFIG = {
+        'poc_compression_pts': 15,       # max spread between POC1/2/3 to count as compressed
+        'gex_flip_proximity_pct': 0.5,   # % distance from gamma flip to flag proximity
+        'gex_delta_pct': 30,             # ΔGEX % threshold for regime change alert
+        'pcr_bull_threshold': 1.2,
+        'pcr_bear_threshold': 0.7,
+        'swing_flat_pct': 0.15,          # below this swing % = flat / no-trade
+    }
+
+    def __init__(self, config=None):
+        self.cfg = {**self.DEFAULT_CONFIG, **(config or {})}
+
+    # ── Step 1: GEX Big Move Warning ────────────────────────
+    def step1_gex_warning(self, gex_data, spot_price):
+        """Mandatory gate – at least ONE must fire or no trade."""
+        result = {
+            'pass': False,
+            'signals': [],
+            'net_gex': None,
+            'gamma_flip': None,
+            'regime': None,
+        }
+        if gex_data is None:
+            result['signals'].append('NO GEX DATA')
+            return result
+
+        net_gex = gex_data.get('total_gex', 0)
+        flip = gex_data.get('gamma_flip_level')
+        signal = gex_data.get('gex_signal', '')
+        result['net_gex'] = net_gex
+        result['gamma_flip'] = flip
+        result['regime'] = signal
+
+        # Check GEX history for sign flip
+        history = []
+        try:
+            history = st.session_state.get('gex_history', [])
+        except Exception:
+            pass
+        if len(history) >= 2:
+            prev_gex = history[-2].get('total_gex', 0)
+            if prev_gex * net_gex < 0:
+                result['signals'].append('GEX SIGN FLIP')
+            if prev_gex != 0 and abs(net_gex - prev_gex) / abs(prev_gex) * 100 > self.cfg['gex_delta_pct']:
+                result['signals'].append(f'DELTA_GEX > {self.cfg["gex_delta_pct"]}%')
+
+        # Approaching zero
+        if abs(net_gex) < 5:
+            result['signals'].append('GEX NEAR ZERO')
+
+        # Strong negative (trend regime)
+        if net_gex < -50:
+            result['signals'].append('STRONG NEGATIVE GEX')
+
+        # Price near gamma flip
+        if flip and spot_price:
+            dist_pct = abs(spot_price - flip) / spot_price * 100
+            if dist_pct < self.cfg['gex_flip_proximity_pct']:
+                result['signals'].append('NEAR GAMMA FLIP')
+
+        result['pass'] = len(result['signals']) > 0
+        return result
+
+    # ── Step 2: Triple POC Compression ──────────────────────
+    def step2_poc_compression(self, poc_data, spot_price):
+        """Checks if POC1/2/3 are clustered tightly = coiled market."""
+        result = {
+            'pass': False,
+            'compressed': False,
+            'spread': None,
+            'cluster_mid': None,
+            'price_vs_cluster': None,
+        }
+        if not poc_data:
+            return result
+
+        pocs = []
+        for key in ['poc1', 'poc2', 'poc3']:
+            p = poc_data.get(key)
+            if p and p.get('poc'):
+                pocs.append(p['poc'])
+
+        if len(pocs) < 2:
+            return result
+
+        spread = max(pocs) - min(pocs)
+        mid = sum(pocs) / len(pocs)
+        result['spread'] = round(spread, 2)
+        result['cluster_mid'] = round(mid, 2)
+
+        result['compressed'] = spread <= self.cfg['poc_compression_pts']
+
+        if spot_price > max(pocs):
+            result['price_vs_cluster'] = 'ABOVE'
+        elif spot_price < min(pocs):
+            result['price_vs_cluster'] = 'BELOW'
+        else:
+            result['price_vs_cluster'] = 'INSIDE'
+
+        result['pass'] = result['compressed']
+        return result
+
+    # ── Step 3: Future Swing Alignment ──────────────────────
+    def step3_swing_alignment(self, swing_data, poc_result):
+        """Checks if swing direction supports the move away from POC cluster."""
+        result = {
+            'pass': False,
+            'direction': None,
+            'swing_pct': None,
+            'delta_bias': None,
+            'aligned': False,
+        }
+        if not swing_data:
+            return result
+
+        projection = swing_data.get('projection')
+        swings = swing_data.get('swings', {})
+        vol = swing_data.get('volume', {})
+
+        direction = swings.get('direction', 'unknown')
+        result['direction'] = direction
+
+        if projection:
+            result['swing_pct'] = projection.get('swing_pct', 0)
+
+        # Volume delta bias
+        delta = vol.get('delta', 0)
+        result['delta_bias'] = 'BUY' if delta > 0 else 'SELL' if delta < 0 else 'FLAT'
+
+        # Flat filter
+        if result['swing_pct'] is not None and abs(result['swing_pct']) < self.cfg['swing_flat_pct']:
+            result['direction'] = 'flat'
+            return result
+
+        # Alignment with POC position
+        pvc = poc_result.get('price_vs_cluster') if poc_result else None
+        if direction == 'bullish' and pvc in ('ABOVE', 'INSIDE'):
+            result['aligned'] = True
+        elif direction == 'bearish' and pvc in ('BELOW', 'INSIDE'):
+            result['aligned'] = True
+
+        # Delta should confirm direction
+        delta_confirms = (direction == 'bullish' and delta > 0) or (direction == 'bearish' and delta < 0)
+
+        result['pass'] = result['aligned'] and delta_confirms
+        return result
+
+    # ── Step 4: PCR + Positioning Trap Detection ────────────
+    def step4_pcr_positioning(self, pcr_value, gex_data, swing_direction):
+        """Detects trapped retail positioning that fuels the move."""
+        result = {
+            'pass': False,
+            'pcr': pcr_value,
+            'pcr_signal': None,
+            'trap_type': None,
+            'confluence': None,
+            'strength': 0,
+        }
+        if pcr_value is None:
+            return result
+
+        bull_th = self.cfg['pcr_bull_threshold']
+        bear_th = self.cfg['pcr_bear_threshold']
+
+        if pcr_value > bull_th:
+            result['pcr_signal'] = 'BULLISH'
+        elif pcr_value < bear_th:
+            result['pcr_signal'] = 'BEARISH'
+        else:
+            result['pcr_signal'] = 'NEUTRAL'
+
+        # Trap detection
+        net_gex = gex_data.get('total_gex', 0) if gex_data else 0
+
+        # Bullish trap: PCR > 1.2 + GEX weakening = put writers trapped (fuel for up move)
+        if result['pcr_signal'] == 'BULLISH' and net_gex < 10:
+            result['trap_type'] = 'PUT_WRITERS_TRAPPED'
+        # Bearish trap: PCR < 0.7 + GEX weakening = call writers trapped (fuel for down move)
+        elif result['pcr_signal'] == 'BEARISH' and net_gex < 10:
+            result['trap_type'] = 'CALL_WRITERS_TRAPPED'
+
+        # Confluence with swing direction
+        if swing_direction == 'bullish' and result['pcr_signal'] == 'BULLISH':
+            result['confluence'] = 'BULLISH_ALIGNED'
+            result['strength'] = 3 if result['trap_type'] else 2
+        elif swing_direction == 'bearish' and result['pcr_signal'] == 'BEARISH':
+            result['confluence'] = 'BEARISH_ALIGNED'
+            result['strength'] = 3 if result['trap_type'] else 2
+        elif result['pcr_signal'] == 'NEUTRAL':
+            result['confluence'] = 'NEUTRAL'
+            result['strength'] = 1
+        else:
+            result['confluence'] = 'DIVERGENT'
+            result['strength'] = 0
+
+        result['pass'] = result['strength'] >= 2
+        return result
+
+    # ── Step 5: Structural Timing (Aether Flow trigger) ─────
+    def step5_structural_trigger(self, reversal_score, reversal_signals, swing_direction):
+        """
+        Uses reversal detection signals as proxy for Aether Flow timing.
+        In live TradingView: this maps to CHoCH/FVG/UT Bot/Hull flip events.
+        In-app: uses the ReversalDetector score as structural confirmation.
+        """
+        result = {
+            'pass': False,
+            'trigger_type': None,
+            'score': reversal_score,
+            'signals': [],
+        }
+        if reversal_score is None:
+            return result
+
+        if swing_direction == 'bullish' and reversal_score >= 3:
+            result['trigger_type'] = 'BULLISH_STRUCTURE_CONFIRMED'
+            result['pass'] = True
+        elif swing_direction == 'bearish' and reversal_score <= -3:
+            result['trigger_type'] = 'BEARISH_STRUCTURE_CONFIRMED'
+            result['pass'] = True
+        elif swing_direction == 'bullish' and reversal_score >= 2:
+            result['trigger_type'] = 'BULLISH_STRUCTURE_DEVELOPING'
+            result['pass'] = True
+        elif swing_direction == 'bearish' and reversal_score <= -2:
+            result['trigger_type'] = 'BEARISH_STRUCTURE_DEVELOPING'
+            result['pass'] = True
+
+        if reversal_signals:
+            result['signals'] = list(reversal_signals.keys()) if isinstance(reversal_signals, dict) else []
+
+        return result
+
+    # ── Master Decision: ENTRY READY ────────────────────────
+    def evaluate(self, gex_data, poc_data, swing_data, pcr_value, reversal_score,
+                 reversal_signals, spot_price):
+        """
+        Runs the full 5-step pipeline and returns the final decision.
+
+        Returns dict with:
+          - entry_ready (bool): THE boolean
+          - direction (str): 'LONG' / 'SHORT' / 'NO_TRADE'
+          - confidence (int): 0-5 (steps passed)
+          - steps (dict): detailed result of each step
+          - reason (str): human-readable reasoning chain
+          - invalidation (list): why NOT to trade (if applicable)
+        """
+        s1 = self.step1_gex_warning(gex_data, spot_price)
+        s2 = self.step2_poc_compression(poc_data, spot_price)
+
+        swing_dir = 'unknown'
+        if swing_data:
+            swing_dir = swing_data.get('swings', {}).get('direction', 'unknown')
+
+        s3 = self.step3_swing_alignment(swing_data, s2)
+        s4 = self.step4_pcr_positioning(pcr_value, gex_data, swing_dir)
+        s5 = self.step5_structural_trigger(reversal_score, reversal_signals, swing_dir)
+
+        steps = {'gex': s1, 'poc': s2, 'swing': s3, 'pcr': s4, 'trigger': s5}
+        confidence = sum(1 for s in [s1, s2, s3, s4, s5] if s['pass'])
+
+        # ── ENTRY READY LOGIC ──
+        # Mandatory: Step 1 (GEX) must pass
+        # At least 3 of 5 steps total must pass
+        # Step 5 (trigger) must pass for actual entry
+        entry_ready = s1['pass'] and s5['pass'] and confidence >= 3
+
+        # Direction
+        if not entry_ready:
+            direction = 'NO_TRADE'
+        elif swing_dir == 'bullish':
+            direction = 'LONG'
+        elif swing_dir == 'bearish':
+            direction = 'SHORT'
+        else:
+            direction = 'NO_TRADE'
+            entry_ready = False
+
+        # Invalidation reasons
+        invalidation = []
+        if not s1['pass']:
+            invalidation.append('GEX regime unchanged - no dealer shift detected')
+        if not s2['pass']:
+            invalidation.append(f'POC spread too wide ({s2.get("spread", "?")} pts) - market not compressed')
+        if not s3['pass']:
+            if s3.get('direction') == 'flat':
+                invalidation.append('Swing projection flat - no directional bias')
+            elif not s3.get('aligned'):
+                invalidation.append('Swing direction misaligned with POC position')
+            else:
+                invalidation.append('Volume delta does not confirm swing direction')
+        if not s4['pass']:
+            invalidation.append(f'PCR positioning not confirming ({s4.get("pcr_signal", "?")})')
+        if not s5['pass']:
+            invalidation.append('No structural trigger - wait for confirmation')
+
+        # Build reasoning chain
+        reasons = []
+        if s1['pass']:
+            reasons.append(f'GEX WARNING: {", ".join(s1["signals"])}')
+        if s2['pass']:
+            reasons.append(f'POC COMPRESSED: {s2["spread"]} pts spread, price {s2["price_vs_cluster"]}')
+        if s3['pass']:
+            reasons.append(f'SWING {s3["direction"].upper()}: delta={s3["delta_bias"]}')
+        if s4['pass']:
+            trap = s4.get('trap_type', 'none')
+            reasons.append(f'PCR {s4["pcr_signal"]}: trap={trap}, strength={s4["strength"]}')
+        if s5['pass']:
+            reasons.append(f'TRIGGER: {s5["trigger_type"]}')
+
+        # Stop/target suggestions
+        targets = {}
+        if entry_ready and gex_data:
+            if direction == 'LONG':
+                targets['stop'] = s2.get('cluster_mid', spot_price) if s2['pass'] else (gex_data.get('gamma_flip_level') or spot_price)
+                targets['t1'] = gex_data.get('gex_magnet')
+                targets['t2'] = gex_data.get('gex_repeller')
+            elif direction == 'SHORT':
+                targets['stop'] = s2.get('cluster_mid', spot_price) if s2['pass'] else (gex_data.get('gamma_flip_level') or spot_price)
+                targets['t1'] = gex_data.get('gex_repeller')
+                targets['t2'] = gex_data.get('gex_magnet')
+
+        return {
+            'entry_ready': entry_ready,
+            'direction': direction,
+            'confidence': confidence,
+            'steps': steps,
+            'reason': ' → '.join(reasons) if reasons else 'No conditions met',
+            'invalidation': invalidation,
+            'targets': targets,
+        }
+
+
 def calculate_max_pain(df_options, spot_price):
     """
     Calculate Max Pain - the strike price where option buyers lose the most money.
@@ -5225,6 +5572,196 @@ def main():
             file_name=f"nifty_options_summary_{option_data['expiry']}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv"
         )
+
+    # ═══════════════════════════════════════════════════════════════
+    # AETHER FLOW DECISION ENGINE DASHBOARD
+    # ═══════════════════════════════════════════════════════════════
+    if option_data and option_data.get('underlying') and not df.empty:
+        st.markdown("---")
+        st.markdown("## 🔱 Aether Flow Decision Engine")
+        st.caption("Compression → Ignition → Expansion  |  5-Step Institutional Entry System")
+
+        try:
+            engine = AetherFlowEngine()
+
+            # Gather inputs from existing computations
+            _gex = st.session_state.get('gex_last_valid_data')
+            _spot = option_data.get('underlying', 0)
+            _poc = poc_data_for_chart if 'poc_data_for_chart' in dir() else None
+            _swing = swing_data_for_chart if 'swing_data_for_chart' in dir() else None
+
+            # Get ATM PCR
+            _df_sum = option_data.get('df_summary')
+            _atm_pcr = None
+            if _df_sum is not None and 'Zone' in _df_sum.columns and 'PCR' in _df_sum.columns:
+                _atm = _df_sum[_df_sum['Zone'] == 'ATM']
+                if not _atm.empty:
+                    _atm_pcr = _atm.iloc[0].get('PCR', None)
+
+            # Get reversal scores
+            _bull_sc = bull_score if 'bull_score' in dir() else 0
+            _bear_sc = bear_score if 'bear_score' in dir() else 0
+            _bull_sig = bull_signals if 'bull_signals' in dir() else {}
+            _bear_sig = bear_signals if 'bear_signals' in dir() else {}
+
+            # Use the stronger reversal signal
+            _rev_score = _bull_sc if abs(_bull_sc) >= abs(_bear_sc) else _bear_sc
+            _rev_signals = _bull_sig if abs(_bull_sc) >= abs(_bear_sc) else _bear_sig
+
+            # Run engine
+            decision = engine.evaluate(
+                gex_data=_gex,
+                poc_data=_poc,
+                swing_data=_swing,
+                pcr_value=_atm_pcr,
+                reversal_score=_rev_score,
+                reversal_signals=_rev_signals,
+                spot_price=_spot
+            )
+
+            # ── Main Decision Banner ──
+            entry = decision['entry_ready']
+            direction = decision['direction']
+            confidence = decision['confidence']
+
+            if entry and direction == 'LONG':
+                banner_color = "#00ff88"
+                banner_icon = "🟢"
+                banner_text = "ENTRY READY — LONG"
+            elif entry and direction == 'SHORT':
+                banner_color = "#ff4444"
+                banner_icon = "🔴"
+                banner_text = "ENTRY READY — SHORT"
+            else:
+                banner_color = "#666666"
+                banner_icon = "⏸️"
+                banner_text = "NO TRADE — WAIT"
+
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, {banner_color}20, {banner_color}05);
+                        border: 2px solid {banner_color}; border-radius: 12px;
+                        padding: 20px; text-align: center; margin: 10px 0;">
+                <h1 style="color: {banner_color}; margin: 0; font-size: 2em;">{banner_icon} {banner_text}</h1>
+                <p style="color: {banner_color}; margin: 5px 0; font-size: 1.1em;">
+                    Confidence: {confidence}/5 steps passed  |  Spot: ₹{_spot:.2f}
+                </p>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # ── 5-Step Pipeline Visualization ──
+            steps = decision['steps']
+            step_names = ['GEX Warning', 'POC Compression', 'Swing Align', 'PCR Trap', 'Trigger']
+            step_keys = ['gex', 'poc', 'swing', 'pcr', 'trigger']
+            step_icons = ['⚡', '🧱', '🔮', '⚖️', '🔥']
+
+            cols = st.columns(5)
+            for i, col in enumerate(cols):
+                with col:
+                    s = steps[step_keys[i]]
+                    passed = s['pass']
+                    icon = "✅" if passed else "❌"
+                    color = "#00ff88" if passed else "#ff4444"
+                    mandatory = " (REQ)" if i == 0 else ""
+
+                    st.markdown(f"""
+                    <div style="background-color: {color}15; border: 1px solid {color};
+                                border-radius: 8px; padding: 10px; text-align: center; min-height: 100px;">
+                        <div style="font-size: 1.5em;">{step_icons[i]}</div>
+                        <div style="color: {color}; font-weight: bold; font-size: 0.85em;">
+                            {icon} Step {i+1}{mandatory}
+                        </div>
+                        <div style="color: white; font-size: 0.75em; margin-top: 4px;">
+                            {step_names[i]}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # ── Detailed Step Breakdown ──
+            with st.expander("📋 Detailed Step Analysis", expanded=entry):
+                # Step 1 detail
+                s1 = steps['gex']
+                st.markdown(f"**⚡ Step 1 — GEX Big Move Warning** {'✅' if s1['pass'] else '❌'}")
+                if s1['signals']:
+                    st.markdown(f"  Signals: `{'`, `'.join(s1['signals'])}`")
+                st.markdown(f"  Net GEX: {s1.get('net_gex', 'N/A')} L  |  Gamma Flip: {s1.get('gamma_flip', 'N/A')}  |  Regime: {s1.get('regime', 'N/A')}")
+
+                st.markdown("---")
+
+                # Step 2 detail
+                s2 = steps['poc']
+                st.markdown(f"**🧱 Step 2 — POC Compression** {'✅' if s2['pass'] else '❌'}")
+                st.markdown(f"  POC Spread: {s2.get('spread', 'N/A')} pts (threshold: ≤{engine.cfg['poc_compression_pts']})")
+                st.markdown(f"  Cluster Mid: {s2.get('cluster_mid', 'N/A')}  |  Price Position: {s2.get('price_vs_cluster', 'N/A')}")
+
+                st.markdown("---")
+
+                # Step 3 detail
+                s3 = steps['swing']
+                st.markdown(f"**🔮 Step 3 — Swing Alignment** {'✅' if s3['pass'] else '❌'}")
+                st.markdown(f"  Direction: {s3.get('direction', 'N/A')}  |  Swing %: {s3.get('swing_pct', 'N/A')}  |  Delta: {s3.get('delta_bias', 'N/A')}")
+                st.markdown(f"  Aligned: {'Yes' if s3.get('aligned') else 'No'}")
+
+                st.markdown("---")
+
+                # Step 4 detail
+                s4 = steps['pcr']
+                st.markdown(f"**⚖️ Step 4 — PCR Positioning** {'✅' if s4['pass'] else '❌'}")
+                st.markdown(f"  ATM PCR: {s4.get('pcr', 'N/A')}  |  Signal: {s4.get('pcr_signal', 'N/A')}  |  Trap: {s4.get('trap_type', 'None')}")
+                st.markdown(f"  Confluence: {s4.get('confluence', 'N/A')}  |  Strength: {s4.get('strength', 0)}/3")
+
+                st.markdown("---")
+
+                # Step 5 detail
+                s5 = steps['trigger']
+                st.markdown(f"**🔥 Step 5 — Structural Trigger** {'✅' if s5['pass'] else '❌'}")
+                st.markdown(f"  Trigger: {s5.get('trigger_type', 'None')}  |  Score: {s5.get('score', 'N/A')}")
+
+            # ── Targets (if entry ready) ──
+            if entry and decision.get('targets'):
+                t = decision['targets']
+                st.markdown("### 🎯 Trade Levels")
+                t_cols = st.columns(3)
+                with t_cols[0]:
+                    sl = t.get('stop')
+                    if sl:
+                        st.markdown(f"""
+                        <div style="background: #ff444420; border: 1px solid #ff4444; border-radius: 8px; padding: 12px; text-align: center;">
+                            <div style="color: #ff4444; font-size: 0.8em;">STOP LOSS</div>
+                            <div style="color: #ff4444; font-size: 1.3em; font-weight: bold;">₹{sl:.2f}</div>
+                            <div style="color: #ff444480; font-size: 0.7em;">Below POC cluster / Gamma Flip</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                with t_cols[1]:
+                    t1 = t.get('t1')
+                    if t1:
+                        st.markdown(f"""
+                        <div style="background: #00ff8820; border: 1px solid #00ff88; border-radius: 8px; padding: 12px; text-align: center;">
+                            <div style="color: #00ff88; font-size: 0.8em;">TARGET 1 (GEX Magnet/Repeller)</div>
+                            <div style="color: #00ff88; font-size: 1.3em; font-weight: bold;">₹{t1:.0f}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                with t_cols[2]:
+                    t2 = t.get('t2')
+                    if t2:
+                        st.markdown(f"""
+                        <div style="background: #FFD70020; border: 1px solid #FFD700; border-radius: 8px; padding: 12px; text-align: center;">
+                            <div style="color: #FFD700; font-size: 0.8em;">TARGET 2 (OI Wall / HTF Pivot)</div>
+                            <div style="color: #FFD700; font-size: 1.3em; font-weight: bold;">₹{t2:.0f}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+            # ── Invalidation Reasons (if no trade) ──
+            if not entry and decision.get('invalidation'):
+                st.markdown("### ⛔ Why NOT to Trade")
+                for inv in decision['invalidation']:
+                    st.markdown(f"- 🚫 {inv}")
+
+            # ── Reasoning Chain ──
+            st.markdown("### 🧠 Reasoning Chain")
+            st.code(decision.get('reason', 'No conditions met'), language=None)
+
+        except Exception as e:
+            st.warning(f"Aether Flow Engine unavailable: {str(e)}")
 
     # Analytics dashboard below
     if show_analytics:
