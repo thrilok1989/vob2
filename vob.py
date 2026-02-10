@@ -884,8 +884,8 @@ class TriplePOC:
     - POC 2: Medium-term (default 25 periods)
     - POC 3: Long-term (default 70 periods)
 
-    POC represents the price level where most trading activity occurred,
-    often acting as support/resistance.
+    POC is computed as a rolling time series (updated every 15 bars in Pine,
+    here computed at every bar) and rendered as steplines on the chart.
     """
 
     def __init__(self, period1=10, period2=25, period3=70, bins=25):
@@ -903,21 +903,82 @@ class TriplePOC:
         self.period3 = period3
         self.bins = bins
 
-    def calculate_poc(self, df, period):
+    def _calculate_poc_series(self, df, period):
         """
-        Calculate Point of Control for a given period.
-
-        Args:
-            df: DataFrame with OHLCV data
-            period: Lookback period
+        Calculate POC as a rolling time series across all bars.
+        Mirrors Pine Script logic: at each bar, look back 'period' bars,
+        build volume profile, find POC (max volume level).
 
         Returns:
-            dict with poc, upper_poc, lower_poc, volume, high, low
+            dict with 'poc', 'upper_poc', 'lower_poc' as pandas Series
+        """
+        n = len(df)
+        poc_vals = np.full(n, np.nan)
+        upper_vals = np.full(n, np.nan)
+        lower_vals = np.full(n, np.nan)
+
+        closes = df['close'].values.astype(float)
+        highs = df['high'].values.astype(float)
+        lows = df['low'].values.astype(float)
+        volumes = df['volume'].values.astype(float) if 'volume' in df.columns else np.ones(n)
+
+        # Pine recalculates every 15 bars (bar_index % 15 == 0).
+        # We use a dynamic interval: min(15, period//2) for shorter periods
+        recalc_interval = min(15, max(3, period // 3))
+        last_poc = np.nan
+        last_upper = np.nan
+        last_lower = np.nan
+
+        for i in range(period, n):
+            if (i - period) % recalc_interval == 0:
+                start = i - period
+                end = i + 1
+
+                H = highs[start:end].max()
+                L = lows[start:end].min()
+
+                if H == L:
+                    last_poc = H
+                    last_upper = H
+                    last_lower = L
+                else:
+                    step = (H - L) / self.bins
+                    vol_bins = np.zeros(self.bins)
+                    level_mids = np.zeros(self.bins)
+
+                    for k in range(self.bins):
+                        level_mids[k] = L + k * step + step / 2
+
+                    for j in range(start, end):
+                        c = closes[j]
+                        v = volumes[j]
+                        for k in range(self.bins):
+                            if abs(c - level_mids[k]) <= step:
+                                vol_bins[k] += v
+
+                    max_idx = vol_bins.argmax()
+                    last_poc = level_mids[max_idx]
+                    last_upper = last_poc + step * 2
+                    last_lower = last_poc - step * 2
+
+            poc_vals[i] = last_poc
+            upper_vals[i] = last_upper
+            lower_vals[i] = last_lower
+
+        return {
+            'poc': pd.Series(poc_vals, index=df.index),
+            'upper_poc': pd.Series(upper_vals, index=df.index),
+            'lower_poc': pd.Series(lower_vals, index=df.index),
+        }
+
+    def calculate_poc(self, df, period):
+        """
+        Calculate single (latest) POC for a given period.
+        Used for signal generation and table display.
         """
         if df.empty or len(df) < period:
             return None
 
-        # Get last 'period' bars
         recent_df = df.tail(period).copy()
 
         H = recent_df['high'].max()
@@ -925,64 +986,44 @@ class TriplePOC:
 
         if H == L:
             return {
-                'poc': H,
-                'upper_poc': H,
-                'lower_poc': L,
-                'volume': 0,
-                'high': H,
-                'low': L
+                'poc': H, 'upper_poc': H, 'lower_poc': L,
+                'volume': 0, 'high': H, 'low': L
             }
 
         step = (H - L) / self.bins
-
-        # Initialize volume bins
         vol_bins = [0.0] * self.bins
         level_mids = []
 
         for k in range(self.bins):
-            l = L + k * step
-            mid = l + step / 2
-            level_mids.append(mid)
+            level_mids.append(L + k * step + step / 2)
 
-        # Distribute volume across bins
         for _, row in recent_df.iterrows():
             c = row['close']
-            v = row.get('volume', 1)  # Default volume if not available
-
+            v = row.get('volume', 1)
             for k in range(len(level_mids)):
-                mid = level_mids[k]
-                if abs(c - mid) <= step:
+                if abs(c - level_mids[k]) <= step:
                     vol_bins[k] += v
 
-        # Find POC (price level with max volume)
         max_vol_idx = vol_bins.index(max(vol_bins))
         poc = level_mids[max_vol_idx]
-        max_volume = vol_bins[max_vol_idx]
-
-        # Upper and lower POC boundaries (±2 steps)
-        upper_poc = poc + step * 2
-        lower_poc = poc - step * 2
 
         return {
             'poc': round(poc, 2),
-            'upper_poc': round(upper_poc, 2),
-            'lower_poc': round(lower_poc, 2),
-            'volume': max_volume,
-            'high': H,
-            'low': L,
-            'step': step
+            'upper_poc': round(poc + step * 2, 2),
+            'lower_poc': round(poc - step * 2, 2),
+            'volume': vol_bins[max_vol_idx],
+            'high': H, 'low': L, 'step': step
         }
 
     def calculate_all_pocs(self, df):
         """
-        Calculate all three POCs.
-
-        Args:
-            df: DataFrame with OHLCV data
-
-        Returns:
-            dict with poc1, poc2, poc3 data
+        Calculate all three POCs — both time series (for chart) and latest values (for signals/tables).
         """
+        poc1_series = self._calculate_poc_series(df, self.period1)
+        poc2_series = self._calculate_poc_series(df, self.period2)
+        poc3_series = self._calculate_poc_series(df, self.period3)
+
+        # Latest single values for tables/signals
         poc1 = self.calculate_poc(df, self.period1)
         poc2 = self.calculate_poc(df, self.period2)
         poc3 = self.calculate_poc(df, self.period3)
@@ -991,6 +1032,9 @@ class TriplePOC:
             'poc1': poc1,
             'poc2': poc2,
             'poc3': poc3,
+            'poc1_series': poc1_series,
+            'poc2_series': poc2_series,
+            'poc3_series': poc3_series,
             'periods': {
                 'poc1': self.period1,
                 'poc2': self.period2,
@@ -2790,12 +2834,9 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         except Exception as e:
             pass  # VOB drawing failed, skip it
 
-    # Add Triple POC lines if provided
+    # Add Triple POC steplines if provided
     if poc_data:
         try:
-            x_start = df['datetime'].min()
-            x_end = df['datetime'].max()
-
             poc_colors = {
                 'poc1': '#e91e63',  # Pink - Short-term
                 'poc2': '#2196f3',  # Blue - Medium-term
@@ -2803,30 +2844,85 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
             }
 
             for poc_key in ['poc1', 'poc2', 'poc3']:
-                poc = poc_data.get(poc_key)
-                if poc and poc.get('poc'):
+                series_key = f'{poc_key}_series'
+                series_data = poc_data.get(series_key)
+                poc_latest = poc_data.get(poc_key)
+
+                if series_data is not None:
                     color = poc_colors[poc_key]
                     period = poc_data.get('periods', {}).get(poc_key, '')
 
-                    # POC main line
-                    fig.add_shape(
-                        type="line",
-                        x0=x_start, x1=x_end,
-                        y0=poc['poc'], y1=poc['poc'],
-                        line=dict(color=color, width=2),
-                        row=1, col=1
-                    )
+                    poc_s = series_data['poc']
+                    upper_s = series_data['upper_poc']
+                    lower_s = series_data['lower_poc']
 
-                    # POC annotation
-                    fig.add_annotation(
-                        x=x_end,
-                        y=poc['poc'],
-                        text=f"POC{poc_key[-1]} ({period}): ₹{poc['poc']:.0f}",
-                        showarrow=False,
-                        font=dict(color=color, size=10),
-                        xanchor="left",
-                        row=1, col=1
-                    )
+                    # Filter out NaN values and align with datetime
+                    valid_mask = poc_s.notna()
+                    if valid_mask.any():
+                        dt = df.loc[valid_mask, 'datetime']
+                        poc_vals = poc_s[valid_mask]
+                        upper_vals = upper_s[valid_mask]
+                        lower_vals = lower_s[valid_mask]
+
+                        # Main POC stepline
+                        fig.add_trace(
+                            go.Scatter(
+                                x=dt, y=poc_vals,
+                                mode='lines',
+                                name=f'POC {poc_key[-1]} ({period})',
+                                line=dict(color=color, width=2, shape='hv'),
+                                showlegend=True,
+                                hovertemplate=f'POC{poc_key[-1]}: ₹%{{y:.2f}}<extra></extra>'
+                            ),
+                            row=1, col=1
+                        )
+
+                        # Upper POC channel (translucent)
+                        fig.add_trace(
+                            go.Scatter(
+                                x=dt, y=upper_vals,
+                                mode='lines',
+                                name=f'Upper POC {poc_key[-1]}',
+                                line=dict(color=color, width=1, shape='hv', dash='dot'),
+                                opacity=0.3,
+                                showlegend=False,
+                                hoverinfo='skip'
+                            ),
+                            row=1, col=1
+                        )
+
+                        # Lower POC channel (translucent) with fill to upper
+                        # Convert hex to rgba for fill
+                        hex_c = color.lstrip('#')
+                        r, g, b = int(hex_c[:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+                        fill_rgba = f'rgba({r},{g},{b},0.08)'
+
+                        fig.add_trace(
+                            go.Scatter(
+                                x=dt, y=lower_vals,
+                                mode='lines',
+                                name=f'Lower POC {poc_key[-1]}',
+                                line=dict(color=color, width=1, shape='hv', dash='dot'),
+                                opacity=0.3,
+                                showlegend=False,
+                                fill='tonexty',
+                                fillcolor=fill_rgba,
+                                hoverinfo='skip'
+                            ),
+                            row=1, col=1
+                        )
+
+                        # Label at the end
+                        last_poc_val = poc_vals.iloc[-1]
+                        last_dt = dt.iloc[-1]
+                        fig.add_annotation(
+                            x=last_dt, y=last_poc_val,
+                            text=f"POC{poc_key[-1]} ({period}): ₹{last_poc_val:.0f}",
+                            showarrow=False,
+                            font=dict(color=color, size=10),
+                            xanchor="left",
+                            row=1, col=1
+                        )
 
         except Exception as e:
             pass  # POC drawing failed, skip it
