@@ -283,7 +283,7 @@ class SupabaseDB:
                 return prefs
             else:
                 return {
-                    'timeframe': '5',
+                    'timeframe': '1',
                     'auto_refresh': True,
                     'days_back': 1,
                     'pivot_proximity': 5,
@@ -295,8 +295,8 @@ class SupabaseDB:
         except Exception as e:
             st.error(f"Error retrieving preferences: {str(e)}")
             return {
-                'timeframe': '5', 
-                'auto_refresh': True, 
+                'timeframe': '1',
+                'auto_refresh': True,
                 'days_back': 1,
                 'pivot_proximity': 5,
                 'pivot_settings': {
@@ -880,9 +880,9 @@ class TriplePOC:
     Triple Point of Control (POC) Indicator - Converted from Pine Script [BigBeluga]
 
     Calculates POC (price level with highest volume) for 3 different periods:
-    - POC 1: Short-term (default 25 periods)
-    - POC 2: Medium-term (default 40 periods)
-    - POC 3: Long-term (default 100 periods)
+    - POC 1: Short-term (default 10 periods)
+    - POC 2: Medium-term (default 25 periods)
+    - POC 3: Long-term (default 70 periods)
 
     POC represents the price level where most trading activity occurred,
     often acting as support/resistance.
@@ -1016,6 +1016,199 @@ class TriplePOC:
             return 'below'
         else:
             return 'inside'
+
+
+class RSIVolatilitySuppression:
+    """
+    RSI Volatility Suppression Zones - Converted from Pine Script [BigBeluga]
+
+    Detects zones where RSI volatility is suppressed (low), indicating
+    consolidation periods that often precede breakouts.
+
+    When price breaks out of a suppression zone:
+    - Upward breakout (low crosses above zone top) → Bullish signal
+    - Downward breakout (high crosses below zone bottom) → Bearish signal
+    """
+
+    def __init__(self, rsi_length=14, vol_length=5, bins_size=150, zone_threshold=10, extended_threshold=50):
+        self.rsi_length = rsi_length
+        self.vol_length = vol_length
+        self.bins_size = bins_size
+        self.zone_threshold = zone_threshold
+        self.extended_threshold = extended_threshold
+
+    @staticmethod
+    def _hma(series, period):
+        """Hull Moving Average"""
+        if len(series) < period:
+            return series.copy()
+        half_period = max(int(period / 2), 1)
+        sqrt_period = max(int(np.sqrt(period)), 1)
+
+        wma1 = series.rolling(window=half_period, min_periods=1).apply(
+            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
+        )
+        wma2 = series.rolling(window=period, min_periods=1).apply(
+            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
+        )
+        diff = 2 * wma1 - wma2
+        hma = diff.rolling(window=sqrt_period, min_periods=1).apply(
+            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
+        )
+        return hma
+
+    @staticmethod
+    def _rsi(series, period):
+        """Standard RSI calculation"""
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta).where(delta < 0, 0.0)
+        avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
+        avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50)
+
+    def _calculate_rsi_volatility(self, rsi_series):
+        """Calculate historical volatility of RSI (normalized)"""
+        log_returns = np.log(rsi_series / rsi_series.shift(1))
+        hv = 100 * log_returns.rolling(window=5, min_periods=1).std()
+        hv_std = hv.rolling(window=200, min_periods=20).std()
+        hv_normalized = hv / hv_std.replace(0, np.nan)
+        return hv_normalized.fillna(0)
+
+    def analyze(self, df):
+        """
+        Analyze RSI volatility suppression zones.
+
+        Returns:
+            dict with 'zones' (list of zone dicts), 'rsi' (smoothed RSI series),
+            'rsi_volatility' (normalized RSI volatility), 'current_signal'
+        """
+        if df.empty or len(df) < self.rsi_length + self.vol_length + 10:
+            return None
+
+        close = df['close'].astype(float)
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+        hl2 = (high + low) / 2
+
+        # RSI smoothed with HMA
+        raw_rsi = self._rsi(close, self.rsi_length)
+        rsi = self._hma(raw_rsi, self.vol_length)
+
+        # Average bar range (size)
+        bar_range = high - low
+        size = bar_range.rolling(window=self.bins_size, min_periods=20).mean()
+
+        # SMA of hl2 for zone center
+        sma = hl2.rolling(window=5, min_periods=1).mean()
+
+        # RSI volatility
+        rsi_volatility = self._calculate_rsi_volatility(rsi)
+
+        # Build suppression zones bar-by-bar
+        zones = []
+        count_volatility = 0
+        active_zone = None
+
+        for i in range(len(df)):
+            rv = rsi_volatility.iloc[i] if not np.isnan(rsi_volatility.iloc[i]) else 0
+            curr_low = low.iloc[i]
+            curr_high = high.iloc[i]
+            curr_sma = sma.iloc[i] if not np.isnan(sma.iloc[i]) else hl2.iloc[i]
+            curr_size = size.iloc[i] if not np.isnan(size.iloc[i]) else bar_range.iloc[i]
+
+            prev_rv = rsi_volatility.iloc[i-1] if i > 0 and not np.isnan(rsi_volatility.iloc[i-1]) else 0
+
+            # Count consecutive low-volatility bars
+            if rv <= 2:
+                count_volatility += 1
+            # Reset on crossover above 2
+            if rv > 2 and prev_rv <= 2:
+                count_volatility = 0
+
+            # Create new zone when count crosses threshold
+            prev_count = count_volatility - 1 if rv <= 2 else 0
+            zone_top = curr_sma + curr_size * 2
+            zone_bottom = curr_sma - curr_size * 2
+
+            if prev_count < self.zone_threshold and count_volatility >= self.zone_threshold and count_volatility > 0:
+                active_zone = {
+                    'start_idx': max(0, i - self.zone_threshold),
+                    'start_time': df['datetime'].iloc[max(0, i - self.zone_threshold)] if 'datetime' in df.columns else None,
+                    'end_idx': i,
+                    'end_time': df['datetime'].iloc[i] if 'datetime' in df.columns else None,
+                    'top': zone_top,
+                    'bottom': zone_bottom,
+                    'breakout': None,
+                    'breakout_idx': None,
+                    'breakout_time': None,
+                }
+
+            # Extend active zone
+            if active_zone and active_zone['breakout'] is None:
+                active_zone['end_idx'] = i
+                if 'datetime' in df.columns:
+                    active_zone['end_time'] = df['datetime'].iloc[i]
+
+            # Check breakout up: low crosses above zone top
+            if active_zone and active_zone['breakout'] is None:
+                if i > 0 and curr_low > active_zone['top'] and low.iloc[i-1] <= active_zone['top']:
+                    active_zone['breakout'] = 'bullish'
+                    active_zone['breakout_idx'] = i
+                    if 'datetime' in df.columns:
+                        active_zone['breakout_time'] = df['datetime'].iloc[i]
+                    zones.append(active_zone.copy())
+                    active_zone = None
+
+            # Check breakout down: high crosses below zone bottom
+            if active_zone and active_zone['breakout'] is None:
+                if i > 0 and curr_high < active_zone['bottom'] and high.iloc[i-1] >= active_zone['bottom']:
+                    active_zone['breakout'] = 'bearish'
+                    active_zone['breakout_idx'] = i
+                    if 'datetime' in df.columns:
+                        active_zone['breakout_time'] = df['datetime'].iloc[i]
+                    zones.append(active_zone.copy())
+                    active_zone = None
+
+            # Extended zone: after 50 bars of low vol with no active zone
+            if active_zone is None and prev_count < self.extended_threshold and count_volatility >= self.extended_threshold:
+                active_zone = {
+                    'start_idx': max(0, i - self.zone_threshold),
+                    'start_time': df['datetime'].iloc[max(0, i - self.zone_threshold)] if 'datetime' in df.columns else None,
+                    'end_idx': i,
+                    'end_time': df['datetime'].iloc[i] if 'datetime' in df.columns else None,
+                    'top': zone_top,
+                    'bottom': zone_bottom,
+                    'breakout': None,
+                    'breakout_idx': None,
+                    'breakout_time': None,
+                }
+
+        # Add still-active zone (no breakout yet)
+        if active_zone and active_zone['breakout'] is None:
+            active_zone['breakout'] = 'pending'
+            zones.append(active_zone.copy())
+
+        # Current signal
+        current_signal = 'No Zone'
+        if zones:
+            last_zone = zones[-1]
+            if last_zone['breakout'] == 'pending':
+                current_signal = 'In Suppression Zone'
+            elif last_zone['breakout'] == 'bullish':
+                current_signal = 'Bullish Breakout'
+            elif last_zone['breakout'] == 'bearish':
+                current_signal = 'Bearish Breakout'
+
+        return {
+            'zones': zones,
+            'rsi': rsi,
+            'rsi_volatility': rsi_volatility,
+            'current_signal': current_signal,
+            'count_volatility': count_volatility,
+        }
 
 
 class FutureSwing:
@@ -1845,260 +2038,191 @@ def calculate_max_pain(df_options, spot_price):
     return max_pain_strike, pain_df
 
 
-def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5):
-    """Trading signal detection with Normal Bias OR OI Dominance (both require full ATM bias alignment)."""
-    if df.empty or option_data is None or len(option_data) == 0 or not current_price:
+def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price, pivot_proximity,
+                                   poc_data=None, rsi_sz_data=None, gex_data=None):
+    """
+    Unified Confluence Entry Signal — sends ONE Telegram alert only when ALL conditions align:
+
+    1. ATM Bias: Verdict is Strong Bullish or Strong Bearish (BiasScore >= 4 or <= -4)
+    2. PCR + GEX: Confluence strength >= 2
+    3. POC Alignment: Price position consistent with direction (above for bull, below for bear)
+    4. RSI Suppression Zone: Recent breakout in same direction (or active zone = pending entry)
+    5. Near Pivot Level: Price within proximity of HTF pivot S/R
+    """
+    if df.empty or df_summary is None or len(df_summary) == 0 or not current_price:
         return
+
+    # Dedup: avoid sending same alert twice
+    if 'last_confluence_alert' not in st.session_state:
+        st.session_state.last_confluence_alert = None
 
     try:
-        df_json = df.to_json()
-        pivots = cached_pivot_calculation(df_json, pivot_settings)
-    except:
-        pivots = PivotIndicator.get_all_pivots(df, pivot_settings)
+        # --- 1. ATM Bias Verdict ---
+        atm_data = df_summary[df_summary['Zone'] == 'ATM']
+        if atm_data.empty:
+            return
+        row = atm_data.iloc[0]
+        verdict = row.get('Verdict', 'Neutral')
+        bias_score = row.get('BiasScore', 0)
+        atm_strike = row.get('Strike', 0)
 
-    # Calculate Reversal Detector signals
-    pivot_lows = [p['value'] for p in pivots if p['type'] == 'low']
-    reversal_score, reversal_signals, reversal_verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
-    
-    near_pivot = False
-    pivot_level = None
-    
-    for pivot in pivots:
-        if pivot['timeframe'] in ['3M', '5M', '10M', '15M']:
-            price_diff = current_price - pivot['value']
-            if abs(price_diff) <= pivot_proximity:
-                near_pivot = True
-                pivot_level = pivot
-                break
-    
-    if near_pivot and len(option_data) > 0:
-        atm_data = option_data[option_data['Zone'] == 'ATM']
-        
-        if not atm_data.empty:
-            row = atm_data.iloc[0]
-            
-            # Bias checks (including DeltaExp and GammaExp)
-            bullish_conditions = {
-                'Support Level': row.get('Level') == 'Support',
-                'ChgOI Bias': row.get('ChgOI_Bias') == 'Bullish',
-                'Volume Bias': row.get('Volume_Bias') == 'Bullish',
-                'AskQty Bias': row.get('AskQty_Bias') == 'Bullish',
-                'BidQty Bias': row.get('BidQty_Bias') == 'Bullish',
-                'Pressure Bias': row.get('PressureBias') == 'Bullish',
-                'Delta Exposure': row.get('DeltaExp') == 'Bullish',
-                'Gamma Exposure': row.get('GammaExp') == 'Bullish'
-            }
-
-            bearish_conditions = {
-                'Resistance Level': row.get('Level') == 'Resistance',
-                'ChgOI Bias': row.get('ChgOI_Bias') == 'Bearish',
-                'Volume Bias': row.get('Volume_Bias') == 'Bearish',
-                'AskQty Bias': row.get('AskQty_Bias') == 'Bearish',
-                'BidQty Bias': row.get('BidQty_Bias') == 'Bearish',
-                'Pressure Bias': row.get('PressureBias') == 'Bearish',
-                'Delta Exposure': row.get('DeltaExp') == 'Bearish',
-                'Gamma Exposure': row.get('GammaExp') == 'Bearish'
-            }
-            
-            atm_strike = row['Strike']
-            stop_loss_percent = 20
-            
-            # Change in OI
-            ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
-            pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
-
-            # OI dominance logic (flipped as per your request)
-            bullish_oi_confirm = pe_chg_oi > 1.5 * ce_chg_oi   # Bullish if Put ChgOI dominates
-            bearish_oi_confirm = ce_chg_oi > 1.5 * pe_chg_oi   # Bearish if Call ChgOI dominates
-
-            # === Bullish Call Signal (spot near pivot, above OR below) ===
-            if (
-                (all(bullish_conditions.values()) and abs(current_price - pivot_level['value']) <= pivot_proximity)
-                or (bullish_oi_confirm and all(bullish_conditions.values()) and abs(current_price - pivot_level['value']) <= pivot_proximity)
-            ):
-                trigger_type = "📊 Normal Bias Trigger" if not bullish_oi_confirm else "🔥 OI Dominance Trigger"
-                conditions_text = "\n".join([f"✅ {k}" for k, v in bullish_conditions.items() if v])
-                price_diff = current_price - pivot_level['value']
-                
-                # Build reversal analysis text
-                reversal_text = f"""
-🔄 <b>REVERSAL DETECTOR:</b>
-• Score: {reversal_signals.get('Reversal_Score', 0)}/6
-• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
-• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
-• Strong Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
-• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
-• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
-• {reversal_verdict}"""
-
-                message = f"""
-🚨 <b>NIFTY CALL SIGNAL ALERT</b> 🚨
-
-📍 <b>Spot Price:</b> ₹{current_price:.2f} ({'ABOVE' if price_diff > 0 else 'BELOW'} Pivot by {price_diff:+.2f} points)
-📌 <b>Near Pivot:</b> {pivot_level['timeframe']} Level at ₹{pivot_level['value']:.2f}
-🎯 <b>ATM Strike:</b> {atm_strike}
-
-<b>✅ BULLISH CONDITIONS MET:</b>
-{conditions_text}
-
-⚡ <b>{trigger_type}</b>
-⚡ <b>OI:</b> PE ChgOI {pe_chg_oi:,} vs CE ChgOI {ce_chg_oi:,}
-{reversal_text}
-
-📋 <b>SUGGESTED REVIEW:</b>
-• Strike: {atm_strike} CE
-• Stop Loss: {stop_loss_percent}%
-• Manual verification required
-
-🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
-"""
-                try:
-                    send_telegram_message_sync(message)
-                    st.success("🟢 Bullish signal notification sent!")
-                except Exception as e:
-                    st.error(f"Failed to send notification: {e}")
-            
-            # === Bearish Put Signal (spot near pivot, above OR below) ===
-            elif (
-                (all(bearish_conditions.values()) and abs(current_price - pivot_level['value']) <= pivot_proximity)
-                or (bearish_oi_confirm and all(bearish_conditions.values()) and abs(current_price - pivot_level['value']) <= pivot_proximity)
-            ):
-                trigger_type = "📊 Normal Bias Trigger" if not bearish_oi_confirm else "🔥 OI Dominance Trigger"
-                conditions_text = "\n".join([f"🔴 {k}" for k, v in bearish_conditions.items() if v])
-                price_diff = current_price - pivot_level['value']
-                
-                # Build reversal analysis text for bearish
-                reversal_text = f"""
-🔄 <b>REVERSAL DETECTOR:</b>
-• Score: {reversal_signals.get('Reversal_Score', 0)}/6
-• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
-• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
-• Strong Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
-• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
-• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
-• {reversal_verdict}"""
-
-                message = f"""
-🔴 <b>NIFTY PUT SIGNAL ALERT</b> 🔴
-
-📍 <b>Spot Price:</b> ₹{current_price:.2f} ({'ABOVE' if price_diff > 0 else 'BELOW'} Pivot by {price_diff:+.2f} points)
-📌 <b>Near Pivot:</b> {pivot_level['timeframe']} Level at ₹{pivot_level['value']:.2f}
-🎯 <b>ATM Strike:</b> {atm_strike}
-
-<b>🔴 BEARISH CONDITIONS MET:</b>
-{conditions_text}
-
-⚡ <b>{trigger_type}</b>
-⚡ <b>OI:</b> CE ChgOI {ce_chg_oi:,} vs PE ChgOI {pe_chg_oi:,}
-{reversal_text}
-
-📋 <b>SUGGESTED REVIEW:</b>
-• Strike: {atm_strike} PE
-• Stop Loss: {stop_loss_percent}%
-• Manual verification required
-
-🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
-"""
-                try:
-                    send_telegram_message_sync(message)
-                    st.success("🔴 Bearish signal notification sent!")
-                except Exception as e:
-                    st.error(f"Failed to send notification: {e}")
-
-
-def check_atm_verdict_alert(df_summary, underlying_price):
-    """Send Telegram alert when ATM strike verdict is Strong Bullish or Strong Bearish."""
-    if df_summary is None or len(df_summary) == 0 or not underlying_price:
-        return
-
-    # Find ATM strike row
-    atm_data = df_summary[df_summary['Zone'] == 'ATM']
-    if atm_data.empty:
-        return
-
-    row = atm_data.iloc[0]
-    verdict = row.get('Verdict', 'Neutral')
-    atm_strike = row.get('Strike', 0)
-    bias_score = row.get('BiasScore', 0)
-
-    # Only alert for Strong Bullish or Strong Bearish
-    if verdict not in ['Strong Bullish', 'Strong Bearish']:
-        return
-
-    # Avoid duplicate alerts using session state
-    alert_key = f"atm_verdict_{atm_strike}_{verdict}"
-    if 'last_atm_verdict_alert' not in st.session_state:
-        st.session_state.last_atm_verdict_alert = None
-
-    # Check if this is a new alert (different from last sent)
-    if st.session_state.last_atm_verdict_alert == alert_key:
-        return  # Same alert already sent, skip
-
-    # Get additional bias details
-    oi_bias = row.get('OI_Bias', 'N/A')
-    chgoi_bias = row.get('ChgOI_Bias', 'N/A')
-    volume_bias = row.get('Volume_Bias', 'N/A')
-    delta_exp = row.get('DeltaExp', 'N/A')
-    gamma_exp = row.get('GammaExp', 'N/A')
-    pressure_bias = row.get('PressureBias', 'N/A')
-    operator_entry = row.get('Operator_Entry', 'N/A')
-    scalp_moment = row.get('Scalp_Moment', 'N/A')
-
-    # Get OI and ChgOI values
-    ce_oi = row.get('openInterest_CE', 0)
-    pe_oi = row.get('openInterest_PE', 0)
-    ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
-    pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
-
-    # Build the message
-    if verdict == 'Strong Bullish':
-        emoji = "🟢🟢🟢"
-        direction = "BULLISH"
-        suggested_option = "CE"
-    else:
-        emoji = "🔴🔴🔴"
-        direction = "BEARISH"
-        suggested_option = "PE"
-
-    message = f"""
-{emoji} <b>ATM STRIKE STRONG {direction} ALERT</b> {emoji}
-
-📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
-🎯 <b>ATM Strike:</b> {atm_strike}
-📊 <b>Verdict:</b> {verdict} (Score: {bias_score})
-
-<b>📈 BIAS BREAKDOWN:</b>
-• OI Bias: {oi_bias}
-• ChgOI Bias: {chgoi_bias}
-• Volume Bias: {volume_bias}
-• Delta Exp: {delta_exp}
-• Gamma Exp: {gamma_exp}
-• Pressure: {pressure_bias}
-
-<b>📊 OI DATA:</b>
-• CE OI: {ce_oi/100000:.1f}L | PE OI: {pe_oi/100000:.1f}L
-• CE ΔOI: {ce_chg_oi/1000:.1f}K | PE ΔOI: {pe_chg_oi/1000:.1f}K
-
-<b>⚡ SIGNALS:</b>
-• Operator Entry: {operator_entry}
-• Scalp/Momentum: {scalp_moment}
-
-📋 <b>SUGGESTED REVIEW:</b>
-• Strike: {atm_strike} {suggested_option}
-• Manual verification required
-
-🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
-"""
-
-    try:
-        send_telegram_message_sync(message)
-        st.session_state.last_atm_verdict_alert = alert_key
         if verdict == 'Strong Bullish':
-            st.success(f"🟢 ATM Strong Bullish alert sent for strike {atm_strike}!")
+            direction = 'bullish'
+        elif verdict == 'Strong Bearish':
+            direction = 'bearish'
         else:
-            st.success(f"🔴 ATM Strong Bearish alert sent for strike {atm_strike}!")
+            return  # No strong verdict → no alert
+
+        # --- 2. PCR + GEX Confluence ---
+        atm_pcr = row.get('PCR', 1.0)
+        confluence_badge, confluence_signal, confluence_strength = calculate_pcr_gex_confluence(atm_pcr, gex_data)
+        if confluence_strength < 2:
+            return  # Weak confluence → no alert
+
+        # Check confluence direction matches verdict
+        if direction == 'bullish' and 'BULL' not in confluence_badge:
+            return
+        if direction == 'bearish' and 'BEAR' not in confluence_badge:
+            return
+
+        # --- 3. POC Alignment ---
+        poc_aligned = False
+        poc_detail = "N/A"
+        if poc_data:
+            positions = []
+            for poc_key in ['poc1', 'poc2', 'poc3']:
+                poc = poc_data.get(poc_key)
+                if poc and poc.get('poc'):
+                    if current_price > poc.get('upper_poc', 0):
+                        positions.append('above')
+                    elif current_price < poc.get('lower_poc', 0):
+                        positions.append('below')
+                    else:
+                        positions.append('inside')
+
+            if direction == 'bullish' and positions.count('above') >= 2:
+                poc_aligned = True
+                poc_detail = f"Above {positions.count('above')}/3 POCs"
+            elif direction == 'bearish' and positions.count('below') >= 2:
+                poc_aligned = True
+                poc_detail = f"Below {positions.count('below')}/3 POCs"
+        else:
+            poc_aligned = True  # Skip if no POC data available
+            poc_detail = "POC data N/A"
+
+        if not poc_aligned:
+            return
+
+        # --- 4. RSI Suppression Zone ---
+        rsi_sz_signal = "N/A"
+        rsi_sz_aligned = False
+        if rsi_sz_data and rsi_sz_data.get('zones'):
+            last_zone = rsi_sz_data['zones'][-1]
+            breakout = last_zone.get('breakout', 'pending')
+            if direction == 'bullish' and breakout == 'bullish':
+                rsi_sz_aligned = True
+                rsi_sz_signal = "Bullish Breakout"
+            elif direction == 'bearish' and breakout == 'bearish':
+                rsi_sz_aligned = True
+                rsi_sz_signal = "Bearish Breakout"
+            elif breakout == 'pending':
+                rsi_sz_aligned = True  # Active zone = compression, accept it
+                rsi_sz_signal = "In Suppression (pending breakout)"
+        else:
+            rsi_sz_aligned = True  # Skip if no data
+            rsi_sz_signal = "RSI SZ data N/A"
+
+        if not rsi_sz_aligned:
+            return
+
+        # --- 5. Near Pivot Level ---
+        try:
+            df_json = df.to_json()
+            pivots = cached_pivot_calculation(df_json, pivot_settings)
+        except Exception:
+            pivots = PivotIndicator.get_all_pivots(df, pivot_settings)
+
+        near_pivot = False
+        pivot_level = None
+        for pivot in pivots:
+            if pivot['timeframe'] in ['3M', '5M', '10M', '15M']:
+                if abs(current_price - pivot['value']) <= pivot_proximity:
+                    near_pivot = True
+                    pivot_level = pivot
+                    break
+
+        if not near_pivot:
+            return
+
+        # ===== ALL CONDITIONS MET — BUILD AND SEND ALERT =====
+        ist = pytz.timezone('Asia/Kolkata')
+        now_str = datetime.now(ist).strftime('%H:%M:%S IST')
+        alert_key = f"confluence_{direction}_{atm_strike}_{datetime.now(ist).strftime('%Y%m%d_%H%M')}"
+
+        if st.session_state.last_confluence_alert == alert_key:
+            return  # Already sent this minute
+
+        # Gather all details
+        price_diff = current_price - pivot_level['value']
+        oi_bias = row.get('OI_Bias', 'N/A')
+        chgoi_bias = row.get('ChgOI_Bias', 'N/A')
+        volume_bias = row.get('Volume_Bias', 'N/A')
+        delta_exp = row.get('DeltaExp', 'N/A')
+        gamma_exp = row.get('GammaExp', 'N/A')
+        pressure_bias = row.get('PressureBias', 'N/A')
+        operator_entry = row.get('Operator_Entry', 'N/A')
+        ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
+        pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
+
+        net_gex = gex_data.get('total_gex', 0) if gex_data else 0
+        gex_signal_text = gex_data.get('gex_signal', 'N/A') if gex_data else 'N/A'
+        gex_magnet = gex_data.get('gex_magnet', 'N/A') if gex_data else 'N/A'
+
+        if direction == 'bullish':
+            emoji = "🟢🔥"
+            dir_label = "BULLISH"
+            option_type = "CE"
+        else:
+            emoji = "🔴🔥"
+            dir_label = "BEARISH"
+            option_type = "PE"
+
+        message = f"""
+{emoji} <b>CONFLUENCE ENTRY ALERT — {dir_label}</b> {emoji}
+
+📍 <b>Spot:</b> ₹{current_price:.2f} ({'ABOVE' if price_diff > 0 else 'BELOW'} Pivot by {price_diff:+.1f} pts)
+📌 <b>Pivot:</b> {pivot_level['timeframe']} at ₹{pivot_level['value']:.2f}
+🎯 <b>ATM Strike:</b> {atm_strike} {option_type}
+
+<b>✅ ALL 5 CONDITIONS MET:</b>
+1️⃣ ATM Verdict: {verdict} (Score: {bias_score})
+2️⃣ PCR×GEX: {confluence_badge} ({confluence_signal}) ★{confluence_strength}
+3️⃣ POC: {poc_detail}
+4️⃣ RSI SZ: {rsi_sz_signal}
+5️⃣ Pivot: {pivot_level['timeframe']} within {pivot_proximity} pts
+
+<b>📊 ATM BIAS:</b>
+• OI: {oi_bias} | ChgOI: {chgoi_bias} | Vol: {volume_bias}
+• Delta: {delta_exp} | Gamma: {gamma_exp} | Pressure: {pressure_bias}
+• Operator: {operator_entry}
+
+<b>📈 OI DATA:</b>
+• CE ΔOI: {ce_chg_oi/1000:.1f}K | PE ΔOI: {pe_chg_oi/1000:.1f}K | PCR: {atm_pcr:.2f}
+
+<b>🎯 GEX:</b>
+• Net: {net_gex:.2f}L | Regime: {gex_signal_text} | Magnet: {gex_magnet}
+
+🕐 {now_str}
+"""
+        send_telegram_message_sync(message)
+        st.session_state.last_confluence_alert = alert_key
+        if direction == 'bullish':
+            st.success(f"🟢🔥 Confluence BULLISH entry alert sent! Strike {atm_strike} CE")
+        else:
+            st.success(f"🔴🔥 Confluence BEARISH entry alert sent! Strike {atm_strike} PE")
+
     except Exception as e:
-        st.error(f"Failed to send ATM verdict alert: {e}")
+        pass  # Silently fail to avoid disrupting the app
 
 
 def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
@@ -2210,138 +2334,6 @@ def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
     except Exception as e:
         return None
 
-
-def check_gex_alert(gex_data, df_summary, underlying_price):
-    """
-    Send Telegram alert when GEX changes significantly (ΔGEX alert).
-    Triggers on:
-    1. Total GEX sign flip (positive to negative or vice versa)
-    2. Large GEX change (>30% in 5 minutes)
-    3. Price crosses Gamma Flip level
-    """
-    if gex_data is None or 'gex_history' not in st.session_state:
-        return
-
-    try:
-        ist = pytz.timezone('Asia/Kolkata')
-        current_time = datetime.now(ist)
-
-        # Store current GEX in history
-        gex_entry = {
-            'time': current_time,
-            'total_gex': gex_data['total_gex'],
-            'gamma_flip': gex_data['gamma_flip_level'],
-            'spot': underlying_price,
-            'signal': gex_data['gex_signal']
-        }
-
-        # Check if we should add (avoid duplicates within 30 seconds)
-        should_add = True
-        if st.session_state.gex_history:
-            last_entry = st.session_state.gex_history[-1]
-            time_diff = (current_time - last_entry['time']).total_seconds()
-            if time_diff < 30:
-                should_add = False
-
-        if should_add:
-            st.session_state.gex_history.append(gex_entry)
-            # Keep only last 100 entries
-            if len(st.session_state.gex_history) > 100:
-                st.session_state.gex_history = st.session_state.gex_history[-100:]
-
-        # Need at least 2 entries to detect change
-        if len(st.session_state.gex_history) < 2:
-            return
-
-        prev_entry = st.session_state.gex_history[-2]
-
-        # Calculate ΔGEX (change in GEX)
-        delta_gex = gex_data['total_gex'] - prev_entry['total_gex']
-        gex_pct_change = abs(delta_gex / prev_entry['total_gex'] * 100) if prev_entry['total_gex'] != 0 else 0
-
-        # Detect alert conditions
-        alert_triggered = False
-        alert_type = None
-        alert_message = None
-
-        # Condition 1: GEX sign flip
-        if prev_entry['total_gex'] * gex_data['total_gex'] < 0:
-            alert_triggered = True
-            alert_type = "GEX SIGN FLIP"
-            flip_direction = "Positive → Negative" if prev_entry['total_gex'] > 0 else "Negative → Positive"
-            alert_message = f"""
-🔄 <b>GEX SIGN FLIP ALERT</b> 🔄
-
-📊 <b>Gamma Exposure Flipped:</b> {flip_direction}
-📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
-
-<b>Previous GEX:</b> {prev_entry['total_gex']:.2f}L ({prev_entry['signal']})
-<b>Current GEX:</b> {gex_data['total_gex']:.2f}L ({gex_data['gex_signal']})
-<b>ΔGEX:</b> {delta_gex:+.2f}L
-
-<b>🎯 Market Implication:</b>
-{gex_data['gex_interpretation']}
-
-⚡ <b>ACTION:</b> {'Expect acceleration/trend moves!' if gex_data['total_gex'] < 0 else 'Expect mean reversion/pin!'}
-
-🕐 Time: {current_time.strftime('%H:%M:%S IST')}
-"""
-
-        # Condition 2: Large GEX change (>30%)
-        elif gex_pct_change > 30:
-            alert_triggered = True
-            alert_type = "LARGE ΔGEX"
-            alert_message = f"""
-⚡ <b>LARGE ΔGEX ALERT</b> ⚡
-
-📊 <b>Gamma Exposure Changed Significantly!</b>
-📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
-
-<b>Previous GEX:</b> {prev_entry['total_gex']:.2f}L
-<b>Current GEX:</b> {gex_data['total_gex']:.2f}L
-<b>ΔGEX:</b> {delta_gex:+.2f}L ({gex_pct_change:.1f}%)
-
-<b>🎯 Market Regime:</b> {gex_data['gex_signal']}
-{gex_data['gex_interpretation']}
-
-🕐 Time: {current_time.strftime('%H:%M:%S IST')}
-"""
-
-        # Condition 3: Price crosses Gamma Flip level
-        elif gex_data['gamma_flip_level'] and prev_entry.get('gamma_flip'):
-            prev_above_flip = prev_entry['spot'] > prev_entry['gamma_flip']
-            curr_above_flip = underlying_price > gex_data['gamma_flip_level']
-
-            if prev_above_flip != curr_above_flip:
-                alert_triggered = True
-                alert_type = "GAMMA FLIP CROSSED"
-                cross_direction = "Crossed ABOVE" if curr_above_flip else "Crossed BELOW"
-                alert_message = f"""
-🎯 <b>GAMMA FLIP LEVEL CROSSED</b> 🎯
-
-📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
-📊 <b>Gamma Flip Level:</b> ₹{gex_data['gamma_flip_level']:.2f}
-🔀 <b>Direction:</b> {cross_direction}
-
-<b>Current GEX:</b> {gex_data['total_gex']:.2f}L ({gex_data['gex_signal']})
-
-<b>🎯 Implication:</b>
-{'Above flip = More pinning/mean reversion' if curr_above_flip else 'Below flip = More trending/acceleration'}
-
-🕐 Time: {current_time.strftime('%H:%M:%S IST')}
-"""
-
-        # Send alert if triggered and not duplicate
-        if alert_triggered:
-            alert_key = f"{alert_type}_{current_time.strftime('%Y%m%d_%H%M')}"
-
-            if st.session_state.last_gex_alert != alert_key:
-                send_telegram_message_sync(alert_message)
-                st.session_state.last_gex_alert = alert_key
-                st.success(f"📊 {alert_type} alert sent!")
-
-    except Exception as e:
-        pass  # Silently fail GEX alerts
 
 
 def calculate_pcr_gex_confluence(pcr_value, gex_data, zone='ATM'):
@@ -2618,8 +2610,8 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None):
-    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, and Swing data"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None):
+    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, and RSI Suppression Zones"""
     if df.empty:
         return go.Figure()
     
@@ -2931,6 +2923,57 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
 
         except Exception as e:
             pass  # Swing drawing failed, skip it
+
+    # ===== RSI VOLATILITY SUPPRESSION ZONES =====
+    if rsi_sz_data and rsi_sz_data.get('zones'):
+        try:
+            for zone in rsi_sz_data['zones']:
+                if zone.get('start_time') is None or zone.get('end_time') is None:
+                    continue
+
+                x_start = zone['start_time']
+                x_end = zone['end_time']
+                y_top = zone['top']
+                y_bottom = zone['bottom']
+                breakout = zone.get('breakout', 'pending')
+
+                # Colors based on breakout direction
+                if breakout == 'bullish':
+                    fill_color = 'rgba(0, 187, 212, 0.15)'
+                    border_color = 'rgba(0, 187, 212, 0.4)'
+                    symbol_text = "▲"
+                elif breakout == 'bearish':
+                    fill_color = 'rgba(155, 39, 176, 0.15)'
+                    border_color = 'rgba(155, 39, 176, 0.4)'
+                    symbol_text = "▼"
+                else:
+                    fill_color = 'rgba(128, 128, 128, 0.1)'
+                    border_color = 'rgba(128, 128, 128, 0.3)'
+                    symbol_text = "∿"
+
+                # Draw zone rectangle using shapes
+                fig.add_shape(
+                    type="rect",
+                    x0=x_start, x1=x_end,
+                    y0=y_bottom, y1=y_top,
+                    fillcolor=fill_color,
+                    line=dict(color=border_color, width=1),
+                    row=1, col=1
+                )
+
+                # Add label
+                fig.add_annotation(
+                    x=x_end,
+                    y=y_top,
+                    text=f"SZ {symbol_text}",
+                    showarrow=False,
+                    font=dict(color=border_color.replace('0.4', '1').replace('0.3', '1'), size=9),
+                    xanchor="right",
+                    yanchor="bottom",
+                    row=1, col=1
+                )
+        except Exception:
+            pass  # RSI SZ drawing failed, skip it
 
     volume_colors = ['#00ff88' if close >= open else '#ff4444'
                     for close, open in zip(df['close'], df['open'])]
@@ -3952,7 +3995,7 @@ def main():
         "15 min": "15"
     }
     
-    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "5 min")
+    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "1 min")
     selected_timeframe = st.sidebar.selectbox(
         "Select Timeframe",
         list(timeframes.keys()),
@@ -4176,6 +4219,15 @@ def main():
             except Exception:
                 swing_data_for_chart = None
 
+        # Calculate RSI Volatility Suppression Zones for chart display
+        rsi_sz_data_for_chart = None
+        if not df.empty and len(df) > 30:
+            try:
+                rsi_sz_calculator = RSIVolatilitySuppression(rsi_length=14, vol_length=5)
+                rsi_sz_data_for_chart = rsi_sz_calculator.analyze(df)
+            except Exception:
+                rsi_sz_data_for_chart = None
+
         # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
@@ -4186,7 +4238,8 @@ def main():
                 pivot_settings=pivot_settings,
                 vob_blocks=vob_blocks_for_chart,
                 poc_data=poc_data_for_chart,
-                swing_data=swing_data_for_chart
+                swing_data=swing_data_for_chart,
+                rsi_sz_data=rsi_sz_data_for_chart
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -4378,9 +4431,9 @@ def main():
 
                     st.markdown("""
                     **POC Interpretation:**
-                    - **POC 1 (25)**: Short-term volume profile - intraday support/resistance
-                    - **POC 2 (40)**: Medium-term volume profile - swing trading levels
-                    - **POC 3 (100)**: Long-term volume profile - major support/resistance
+                    - **POC 1 (10)**: Short-term volume profile - intraday support/resistance
+                    - **POC 2 (25)**: Medium-term volume profile - swing trading levels
+                    - **POC 3 (70)**: Long-term volume profile - major support/resistance
                     - **Above POC**: Bullish bias - POC acts as support
                     - **Below POC**: Bearish bias - POC acts as resistance
                     - **Inside POC**: Neutral - price consolidating at high-volume zone
@@ -4490,6 +4543,69 @@ def main():
                 - **Projected Target**: Based on average of historical swing percentages
                 """)
 
+            # ===== RSI VOLATILITY SUPPRESSION ZONES =====
+            if rsi_sz_data_for_chart and rsi_sz_data_for_chart.get('zones'):
+                st.markdown("---")
+                st.markdown("## ∿ RSI Volatility Suppression Zones")
+
+                current_signal = rsi_sz_data_for_chart.get('current_signal', 'No Zone')
+                count_vol = rsi_sz_data_for_chart.get('count_volatility', 0)
+
+                # Signal summary
+                sz_col1, sz_col2, sz_col3 = st.columns(3)
+                with sz_col1:
+                    signal_color = "normal" if current_signal == 'Bullish Breakout' else ("inverse" if current_signal == 'Bearish Breakout' else "off")
+                    st.metric("Current Signal", current_signal, delta=current_signal if current_signal != 'No Zone' else None, delta_color=signal_color)
+                with sz_col2:
+                    st.metric("Low Vol Bar Count", count_vol)
+                with sz_col3:
+                    total_zones = len(rsi_sz_data_for_chart['zones'])
+                    bullish_count = sum(1 for z in rsi_sz_data_for_chart['zones'] if z['breakout'] == 'bullish')
+                    bearish_count = sum(1 for z in rsi_sz_data_for_chart['zones'] if z['breakout'] == 'bearish')
+                    st.metric("Zones Detected", f"{total_zones} (▲{bullish_count} / ▼{bearish_count})")
+
+                # Zone table
+                zone_table_data = []
+                for idx, zone in enumerate(reversed(rsi_sz_data_for_chart['zones'][-10:]), 1):
+                    breakout = zone.get('breakout', 'pending')
+                    if breakout == 'bullish':
+                        signal = '▲ Bullish'
+                    elif breakout == 'bearish':
+                        signal = '▼ Bearish'
+                    else:
+                        signal = '∿ Pending'
+
+                    zone_table_data.append({
+                        '#': idx,
+                        'Zone Top': f"₹{zone['top']:.2f}",
+                        'Zone Bottom': f"₹{zone['bottom']:.2f}",
+                        'Range': f"₹{zone['top'] - zone['bottom']:.2f}",
+                        'Bars': zone['end_idx'] - zone['start_idx'],
+                        'Breakout': signal,
+                    })
+
+                if zone_table_data:
+                    sz_df = pd.DataFrame(zone_table_data)
+
+                    def style_sz_signal(val):
+                        if '▲' in str(val):
+                            return 'background-color: #00bbd440; color: white'
+                        elif '▼' in str(val):
+                            return 'background-color: #9b27b040; color: white'
+                        return 'background-color: #80808040; color: white'
+
+                    styled_sz = sz_df.style.applymap(style_sz_signal, subset=['Breakout'])
+                    st.dataframe(styled_sz, use_container_width=True, hide_index=True)
+
+                st.markdown("""
+                **RSI Suppression Zone Interpretation:**
+                - **Suppression Zone (∿)**: RSI volatility is low — price is consolidating
+                - **Bullish Breakout (▲)**: Price broke above zone — momentum shifting up
+                - **Bearish Breakout (▼)**: Price broke below zone — momentum shifting down
+                - Longer suppression zones often lead to stronger breakouts
+                - Use with POC and Swing levels for confluence-based entries
+                """)
+
         else:
             st.error("No data available. Please check your API credentials and try again.")
     
@@ -4504,13 +4620,6 @@ def main():
             df_summary = option_data['df_summary']
             st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
 
-            # Check for trading signals if enabled
-            if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
-                check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
-
-            # Check ATM strike verdict for Strong Bullish/Bearish alerts
-            if df_summary is not None and len(df_summary) > 0:
-                check_atm_verdict_alert(df_summary, underlying_price)
         else:
             option_data = None
 
@@ -4751,6 +4860,7 @@ def main():
         st.markdown("---")
         st.markdown("## 📊 Gamma Exposure (GEX) Analysis - Dealer Hedging Flow")
 
+        gex_data = None
         try:
             df_summary = option_data.get('df_summary')
             underlying_price = option_data.get('underlying')
@@ -4764,9 +4874,6 @@ def main():
 
                     # Save last valid GEX data
                     st.session_state.gex_last_valid_data = gex_data
-
-                    # Check for GEX alerts
-                    check_gex_alert(gex_data, df_summary, underlying_price)
 
                     # ===== GEX Summary Cards =====
                     gex_col1, gex_col2, gex_col3, gex_col4 = st.columns(4)
@@ -5225,6 +5332,25 @@ def main():
             file_name=f"nifty_options_summary_{option_data['expiry']}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv"
         )
+
+    # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
+    if enable_signals and option_data and option_data.get('underlying') and not df.empty:
+        try:
+            _df_summary = option_data.get('df_summary')
+            _underlying = option_data.get('underlying')
+            if _df_summary is not None and _underlying:
+                check_confluence_entry_signal(
+                    df=df,
+                    pivot_settings=pivot_settings,
+                    df_summary=_df_summary,
+                    current_price=_underlying,
+                    pivot_proximity=pivot_proximity,
+                    poc_data=poc_data_for_chart,
+                    rsi_sz_data=rsi_sz_data_for_chart,
+                    gex_data=gex_data,
+                )
+        except Exception:
+            pass
 
     # Analytics dashboard below
     if show_analytics:

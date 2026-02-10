@@ -103,6 +103,7 @@ def build_pdf():
             ['3', 'TriplePOC', 'Point of Control across 3 periods (10, 25, 70)', 'POC1 (pink), POC2 (blue), POC3 (green) lines, signals'],
             ['4', 'FutureSwing', 'Swing projection with volume delta analysis', 'Direction (Bull/Bear), projected target %, volume delta'],
             ['5', 'ReversalDetector', 'Intraday reversal detection (bullish + bearish)', 'Score (0-6), verdict (Strong Buy to Strong Sell), entry rules'],
+            ['6', 'RSIVolatilitySuppression', 'RSI volatility suppression zone detection', 'Suppression zones on chart, breakout signals (▲/▼)'],
         ],
         [12, 55, 110, 100]
     ))
