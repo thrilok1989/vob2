@@ -283,7 +283,7 @@ class SupabaseDB:
                 return prefs
             else:
                 return {
-                    'timeframe': '5',
+                    'timeframe': '1',
                     'auto_refresh': True,
                     'days_back': 1,
                     'pivot_proximity': 5,
@@ -295,8 +295,8 @@ class SupabaseDB:
         except Exception as e:
             st.error(f"Error retrieving preferences: {str(e)}")
             return {
-                'timeframe': '5', 
-                'auto_refresh': True, 
+                'timeframe': '1',
+                'auto_refresh': True,
                 'days_back': 1,
                 'pivot_proximity': 5,
                 'pivot_settings': {
@@ -3952,7 +3952,7 @@ def main():
         "15 min": "15"
     }
     
-    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "5 min")
+    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "1 min")
     selected_timeframe = st.sidebar.selectbox(
         "Select Timeframe",
         list(timeframes.keys()),
