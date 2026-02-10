@@ -1018,6 +1018,199 @@ class TriplePOC:
             return 'inside'
 
 
+class RSIVolatilitySuppression:
+    """
+    RSI Volatility Suppression Zones - Converted from Pine Script [BigBeluga]
+
+    Detects zones where RSI volatility is suppressed (low), indicating
+    consolidation periods that often precede breakouts.
+
+    When price breaks out of a suppression zone:
+    - Upward breakout (low crosses above zone top) → Bullish signal
+    - Downward breakout (high crosses below zone bottom) → Bearish signal
+    """
+
+    def __init__(self, rsi_length=14, vol_length=5, bins_size=150, zone_threshold=10, extended_threshold=50):
+        self.rsi_length = rsi_length
+        self.vol_length = vol_length
+        self.bins_size = bins_size
+        self.zone_threshold = zone_threshold
+        self.extended_threshold = extended_threshold
+
+    @staticmethod
+    def _hma(series, period):
+        """Hull Moving Average"""
+        if len(series) < period:
+            return series.copy()
+        half_period = max(int(period / 2), 1)
+        sqrt_period = max(int(np.sqrt(period)), 1)
+
+        wma1 = series.rolling(window=half_period, min_periods=1).apply(
+            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
+        )
+        wma2 = series.rolling(window=period, min_periods=1).apply(
+            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
+        )
+        diff = 2 * wma1 - wma2
+        hma = diff.rolling(window=sqrt_period, min_periods=1).apply(
+            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
+        )
+        return hma
+
+    @staticmethod
+    def _rsi(series, period):
+        """Standard RSI calculation"""
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta).where(delta < 0, 0.0)
+        avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
+        avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
+        rs = avg_gain / avg_loss.replace(0, np.nan)
+        rsi = 100 - (100 / (1 + rs))
+        return rsi.fillna(50)
+
+    def _calculate_rsi_volatility(self, rsi_series):
+        """Calculate historical volatility of RSI (normalized)"""
+        log_returns = np.log(rsi_series / rsi_series.shift(1))
+        hv = 100 * log_returns.rolling(window=5, min_periods=1).std()
+        hv_std = hv.rolling(window=200, min_periods=20).std()
+        hv_normalized = hv / hv_std.replace(0, np.nan)
+        return hv_normalized.fillna(0)
+
+    def analyze(self, df):
+        """
+        Analyze RSI volatility suppression zones.
+
+        Returns:
+            dict with 'zones' (list of zone dicts), 'rsi' (smoothed RSI series),
+            'rsi_volatility' (normalized RSI volatility), 'current_signal'
+        """
+        if df.empty or len(df) < self.rsi_length + self.vol_length + 10:
+            return None
+
+        close = df['close'].astype(float)
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+        hl2 = (high + low) / 2
+
+        # RSI smoothed with HMA
+        raw_rsi = self._rsi(close, self.rsi_length)
+        rsi = self._hma(raw_rsi, self.vol_length)
+
+        # Average bar range (size)
+        bar_range = high - low
+        size = bar_range.rolling(window=self.bins_size, min_periods=20).mean()
+
+        # SMA of hl2 for zone center
+        sma = hl2.rolling(window=5, min_periods=1).mean()
+
+        # RSI volatility
+        rsi_volatility = self._calculate_rsi_volatility(rsi)
+
+        # Build suppression zones bar-by-bar
+        zones = []
+        count_volatility = 0
+        active_zone = None
+
+        for i in range(len(df)):
+            rv = rsi_volatility.iloc[i] if not np.isnan(rsi_volatility.iloc[i]) else 0
+            curr_low = low.iloc[i]
+            curr_high = high.iloc[i]
+            curr_sma = sma.iloc[i] if not np.isnan(sma.iloc[i]) else hl2.iloc[i]
+            curr_size = size.iloc[i] if not np.isnan(size.iloc[i]) else bar_range.iloc[i]
+
+            prev_rv = rsi_volatility.iloc[i-1] if i > 0 and not np.isnan(rsi_volatility.iloc[i-1]) else 0
+
+            # Count consecutive low-volatility bars
+            if rv <= 2:
+                count_volatility += 1
+            # Reset on crossover above 2
+            if rv > 2 and prev_rv <= 2:
+                count_volatility = 0
+
+            # Create new zone when count crosses threshold
+            prev_count = count_volatility - 1 if rv <= 2 else 0
+            zone_top = curr_sma + curr_size * 2
+            zone_bottom = curr_sma - curr_size * 2
+
+            if prev_count < self.zone_threshold and count_volatility >= self.zone_threshold and count_volatility > 0:
+                active_zone = {
+                    'start_idx': max(0, i - self.zone_threshold),
+                    'start_time': df['datetime'].iloc[max(0, i - self.zone_threshold)] if 'datetime' in df.columns else None,
+                    'end_idx': i,
+                    'end_time': df['datetime'].iloc[i] if 'datetime' in df.columns else None,
+                    'top': zone_top,
+                    'bottom': zone_bottom,
+                    'breakout': None,
+                    'breakout_idx': None,
+                    'breakout_time': None,
+                }
+
+            # Extend active zone
+            if active_zone and active_zone['breakout'] is None:
+                active_zone['end_idx'] = i
+                if 'datetime' in df.columns:
+                    active_zone['end_time'] = df['datetime'].iloc[i]
+
+            # Check breakout up: low crosses above zone top
+            if active_zone and active_zone['breakout'] is None:
+                if i > 0 and curr_low > active_zone['top'] and low.iloc[i-1] <= active_zone['top']:
+                    active_zone['breakout'] = 'bullish'
+                    active_zone['breakout_idx'] = i
+                    if 'datetime' in df.columns:
+                        active_zone['breakout_time'] = df['datetime'].iloc[i]
+                    zones.append(active_zone.copy())
+                    active_zone = None
+
+            # Check breakout down: high crosses below zone bottom
+            if active_zone and active_zone['breakout'] is None:
+                if i > 0 and curr_high < active_zone['bottom'] and high.iloc[i-1] >= active_zone['bottom']:
+                    active_zone['breakout'] = 'bearish'
+                    active_zone['breakout_idx'] = i
+                    if 'datetime' in df.columns:
+                        active_zone['breakout_time'] = df['datetime'].iloc[i]
+                    zones.append(active_zone.copy())
+                    active_zone = None
+
+            # Extended zone: after 50 bars of low vol with no active zone
+            if active_zone is None and prev_count < self.extended_threshold and count_volatility >= self.extended_threshold:
+                active_zone = {
+                    'start_idx': max(0, i - self.zone_threshold),
+                    'start_time': df['datetime'].iloc[max(0, i - self.zone_threshold)] if 'datetime' in df.columns else None,
+                    'end_idx': i,
+                    'end_time': df['datetime'].iloc[i] if 'datetime' in df.columns else None,
+                    'top': zone_top,
+                    'bottom': zone_bottom,
+                    'breakout': None,
+                    'breakout_idx': None,
+                    'breakout_time': None,
+                }
+
+        # Add still-active zone (no breakout yet)
+        if active_zone and active_zone['breakout'] is None:
+            active_zone['breakout'] = 'pending'
+            zones.append(active_zone.copy())
+
+        # Current signal
+        current_signal = 'No Zone'
+        if zones:
+            last_zone = zones[-1]
+            if last_zone['breakout'] == 'pending':
+                current_signal = 'In Suppression Zone'
+            elif last_zone['breakout'] == 'bullish':
+                current_signal = 'Bullish Breakout'
+            elif last_zone['breakout'] == 'bearish':
+                current_signal = 'Bearish Breakout'
+
+        return {
+            'zones': zones,
+            'rsi': rsi,
+            'rsi_volatility': rsi_volatility,
+            'current_signal': current_signal,
+            'count_volatility': count_volatility,
+        }
+
+
 class FutureSwing:
     """
     Future Swing Projection Indicator - Converted from Pine Script [BigBeluga]
@@ -2618,8 +2811,8 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None):
-    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, and Swing data"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None):
+    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, and RSI Suppression Zones"""
     if df.empty:
         return go.Figure()
     
@@ -2931,6 +3124,57 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
 
         except Exception as e:
             pass  # Swing drawing failed, skip it
+
+    # ===== RSI VOLATILITY SUPPRESSION ZONES =====
+    if rsi_sz_data and rsi_sz_data.get('zones'):
+        try:
+            for zone in rsi_sz_data['zones']:
+                if zone.get('start_time') is None or zone.get('end_time') is None:
+                    continue
+
+                x_start = zone['start_time']
+                x_end = zone['end_time']
+                y_top = zone['top']
+                y_bottom = zone['bottom']
+                breakout = zone.get('breakout', 'pending')
+
+                # Colors based on breakout direction
+                if breakout == 'bullish':
+                    fill_color = 'rgba(0, 187, 212, 0.15)'
+                    border_color = 'rgba(0, 187, 212, 0.4)'
+                    symbol_text = "▲"
+                elif breakout == 'bearish':
+                    fill_color = 'rgba(155, 39, 176, 0.15)'
+                    border_color = 'rgba(155, 39, 176, 0.4)'
+                    symbol_text = "▼"
+                else:
+                    fill_color = 'rgba(128, 128, 128, 0.1)'
+                    border_color = 'rgba(128, 128, 128, 0.3)'
+                    symbol_text = "∿"
+
+                # Draw zone rectangle using shapes
+                fig.add_shape(
+                    type="rect",
+                    x0=x_start, x1=x_end,
+                    y0=y_bottom, y1=y_top,
+                    fillcolor=fill_color,
+                    line=dict(color=border_color, width=1),
+                    row=1, col=1
+                )
+
+                # Add label
+                fig.add_annotation(
+                    x=x_end,
+                    y=y_top,
+                    text=f"SZ {symbol_text}",
+                    showarrow=False,
+                    font=dict(color=border_color.replace('0.4', '1').replace('0.3', '1'), size=9),
+                    xanchor="right",
+                    yanchor="bottom",
+                    row=1, col=1
+                )
+        except Exception:
+            pass  # RSI SZ drawing failed, skip it
 
     volume_colors = ['#00ff88' if close >= open else '#ff4444'
                     for close, open in zip(df['close'], df['open'])]
@@ -4176,6 +4420,15 @@ def main():
             except Exception:
                 swing_data_for_chart = None
 
+        # Calculate RSI Volatility Suppression Zones for chart display
+        rsi_sz_data_for_chart = None
+        if not df.empty and len(df) > 30:
+            try:
+                rsi_sz_calculator = RSIVolatilitySuppression(rsi_length=14, vol_length=5)
+                rsi_sz_data_for_chart = rsi_sz_calculator.analyze(df)
+            except Exception:
+                rsi_sz_data_for_chart = None
+
         # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
@@ -4186,7 +4439,8 @@ def main():
                 pivot_settings=pivot_settings,
                 vob_blocks=vob_blocks_for_chart,
                 poc_data=poc_data_for_chart,
-                swing_data=swing_data_for_chart
+                swing_data=swing_data_for_chart,
+                rsi_sz_data=rsi_sz_data_for_chart
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -4488,6 +4742,69 @@ def main():
                 - **Swing Low**: Support level where price reversed up
                 - **Volume Delta**: Positive = more buying, Negative = more selling
                 - **Projected Target**: Based on average of historical swing percentages
+                """)
+
+            # ===== RSI VOLATILITY SUPPRESSION ZONES =====
+            if rsi_sz_data_for_chart and rsi_sz_data_for_chart.get('zones'):
+                st.markdown("---")
+                st.markdown("## ∿ RSI Volatility Suppression Zones")
+
+                current_signal = rsi_sz_data_for_chart.get('current_signal', 'No Zone')
+                count_vol = rsi_sz_data_for_chart.get('count_volatility', 0)
+
+                # Signal summary
+                sz_col1, sz_col2, sz_col3 = st.columns(3)
+                with sz_col1:
+                    signal_color = "normal" if current_signal == 'Bullish Breakout' else ("inverse" if current_signal == 'Bearish Breakout' else "off")
+                    st.metric("Current Signal", current_signal, delta=current_signal if current_signal != 'No Zone' else None, delta_color=signal_color)
+                with sz_col2:
+                    st.metric("Low Vol Bar Count", count_vol)
+                with sz_col3:
+                    total_zones = len(rsi_sz_data_for_chart['zones'])
+                    bullish_count = sum(1 for z in rsi_sz_data_for_chart['zones'] if z['breakout'] == 'bullish')
+                    bearish_count = sum(1 for z in rsi_sz_data_for_chart['zones'] if z['breakout'] == 'bearish')
+                    st.metric("Zones Detected", f"{total_zones} (▲{bullish_count} / ▼{bearish_count})")
+
+                # Zone table
+                zone_table_data = []
+                for idx, zone in enumerate(reversed(rsi_sz_data_for_chart['zones'][-10:]), 1):
+                    breakout = zone.get('breakout', 'pending')
+                    if breakout == 'bullish':
+                        signal = '▲ Bullish'
+                    elif breakout == 'bearish':
+                        signal = '▼ Bearish'
+                    else:
+                        signal = '∿ Pending'
+
+                    zone_table_data.append({
+                        '#': idx,
+                        'Zone Top': f"₹{zone['top']:.2f}",
+                        'Zone Bottom': f"₹{zone['bottom']:.2f}",
+                        'Range': f"₹{zone['top'] - zone['bottom']:.2f}",
+                        'Bars': zone['end_idx'] - zone['start_idx'],
+                        'Breakout': signal,
+                    })
+
+                if zone_table_data:
+                    sz_df = pd.DataFrame(zone_table_data)
+
+                    def style_sz_signal(val):
+                        if '▲' in str(val):
+                            return 'background-color: #00bbd440; color: white'
+                        elif '▼' in str(val):
+                            return 'background-color: #9b27b040; color: white'
+                        return 'background-color: #80808040; color: white'
+
+                    styled_sz = sz_df.style.applymap(style_sz_signal, subset=['Breakout'])
+                    st.dataframe(styled_sz, use_container_width=True, hide_index=True)
+
+                st.markdown("""
+                **RSI Suppression Zone Interpretation:**
+                - **Suppression Zone (∿)**: RSI volatility is low — price is consolidating
+                - **Bullish Breakout (▲)**: Price broke above zone — momentum shifting up
+                - **Bearish Breakout (▼)**: Price broke below zone — momentum shifting down
+                - Longer suppression zones often lead to stronger breakouts
+                - Use with POC and Swing levels for confluence-based entries
                 """)
 
         else:
