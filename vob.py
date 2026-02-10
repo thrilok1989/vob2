@@ -880,9 +880,9 @@ class TriplePOC:
     Triple Point of Control (POC) Indicator - Converted from Pine Script [BigBeluga]
 
     Calculates POC (price level with highest volume) for 3 different periods:
-    - POC 1: Short-term (default 25 periods)
-    - POC 2: Medium-term (default 40 periods)
-    - POC 3: Long-term (default 100 periods)
+    - POC 1: Short-term (default 10 periods)
+    - POC 2: Medium-term (default 25 periods)
+    - POC 3: Long-term (default 70 periods)
 
     POC represents the price level where most trading activity occurred,
     often acting as support/resistance.
@@ -4378,9 +4378,9 @@ def main():
 
                     st.markdown("""
                     **POC Interpretation:**
-                    - **POC 1 (25)**: Short-term volume profile - intraday support/resistance
-                    - **POC 2 (40)**: Medium-term volume profile - swing trading levels
-                    - **POC 3 (100)**: Long-term volume profile - major support/resistance
+                    - **POC 1 (10)**: Short-term volume profile - intraday support/resistance
+                    - **POC 2 (25)**: Medium-term volume profile - swing trading levels
+                    - **POC 3 (70)**: Long-term volume profile - major support/resistance
                     - **Above POC**: Bullish bias - POC acts as support
                     - **Below POC**: Bearish bias - POC acts as resistance
                     - **Inside POC**: Neutral - price consolidating at high-volume zone
