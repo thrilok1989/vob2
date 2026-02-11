@@ -2207,7 +2207,7 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
     """
     Unified Confluence Entry Signal — sends ONE Telegram alert only when ALL conditions align:
 
-    1. ATM Bias: Verdict is Strong Bullish or Strong Bearish (BiasScore >= 4 or <= -4)
+    1. ATM Bias: Verdict is Strong Bullish or Strong Bearish (BiasScore >= 6 or <= -6)
     2. PCR + GEX: Confluence strength >= 2
     3. POC Alignment: Price position consistent with direction (above for bull, below for bear)
     4. RSI Suppression Zone: Recent breakout in same direction (or active zone = pending entry)
@@ -2646,13 +2646,13 @@ def calculate_greeks(option_type, S, K, T, r, sigma):
         return 0, 0, 0, 0, 0
 
 def final_verdict(score):
-    if score >= 4:
+    if score >= 6:
         return "Strong Bullish"
-    elif score >= 2:
+    elif score >= 3:
         return "Bullish"
-    elif score <= -4:
+    elif score <= -6:
         return "Strong Bearish"
-    elif score <= -2:
+    elif score <= -3:
         return "Bearish"
     else:
         return "Neutral"
@@ -2769,13 +2769,13 @@ def color_score(val):
     """Color score based on value"""
     try:
         score = float(val)
-        if score >= 4:
+        if score >= 6:
             return 'background-color: #228B22; color: white'
-        elif score >= 2:
+        elif score >= 3:
             return 'background-color: #90EE90; color: black'
-        elif score <= -4:
+        elif score <= -6:
             return 'background-color: #DC143C; color: white'
-        elif score <= -2:
+        elif score <= -3:
             return 'background-color: #FFB6C1; color: black'
         else:
             return 'background-color: #FFFFE0; color: black'
@@ -3668,15 +3668,25 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         row_data["BidAskPressure"] = bid_ask_pressure
         row_data["PressureBias"] = pressure_bias
 
-        # ===== Score Calculation =====
-        # Count all bias columns for scoring
-        for k in row_data:
-            if "_Bias" in k or k in ["DeltaExp", "GammaExp"]:
-                bias_val = row_data[k]
-                if bias_val == "Bullish":
-                    score += 1
-                elif bias_val == "Bearish":
-                    score -= 1
+        # ===== Weighted Score Calculation (Bias Engine v2) =====
+        # Tier 1 (2.0): Institutional-grade signals
+        # Tier 2 (1.5): Strong directional signals
+        # Tier 3 (1.0): Medium reliability signals
+        # Tier 4 (0.5): Weak/noisy signals
+        # Theta_Bias excluded — not directionally reliable
+        bias_weights = {
+            'ChgOI_Bias': 2.0,  'DeltaExp': 2.0,  'GammaExp': 2.0,
+            'OI_Bias': 1.5,     'PressureBias': 1.5, 'DVP_Bias': 1.5,
+            'Volume_Bias': 1.0, 'LTP_Bias': 1.0,  'Delta_Bias': 1.0,
+            'AskQty_Bias': 0.5, 'BidQty_Bias': 0.5, 'AskBid_Bias': 0.5,
+            'Gamma_Bias': 0.5,  'IV_Bias': 0.5,
+        }
+        for k, weight in bias_weights.items():
+            bias_val = row_data.get(k)
+            if bias_val == "Bullish":
+                score += weight
+            elif bias_val == "Bearish":
+                score -= weight
 
         row_data["BiasScore"] = score
         row_data["Verdict"] = final_verdict(score)
@@ -3691,25 +3701,25 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
             row_data["Operator_Entry"] = "No Entry"
 
         # Scalp/Momentum: Based on score strength
-        if score >= 4:
+        if score >= 6:
             row_data["Scalp_Moment"] = "Scalp Bull"
-        elif score >= 2:
+        elif score >= 3:
             row_data["Scalp_Moment"] = "Moment Bull"
-        elif score <= -4:
+        elif score <= -6:
             row_data["Scalp_Moment"] = "Scalp Bear"
-        elif score <= -2:
+        elif score <= -3:
             row_data["Scalp_Moment"] = "Moment Bear"
         else:
             row_data["Scalp_Moment"] = "No Signal"
 
         # FakeReal: Distinguish real moves from fake
-        if score >= 4:
+        if score >= 6:
             row_data["FakeReal"] = "Real Up"
-        elif 1 <= score < 4:
+        elif 1.5 <= score < 6:
             row_data["FakeReal"] = "Fake Up"
-        elif score <= -4:
+        elif score <= -6:
             row_data["FakeReal"] = "Real Down"
-        elif -4 < score <= -1:
+        elif -6 < score <= -1.5:
             row_data["FakeReal"] = "Fake Down"
         else:
             row_data["FakeReal"] = "No Move"
