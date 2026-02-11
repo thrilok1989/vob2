@@ -100,7 +100,7 @@ def build_pdf():
         [
             ['1', 'PivotIndicator', 'Multi-TF pivot detection (3M, 5M, 10M, 15M, 1H)', 'Swing High/Low pivot levels, S/R lines on chart'],
             ['2', 'VolumeOrderBlocks', 'Volume-based Order Block detection', 'Bullish OB (teal), Bearish OB (purple), S/R levels'],
-            ['3', 'TriplePOC', 'Point of Control across 3 periods (10, 25, 70)', 'POC1 (pink), POC2 (blue), POC3 (green) lines, signals'],
+            ['3', 'TriplePOC', 'Point of Control across 3 periods (10, 25, 70)', 'POC1 (pink), POC2 (blue), POC3 (green) steplines, signals'],
             ['4', 'FutureSwing', 'Swing projection with volume delta analysis', 'Direction (Bull/Bear), projected target %, volume delta'],
             ['5', 'ReversalDetector', 'Intraday reversal detection (bullish + bearish)', 'Score (0-6), verdict (Strong Buy to Strong Sell), entry rules'],
             ['6', 'RSIVolatilitySuppression', 'RSI volatility suppression zone detection', 'Suppression zones on chart, breakout signals (▲/▼)'],

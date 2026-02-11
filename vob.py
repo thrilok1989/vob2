@@ -884,8 +884,8 @@ class TriplePOC:
     - POC 2: Medium-term (default 25 periods)
     - POC 3: Long-term (default 70 periods)
 
-    POC represents the price level where most trading activity occurred,
-    often acting as support/resistance.
+    POC is computed as a rolling time series (updated every 15 bars in Pine,
+    here computed at every bar) and rendered as steplines on the chart.
     """
 
     def __init__(self, period1=10, period2=25, period3=70, bins=25):
@@ -903,21 +903,82 @@ class TriplePOC:
         self.period3 = period3
         self.bins = bins
 
-    def calculate_poc(self, df, period):
+    def _calculate_poc_series(self, df, period):
         """
-        Calculate Point of Control for a given period.
-
-        Args:
-            df: DataFrame with OHLCV data
-            period: Lookback period
+        Calculate POC as a rolling time series across all bars.
+        Mirrors Pine Script logic: at each bar, look back 'period' bars,
+        build volume profile, find POC (max volume level).
 
         Returns:
-            dict with poc, upper_poc, lower_poc, volume, high, low
+            dict with 'poc', 'upper_poc', 'lower_poc' as pandas Series
+        """
+        n = len(df)
+        poc_vals = np.full(n, np.nan)
+        upper_vals = np.full(n, np.nan)
+        lower_vals = np.full(n, np.nan)
+
+        closes = df['close'].values.astype(float)
+        highs = df['high'].values.astype(float)
+        lows = df['low'].values.astype(float)
+        volumes = df['volume'].values.astype(float) if 'volume' in df.columns else np.ones(n)
+
+        # Pine recalculates every 15 bars (bar_index % 15 == 0).
+        # We use a dynamic interval: min(15, period//2) for shorter periods
+        recalc_interval = min(15, max(3, period // 3))
+        last_poc = np.nan
+        last_upper = np.nan
+        last_lower = np.nan
+
+        for i in range(period, n):
+            if (i - period) % recalc_interval == 0:
+                start = i - period
+                end = i + 1
+
+                H = highs[start:end].max()
+                L = lows[start:end].min()
+
+                if H == L:
+                    last_poc = H
+                    last_upper = H
+                    last_lower = L
+                else:
+                    step = (H - L) / self.bins
+                    vol_bins = np.zeros(self.bins)
+                    level_mids = np.zeros(self.bins)
+
+                    for k in range(self.bins):
+                        level_mids[k] = L + k * step + step / 2
+
+                    for j in range(start, end):
+                        c = closes[j]
+                        v = volumes[j]
+                        for k in range(self.bins):
+                            if abs(c - level_mids[k]) <= step:
+                                vol_bins[k] += v
+
+                    max_idx = vol_bins.argmax()
+                    last_poc = level_mids[max_idx]
+                    last_upper = last_poc + step * 2
+                    last_lower = last_poc - step * 2
+
+            poc_vals[i] = last_poc
+            upper_vals[i] = last_upper
+            lower_vals[i] = last_lower
+
+        return {
+            'poc': pd.Series(poc_vals, index=df.index),
+            'upper_poc': pd.Series(upper_vals, index=df.index),
+            'lower_poc': pd.Series(lower_vals, index=df.index),
+        }
+
+    def calculate_poc(self, df, period):
+        """
+        Calculate single (latest) POC for a given period.
+        Used for signal generation and table display.
         """
         if df.empty or len(df) < period:
             return None
 
-        # Get last 'period' bars
         recent_df = df.tail(period).copy()
 
         H = recent_df['high'].max()
@@ -925,64 +986,44 @@ class TriplePOC:
 
         if H == L:
             return {
-                'poc': H,
-                'upper_poc': H,
-                'lower_poc': L,
-                'volume': 0,
-                'high': H,
-                'low': L
+                'poc': H, 'upper_poc': H, 'lower_poc': L,
+                'volume': 0, 'high': H, 'low': L
             }
 
         step = (H - L) / self.bins
-
-        # Initialize volume bins
         vol_bins = [0.0] * self.bins
         level_mids = []
 
         for k in range(self.bins):
-            l = L + k * step
-            mid = l + step / 2
-            level_mids.append(mid)
+            level_mids.append(L + k * step + step / 2)
 
-        # Distribute volume across bins
         for _, row in recent_df.iterrows():
             c = row['close']
-            v = row.get('volume', 1)  # Default volume if not available
-
+            v = row.get('volume', 1)
             for k in range(len(level_mids)):
-                mid = level_mids[k]
-                if abs(c - mid) <= step:
+                if abs(c - level_mids[k]) <= step:
                     vol_bins[k] += v
 
-        # Find POC (price level with max volume)
         max_vol_idx = vol_bins.index(max(vol_bins))
         poc = level_mids[max_vol_idx]
-        max_volume = vol_bins[max_vol_idx]
-
-        # Upper and lower POC boundaries (±2 steps)
-        upper_poc = poc + step * 2
-        lower_poc = poc - step * 2
 
         return {
             'poc': round(poc, 2),
-            'upper_poc': round(upper_poc, 2),
-            'lower_poc': round(lower_poc, 2),
-            'volume': max_volume,
-            'high': H,
-            'low': L,
-            'step': step
+            'upper_poc': round(poc + step * 2, 2),
+            'lower_poc': round(poc - step * 2, 2),
+            'volume': vol_bins[max_vol_idx],
+            'high': H, 'low': L, 'step': step
         }
 
     def calculate_all_pocs(self, df):
         """
-        Calculate all three POCs.
-
-        Args:
-            df: DataFrame with OHLCV data
-
-        Returns:
-            dict with poc1, poc2, poc3 data
+        Calculate all three POCs — both time series (for chart) and latest values (for signals/tables).
         """
+        poc1_series = self._calculate_poc_series(df, self.period1)
+        poc2_series = self._calculate_poc_series(df, self.period2)
+        poc3_series = self._calculate_poc_series(df, self.period3)
+
+        # Latest single values for tables/signals
         poc1 = self.calculate_poc(df, self.period1)
         poc2 = self.calculate_poc(df, self.period2)
         poc3 = self.calculate_poc(df, self.period3)
@@ -991,6 +1032,9 @@ class TriplePOC:
             'poc1': poc1,
             'poc2': poc2,
             'poc3': poc3,
+            'poc1_series': poc1_series,
+            'poc2_series': poc2_series,
+            'poc3_series': poc3_series,
             'periods': {
                 'poc1': self.period1,
                 'poc2': self.period2,
@@ -1208,6 +1252,126 @@ class RSIVolatilitySuppression:
             'rsi_volatility': rsi_volatility,
             'current_signal': current_signal,
             'count_volatility': count_volatility,
+        }
+
+
+class UltimateRSI:
+    """
+    Ultimate RSI Indicator - Converted from Pine Script [LuxAlgo]
+
+    An augmented RSI that uses highest/lowest range to detect momentum shifts
+    more accurately than standard RSI. Includes signal line and OB/OS zones.
+
+    Key differences from standard RSI:
+    - Uses highest-lowest range as the diff when range expands/contracts
+    - Smoothed with selectable MA type (RMA default)
+    - Signal line (EMA of RSI) for crossover detection
+    """
+
+    def __init__(self, length=14, smo_type='RMA', signal_length=14, signal_type='EMA',
+                 ob_value=80, os_value=20):
+        self.length = length
+        self.smo_type = smo_type
+        self.signal_length = signal_length
+        self.signal_type = signal_type
+        self.ob_value = ob_value
+        self.os_value = os_value
+
+    @staticmethod
+    def _ma(series, length, ma_type):
+        """Moving average with selectable type"""
+        if ma_type == 'EMA':
+            return series.ewm(span=length, adjust=False).mean()
+        elif ma_type == 'SMA':
+            return series.rolling(window=length, min_periods=1).mean()
+        elif ma_type == 'RMA':
+            return series.ewm(alpha=1/length, adjust=False).mean()
+        elif ma_type == 'TMA':
+            sma1 = series.rolling(window=length, min_periods=1).mean()
+            return sma1.rolling(window=length, min_periods=1).mean()
+        return series
+
+    def calculate(self, df):
+        """
+        Calculate Ultimate RSI time series.
+
+        Returns:
+            dict with 'arsi' (Series), 'signal' (Series), 'ob', 'os',
+            'latest_arsi', 'latest_signal', 'zone', 'cross_signal'
+        """
+        if df.empty or len(df) < self.length + 5:
+            return None
+
+        src = df['close'].astype(float)
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+
+        # Augmented RSI calculation (Pine Script logic)
+        upper = high.rolling(window=self.length, min_periods=1).max()
+        lower = low.rolling(window=self.length, min_periods=1).min()
+        r = upper - lower
+
+        d = src.diff()  # src - src[1]
+
+        # diff = upper > upper[1] ? r : lower < lower[1] ? -r : d
+        upper_expanded = upper > upper.shift(1)
+        lower_expanded = lower < lower.shift(1)
+
+        diff = pd.Series(np.where(
+            upper_expanded, r,
+            np.where(lower_expanded, -r, d)
+        ), index=df.index, dtype=float)
+
+        # num = ma(diff, length); den = ma(abs(diff), length)
+        num = self._ma(diff, self.length, self.smo_type)
+        den = self._ma(diff.abs(), self.length, self.smo_type)
+
+        # arsi = num/den * 50 + 50
+        arsi = (num / den.replace(0, np.nan) * 50 + 50).fillna(50)
+
+        # Signal line
+        signal = self._ma(arsi, self.signal_length, self.signal_type)
+
+        # Latest values
+        latest_arsi = arsi.iloc[-1]
+        latest_signal = signal.iloc[-1]
+
+        # Zone determination
+        if latest_arsi > self.ob_value:
+            zone = 'Overbought'
+        elif latest_arsi < self.os_value:
+            zone = 'Oversold'
+        else:
+            zone = 'Neutral'
+
+        # Crossover signals
+        prev_arsi = arsi.iloc[-2] if len(arsi) > 1 else 50
+        prev_signal = signal.iloc[-2] if len(signal) > 1 else 50
+
+        cross_signal = 'None'
+        if prev_arsi <= prev_signal and latest_arsi > latest_signal:
+            cross_signal = 'Bullish Cross'
+        elif prev_arsi >= prev_signal and latest_arsi < latest_signal:
+            cross_signal = 'Bearish Cross'
+
+        # Momentum direction
+        if latest_arsi > 50 and latest_arsi > latest_signal:
+            momentum = 'Bullish'
+        elif latest_arsi < 50 and latest_arsi < latest_signal:
+            momentum = 'Bearish'
+        else:
+            momentum = 'Neutral'
+
+        return {
+            'arsi': arsi,
+            'signal': signal,
+            'ob': self.ob_value,
+            'os': self.os_value,
+            'latest_arsi': round(latest_arsi, 2),
+            'latest_signal': round(latest_signal, 2),
+            'zone': zone,
+            'cross_signal': cross_signal,
+            'momentum': momentum,
         }
 
 
@@ -2039,7 +2203,7 @@ def calculate_max_pain(df_options, spot_price):
 
 
 def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price, pivot_proximity,
-                                   poc_data=None, rsi_sz_data=None, gex_data=None):
+                                   poc_data=None, rsi_sz_data=None, gex_data=None, ultimate_rsi_data=None):
     """
     Unified Confluence Entry Signal — sends ONE Telegram alert only when ALL conditions align:
 
@@ -2048,6 +2212,7 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
     3. POC Alignment: Price position consistent with direction (above for bull, below for bear)
     4. RSI Suppression Zone: Recent breakout in same direction (or active zone = pending entry)
     5. Near Pivot Level: Price within proximity of HTF pivot S/R
+    6. Ultimate RSI: Momentum and zone aligned with direction
     """
     if df.empty or df_summary is None or len(df_summary) == 0 or not current_price:
         return
@@ -2154,6 +2319,35 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
         if not near_pivot:
             return
 
+        # --- 6. Ultimate RSI ---
+        ursi_detail = "N/A"
+        ursi_aligned = False
+        if ultimate_rsi_data:
+            ursi_momentum = ultimate_rsi_data.get('momentum', 'Neutral')
+            ursi_zone = ultimate_rsi_data.get('zone', 'Neutral')
+            ursi_val = ultimate_rsi_data.get('latest_arsi', 50)
+            ursi_sig_val = ultimate_rsi_data.get('latest_signal', 50)
+            ursi_cross = ultimate_rsi_data.get('cross_signal', 'None')
+
+            if direction == 'bullish' and ursi_momentum == 'Bullish':
+                ursi_aligned = True
+                ursi_detail = f"Bullish ({ursi_val:.0f} > Sig {ursi_sig_val:.0f})"
+            elif direction == 'bearish' and ursi_momentum == 'Bearish':
+                ursi_aligned = True
+                ursi_detail = f"Bearish ({ursi_val:.0f} < Sig {ursi_sig_val:.0f})"
+            elif ursi_cross == 'Bullish Cross' and direction == 'bullish':
+                ursi_aligned = True
+                ursi_detail = f"Bullish Cross ({ursi_val:.0f})"
+            elif ursi_cross == 'Bearish Cross' and direction == 'bearish':
+                ursi_aligned = True
+                ursi_detail = f"Bearish Cross ({ursi_val:.0f})"
+        else:
+            ursi_aligned = True  # Skip if no data
+            ursi_detail = "URSI data N/A"
+
+        if not ursi_aligned:
+            return
+
         # ===== ALL CONDITIONS MET — BUILD AND SEND ALERT =====
         ist = pytz.timezone('Asia/Kolkata')
         now_str = datetime.now(ist).strftime('%H:%M:%S IST')
@@ -2194,12 +2388,13 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
 📌 <b>Pivot:</b> {pivot_level['timeframe']} at ₹{pivot_level['value']:.2f}
 🎯 <b>ATM Strike:</b> {atm_strike} {option_type}
 
-<b>✅ ALL 5 CONDITIONS MET:</b>
+<b>✅ ALL 6 CONDITIONS MET:</b>
 1️⃣ ATM Verdict: {verdict} (Score: {bias_score})
 2️⃣ PCR×GEX: {confluence_badge} ({confluence_signal}) ★{confluence_strength}
 3️⃣ POC: {poc_detail}
 4️⃣ RSI SZ: {rsi_sz_signal}
 5️⃣ Pivot: {pivot_level['timeframe']} within {pivot_proximity} pts
+6️⃣ URSI: {ursi_detail}
 
 <b>📊 ATM BIAS:</b>
 • OI: {oi_bias} | ChgOI: {chgoi_bias} | Vol: {volume_bias}
@@ -2610,18 +2805,20 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None):
-    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, and RSI Suppression Zones"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None):
+    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, RSI Suppression Zones, and Ultimate RSI"""
     if df.empty:
         return go.Figure()
-    
+
+    has_ursi = ultimate_rsi_data is not None and ultimate_rsi_data.get('arsi') is not None
+
     fig = make_subplots(
-        rows=2, 
+        rows=3 if has_ursi else 2,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.7, 0.3],
-        specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
+        vertical_spacing=0.03,
+        row_heights=[0.55, 0.2, 0.25] if has_ursi else [0.7, 0.3],
+        subplot_titles=(None, None, "Ultimate RSI") if has_ursi else None
     )
     
     fig.add_trace(
@@ -2790,12 +2987,9 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         except Exception as e:
             pass  # VOB drawing failed, skip it
 
-    # Add Triple POC lines if provided
+    # Add Triple POC steplines if provided
     if poc_data:
         try:
-            x_start = df['datetime'].min()
-            x_end = df['datetime'].max()
-
             poc_colors = {
                 'poc1': '#e91e63',  # Pink - Short-term
                 'poc2': '#2196f3',  # Blue - Medium-term
@@ -2803,30 +2997,85 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
             }
 
             for poc_key in ['poc1', 'poc2', 'poc3']:
-                poc = poc_data.get(poc_key)
-                if poc and poc.get('poc'):
+                series_key = f'{poc_key}_series'
+                series_data = poc_data.get(series_key)
+                poc_latest = poc_data.get(poc_key)
+
+                if series_data is not None:
                     color = poc_colors[poc_key]
                     period = poc_data.get('periods', {}).get(poc_key, '')
 
-                    # POC main line
-                    fig.add_shape(
-                        type="line",
-                        x0=x_start, x1=x_end,
-                        y0=poc['poc'], y1=poc['poc'],
-                        line=dict(color=color, width=2),
-                        row=1, col=1
-                    )
+                    poc_s = series_data['poc']
+                    upper_s = series_data['upper_poc']
+                    lower_s = series_data['lower_poc']
 
-                    # POC annotation
-                    fig.add_annotation(
-                        x=x_end,
-                        y=poc['poc'],
-                        text=f"POC{poc_key[-1]} ({period}): ₹{poc['poc']:.0f}",
-                        showarrow=False,
-                        font=dict(color=color, size=10),
-                        xanchor="left",
-                        row=1, col=1
-                    )
+                    # Filter out NaN values and align with datetime
+                    valid_mask = poc_s.notna()
+                    if valid_mask.any():
+                        dt = df.loc[valid_mask, 'datetime']
+                        poc_vals = poc_s[valid_mask]
+                        upper_vals = upper_s[valid_mask]
+                        lower_vals = lower_s[valid_mask]
+
+                        # Main POC stepline
+                        fig.add_trace(
+                            go.Scatter(
+                                x=dt, y=poc_vals,
+                                mode='lines',
+                                name=f'POC {poc_key[-1]} ({period})',
+                                line=dict(color=color, width=2, shape='hv'),
+                                showlegend=True,
+                                hovertemplate=f'POC{poc_key[-1]}: ₹%{{y:.2f}}<extra></extra>'
+                            ),
+                            row=1, col=1
+                        )
+
+                        # Upper POC channel (translucent)
+                        fig.add_trace(
+                            go.Scatter(
+                                x=dt, y=upper_vals,
+                                mode='lines',
+                                name=f'Upper POC {poc_key[-1]}',
+                                line=dict(color=color, width=1, shape='hv', dash='dot'),
+                                opacity=0.3,
+                                showlegend=False,
+                                hoverinfo='skip'
+                            ),
+                            row=1, col=1
+                        )
+
+                        # Lower POC channel (translucent) with fill to upper
+                        # Convert hex to rgba for fill
+                        hex_c = color.lstrip('#')
+                        r, g, b = int(hex_c[:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
+                        fill_rgba = f'rgba({r},{g},{b},0.08)'
+
+                        fig.add_trace(
+                            go.Scatter(
+                                x=dt, y=lower_vals,
+                                mode='lines',
+                                name=f'Lower POC {poc_key[-1]}',
+                                line=dict(color=color, width=1, shape='hv', dash='dot'),
+                                opacity=0.3,
+                                showlegend=False,
+                                fill='tonexty',
+                                fillcolor=fill_rgba,
+                                hoverinfo='skip'
+                            ),
+                            row=1, col=1
+                        )
+
+                        # Label at the end
+                        last_poc_val = poc_vals.iloc[-1]
+                        last_dt = dt.iloc[-1]
+                        fig.add_annotation(
+                            x=last_dt, y=last_poc_val,
+                            text=f"POC{poc_key[-1]} ({period}): ₹{last_poc_val:.0f}",
+                            showarrow=False,
+                            font=dict(color=color, size=10),
+                            xanchor="left",
+                            row=1, col=1
+                        )
 
         except Exception as e:
             pass  # POC drawing failed, skip it
@@ -2989,12 +3238,102 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         ),
         row=2, col=1
     )
-    
+
+    # ===== ULTIMATE RSI SUBPLOT (Row 3) =====
+    if has_ursi:
+        try:
+            arsi = ultimate_rsi_data['arsi']
+            sig = ultimate_rsi_data['signal']
+            ob = ultimate_rsi_data['ob']
+            os_val = ultimate_rsi_data['os']
+
+            valid_mask = arsi.notna()
+            if valid_mask.any():
+                dt = df.loc[valid_mask, 'datetime']
+                arsi_vals = arsi[valid_mask]
+                sig_vals = sig[valid_mask]
+
+                # Color RSI by zone: green if OB, red if OS, white otherwise
+                arsi_colors = ['#089981' if v > ob else '#f23645' if v < os_val else '#c0c0c0'
+                               for v in arsi_vals]
+
+                # RSI line (colored segments via markers)
+                fig.add_trace(
+                    go.Scatter(
+                        x=dt, y=arsi_vals,
+                        mode='lines',
+                        name='Ultimate RSI',
+                        line=dict(color='#c0c0c0', width=1.5),
+                        showlegend=False,
+                        hovertemplate='URSI: %{y:.1f}<extra></extra>'
+                    ),
+                    row=3, col=1
+                )
+
+                # Signal line
+                fig.add_trace(
+                    go.Scatter(
+                        x=dt, y=sig_vals,
+                        mode='lines',
+                        name='Signal',
+                        line=dict(color='#ff5d00', width=1, dash='dot'),
+                        showlegend=False,
+                        hovertemplate='Signal: %{y:.1f}<extra></extra>'
+                    ),
+                    row=3, col=1
+                )
+
+                # OB fill (RSI above OB)
+                arsi_ob = arsi_vals.where(arsi_vals > ob, ob)
+                fig.add_trace(
+                    go.Scatter(x=dt, y=[ob]*len(dt), mode='lines',
+                               line=dict(color='rgba(0,0,0,0)', width=0),
+                               showlegend=False, hoverinfo='skip'),
+                    row=3, col=1
+                )
+                fig.add_trace(
+                    go.Scatter(x=dt, y=arsi_ob, mode='lines',
+                               line=dict(color='rgba(0,0,0,0)', width=0),
+                               fill='tonexty', fillcolor='rgba(8,153,129,0.25)',
+                               showlegend=False, hoverinfo='skip'),
+                    row=3, col=1
+                )
+
+                # OS fill (RSI below OS)
+                arsi_os = arsi_vals.where(arsi_vals < os_val, os_val)
+                fig.add_trace(
+                    go.Scatter(x=dt, y=arsi_os, mode='lines',
+                               line=dict(color='rgba(0,0,0,0)', width=0),
+                               showlegend=False, hoverinfo='skip'),
+                    row=3, col=1
+                )
+                fig.add_trace(
+                    go.Scatter(x=dt, y=[os_val]*len(dt), mode='lines',
+                               line=dict(color='rgba(0,0,0,0)', width=0),
+                               fill='tonexty', fillcolor='rgba(242,54,69,0.25)',
+                               showlegend=False, hoverinfo='skip'),
+                    row=3, col=1
+                )
+
+                # Horizontal reference lines
+                for level, label in [(ob, 'OB'), (50, 'Mid'), (os_val, 'OS')]:
+                    fig.add_hline(y=level, line_dash="dot", line_color="#555555",
+                                  line_width=1, row=3, col=1,
+                                  annotation_text=label, annotation_position="right")
+
+                fig.update_yaxes(title_text="URSI", range=[0, 100],
+                                 showgrid=True, gridwidth=1, gridcolor='#333333',
+                                 row=3, col=1)
+                fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#333333',
+                                 type='date', row=3, col=1)
+        except Exception:
+            pass  # Ultimate RSI drawing failed, skip it
+
     fig.update_layout(
         title=title,
         template='plotly_dark',
         xaxis_rangeslider_visible=False,
-        height=700,
+        height=850 if has_ursi else 700,
         showlegend=False,
         margin=dict(l=0, r=0, t=40, b=0),
         font=dict(color='white'),
@@ -4228,6 +4567,15 @@ def main():
             except Exception:
                 rsi_sz_data_for_chart = None
 
+        # Calculate Ultimate RSI for chart display
+        ultimate_rsi_data_for_chart = None
+        if not df.empty and len(df) > 20:
+            try:
+                ursi_calculator = UltimateRSI(length=7, smo_type='RMA', signal_length=14, signal_type='EMA', ob_value=70, os_value=40)
+                ultimate_rsi_data_for_chart = ursi_calculator.calculate(df)
+            except Exception:
+                ultimate_rsi_data_for_chart = None
+
         # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
@@ -4239,7 +4587,8 @@ def main():
                 vob_blocks=vob_blocks_for_chart,
                 poc_data=poc_data_for_chart,
                 swing_data=swing_data_for_chart,
-                rsi_sz_data=rsi_sz_data_for_chart
+                rsi_sz_data=rsi_sz_data_for_chart,
+                ultimate_rsi_data=ultimate_rsi_data_for_chart
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -4604,6 +4953,39 @@ def main():
                 - **Bearish Breakout (▼)**: Price broke below zone — momentum shifting down
                 - Longer suppression zones often lead to stronger breakouts
                 - Use with POC and Swing levels for confluence-based entries
+                """)
+
+            # ===== ULTIMATE RSI [LuxAlgo] =====
+            if ultimate_rsi_data_for_chart:
+                st.markdown("---")
+                st.markdown("## 📈 Ultimate RSI [LuxAlgo]")
+
+                ursi_val = ultimate_rsi_data_for_chart.get('latest_arsi', 50)
+                ursi_sig = ultimate_rsi_data_for_chart.get('latest_signal', 50)
+                ursi_zone = ultimate_rsi_data_for_chart.get('zone', 'Neutral')
+                ursi_cross = ultimate_rsi_data_for_chart.get('cross_signal', 'None')
+                ursi_momentum = ultimate_rsi_data_for_chart.get('momentum', 'Neutral')
+
+                ursi_col1, ursi_col2, ursi_col3, ursi_col4 = st.columns(4)
+                with ursi_col1:
+                    delta_color = "normal" if ursi_momentum == 'Bullish' else ("inverse" if ursi_momentum == 'Bearish' else "off")
+                    st.metric("URSI Value", f"{ursi_val:.1f}", delta=ursi_momentum, delta_color=delta_color)
+                with ursi_col2:
+                    st.metric("Signal Line", f"{ursi_sig:.1f}")
+                with ursi_col3:
+                    zone_icon = "🟢" if ursi_zone == 'Overbought' else ("🔴" if ursi_zone == 'Oversold' else "⚪")
+                    st.metric("Zone", f"{zone_icon} {ursi_zone}")
+                with ursi_col4:
+                    cross_icon = "🔼" if 'Bullish' in ursi_cross else ("🔽" if 'Bearish' in ursi_cross else "➖")
+                    st.metric("Cross Signal", f"{cross_icon} {ursi_cross}")
+
+                st.markdown("""
+                **Ultimate RSI Interpretation:**
+                - **Above 70 (OB)**: Overbought — expect bearish reversal
+                - **Below 40 (OS)**: Oversold — expect bullish bounce
+                - **URSI > Signal + Above 50**: Bullish momentum confirmed
+                - **URSI < Signal + Below 50**: Bearish momentum confirmed
+                - **Bullish/Bearish Cross**: URSI crossing signal line = momentum shift
                 """)
 
         else:
@@ -5348,6 +5730,7 @@ def main():
                     poc_data=poc_data_for_chart,
                     rsi_sz_data=rsi_sz_data_for_chart,
                     gex_data=gex_data,
+                    ultimate_rsi_data=ultimate_rsi_data_for_chart,
                 )
         except Exception:
             pass
