@@ -1255,6 +1255,126 @@ class RSIVolatilitySuppression:
         }
 
 
+class UltimateRSI:
+    """
+    Ultimate RSI Indicator - Converted from Pine Script [LuxAlgo]
+
+    An augmented RSI that uses highest/lowest range to detect momentum shifts
+    more accurately than standard RSI. Includes signal line and OB/OS zones.
+
+    Key differences from standard RSI:
+    - Uses highest-lowest range as the diff when range expands/contracts
+    - Smoothed with selectable MA type (RMA default)
+    - Signal line (EMA of RSI) for crossover detection
+    """
+
+    def __init__(self, length=14, smo_type='RMA', signal_length=14, signal_type='EMA',
+                 ob_value=80, os_value=20):
+        self.length = length
+        self.smo_type = smo_type
+        self.signal_length = signal_length
+        self.signal_type = signal_type
+        self.ob_value = ob_value
+        self.os_value = os_value
+
+    @staticmethod
+    def _ma(series, length, ma_type):
+        """Moving average with selectable type"""
+        if ma_type == 'EMA':
+            return series.ewm(span=length, adjust=False).mean()
+        elif ma_type == 'SMA':
+            return series.rolling(window=length, min_periods=1).mean()
+        elif ma_type == 'RMA':
+            return series.ewm(alpha=1/length, adjust=False).mean()
+        elif ma_type == 'TMA':
+            sma1 = series.rolling(window=length, min_periods=1).mean()
+            return sma1.rolling(window=length, min_periods=1).mean()
+        return series
+
+    def calculate(self, df):
+        """
+        Calculate Ultimate RSI time series.
+
+        Returns:
+            dict with 'arsi' (Series), 'signal' (Series), 'ob', 'os',
+            'latest_arsi', 'latest_signal', 'zone', 'cross_signal'
+        """
+        if df.empty or len(df) < self.length + 5:
+            return None
+
+        src = df['close'].astype(float)
+        high = df['high'].astype(float)
+        low = df['low'].astype(float)
+
+        # Augmented RSI calculation (Pine Script logic)
+        upper = high.rolling(window=self.length, min_periods=1).max()
+        lower = low.rolling(window=self.length, min_periods=1).min()
+        r = upper - lower
+
+        d = src.diff()  # src - src[1]
+
+        # diff = upper > upper[1] ? r : lower < lower[1] ? -r : d
+        upper_expanded = upper > upper.shift(1)
+        lower_expanded = lower < lower.shift(1)
+
+        diff = pd.Series(np.where(
+            upper_expanded, r,
+            np.where(lower_expanded, -r, d)
+        ), index=df.index, dtype=float)
+
+        # num = ma(diff, length); den = ma(abs(diff), length)
+        num = self._ma(diff, self.length, self.smo_type)
+        den = self._ma(diff.abs(), self.length, self.smo_type)
+
+        # arsi = num/den * 50 + 50
+        arsi = (num / den.replace(0, np.nan) * 50 + 50).fillna(50)
+
+        # Signal line
+        signal = self._ma(arsi, self.signal_length, self.signal_type)
+
+        # Latest values
+        latest_arsi = arsi.iloc[-1]
+        latest_signal = signal.iloc[-1]
+
+        # Zone determination
+        if latest_arsi > self.ob_value:
+            zone = 'Overbought'
+        elif latest_arsi < self.os_value:
+            zone = 'Oversold'
+        else:
+            zone = 'Neutral'
+
+        # Crossover signals
+        prev_arsi = arsi.iloc[-2] if len(arsi) > 1 else 50
+        prev_signal = signal.iloc[-2] if len(signal) > 1 else 50
+
+        cross_signal = 'None'
+        if prev_arsi <= prev_signal and latest_arsi > latest_signal:
+            cross_signal = 'Bullish Cross'
+        elif prev_arsi >= prev_signal and latest_arsi < latest_signal:
+            cross_signal = 'Bearish Cross'
+
+        # Momentum direction
+        if latest_arsi > 50 and latest_arsi > latest_signal:
+            momentum = 'Bullish'
+        elif latest_arsi < 50 and latest_arsi < latest_signal:
+            momentum = 'Bearish'
+        else:
+            momentum = 'Neutral'
+
+        return {
+            'arsi': arsi,
+            'signal': signal,
+            'ob': self.ob_value,
+            'os': self.os_value,
+            'latest_arsi': round(latest_arsi, 2),
+            'latest_signal': round(latest_signal, 2),
+            'zone': zone,
+            'cross_signal': cross_signal,
+            'momentum': momentum,
+        }
+
+
 class FutureSwing:
     """
     Future Swing Projection Indicator - Converted from Pine Script [BigBeluga]
@@ -2083,7 +2203,7 @@ def calculate_max_pain(df_options, spot_price):
 
 
 def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price, pivot_proximity,
-                                   poc_data=None, rsi_sz_data=None, gex_data=None):
+                                   poc_data=None, rsi_sz_data=None, gex_data=None, ultimate_rsi_data=None):
     """
     Unified Confluence Entry Signal — sends ONE Telegram alert only when ALL conditions align:
 
@@ -2092,6 +2212,7 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
     3. POC Alignment: Price position consistent with direction (above for bull, below for bear)
     4. RSI Suppression Zone: Recent breakout in same direction (or active zone = pending entry)
     5. Near Pivot Level: Price within proximity of HTF pivot S/R
+    6. Ultimate RSI: Momentum and zone aligned with direction
     """
     if df.empty or df_summary is None or len(df_summary) == 0 or not current_price:
         return
@@ -2198,6 +2319,35 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
         if not near_pivot:
             return
 
+        # --- 6. Ultimate RSI ---
+        ursi_detail = "N/A"
+        ursi_aligned = False
+        if ultimate_rsi_data:
+            ursi_momentum = ultimate_rsi_data.get('momentum', 'Neutral')
+            ursi_zone = ultimate_rsi_data.get('zone', 'Neutral')
+            ursi_val = ultimate_rsi_data.get('latest_arsi', 50)
+            ursi_sig_val = ultimate_rsi_data.get('latest_signal', 50)
+            ursi_cross = ultimate_rsi_data.get('cross_signal', 'None')
+
+            if direction == 'bullish' and ursi_momentum == 'Bullish':
+                ursi_aligned = True
+                ursi_detail = f"Bullish ({ursi_val:.0f} > Sig {ursi_sig_val:.0f})"
+            elif direction == 'bearish' and ursi_momentum == 'Bearish':
+                ursi_aligned = True
+                ursi_detail = f"Bearish ({ursi_val:.0f} < Sig {ursi_sig_val:.0f})"
+            elif ursi_cross == 'Bullish Cross' and direction == 'bullish':
+                ursi_aligned = True
+                ursi_detail = f"Bullish Cross ({ursi_val:.0f})"
+            elif ursi_cross == 'Bearish Cross' and direction == 'bearish':
+                ursi_aligned = True
+                ursi_detail = f"Bearish Cross ({ursi_val:.0f})"
+        else:
+            ursi_aligned = True  # Skip if no data
+            ursi_detail = "URSI data N/A"
+
+        if not ursi_aligned:
+            return
+
         # ===== ALL CONDITIONS MET — BUILD AND SEND ALERT =====
         ist = pytz.timezone('Asia/Kolkata')
         now_str = datetime.now(ist).strftime('%H:%M:%S IST')
@@ -2238,12 +2388,13 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
 📌 <b>Pivot:</b> {pivot_level['timeframe']} at ₹{pivot_level['value']:.2f}
 🎯 <b>ATM Strike:</b> {atm_strike} {option_type}
 
-<b>✅ ALL 5 CONDITIONS MET:</b>
+<b>✅ ALL 6 CONDITIONS MET:</b>
 1️⃣ ATM Verdict: {verdict} (Score: {bias_score})
 2️⃣ PCR×GEX: {confluence_badge} ({confluence_signal}) ★{confluence_strength}
 3️⃣ POC: {poc_detail}
 4️⃣ RSI SZ: {rsi_sz_signal}
 5️⃣ Pivot: {pivot_level['timeframe']} within {pivot_proximity} pts
+6️⃣ URSI: {ursi_detail}
 
 <b>📊 ATM BIAS:</b>
 • OI: {oi_bias} | ChgOI: {chgoi_bias} | Vol: {volume_bias}
@@ -2654,18 +2805,20 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None):
-    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, and RSI Suppression Zones"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None):
+    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, RSI Suppression Zones, and Ultimate RSI"""
     if df.empty:
         return go.Figure()
-    
+
+    has_ursi = ultimate_rsi_data is not None and ultimate_rsi_data.get('arsi') is not None
+
     fig = make_subplots(
-        rows=2, 
+        rows=3 if has_ursi else 2,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.7, 0.3],
-        specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
+        vertical_spacing=0.03,
+        row_heights=[0.55, 0.2, 0.25] if has_ursi else [0.7, 0.3],
+        subplot_titles=(None, None, "Ultimate RSI") if has_ursi else None
     )
     
     fig.add_trace(
@@ -3085,12 +3238,102 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         ),
         row=2, col=1
     )
-    
+
+    # ===== ULTIMATE RSI SUBPLOT (Row 3) =====
+    if has_ursi:
+        try:
+            arsi = ultimate_rsi_data['arsi']
+            sig = ultimate_rsi_data['signal']
+            ob = ultimate_rsi_data['ob']
+            os_val = ultimate_rsi_data['os']
+
+            valid_mask = arsi.notna()
+            if valid_mask.any():
+                dt = df.loc[valid_mask, 'datetime']
+                arsi_vals = arsi[valid_mask]
+                sig_vals = sig[valid_mask]
+
+                # Color RSI by zone: green if OB, red if OS, white otherwise
+                arsi_colors = ['#089981' if v > ob else '#f23645' if v < os_val else '#c0c0c0'
+                               for v in arsi_vals]
+
+                # RSI line (colored segments via markers)
+                fig.add_trace(
+                    go.Scatter(
+                        x=dt, y=arsi_vals,
+                        mode='lines',
+                        name='Ultimate RSI',
+                        line=dict(color='#c0c0c0', width=1.5),
+                        showlegend=False,
+                        hovertemplate='URSI: %{y:.1f}<extra></extra>'
+                    ),
+                    row=3, col=1
+                )
+
+                # Signal line
+                fig.add_trace(
+                    go.Scatter(
+                        x=dt, y=sig_vals,
+                        mode='lines',
+                        name='Signal',
+                        line=dict(color='#ff5d00', width=1, dash='dot'),
+                        showlegend=False,
+                        hovertemplate='Signal: %{y:.1f}<extra></extra>'
+                    ),
+                    row=3, col=1
+                )
+
+                # OB fill (RSI above OB)
+                arsi_ob = arsi_vals.where(arsi_vals > ob, ob)
+                fig.add_trace(
+                    go.Scatter(x=dt, y=[ob]*len(dt), mode='lines',
+                               line=dict(color='rgba(0,0,0,0)', width=0),
+                               showlegend=False, hoverinfo='skip'),
+                    row=3, col=1
+                )
+                fig.add_trace(
+                    go.Scatter(x=dt, y=arsi_ob, mode='lines',
+                               line=dict(color='rgba(0,0,0,0)', width=0),
+                               fill='tonexty', fillcolor='rgba(8,153,129,0.25)',
+                               showlegend=False, hoverinfo='skip'),
+                    row=3, col=1
+                )
+
+                # OS fill (RSI below OS)
+                arsi_os = arsi_vals.where(arsi_vals < os_val, os_val)
+                fig.add_trace(
+                    go.Scatter(x=dt, y=arsi_os, mode='lines',
+                               line=dict(color='rgba(0,0,0,0)', width=0),
+                               showlegend=False, hoverinfo='skip'),
+                    row=3, col=1
+                )
+                fig.add_trace(
+                    go.Scatter(x=dt, y=[os_val]*len(dt), mode='lines',
+                               line=dict(color='rgba(0,0,0,0)', width=0),
+                               fill='tonexty', fillcolor='rgba(242,54,69,0.25)',
+                               showlegend=False, hoverinfo='skip'),
+                    row=3, col=1
+                )
+
+                # Horizontal reference lines
+                for level, label in [(ob, 'OB'), (50, 'Mid'), (os_val, 'OS')]:
+                    fig.add_hline(y=level, line_dash="dot", line_color="#555555",
+                                  line_width=1, row=3, col=1,
+                                  annotation_text=label, annotation_position="right")
+
+                fig.update_yaxes(title_text="URSI", range=[0, 100],
+                                 showgrid=True, gridwidth=1, gridcolor='#333333',
+                                 row=3, col=1)
+                fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#333333',
+                                 type='date', row=3, col=1)
+        except Exception:
+            pass  # Ultimate RSI drawing failed, skip it
+
     fig.update_layout(
         title=title,
         template='plotly_dark',
         xaxis_rangeslider_visible=False,
-        height=700,
+        height=850 if has_ursi else 700,
         showlegend=False,
         margin=dict(l=0, r=0, t=40, b=0),
         font=dict(color='white'),
@@ -4324,6 +4567,15 @@ def main():
             except Exception:
                 rsi_sz_data_for_chart = None
 
+        # Calculate Ultimate RSI for chart display
+        ultimate_rsi_data_for_chart = None
+        if not df.empty and len(df) > 20:
+            try:
+                ursi_calculator = UltimateRSI(length=14, smo_type='RMA', signal_length=14, signal_type='EMA')
+                ultimate_rsi_data_for_chart = ursi_calculator.calculate(df)
+            except Exception:
+                ultimate_rsi_data_for_chart = None
+
         # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
@@ -4335,7 +4587,8 @@ def main():
                 vob_blocks=vob_blocks_for_chart,
                 poc_data=poc_data_for_chart,
                 swing_data=swing_data_for_chart,
-                rsi_sz_data=rsi_sz_data_for_chart
+                rsi_sz_data=rsi_sz_data_for_chart,
+                ultimate_rsi_data=ultimate_rsi_data_for_chart
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -4700,6 +4953,39 @@ def main():
                 - **Bearish Breakout (▼)**: Price broke below zone — momentum shifting down
                 - Longer suppression zones often lead to stronger breakouts
                 - Use with POC and Swing levels for confluence-based entries
+                """)
+
+            # ===== ULTIMATE RSI [LuxAlgo] =====
+            if ultimate_rsi_data_for_chart:
+                st.markdown("---")
+                st.markdown("## 📈 Ultimate RSI [LuxAlgo]")
+
+                ursi_val = ultimate_rsi_data_for_chart.get('latest_arsi', 50)
+                ursi_sig = ultimate_rsi_data_for_chart.get('latest_signal', 50)
+                ursi_zone = ultimate_rsi_data_for_chart.get('zone', 'Neutral')
+                ursi_cross = ultimate_rsi_data_for_chart.get('cross_signal', 'None')
+                ursi_momentum = ultimate_rsi_data_for_chart.get('momentum', 'Neutral')
+
+                ursi_col1, ursi_col2, ursi_col3, ursi_col4 = st.columns(4)
+                with ursi_col1:
+                    delta_color = "normal" if ursi_momentum == 'Bullish' else ("inverse" if ursi_momentum == 'Bearish' else "off")
+                    st.metric("URSI Value", f"{ursi_val:.1f}", delta=ursi_momentum, delta_color=delta_color)
+                with ursi_col2:
+                    st.metric("Signal Line", f"{ursi_sig:.1f}")
+                with ursi_col3:
+                    zone_icon = "🟢" if ursi_zone == 'Overbought' else ("🔴" if ursi_zone == 'Oversold' else "⚪")
+                    st.metric("Zone", f"{zone_icon} {ursi_zone}")
+                with ursi_col4:
+                    cross_icon = "🔼" if 'Bullish' in ursi_cross else ("🔽" if 'Bearish' in ursi_cross else "➖")
+                    st.metric("Cross Signal", f"{cross_icon} {ursi_cross}")
+
+                st.markdown("""
+                **Ultimate RSI Interpretation:**
+                - **Above 80 (OB)**: Overbought — potential reversal or exhaustion
+                - **Below 20 (OS)**: Oversold — potential bounce or accumulation
+                - **URSI > Signal + Above 50**: Bullish momentum confirmed
+                - **URSI < Signal + Below 50**: Bearish momentum confirmed
+                - **Bullish/Bearish Cross**: URSI crossing signal line = momentum shift
                 """)
 
         else:
@@ -5444,6 +5730,7 @@ def main():
                     poc_data=poc_data_for_chart,
                     rsi_sz_data=rsi_sz_data_for_chart,
                     gex_data=gex_data,
+                    ultimate_rsi_data=ultimate_rsi_data_for_chart,
                 )
         except Exception:
             pass
