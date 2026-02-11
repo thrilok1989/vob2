@@ -2250,27 +2250,28 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
         if direction == 'bearish' and 'BEAR' not in confluence_badge:
             return
 
-        # --- 3. POC Alignment ---
+        # --- 3. POC Alignment (spot above POC = bull, below POC = bear) ---
         poc_aligned = False
         poc_detail = "N/A"
         if poc_data:
-            positions = []
+            above_count = 0
+            below_count = 0
+            total = 0
             for poc_key in ['poc1', 'poc2', 'poc3']:
                 poc = poc_data.get(poc_key)
                 if poc and poc.get('poc'):
-                    if current_price > poc.get('upper_poc', 0):
-                        positions.append('above')
-                    elif current_price < poc.get('lower_poc', 0):
-                        positions.append('below')
+                    total += 1
+                    if current_price > poc['poc']:
+                        above_count += 1
                     else:
-                        positions.append('inside')
+                        below_count += 1
 
-            if direction == 'bullish' and positions.count('above') >= 2:
+            if direction == 'bullish' and above_count >= 2:
                 poc_aligned = True
-                poc_detail = f"Above {positions.count('above')}/3 POCs"
-            elif direction == 'bearish' and positions.count('below') >= 2:
+                poc_detail = f"Above {above_count}/{total} POCs (Bull)"
+            elif direction == 'bearish' and below_count >= 2:
                 poc_aligned = True
-                poc_detail = f"Below {positions.count('below')}/3 POCs"
+                poc_detail = f"Below {below_count}/{total} POCs (Bear)"
         else:
             poc_aligned = True  # Skip if no POC data available
             poc_detail = "POC data N/A"
@@ -4742,16 +4743,14 @@ def main():
                     period = poc_data_for_chart.get('periods', {}).get(period_key, '')
 
                     if poc:
-                        # Determine position relative to POC
-                        if current_price_for_poc > poc.get('upper_poc', 0):
+                        # Determine position relative to POC line
+                        # Above POC = Bull, Below POC = Bear
+                        if current_price_for_poc > poc.get('poc', 0):
                             position = "🟢 Above"
                             signal = "Bullish"
-                        elif current_price_for_poc < poc.get('lower_poc', 0):
+                        else:
                             position = "🔴 Below"
                             signal = "Bearish"
-                        else:
-                            position = "🟡 Inside"
-                            signal = "Neutral"
 
                         poc_table_data.append({
                             'POC': f"POC {poc_key[-1]} ({period})",
@@ -4783,9 +4782,8 @@ def main():
                     - **POC 1 (10)**: Short-term volume profile - intraday support/resistance
                     - **POC 2 (25)**: Medium-term volume profile - swing trading levels
                     - **POC 3 (70)**: Long-term volume profile - major support/resistance
-                    - **Above POC**: Bullish bias - POC acts as support
-                    - **Below POC**: Bearish bias - POC acts as resistance
-                    - **Inside POC**: Neutral - price consolidating at high-volume zone
+                    - **Above POC**: Bullish — market is bull, POC acts as support
+                    - **Below POC**: Bearish — market is bear, POC acts as resistance
                     """)
 
             # Future Swing Table
