@@ -4571,7 +4571,7 @@ def main():
         ultimate_rsi_data_for_chart = None
         if not df.empty and len(df) > 20:
             try:
-                ursi_calculator = UltimateRSI(length=14, smo_type='RMA', signal_length=14, signal_type='EMA')
+                ursi_calculator = UltimateRSI(length=7, smo_type='RMA', signal_length=14, signal_type='EMA')
                 ultimate_rsi_data_for_chart = ursi_calculator.calculate(df)
             except Exception:
                 ultimate_rsi_data_for_chart = None
