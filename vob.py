@@ -4571,7 +4571,7 @@ def main():
         ultimate_rsi_data_for_chart = None
         if not df.empty and len(df) > 20:
             try:
-                ursi_calculator = UltimateRSI(length=7, smo_type='RMA', signal_length=14, signal_type='EMA')
+                ursi_calculator = UltimateRSI(length=7, smo_type='RMA', signal_length=14, signal_type='EMA', ob_value=70, os_value=40)
                 ultimate_rsi_data_for_chart = ursi_calculator.calculate(df)
             except Exception:
                 ultimate_rsi_data_for_chart = None
@@ -4981,8 +4981,8 @@ def main():
 
                 st.markdown("""
                 **Ultimate RSI Interpretation:**
-                - **Above 80 (OB)**: Overbought — potential reversal or exhaustion
-                - **Below 20 (OS)**: Oversold — potential bounce or accumulation
+                - **Above 70 (OB)**: Overbought — expect bearish reversal
+                - **Below 40 (OS)**: Oversold — expect bullish bounce
                 - **URSI > Signal + Above 50**: Bullish momentum confirmed
                 - **URSI < Signal + Below 50**: Bearish momentum confirmed
                 - **Bullish/Bearish Cross**: URSI crossing signal line = momentum shift
