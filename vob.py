@@ -2639,7 +2639,8 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
         pass  # Silently fail to avoid disrupting the app
 
 
-def check_vwap_poc_alignment_signal(df, current_price, vwap_data=None, poc_data=None, poc_proximity=3.0):
+def check_vwap_poc_alignment_signal(df, current_price, vwap_data=None, poc_data=None, poc_proximity=3.0,
+                                     option_data=None, gex_data=None, require_gex_move=False):
     """
     VWAP + POC Alignment Signal — sends Telegram alert when:
 
@@ -2647,6 +2648,11 @@ def check_vwap_poc_alignment_signal(df, current_price, vwap_data=None, poc_data=
     PUT Signal:  Spot BELOW VWAP AND POC 1,2,3 all aligned ABOVE spot (within proximity of each other)
 
     POC alignment = all 3 POC values are within `poc_proximity` points of each other.
+
+    Enhanced with:
+    - ATM strike + Bull/Bear verdict from option chain bias engine
+    - GEX regime (Pin/Chop, Range, Trending, Breakout) with big-move detection
+    - Optional: require GEX Trending/Breakout for signal (require_gex_move=True)
     """
     if df.empty or not current_price:
         return
@@ -2700,6 +2706,48 @@ def check_vwap_poc_alignment_signal(df, current_price, vwap_data=None, poc_data=
         else:
             return  # Conditions not met
 
+        # --- ATM Strike + Bull/Bear Verdict ---
+        atm_strike = None
+        atm_verdict = "N/A"
+        atm_bias_score = 0
+        atm_oi_bias = "N/A"
+        atm_chgoi_bias = "N/A"
+        atm_operator = "N/A"
+        atm_option_type = "CE" if direction == 'bullish' else "PE"
+
+        if option_data and option_data.get('df_summary') is not None:
+            df_summary = option_data['df_summary']
+            atm_rows = df_summary[df_summary['Zone'] == 'ATM']
+            if not atm_rows.empty:
+                atm_row = atm_rows.iloc[0]
+                atm_strike = atm_row.get('Strike', None)
+                atm_verdict = atm_row.get('Verdict', 'N/A')
+                atm_bias_score = atm_row.get('BiasScore', 0)
+                atm_oi_bias = atm_row.get('OI_Bias', 'N/A')
+                atm_chgoi_bias = atm_row.get('ChgOI_Bias', 'N/A')
+                atm_operator = atm_row.get('Operator_Entry', 'N/A')
+
+        # --- GEX Regime ---
+        gex_signal = "N/A"
+        gex_total = 0
+        gex_magnet = "N/A"
+        gex_repeller = "N/A"
+        gex_flip = "N/A"
+        gex_big_move = False  # True when GEX says Trending or Breakout
+
+        if gex_data:
+            gex_signal = gex_data.get('gex_signal', 'N/A')
+            gex_total = gex_data.get('total_gex', 0)
+            gex_magnet = gex_data.get('gex_magnet', 'N/A')
+            gex_repeller = gex_data.get('gex_repeller', 'N/A')
+            gex_flip_level = gex_data.get('gamma_flip_level', None)
+            gex_flip = f"₹{gex_flip_level:,.0f}" if gex_flip_level else "N/A"
+            gex_big_move = gex_signal in ('Trending', 'Breakout')
+
+        # If require_gex_move is enabled, skip signal when GEX is pinning/ranging
+        if require_gex_move and not gex_big_move:
+            return  # GEX says chop/pin, not a big-move environment
+
         # Dedup check (per-minute, per-direction)
         ist = pytz.timezone('Asia/Kolkata')
         now_str = datetime.now(ist).strftime('%H:%M:%S IST')
@@ -2739,6 +2787,40 @@ def check_vwap_poc_alignment_signal(df, current_price, vwap_data=None, poc_data=
 
         band_position = vwap_data.get('band_position', 'N/A')
 
+        # ATM section
+        atm_section = ""
+        if atm_strike:
+            verdict_emoji = "🟢" if "Bullish" in atm_verdict else "🔴" if "Bearish" in atm_verdict else "⚪"
+            atm_section = f"""
+<b>🎯 ATM STRIKE:</b> {atm_strike} {atm_option_type}
+  • Verdict: {verdict_emoji} {atm_verdict} (Score: {atm_bias_score:+.1f})
+  • OI: {atm_oi_bias} | ChgOI: {atm_chgoi_bias} | Operator: {atm_operator}"""
+
+        # GEX section
+        gex_section = ""
+        if gex_data:
+            gex_emoji = "⚡" if gex_big_move else "📍"
+            move_label = "BIG MOVE EXPECTED" if gex_big_move else "RANGE/PIN MODE"
+            gex_section = f"""
+<b>{gex_emoji} GEX REGIME:</b> {gex_signal} — {move_label}
+  • Net GEX: {gex_total:+.2f}L | Flip: {gex_flip}
+  • Magnet: {gex_magnet if gex_magnet != 'N/A' and gex_magnet else 'N/A'} | Repeller: {gex_repeller if gex_repeller != 'N/A' and gex_repeller else 'N/A'}"""
+
+        # Condition count
+        cond_num = 3
+        conditions_text = f"""1️⃣ Spot {'ABOVE' if spot_above_vwap else 'BELOW'} VWAP ({'Bullish' if spot_above_vwap else 'Bearish'} Bias)
+2️⃣ All 3 POCs aligned within {poc_spread:.1f} pts (< {poc_proximity:.0f} pt threshold)
+3️⃣ All POCs {'BELOW' if all_poc_below_spot else 'ABOVE'} spot price ({bias_text} confirmation)"""
+
+        if atm_strike and atm_verdict != 'N/A':
+            verdict_match = ('Bullish' in atm_verdict and direction == 'bullish') or ('Bearish' in atm_verdict and direction == 'bearish')
+            cond_num += 1
+            conditions_text += f"\n{cond_num}\u20e3 ATM {atm_verdict} {'✅ CONFIRMS' if verdict_match else '⚠️ DIVERGENT'}"
+
+        if gex_data:
+            cond_num += 1
+            conditions_text += f"\n{cond_num}\u20e3 GEX: {gex_signal} ({'⚡ BIG MOVE' if gex_big_move else '📍 Range/Pin'})"
+
         message = f"""{emoji} <b>VWAP + POC ALIGNMENT — {dir_label} SIGNAL</b> {emoji}
 
 📍 <b>Spot:</b> ₹{current_price:,.2f}
@@ -2748,11 +2830,11 @@ def check_vwap_poc_alignment_signal(df, current_price, vwap_data=None, poc_data=
 <b>🎯 POC Alignment (spread: {poc_spread:.1f} pts):</b>
 {poc_details}
   • POC Average: ₹{poc_avg:,.2f} (All 3 POCs {'BELOW' if all_poc_below_spot else 'ABOVE'} spot)
+{atm_section}
+{gex_section}
 
 <b>✅ CONDITIONS MET:</b>
-1️⃣ Spot {'ABOVE' if spot_above_vwap else 'BELOW'} VWAP ({'Bullish' if spot_above_vwap else 'Bearish'} Bias)
-2️⃣ All 3 POCs aligned within {poc_spread:.1f} pts (< {poc_proximity:.0f} pt threshold)
-3️⃣ All POCs {'BELOW' if all_poc_below_spot else 'ABOVE'} spot price ({bias_text} confirmation){f'''
+{conditions_text}{f'''
 
 <b>📏 VWAP Bands:</b>{band_info}''' if band_info else ''}
 
@@ -2763,9 +2845,13 @@ def check_vwap_poc_alignment_signal(df, current_price, vwap_data=None, poc_data=
         st.session_state.last_vwap_poc_alert = alert_key
 
         if direction == 'bullish':
-            st.success(f"🟢📊 VWAP+POC CALL signal sent! Spot above VWAP, all 3 POCs aligned below (spread: {poc_spread:.1f} pts)")
+            st.success(f"🟢📊 VWAP+POC CALL signal sent! Spot above VWAP, all 3 POCs aligned below (spread: {poc_spread:.1f} pts)" +
+                       (f" | ATM {atm_verdict}" if atm_strike else "") +
+                       (f" | GEX: {gex_signal}" if gex_data else ""))
         else:
-            st.success(f"🔴📊 VWAP+POC PUT signal sent! Spot below VWAP, all 3 POCs aligned above (spread: {poc_spread:.1f} pts)")
+            st.success(f"🔴📊 VWAP+POC PUT signal sent! Spot below VWAP, all 3 POCs aligned above (spread: {poc_spread:.1f} pts)" +
+                       (f" | ATM {atm_verdict}" if atm_strike else "") +
+                       (f" | GEX: {gex_signal}" if gex_data else ""))
 
     except Exception:
         pass  # Silently fail to avoid disrupting the app
@@ -4903,8 +4989,15 @@ def main():
         help="Max spread between POC 1,2,3 values to consider them 'aligned'"
     ) if enable_vwap_poc_signal else 3
 
+    require_gex_big_move = st.sidebar.checkbox(
+        "Only signal when GEX = Big Move",
+        value=False,
+        help="Only fire VWAP+POC signal when GEX regime is Trending/Breakout (dealers short gamma = violent moves expected)"
+    ) if enable_vwap_poc_signal else False
+
     if enable_signals:
-        st.sidebar.info(f"Signals sent when:\n• Price within ±{pivot_proximity}pts of pivot\n• All option bias aligned\n• ATM at support/resistance\n• VWAP+POC: POCs within ±{poc_alignment_proximity}pts")
+        gex_filter_text = "\n• GEX: Only on Trending/Breakout" if require_gex_big_move else "\n• GEX: All regimes (+ ATM Bull/Bear)"
+        st.sidebar.info(f"Signals sent when:\n• Price within ±{pivot_proximity}pts of pivot\n• All option bias aligned\n• ATM at support/resistance\n• VWAP+POC: POCs within ±{poc_alignment_proximity}pts{gex_filter_text}")
 
     # Options expiry selection
     st.sidebar.header("📅 Options Settings")
@@ -6397,6 +6490,9 @@ def main():
                     vwap_data=vwap_data_for_chart,
                     poc_data=poc_data_for_chart,
                     poc_proximity=poc_alignment_proximity,
+                    option_data=option_data,
+                    gex_data=gex_data,
+                    require_gex_move=require_gex_big_move,
                 )
         except Exception:
             pass
