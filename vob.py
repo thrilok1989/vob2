@@ -2220,6 +2220,8 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
     # Dedup: avoid sending same alert twice
     if 'last_confluence_alert' not in st.session_state:
         st.session_state.last_confluence_alert = None
+    if 'confluence_signal_details' not in st.session_state:
+        st.session_state.confluence_signal_details = None
 
     try:
         # --- 1. ATM Bias Verdict ---
@@ -2412,10 +2414,41 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
 """
         send_telegram_message_sync(message)
         st.session_state.last_confluence_alert = alert_key
-        if direction == 'bullish':
-            st.success(f"🟢🔥 Confluence BULLISH entry alert sent! Strike {atm_strike} CE")
-        else:
-            st.success(f"🔴🔥 Confluence BEARISH entry alert sent! Strike {atm_strike} PE")
+
+        # Store signal details for UI display
+        st.session_state.confluence_signal_details = {
+            'direction': direction,
+            'dir_label': dir_label,
+            'emoji': emoji,
+            'current_price': current_price,
+            'pivot_level': pivot_level,
+            'price_diff': price_diff,
+            'atm_strike': atm_strike,
+            'option_type': option_type,
+            'verdict': verdict,
+            'bias_score': bias_score,
+            'confluence_badge': confluence_badge,
+            'confluence_signal': confluence_signal,
+            'confluence_strength': confluence_strength,
+            'poc_detail': poc_detail,
+            'rsi_sz_signal': rsi_sz_signal,
+            'pivot_proximity': pivot_proximity,
+            'ursi_detail': ursi_detail,
+            'oi_bias': oi_bias,
+            'chgoi_bias': chgoi_bias,
+            'volume_bias': volume_bias,
+            'delta_exp': delta_exp,
+            'gamma_exp': gamma_exp,
+            'pressure_bias': pressure_bias,
+            'operator_entry': operator_entry,
+            'ce_chg_oi': ce_chg_oi,
+            'pe_chg_oi': pe_chg_oi,
+            'atm_pcr': atm_pcr,
+            'net_gex': net_gex,
+            'gex_signal_text': gex_signal_text,
+            'gex_magnet': gex_magnet,
+            'timestamp': now_str,
+        }
 
     except Exception as e:
         pass  # Silently fail to avoid disrupting the app
@@ -5742,6 +5775,124 @@ def main():
                 )
         except Exception:
             pass
+
+    # ===== DISPLAY SIGNAL DETAILS =====
+    if st.session_state.get('confluence_signal_details'):
+        sig = st.session_state.confluence_signal_details
+        direction = sig['direction']
+        border_color = '#00c853' if direction == 'bullish' else '#ff1744'
+        bg_color = '#e8f5e9' if direction == 'bullish' else '#fce4ec'
+        header_bg = '#00c853' if direction == 'bullish' else '#ff1744'
+
+        st.markdown("---")
+        st.markdown(f"""
+        <div style="border: 2px solid {border_color}; border-radius: 12px; padding: 0; margin: 10px 0; overflow: hidden; background: {bg_color};">
+            <div style="background: {header_bg}; color: white; padding: 12px 20px; font-size: 18px; font-weight: bold; text-align: center;">
+                {sig['emoji']} CONFLUENCE ENTRY ALERT — {sig['dir_label']} {sig['emoji']}
+            </div>
+            <div style="padding: 16px 20px;">
+                <div style="display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 14px;">
+                    <div style="flex: 1; min-width: 200px; background: white; border-radius: 8px; padding: 12px; border: 1px solid #ddd;">
+                        <div style="font-size: 12px; color: #666;">📍 Spot Price</div>
+                        <div style="font-size: 20px; font-weight: bold;">₹{sig['current_price']:.2f}</div>
+                        <div style="font-size: 12px; color: {'green' if sig['price_diff'] > 0 else 'red'};">{'▲' if sig['price_diff'] > 0 else '▼'} {sig['price_diff']:+.1f} pts from Pivot</div>
+                    </div>
+                    <div style="flex: 1; min-width: 200px; background: white; border-radius: 8px; padding: 12px; border: 1px solid #ddd;">
+                        <div style="font-size: 12px; color: #666;">📌 Pivot Level</div>
+                        <div style="font-size: 20px; font-weight: bold;">₹{sig['pivot_level']['value']:.2f}</div>
+                        <div style="font-size: 12px; color: #888;">{sig['pivot_level']['timeframe']} Timeframe</div>
+                    </div>
+                    <div style="flex: 1; min-width: 200px; background: white; border-radius: 8px; padding: 12px; border: 1px solid #ddd;">
+                        <div style="font-size: 12px; color: #666;">🎯 ATM Strike</div>
+                        <div style="font-size: 20px; font-weight: bold;">{sig['atm_strike']} {sig['option_type']}</div>
+                        <div style="font-size: 12px; color: #888;">Score: {sig['bias_score']}</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # 6 Conditions detail
+        st.markdown(f"""
+        <div style="border: 1px solid {border_color}; border-radius: 10px; padding: 16px 20px; margin: 10px 0; background: white;">
+            <div style="font-size: 16px; font-weight: bold; margin-bottom: 12px;">✅ All 6 Conditions Met</div>
+            <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+                <tr style="border-bottom: 1px solid #eee;">
+                    <td style="padding: 8px 4px; width: 30px; text-align: center;">1️⃣</td>
+                    <td style="padding: 8px 4px; font-weight: 600; width: 140px;">ATM Verdict</td>
+                    <td style="padding: 8px 4px;">{sig['verdict']} <span style="color: #888;">(Score: {sig['bias_score']})</span></td>
+                </tr>
+                <tr style="border-bottom: 1px solid #eee;">
+                    <td style="padding: 8px 4px; text-align: center;">2️⃣</td>
+                    <td style="padding: 8px 4px; font-weight: 600;">PCR × GEX</td>
+                    <td style="padding: 8px 4px;">{sig['confluence_badge']} &nbsp; {sig['confluence_signal']} <span style="color: #888;">(Strength: {'★' * sig['confluence_strength']})</span></td>
+                </tr>
+                <tr style="border-bottom: 1px solid #eee;">
+                    <td style="padding: 8px 4px; text-align: center;">3️⃣</td>
+                    <td style="padding: 8px 4px; font-weight: 600;">POC Alignment</td>
+                    <td style="padding: 8px 4px;">{sig['poc_detail']}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #eee;">
+                    <td style="padding: 8px 4px; text-align: center;">4️⃣</td>
+                    <td style="padding: 8px 4px; font-weight: 600;">RSI Supp. Zone</td>
+                    <td style="padding: 8px 4px;">{sig['rsi_sz_signal']}</td>
+                </tr>
+                <tr style="border-bottom: 1px solid #eee;">
+                    <td style="padding: 8px 4px; text-align: center;">5️⃣</td>
+                    <td style="padding: 8px 4px; font-weight: 600;">Near Pivot</td>
+                    <td style="padding: 8px 4px;">{sig['pivot_level']['timeframe']} within ±{sig['pivot_proximity']} pts</td>
+                </tr>
+                <tr>
+                    <td style="padding: 8px 4px; text-align: center;">6️⃣</td>
+                    <td style="padding: 8px 4px; font-weight: 600;">Ultimate RSI</td>
+                    <td style="padding: 8px 4px;">{sig['ursi_detail']}</td>
+                </tr>
+            </table>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ATM Bias + OI Data + GEX in columns
+        col_bias, col_oi, col_gex = st.columns(3)
+        with col_bias:
+            st.markdown(f"""
+            <div style="background: white; border: 1px solid #ddd; border-radius: 10px; padding: 14px; height: 100%;">
+                <div style="font-size: 14px; font-weight: bold; margin-bottom: 10px;">📊 ATM Bias</div>
+                <div style="font-size: 13px; line-height: 1.8;">
+                    <b>OI:</b> {sig['oi_bias']}<br>
+                    <b>ChgOI:</b> {sig['chgoi_bias']}<br>
+                    <b>Volume:</b> {sig['volume_bias']}<br>
+                    <b>Delta:</b> {sig['delta_exp']}<br>
+                    <b>Gamma:</b> {sig['gamma_exp']}<br>
+                    <b>Pressure:</b> {sig['pressure_bias']}<br>
+                    <b>Operator:</b> {sig['operator_entry']}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_oi:
+            st.markdown(f"""
+            <div style="background: white; border: 1px solid #ddd; border-radius: 10px; padding: 14px; height: 100%;">
+                <div style="font-size: 14px; font-weight: bold; margin-bottom: 10px;">📈 OI Data</div>
+                <div style="font-size: 13px; line-height: 1.8;">
+                    <b>CE ΔOI:</b> {sig['ce_chg_oi']/1000:.1f}K<br>
+                    <b>PE ΔOI:</b> {sig['pe_chg_oi']/1000:.1f}K<br>
+                    <b>PCR:</b> {sig['atm_pcr']:.2f}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+        with col_gex:
+            st.markdown(f"""
+            <div style="background: white; border: 1px solid #ddd; border-radius: 10px; padding: 14px; height: 100%;">
+                <div style="font-size: 14px; font-weight: bold; margin-bottom: 10px;">🎯 GEX</div>
+                <div style="font-size: 13px; line-height: 1.8;">
+                    <b>Net GEX:</b> {sig['net_gex']:.2f}L<br>
+                    <b>Regime:</b> {sig['gex_signal_text']}<br>
+                    <b>Magnet:</b> {sig['gex_magnet']}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        st.caption(f"🕐 Signal triggered at {sig['timestamp']}")
+        st.markdown("---")
 
     # Analytics dashboard below
     if show_analytics:
