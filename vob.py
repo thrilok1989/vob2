@@ -1627,6 +1627,224 @@ class FutureSwing:
         }
 
 
+class VWAPIndicator:
+    """
+    Volume Weighted Average Price (VWAP) Indicator with Standard Deviation / Percentage Bands.
+
+    Converted from TradingView Pine Script v6.
+
+    Features:
+    - Session-anchored VWAP calculation using HLC/3 (typical price)
+    - Configurable anchor periods (Session default for intraday)
+    - Up to 3 configurable bands (Standard Deviation or Percentage mode)
+    - Hides on daily/weekly/monthly timeframes if configured
+    """
+
+    def __init__(self, src='hlc3', anchor='Session', calc_mode='Standard Deviation',
+                 show_band_1=True, band_mult_1=1.0,
+                 show_band_2=False, band_mult_2=2.0,
+                 show_band_3=False, band_mult_3=3.0):
+        self.src = src
+        self.anchor = anchor
+        self.calc_mode = calc_mode
+        self.show_band_1 = show_band_1
+        self.band_mult_1 = band_mult_1
+        self.show_band_2 = show_band_2
+        self.band_mult_2 = band_mult_2
+        self.show_band_3 = show_band_3
+        self.band_mult_3 = band_mult_3
+
+    @staticmethod
+    def _get_source(df, src='hlc3'):
+        """Calculate source price series"""
+        if src == 'hlc3':
+            return (df['high'] + df['low'] + df['close']) / 3
+        elif src == 'close':
+            return df['close']
+        elif src == 'open':
+            return df['open']
+        elif src == 'hl2':
+            return (df['high'] + df['low']) / 2
+        elif src == 'ohlc4':
+            return (df['open'] + df['high'] + df['low'] + df['close']) / 4
+        return (df['high'] + df['low'] + df['close']) / 3
+
+    @staticmethod
+    def _detect_new_period(df, anchor='Session'):
+        """Detect anchor period boundaries (new session/day start)"""
+        if df.empty or 'datetime' not in df.columns:
+            return pd.Series([False] * len(df), index=df.index)
+
+        dt = df['datetime']
+        new_period = pd.Series([False] * len(df), index=df.index)
+        new_period.iloc[0] = True  # First bar is always a new period
+
+        if anchor == 'Session':
+            # New session = new trading day
+            dates = dt.dt.date
+            new_period = dates != dates.shift(1)
+            new_period.iloc[0] = True
+        elif anchor == 'Week':
+            weeks = dt.dt.isocalendar().week.astype(int)
+            new_period = weeks != weeks.shift(1)
+            new_period.iloc[0] = True
+        elif anchor == 'Month':
+            months = dt.dt.month
+            new_period = months != months.shift(1)
+            new_period.iloc[0] = True
+        elif anchor == 'Quarter':
+            quarters = dt.dt.quarter
+            new_period = quarters != quarters.shift(1)
+            new_period.iloc[0] = True
+        elif anchor == 'Year':
+            years = dt.dt.year
+            new_period = years != years.shift(1)
+            new_period.iloc[0] = True
+
+        return new_period
+
+    def calculate(self, df):
+        """
+        Calculate VWAP with bands.
+
+        Returns dict with:
+        - vwap: VWAP series
+        - upper_band_1/2/3: Upper band series
+        - lower_band_1/2/3: Lower band series
+        - latest values for tabular display
+        """
+        if df.empty or 'volume' not in df.columns:
+            return None
+
+        df = df.copy()
+        src = self._get_source(df, self.src)
+        vol = df['volume'].values
+        new_period = self._detect_new_period(df, self.anchor).values
+
+        n = len(df)
+        vwap = np.full(n, np.nan)
+        upper_1 = np.full(n, np.nan)
+        lower_1 = np.full(n, np.nan)
+        upper_2 = np.full(n, np.nan)
+        lower_2 = np.full(n, np.nan)
+        upper_3 = np.full(n, np.nan)
+        lower_3 = np.full(n, np.nan)
+
+        cum_vol = 0.0
+        cum_tp_vol = 0.0
+        cum_tp2_vol = 0.0  # For standard deviation calculation
+
+        src_values = src.values
+
+        for i in range(n):
+            if new_period[i]:
+                cum_vol = 0.0
+                cum_tp_vol = 0.0
+                cum_tp2_vol = 0.0
+
+            v = vol[i]
+            s = src_values[i]
+
+            if np.isnan(v) or np.isnan(s) or v == 0:
+                if i > 0:
+                    vwap[i] = vwap[i-1]
+                continue
+
+            cum_vol += v
+            cum_tp_vol += s * v
+            cum_tp2_vol += s * s * v
+
+            if cum_vol > 0:
+                vwap_val = cum_tp_vol / cum_vol
+                vwap[i] = vwap_val
+
+                # Standard deviation: sqrt(E[X^2] - E[X]^2)
+                variance = (cum_tp2_vol / cum_vol) - (vwap_val * vwap_val)
+                stdev = np.sqrt(max(variance, 0))
+
+                if self.calc_mode == 'Standard Deviation':
+                    band_basis = stdev
+                else:  # Percentage
+                    band_basis = vwap_val * 0.01
+
+                if self.show_band_1:
+                    upper_1[i] = vwap_val + band_basis * self.band_mult_1
+                    lower_1[i] = vwap_val - band_basis * self.band_mult_1
+                if self.show_band_2:
+                    upper_2[i] = vwap_val + band_basis * self.band_mult_2
+                    lower_2[i] = vwap_val - band_basis * self.band_mult_2
+                if self.show_band_3:
+                    upper_3[i] = vwap_val + band_basis * self.band_mult_3
+                    lower_3[i] = vwap_val - band_basis * self.band_mult_3
+
+        # Build result
+        vwap_series = pd.Series(vwap, index=df.index)
+        result = {
+            'vwap': vwap_series,
+            'upper_band_1': pd.Series(upper_1, index=df.index) if self.show_band_1 else None,
+            'lower_band_1': pd.Series(lower_1, index=df.index) if self.show_band_1 else None,
+            'upper_band_2': pd.Series(upper_2, index=df.index) if self.show_band_2 else None,
+            'lower_band_2': pd.Series(lower_2, index=df.index) if self.show_band_2 else None,
+            'upper_band_3': pd.Series(upper_3, index=df.index) if self.show_band_3 else None,
+            'lower_band_3': pd.Series(lower_3, index=df.index) if self.show_band_3 else None,
+            'show_band_1': self.show_band_1,
+            'show_band_2': self.show_band_2,
+            'show_band_3': self.show_band_3,
+            'band_mult_1': self.band_mult_1,
+            'band_mult_2': self.band_mult_2,
+            'band_mult_3': self.band_mult_3,
+            'calc_mode': self.calc_mode,
+            'anchor': self.anchor,
+        }
+
+        # Latest values for tabular display
+        last_valid = vwap_series.last_valid_index()
+        if last_valid is not None:
+            idx = last_valid
+            result['latest_vwap'] = round(vwap_series[idx], 2)
+            result['latest_upper_1'] = round(upper_1[df.index.get_loc(idx)], 2) if self.show_band_1 else None
+            result['latest_lower_1'] = round(lower_1[df.index.get_loc(idx)], 2) if self.show_band_1 else None
+            result['latest_upper_2'] = round(upper_2[df.index.get_loc(idx)], 2) if self.show_band_2 else None
+            result['latest_lower_2'] = round(lower_2[df.index.get_loc(idx)], 2) if self.show_band_2 else None
+            result['latest_upper_3'] = round(upper_3[df.index.get_loc(idx)], 2) if self.show_band_3 else None
+            result['latest_lower_3'] = round(lower_3[df.index.get_loc(idx)], 2) if self.show_band_3 else None
+
+            # Price position relative to VWAP
+            if not df.empty:
+                current_price = df['close'].iloc[-1]
+                result['current_price'] = round(current_price, 2)
+                result['price_vs_vwap'] = round(current_price - result['latest_vwap'], 2)
+                result['price_vs_vwap_pct'] = round(((current_price / result['latest_vwap']) - 1) * 100, 3)
+
+                # Determine band position
+                if self.show_band_1 and result['latest_upper_1'] is not None:
+                    if current_price > result['latest_upper_1']:
+                        result['band_position'] = 'Above Band 1'
+                    elif current_price < result['latest_lower_1']:
+                        result['band_position'] = 'Below Band 1'
+                    else:
+                        result['band_position'] = 'Inside Band 1'
+
+                    if self.show_band_2 and result['latest_upper_2'] is not None:
+                        if current_price > result['latest_upper_2']:
+                            result['band_position'] = 'Above Band 2'
+                        elif current_price < result['latest_lower_2']:
+                            result['band_position'] = 'Below Band 2'
+
+                    if self.show_band_3 and result['latest_upper_3'] is not None:
+                        if current_price > result['latest_upper_3']:
+                            result['band_position'] = 'Above Band 3'
+                        elif current_price < result['latest_lower_3']:
+                            result['band_position'] = 'Below Band 3'
+                else:
+                    if current_price > result['latest_vwap']:
+                        result['band_position'] = 'Above VWAP'
+                    else:
+                        result['band_position'] = 'Below VWAP'
+
+        return result
+
+
 class ReversalDetector:
     """
     Intraday Reversal Detection System based on Price Action Theory.
@@ -2806,8 +3024,8 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None):
-    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, RSI Suppression Zones, and Ultimate RSI"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None, vwap_data=None):
+    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, RSI Suppression Zones, Ultimate RSI, and VWAP with bands"""
     if df.empty:
         return go.Figure()
 
@@ -2902,21 +3120,114 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         except Exception as e:
             st.warning(f"Error adding pivot levels: {str(e)}")
 
-    # Add VWAP line
+    # Add VWAP line with bands
     try:
-        vwap = ReversalDetector.calculate_vwap(df)
-        if not vwap.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=df['datetime'],
-                    y=vwap,
-                    mode='lines',
-                    name='VWAP',
-                    line=dict(color='#FFD700', width=2, dash='dot'),
-                    opacity=0.8
-                ),
-                row=1, col=1
-            )
+        if vwap_data and vwap_data.get('vwap') is not None:
+            vwap_series = vwap_data['vwap']
+            valid_mask = vwap_series.notna()
+            if valid_mask.any():
+                dt = df.loc[valid_mask, 'datetime']
+                vwap_vals = vwap_series[valid_mask]
+
+                # Main VWAP line
+                fig.add_trace(
+                    go.Scatter(
+                        x=dt, y=vwap_vals,
+                        mode='lines',
+                        name='VWAP',
+                        line=dict(color='#2962FF', width=2),
+                        opacity=0.9,
+                        hovertemplate='VWAP: %{y:.2f}<extra></extra>'
+                    ),
+                    row=1, col=1
+                )
+
+                # Band 1 (green)
+                if vwap_data.get('show_band_1') and vwap_data.get('upper_band_1') is not None:
+                    ub1 = vwap_data['upper_band_1'][valid_mask]
+                    lb1 = vwap_data['lower_band_1'][valid_mask]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=dt, y=ub1, mode='lines',
+                            name=f"Upper Band #1 ({vwap_data['band_mult_1']})",
+                            line=dict(color='#00C853', width=1),
+                            opacity=0.7,
+                            hovertemplate='UB1: %{y:.2f}<extra></extra>'
+                        ), row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=dt, y=lb1, mode='lines',
+                            name=f"Lower Band #1 ({vwap_data['band_mult_1']})",
+                            line=dict(color='#00C853', width=1),
+                            opacity=0.7,
+                            fill='tonexty',
+                            fillcolor='rgba(0, 200, 83, 0.05)',
+                            hovertemplate='LB1: %{y:.2f}<extra></extra>'
+                        ), row=1, col=1
+                    )
+
+                # Band 2 (olive)
+                if vwap_data.get('show_band_2') and vwap_data.get('upper_band_2') is not None:
+                    ub2 = vwap_data['upper_band_2'][valid_mask]
+                    lb2 = vwap_data['lower_band_2'][valid_mask]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=dt, y=ub2, mode='lines',
+                            name=f"Upper Band #2 ({vwap_data['band_mult_2']})",
+                            line=dict(color='#808000', width=1),
+                            opacity=0.7,
+                            hovertemplate='UB2: %{y:.2f}<extra></extra>'
+                        ), row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=dt, y=lb2, mode='lines',
+                            name=f"Lower Band #2 ({vwap_data['band_mult_2']})",
+                            line=dict(color='#808000', width=1),
+                            opacity=0.7,
+                            fill='tonexty',
+                            fillcolor='rgba(128, 128, 0, 0.05)',
+                            hovertemplate='LB2: %{y:.2f}<extra></extra>'
+                        ), row=1, col=1
+                    )
+
+                # Band 3 (teal)
+                if vwap_data.get('show_band_3') and vwap_data.get('upper_band_3') is not None:
+                    ub3 = vwap_data['upper_band_3'][valid_mask]
+                    lb3 = vwap_data['lower_band_3'][valid_mask]
+                    fig.add_trace(
+                        go.Scatter(
+                            x=dt, y=ub3, mode='lines',
+                            name=f"Upper Band #3 ({vwap_data['band_mult_3']})",
+                            line=dict(color='#008080', width=1),
+                            opacity=0.7,
+                            hovertemplate='UB3: %{y:.2f}<extra></extra>'
+                        ), row=1, col=1
+                    )
+                    fig.add_trace(
+                        go.Scatter(
+                            x=dt, y=lb3, mode='lines',
+                            name=f"Lower Band #3 ({vwap_data['band_mult_3']})",
+                            line=dict(color='#008080', width=1),
+                            opacity=0.7,
+                            fill='tonexty',
+                            fillcolor='rgba(0, 128, 128, 0.05)',
+                            hovertemplate='LB3: %{y:.2f}<extra></extra>'
+                        ), row=1, col=1
+                    )
+        else:
+            # Fallback: simple VWAP from ReversalDetector
+            vwap = ReversalDetector.calculate_vwap(df)
+            if not vwap.empty:
+                fig.add_trace(
+                    go.Scatter(
+                        x=df['datetime'], y=vwap,
+                        mode='lines', name='VWAP',
+                        line=dict(color='#2962FF', width=2),
+                        opacity=0.8
+                    ), row=1, col=1
+                )
     except Exception as e:
         pass  # VWAP calculation failed, skip it
 
@@ -4393,6 +4704,52 @@ def main():
             'show_3m': False, 'show_5m': False, 'show_10m': False, 'show_15m': False
         }
     
+    # VWAP Indicator Settings
+    st.sidebar.header("📈 VWAP Settings")
+    show_vwap = st.sidebar.checkbox("Show VWAP", value=True, help="Volume Weighted Average Price with bands")
+
+    if show_vwap:
+        vwap_anchor = st.sidebar.selectbox(
+            "Anchor Period",
+            ["Session", "Week", "Month", "Quarter", "Year"],
+            index=0,
+            help="Period to anchor/reset VWAP calculation"
+        )
+        vwap_src = st.sidebar.selectbox(
+            "Source",
+            ["hlc3", "close", "hl2", "ohlc4", "open"],
+            index=0,
+            help="Price source for VWAP calculation"
+        )
+        vwap_calc_mode = st.sidebar.selectbox(
+            "Bands Calculation Mode",
+            ["Standard Deviation", "Percentage"],
+            index=0,
+            help="Standard Deviation or Percentage-based bands. Percentage mode: multiplier 1 = 1%"
+        )
+
+        st.sidebar.subheader("Bands Settings")
+        vwap_show_band1 = st.sidebar.checkbox("Show Band #1", value=True, help="First standard deviation band (green)")
+        vwap_band_mult1 = st.sidebar.number_input("Band #1 Multiplier", min_value=0.0, value=1.0, step=0.5, format="%.1f") if vwap_show_band1 else 1.0
+        vwap_show_band2 = st.sidebar.checkbox("Show Band #2", value=False, help="Second standard deviation band (olive)")
+        vwap_band_mult2 = st.sidebar.number_input("Band #2 Multiplier", min_value=0.0, value=2.0, step=0.5, format="%.1f") if vwap_show_band2 else 2.0
+        vwap_show_band3 = st.sidebar.checkbox("Show Band #3", value=False, help="Third standard deviation band (teal)")
+        vwap_band_mult3 = st.sidebar.number_input("Band #3 Multiplier", min_value=0.0, value=3.0, step=0.5, format="%.1f") if vwap_show_band3 else 3.0
+
+        vwap_settings = {
+            'anchor': vwap_anchor,
+            'src': vwap_src,
+            'calc_mode': vwap_calc_mode,
+            'show_band_1': vwap_show_band1,
+            'band_mult_1': vwap_band_mult1,
+            'show_band_2': vwap_show_band2,
+            'band_mult_2': vwap_band_mult2,
+            'show_band_3': vwap_show_band3,
+            'band_mult_3': vwap_band_mult3,
+        }
+    else:
+        vwap_settings = None
+
     # Trading signal settings
     st.sidebar.header("🔔 Trading Signals")
     enable_signals = st.sidebar.checkbox("Enable Telegram Signals", value=True, help="Send notifications when conditions are met")
@@ -4587,6 +4944,25 @@ def main():
             except Exception:
                 ultimate_rsi_data_for_chart = None
 
+        # Calculate VWAP with bands for chart display
+        vwap_data_for_chart = None
+        if not df.empty and len(df) > 5 and vwap_settings is not None:
+            try:
+                vwap_calculator = VWAPIndicator(
+                    src=vwap_settings['src'],
+                    anchor=vwap_settings['anchor'],
+                    calc_mode=vwap_settings['calc_mode'],
+                    show_band_1=vwap_settings['show_band_1'],
+                    band_mult_1=vwap_settings['band_mult_1'],
+                    show_band_2=vwap_settings['show_band_2'],
+                    band_mult_2=vwap_settings['band_mult_2'],
+                    show_band_3=vwap_settings['show_band_3'],
+                    band_mult_3=vwap_settings['band_mult_3'],
+                )
+                vwap_data_for_chart = vwap_calculator.calculate(df)
+            except Exception:
+                vwap_data_for_chart = None
+
         # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
@@ -4599,7 +4975,8 @@ def main():
                 poc_data=poc_data_for_chart,
                 swing_data=swing_data_for_chart,
                 rsi_sz_data=rsi_sz_data_for_chart,
-                ultimate_rsi_data=ultimate_rsi_data_for_chart
+                ultimate_rsi_data=ultimate_rsi_data_for_chart,
+                vwap_data=vwap_data_for_chart
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -4736,6 +5113,127 @@ def main():
 
             except Exception as e:
                 st.warning(f"Reversal analysis unavailable: {str(e)}")
+
+            # ===== VWAP INDICATOR TABLE =====
+            if vwap_data_for_chart and vwap_data_for_chart.get('latest_vwap') is not None:
+                st.markdown("---")
+                st.markdown("## 📈 VWAP Indicator (Volume Weighted Average Price)")
+
+                try:
+                    vd = vwap_data_for_chart
+
+                    # Summary metrics row
+                    vwap_col1, vwap_col2, vwap_col3 = st.columns(3)
+
+                    with vwap_col1:
+                        vwap_val = vd['latest_vwap']
+                        price_diff = vd.get('price_vs_vwap', 0)
+                        diff_color = "#15dd7c" if price_diff >= 0 else "#eb7514"
+                        diff_icon = "Above" if price_diff >= 0 else "Below"
+                        st.markdown(f"""
+                        <div style="background-color: {diff_color}20; padding: 15px; border-radius: 10px; border: 2px solid {diff_color};">
+                            <h4 style="color: {diff_color}; margin: 0;">VWAP</h4>
+                            <h2 style="color: {diff_color}; margin: 5px 0;">₹{vwap_val:,.2f}</h2>
+                            <p style="color: white; margin: 0;">Anchor: {vd.get('anchor', 'Session')} | Mode: {vd.get('calc_mode', 'Std Dev')}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with vwap_col2:
+                        price_pct = vd.get('price_vs_vwap_pct', 0)
+                        pct_color = "#15dd7c" if price_pct >= 0 else "#eb7514"
+                        pct_sign = "+" if price_pct >= 0 else ""
+                        st.markdown(f"""
+                        <div style="background-color: {pct_color}20; padding: 15px; border-radius: 10px; border: 2px solid {pct_color};">
+                            <h4 style="color: {pct_color}; margin: 0;">Price vs VWAP</h4>
+                            <h2 style="color: {pct_color}; margin: 5px 0;">{diff_icon} ({pct_sign}{price_pct:.3f}%)</h2>
+                            <p style="color: white; margin: 0;">Diff: {pct_sign}{price_diff:.2f} pts</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with vwap_col3:
+                        band_pos = vd.get('band_position', 'N/A')
+                        if 'Above' in band_pos:
+                            bp_color = "#15dd7c"
+                            bp_icon = "🟢"
+                        elif 'Below' in band_pos:
+                            bp_color = "#eb7514"
+                            bp_icon = "🔴"
+                        else:
+                            bp_color = "#FFD700"
+                            bp_icon = "🟡"
+                        st.markdown(f"""
+                        <div style="background-color: {bp_color}20; padding: 15px; border-radius: 10px; border: 2px solid {bp_color};">
+                            <h4 style="color: {bp_color}; margin: 0;">Band Position</h4>
+                            <h2 style="color: {bp_color}; margin: 5px 0;">{bp_icon} {band_pos}</h2>
+                            <p style="color: white; margin: 0;">Price: ₹{vd.get('current_price', 0):,.2f}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    # Bands detail table
+                    vwap_table_data = []
+                    vwap_table_data.append({
+                        'Level': 'VWAP',
+                        'Value': f"₹{vd['latest_vwap']:,.2f}",
+                        'Upper': '-',
+                        'Lower': '-',
+                        'Multiplier': '-',
+                    })
+
+                    if vd.get('show_band_1') and vd.get('latest_upper_1') is not None:
+                        vwap_table_data.append({
+                            'Level': 'Band #1',
+                            'Value': f"₹{vd['latest_vwap']:,.2f}",
+                            'Upper': f"₹{vd['latest_upper_1']:,.2f}",
+                            'Lower': f"₹{vd['latest_lower_1']:,.2f}",
+                            'Multiplier': f"{vd['band_mult_1']}x",
+                        })
+
+                    if vd.get('show_band_2') and vd.get('latest_upper_2') is not None:
+                        vwap_table_data.append({
+                            'Level': 'Band #2',
+                            'Value': f"₹{vd['latest_vwap']:,.2f}",
+                            'Upper': f"₹{vd['latest_upper_2']:,.2f}",
+                            'Lower': f"₹{vd['latest_lower_2']:,.2f}",
+                            'Multiplier': f"{vd['band_mult_2']}x",
+                        })
+
+                    if vd.get('show_band_3') and vd.get('latest_upper_3') is not None:
+                        vwap_table_data.append({
+                            'Level': 'Band #3',
+                            'Value': f"₹{vd['latest_vwap']:,.2f}",
+                            'Upper': f"₹{vd['latest_upper_3']:,.2f}",
+                            'Lower': f"₹{vd['latest_lower_3']:,.2f}",
+                            'Multiplier': f"{vd['band_mult_3']}x",
+                        })
+
+                    vwap_df = pd.DataFrame(vwap_table_data)
+
+                    def style_vwap_level(val):
+                        if val == 'VWAP':
+                            return 'background-color: #2962FF40; color: white; font-weight: bold'
+                        elif 'Band #1' in str(val):
+                            return 'background-color: #00C85340; color: white'
+                        elif 'Band #2' in str(val):
+                            return 'background-color: #80800040; color: white'
+                        elif 'Band #3' in str(val):
+                            return 'background-color: #00808040; color: white'
+                        return ''
+
+                    styled_vwap = vwap_df.style.applymap(style_vwap_level, subset=['Level'])
+                    st.dataframe(styled_vwap, use_container_width=True, hide_index=True)
+
+                    st.markdown("""
+                    **VWAP Interpretation:**
+                    - **VWAP** (Blue line): Fair value price based on volume - institutional benchmark
+                    - **Above VWAP**: Bullish bias - buyers in control, VWAP acts as support
+                    - **Below VWAP**: Bearish bias - sellers in control, VWAP acts as resistance
+                    - **Band #1** (Green): 1 std dev - normal trading range, mean reversion zone
+                    - **Band #2** (Olive): 2 std dev - extended move, potential reversal area
+                    - **Band #3** (Teal): 3 std dev - extreme move, high probability reversal
+                    """)
+
+                except Exception as e:
+                    st.warning(f"VWAP table display error: {str(e)}")
 
             # ===== TRIPLE POC + FUTURE SWING ANALYSIS =====
             st.markdown("---")
