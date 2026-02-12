@@ -2639,6 +2639,138 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
         pass  # Silently fail to avoid disrupting the app
 
 
+def check_vwap_poc_alignment_signal(df, current_price, vwap_data=None, poc_data=None, poc_proximity=3.0):
+    """
+    VWAP + POC Alignment Signal — sends Telegram alert when:
+
+    CALL Signal: Spot ABOVE VWAP AND POC 1,2,3 all aligned BELOW spot (within proximity of each other)
+    PUT Signal:  Spot BELOW VWAP AND POC 1,2,3 all aligned ABOVE spot (within proximity of each other)
+
+    POC alignment = all 3 POC values are within `poc_proximity` points of each other.
+    """
+    if df.empty or not current_price:
+        return
+    if not vwap_data or vwap_data.get('latest_vwap') is None:
+        return
+    if not poc_data:
+        return
+
+    # Dedup: avoid sending same alert twice
+    if 'last_vwap_poc_alert' not in st.session_state:
+        st.session_state.last_vwap_poc_alert = None
+
+    try:
+        vwap_val = vwap_data['latest_vwap']
+
+        # Collect POC values
+        poc_values = []
+        poc_labels = []
+        for poc_key in ['poc1', 'poc2', 'poc3']:
+            poc = poc_data.get(poc_key)
+            if poc and poc.get('poc') is not None:
+                poc_values.append(poc['poc'])
+                period = poc_data.get('periods', {}).get(poc_key, poc_key)
+                poc_labels.append(f"POC{poc_key[-1]}({period})")
+
+        # Need all 3 POCs
+        if len(poc_values) < 3:
+            return
+
+        # Check POC alignment: all 3 must be within poc_proximity of each other
+        poc_max = max(poc_values)
+        poc_min = min(poc_values)
+        poc_spread = poc_max - poc_min
+
+        if poc_spread > poc_proximity:
+            return  # POCs not aligned closely enough
+
+        poc_avg = sum(poc_values) / len(poc_values)
+
+        # Determine signal direction
+        spot_above_vwap = current_price > vwap_val
+        spot_below_vwap = current_price < vwap_val
+        all_poc_below_spot = all(p < current_price for p in poc_values)
+        all_poc_above_spot = all(p > current_price for p in poc_values)
+
+        direction = None
+        if spot_above_vwap and all_poc_below_spot:
+            direction = 'bullish'
+        elif spot_below_vwap and all_poc_above_spot:
+            direction = 'bearish'
+        else:
+            return  # Conditions not met
+
+        # Dedup check (per-minute, per-direction)
+        ist = pytz.timezone('Asia/Kolkata')
+        now_str = datetime.now(ist).strftime('%H:%M:%S IST')
+        alert_key = f"vwap_poc_{direction}_{datetime.now(ist).strftime('%Y%m%d_%H%M')}"
+
+        if st.session_state.last_vwap_poc_alert == alert_key:
+            return  # Already sent this minute
+
+        # Build message
+        vwap_diff = current_price - vwap_val
+        poc_diff = current_price - poc_avg
+
+        if direction == 'bullish':
+            emoji = "🟢📊"
+            dir_label = "CALL"
+            action = "BUY CE"
+            bias_text = "BULLISH"
+        else:
+            emoji = "🔴📊"
+            dir_label = "PUT"
+            action = "BUY PE"
+            bias_text = "BEARISH"
+
+        poc_details = "\n".join([
+            f"  • {label}: ₹{val:,.2f} ({current_price - val:+.1f} pts from spot)"
+            for label, val in zip(poc_labels, poc_values)
+        ])
+
+        # Band info if available
+        band_info = ""
+        if vwap_data.get('show_band_1') and vwap_data.get('latest_upper_1') is not None:
+            band_info += f"\n  • Band 1: ₹{vwap_data['latest_lower_1']:,.2f} — ₹{vwap_data['latest_upper_1']:,.2f}"
+        if vwap_data.get('show_band_2') and vwap_data.get('latest_upper_2') is not None:
+            band_info += f"\n  • Band 2: ₹{vwap_data['latest_lower_2']:,.2f} — ₹{vwap_data['latest_upper_2']:,.2f}"
+        if vwap_data.get('show_band_3') and vwap_data.get('latest_upper_3') is not None:
+            band_info += f"\n  • Band 3: ₹{vwap_data['latest_lower_3']:,.2f} — ₹{vwap_data['latest_upper_3']:,.2f}"
+
+        band_position = vwap_data.get('band_position', 'N/A')
+
+        message = f"""{emoji} <b>VWAP + POC ALIGNMENT — {dir_label} SIGNAL</b> {emoji}
+
+📍 <b>Spot:</b> ₹{current_price:,.2f}
+📈 <b>VWAP:</b> ₹{vwap_val:,.2f} (Spot {'ABOVE' if vwap_diff > 0 else 'BELOW'} by {abs(vwap_diff):.1f} pts)
+📊 <b>Band Position:</b> {band_position}
+
+<b>🎯 POC Alignment (spread: {poc_spread:.1f} pts):</b>
+{poc_details}
+  • POC Average: ₹{poc_avg:,.2f} (All 3 POCs {'BELOW' if all_poc_below_spot else 'ABOVE'} spot)
+
+<b>✅ CONDITIONS MET:</b>
+1️⃣ Spot {'ABOVE' if spot_above_vwap else 'BELOW'} VWAP ({'Bullish' if spot_above_vwap else 'Bearish'} Bias)
+2️⃣ All 3 POCs aligned within {poc_spread:.1f} pts (< {poc_proximity:.0f} pt threshold)
+3️⃣ All POCs {'BELOW' if all_poc_below_spot else 'ABOVE'} spot price ({bias_text} confirmation){f'''
+
+<b>📏 VWAP Bands:</b>{band_info}''' if band_info else ''}
+
+<b>💡 Action:</b> {action}
+🕐 {now_str}
+"""
+        send_telegram_message_sync(message)
+        st.session_state.last_vwap_poc_alert = alert_key
+
+        if direction == 'bullish':
+            st.success(f"🟢📊 VWAP+POC CALL signal sent! Spot above VWAP, all 3 POCs aligned below (spread: {poc_spread:.1f} pts)")
+        else:
+            st.success(f"🔴📊 VWAP+POC PUT signal sent! Spot below VWAP, all 3 POCs aligned above (spread: {poc_spread:.1f} pts)")
+
+    except Exception:
+        pass  # Silently fail to avoid disrupting the app
+
+
 def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
     """
     Calculate Net Gamma Exposure (GEX) from dealer's perspective.
@@ -4763,9 +4895,17 @@ def main():
         help="Distance from pivot levels to trigger signals (both above and below)"
     )
     
+    # VWAP + POC Alignment Signal
+    enable_vwap_poc_signal = st.sidebar.checkbox("Enable VWAP+POC Signal", value=True, help="Send CALL/PUT signal when VWAP position + POC 1,2,3 alignment confirms direction")
+    poc_alignment_proximity = st.sidebar.slider(
+        "POC Alignment Proximity (pts)",
+        min_value=1, max_value=10, value=3,
+        help="Max spread between POC 1,2,3 values to consider them 'aligned'"
+    ) if enable_vwap_poc_signal else 3
+
     if enable_signals:
-        st.sidebar.info(f"Signals sent when:\n• Price within ±{pivot_proximity}pts of pivot\n• All option bias aligned\n• ATM at support/resistance")
-    
+        st.sidebar.info(f"Signals sent when:\n• Price within ±{pivot_proximity}pts of pivot\n• All option bias aligned\n• ATM at support/resistance\n• VWAP+POC: POCs within ±{poc_alignment_proximity}pts")
+
     # Options expiry selection
     st.sidebar.header("📅 Options Settings")
     
@@ -6237,6 +6377,26 @@ def main():
                     rsi_sz_data=rsi_sz_data_for_chart,
                     gex_data=gex_data,
                     ultimate_rsi_data=ultimate_rsi_data_for_chart,
+                )
+        except Exception:
+            pass
+
+    # ===== VWAP + POC ALIGNMENT SIGNAL =====
+    if enable_vwap_poc_signal and not df.empty:
+        try:
+            _spot = None
+            if option_data and option_data.get('underlying'):
+                _spot = option_data['underlying']
+            elif not df.empty:
+                _spot = df['close'].iloc[-1]
+
+            if _spot:
+                check_vwap_poc_alignment_signal(
+                    df=df,
+                    current_price=_spot,
+                    vwap_data=vwap_data_for_chart,
+                    poc_data=poc_data_for_chart,
+                    poc_proximity=poc_alignment_proximity,
                 )
         except Exception:
             pass
