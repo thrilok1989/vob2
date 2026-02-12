@@ -2692,6 +2692,7 @@ weights = {
     "AskBid_Bias": 1,
     "IV_Bias": 1,
     "DVP_Bias": 1,
+    "POC_Bias": 1,
     "PressureBias": 1,
 }
 
@@ -3501,8 +3502,8 @@ def create_csv_download(df_summary):
     return output.getvalue()
 
 
-def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
-    """Enhanced options chain analysis with expiry selection, HTF pivot data, and VOB data"""
+def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None, poc_data=None):
+    """Enhanced options chain analysis with expiry selection, HTF pivot data, VOB data, and POC bias"""
     now = datetime.now(timezone("Asia/Kolkata"))
     
     # Get expiry list - use cached version for performance
@@ -3668,6 +3669,26 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         row_data["BidAskPressure"] = bid_ask_pressure
         row_data["PressureBias"] = pressure_bias
 
+        # ===== POC Bias: Spot above POC = Bullish, below POC = Bearish =====
+        if poc_data:
+            above_count = 0
+            below_count = 0
+            for pkey in ['poc1', 'poc2', 'poc3']:
+                p = poc_data.get(pkey)
+                if p and p.get('poc'):
+                    if underlying > p['poc']:
+                        above_count += 1
+                    else:
+                        below_count += 1
+            if above_count >= 2:
+                row_data["POC_Bias"] = "Bullish"
+            elif below_count >= 2:
+                row_data["POC_Bias"] = "Bearish"
+            else:
+                row_data["POC_Bias"] = "Neutral"
+        else:
+            row_data["POC_Bias"] = "Neutral"
+
         # ===== Weighted Score Calculation (Bias Engine v2) =====
         # Tier 1 (2.0): Institutional-grade signals
         # Tier 2 (1.5): Strong directional signals
@@ -3676,7 +3697,7 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         # Theta_Bias excluded — not directionally reliable
         bias_weights = {
             'ChgOI_Bias': 2.0,  'DeltaExp': 2.0,  'GammaExp': 2.0,
-            'OI_Bias': 1.5,     'PressureBias': 1.5, 'DVP_Bias': 1.5,
+            'OI_Bias': 1.5,     'PressureBias': 1.5, 'DVP_Bias': 1.5, 'POC_Bias': 1.5,
             'Volume_Bias': 1.0, 'LTP_Bias': 1.0,  'Delta_Bias': 1.0,
             'AskQty_Bias': 0.5, 'BidQty_Bias': 0.5, 'AskBid_Bias': 0.5,
             'Gamma_Bias': 0.5,  'IV_Bias': 0.5,
@@ -3895,7 +3916,7 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
                     'Gamma_SR', 'Delta_SR', 'Depth_SR', 'OI_Wall', 'ChgOI_Wall',
                     # Bias columns for analysis
                     'Delta_Bias', 'Gamma_Bias', 'Theta_Bias', 'AskQty_Bias', 'BidQty_Bias', 'IV_Bias',
-                    'DeltaExp', 'GammaExp', 'DVP_Bias', 'PressureBias', 'BidAskPressure',
+                    'DeltaExp', 'GammaExp', 'DVP_Bias', 'POC_Bias', 'PressureBias', 'BidAskPressure',
                     # Decision columns
                     'BiasScore', 'Operator_Entry', 'Scalp_Moment', 'FakeReal',
                     'ChgOI_Cmp', 'OI_Cmp', 'LTP_Bias', 'PCR_Signal', 'Zone', 'OI_Bias']
@@ -5003,7 +5024,7 @@ def main():
         st.header("📊 Options Analysis")
 
         # Options chain analysis with expiry selection (pass pivot data and VOB data for HTF S/R table)
-        option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
+        option_data = analyze_option_chain(selected_expiry, pivots, vob_data, poc_data=poc_data_for_chart)
 
         if option_data and option_data.get('underlying'):
             underlying_price = option_data['underlying']
