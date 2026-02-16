@@ -283,7 +283,7 @@ class SupabaseDB:
                 return prefs
             else:
                 return {
-                    'timeframe': '1',
+                    'timeframe': '5',
                     'auto_refresh': True,
                     'days_back': 1,
                     'pivot_proximity': 5,
@@ -295,8 +295,8 @@ class SupabaseDB:
         except Exception as e:
             st.error(f"Error retrieving preferences: {str(e)}")
             return {
-                'timeframe': '1',
-                'auto_refresh': True,
+                'timeframe': '5', 
+                'auto_refresh': True, 
                 'days_back': 1,
                 'pivot_proximity': 5,
                 'pivot_settings': {
@@ -880,12 +880,12 @@ class TriplePOC:
     Triple Point of Control (POC) Indicator - Converted from Pine Script [BigBeluga]
 
     Calculates POC (price level with highest volume) for 3 different periods:
-    - POC 1: Short-term (default 10 periods)
-    - POC 2: Medium-term (default 25 periods)
-    - POC 3: Long-term (default 70 periods)
+    - POC 1: Short-term (default 25 periods)
+    - POC 2: Medium-term (default 40 periods)
+    - POC 3: Long-term (default 100 periods)
 
-    POC is computed as a rolling time series (updated every 15 bars in Pine,
-    here computed at every bar) and rendered as steplines on the chart.
+    POC represents the price level where most trading activity occurred,
+    often acting as support/resistance.
     """
 
     def __init__(self, period1=10, period2=25, period3=70, bins=25):
@@ -903,82 +903,21 @@ class TriplePOC:
         self.period3 = period3
         self.bins = bins
 
-    def _calculate_poc_series(self, df, period):
-        """
-        Calculate POC as a rolling time series across all bars.
-        Mirrors Pine Script logic: at each bar, look back 'period' bars,
-        build volume profile, find POC (max volume level).
-
-        Returns:
-            dict with 'poc', 'upper_poc', 'lower_poc' as pandas Series
-        """
-        n = len(df)
-        poc_vals = np.full(n, np.nan)
-        upper_vals = np.full(n, np.nan)
-        lower_vals = np.full(n, np.nan)
-
-        closes = df['close'].values.astype(float)
-        highs = df['high'].values.astype(float)
-        lows = df['low'].values.astype(float)
-        volumes = df['volume'].values.astype(float) if 'volume' in df.columns else np.ones(n)
-
-        # Pine recalculates every 15 bars (bar_index % 15 == 0).
-        # We use a dynamic interval: min(15, period//2) for shorter periods
-        recalc_interval = min(15, max(3, period // 3))
-        last_poc = np.nan
-        last_upper = np.nan
-        last_lower = np.nan
-
-        for i in range(period, n):
-            if (i - period) % recalc_interval == 0:
-                start = i - period
-                end = i + 1
-
-                H = highs[start:end].max()
-                L = lows[start:end].min()
-
-                if H == L:
-                    last_poc = H
-                    last_upper = H
-                    last_lower = L
-                else:
-                    step = (H - L) / self.bins
-                    vol_bins = np.zeros(self.bins)
-                    level_mids = np.zeros(self.bins)
-
-                    for k in range(self.bins):
-                        level_mids[k] = L + k * step + step / 2
-
-                    for j in range(start, end):
-                        c = closes[j]
-                        v = volumes[j]
-                        for k in range(self.bins):
-                            if abs(c - level_mids[k]) <= step:
-                                vol_bins[k] += v
-
-                    max_idx = vol_bins.argmax()
-                    last_poc = level_mids[max_idx]
-                    last_upper = last_poc + step * 2
-                    last_lower = last_poc - step * 2
-
-            poc_vals[i] = last_poc
-            upper_vals[i] = last_upper
-            lower_vals[i] = last_lower
-
-        return {
-            'poc': pd.Series(poc_vals, index=df.index),
-            'upper_poc': pd.Series(upper_vals, index=df.index),
-            'lower_poc': pd.Series(lower_vals, index=df.index),
-        }
-
     def calculate_poc(self, df, period):
         """
-        Calculate single (latest) POC for a given period.
-        Used for signal generation and table display.
+        Calculate Point of Control for a given period.
+
+        Args:
+            df: DataFrame with OHLCV data
+            period: Lookback period
+
+        Returns:
+            dict with poc, upper_poc, lower_poc, volume, high, low
         """
         if df.empty or len(df) < period:
             return None
 
+        # Get last 'period' bars
         recent_df = df.tail(period).copy()
 
         H = recent_df['high'].max()
@@ -986,44 +925,64 @@ class TriplePOC:
 
         if H == L:
             return {
-                'poc': H, 'upper_poc': H, 'lower_poc': L,
-                'volume': 0, 'high': H, 'low': L
+                'poc': H,
+                'upper_poc': H,
+                'lower_poc': L,
+                'volume': 0,
+                'high': H,
+                'low': L
             }
 
         step = (H - L) / self.bins
+
+        # Initialize volume bins
         vol_bins = [0.0] * self.bins
         level_mids = []
 
         for k in range(self.bins):
-            level_mids.append(L + k * step + step / 2)
+            l = L + k * step
+            mid = l + step / 2
+            level_mids.append(mid)
 
+        # Distribute volume across bins
         for _, row in recent_df.iterrows():
             c = row['close']
-            v = row.get('volume', 1)
+            v = row.get('volume', 1)  # Default volume if not available
+
             for k in range(len(level_mids)):
-                if abs(c - level_mids[k]) <= step:
+                mid = level_mids[k]
+                if abs(c - mid) <= step:
                     vol_bins[k] += v
 
+        # Find POC (price level with max volume)
         max_vol_idx = vol_bins.index(max(vol_bins))
         poc = level_mids[max_vol_idx]
+        max_volume = vol_bins[max_vol_idx]
+
+        # Upper and lower POC boundaries (±2 steps)
+        upper_poc = poc + step * 2
+        lower_poc = poc - step * 2
 
         return {
             'poc': round(poc, 2),
-            'upper_poc': round(poc + step * 2, 2),
-            'lower_poc': round(poc - step * 2, 2),
-            'volume': vol_bins[max_vol_idx],
-            'high': H, 'low': L, 'step': step
+            'upper_poc': round(upper_poc, 2),
+            'lower_poc': round(lower_poc, 2),
+            'volume': max_volume,
+            'high': H,
+            'low': L,
+            'step': step
         }
 
     def calculate_all_pocs(self, df):
         """
-        Calculate all three POCs — both time series (for chart) and latest values (for signals/tables).
-        """
-        poc1_series = self._calculate_poc_series(df, self.period1)
-        poc2_series = self._calculate_poc_series(df, self.period2)
-        poc3_series = self._calculate_poc_series(df, self.period3)
+        Calculate all three POCs.
 
-        # Latest single values for tables/signals
+        Args:
+            df: DataFrame with OHLCV data
+
+        Returns:
+            dict with poc1, poc2, poc3 data
+        """
         poc1 = self.calculate_poc(df, self.period1)
         poc2 = self.calculate_poc(df, self.period2)
         poc3 = self.calculate_poc(df, self.period3)
@@ -1032,9 +991,6 @@ class TriplePOC:
             'poc1': poc1,
             'poc2': poc2,
             'poc3': poc3,
-            'poc1_series': poc1_series,
-            'poc2_series': poc2_series,
-            'poc3_series': poc3_series,
             'periods': {
                 'poc1': self.period1,
                 'poc2': self.period2,
@@ -1060,319 +1016,6 @@ class TriplePOC:
             return 'below'
         else:
             return 'inside'
-
-
-class RSIVolatilitySuppression:
-    """
-    RSI Volatility Suppression Zones - Converted from Pine Script [BigBeluga]
-
-    Detects zones where RSI volatility is suppressed (low), indicating
-    consolidation periods that often precede breakouts.
-
-    When price breaks out of a suppression zone:
-    - Upward breakout (low crosses above zone top) → Bullish signal
-    - Downward breakout (high crosses below zone bottom) → Bearish signal
-    """
-
-    def __init__(self, rsi_length=14, vol_length=5, bins_size=150, zone_threshold=10, extended_threshold=50):
-        self.rsi_length = rsi_length
-        self.vol_length = vol_length
-        self.bins_size = bins_size
-        self.zone_threshold = zone_threshold
-        self.extended_threshold = extended_threshold
-
-    @staticmethod
-    def _hma(series, period):
-        """Hull Moving Average"""
-        if len(series) < period:
-            return series.copy()
-        half_period = max(int(period / 2), 1)
-        sqrt_period = max(int(np.sqrt(period)), 1)
-
-        wma1 = series.rolling(window=half_period, min_periods=1).apply(
-            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
-        )
-        wma2 = series.rolling(window=period, min_periods=1).apply(
-            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
-        )
-        diff = 2 * wma1 - wma2
-        hma = diff.rolling(window=sqrt_period, min_periods=1).apply(
-            lambda x: np.average(x, weights=range(1, len(x) + 1)), raw=True
-        )
-        return hma
-
-    @staticmethod
-    def _rsi(series, period):
-        """Standard RSI calculation"""
-        delta = series.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = (-delta).where(delta < 0, 0.0)
-        avg_gain = gain.ewm(alpha=1/period, min_periods=period).mean()
-        avg_loss = loss.ewm(alpha=1/period, min_periods=period).mean()
-        rs = avg_gain / avg_loss.replace(0, np.nan)
-        rsi = 100 - (100 / (1 + rs))
-        return rsi.fillna(50)
-
-    def _calculate_rsi_volatility(self, rsi_series):
-        """Calculate historical volatility of RSI (normalized)"""
-        log_returns = np.log(rsi_series / rsi_series.shift(1))
-        hv = 100 * log_returns.rolling(window=5, min_periods=1).std()
-        hv_std = hv.rolling(window=200, min_periods=20).std()
-        hv_normalized = hv / hv_std.replace(0, np.nan)
-        return hv_normalized.fillna(0)
-
-    def analyze(self, df):
-        """
-        Analyze RSI volatility suppression zones.
-
-        Returns:
-            dict with 'zones' (list of zone dicts), 'rsi' (smoothed RSI series),
-            'rsi_volatility' (normalized RSI volatility), 'current_signal'
-        """
-        if df.empty or len(df) < self.rsi_length + self.vol_length + 10:
-            return None
-
-        close = df['close'].astype(float)
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-        hl2 = (high + low) / 2
-
-        # RSI smoothed with HMA
-        raw_rsi = self._rsi(close, self.rsi_length)
-        rsi = self._hma(raw_rsi, self.vol_length)
-
-        # Average bar range (size)
-        bar_range = high - low
-        size = bar_range.rolling(window=self.bins_size, min_periods=20).mean()
-
-        # SMA of hl2 for zone center
-        sma = hl2.rolling(window=5, min_periods=1).mean()
-
-        # RSI volatility
-        rsi_volatility = self._calculate_rsi_volatility(rsi)
-
-        # Build suppression zones bar-by-bar
-        zones = []
-        count_volatility = 0
-        active_zone = None
-
-        for i in range(len(df)):
-            rv = rsi_volatility.iloc[i] if not np.isnan(rsi_volatility.iloc[i]) else 0
-            curr_low = low.iloc[i]
-            curr_high = high.iloc[i]
-            curr_sma = sma.iloc[i] if not np.isnan(sma.iloc[i]) else hl2.iloc[i]
-            curr_size = size.iloc[i] if not np.isnan(size.iloc[i]) else bar_range.iloc[i]
-
-            prev_rv = rsi_volatility.iloc[i-1] if i > 0 and not np.isnan(rsi_volatility.iloc[i-1]) else 0
-
-            # Count consecutive low-volatility bars
-            if rv <= 2:
-                count_volatility += 1
-            # Reset on crossover above 2
-            if rv > 2 and prev_rv <= 2:
-                count_volatility = 0
-
-            # Create new zone when count crosses threshold
-            prev_count = count_volatility - 1 if rv <= 2 else 0
-            zone_top = curr_sma + curr_size * 2
-            zone_bottom = curr_sma - curr_size * 2
-
-            if prev_count < self.zone_threshold and count_volatility >= self.zone_threshold and count_volatility > 0:
-                active_zone = {
-                    'start_idx': max(0, i - self.zone_threshold),
-                    'start_time': df['datetime'].iloc[max(0, i - self.zone_threshold)] if 'datetime' in df.columns else None,
-                    'end_idx': i,
-                    'end_time': df['datetime'].iloc[i] if 'datetime' in df.columns else None,
-                    'top': zone_top,
-                    'bottom': zone_bottom,
-                    'breakout': None,
-                    'breakout_idx': None,
-                    'breakout_time': None,
-                }
-
-            # Extend active zone
-            if active_zone and active_zone['breakout'] is None:
-                active_zone['end_idx'] = i
-                if 'datetime' in df.columns:
-                    active_zone['end_time'] = df['datetime'].iloc[i]
-
-            # Check breakout up: low crosses above zone top
-            if active_zone and active_zone['breakout'] is None:
-                if i > 0 and curr_low > active_zone['top'] and low.iloc[i-1] <= active_zone['top']:
-                    active_zone['breakout'] = 'bullish'
-                    active_zone['breakout_idx'] = i
-                    if 'datetime' in df.columns:
-                        active_zone['breakout_time'] = df['datetime'].iloc[i]
-                    zones.append(active_zone.copy())
-                    active_zone = None
-
-            # Check breakout down: high crosses below zone bottom
-            if active_zone and active_zone['breakout'] is None:
-                if i > 0 and curr_high < active_zone['bottom'] and high.iloc[i-1] >= active_zone['bottom']:
-                    active_zone['breakout'] = 'bearish'
-                    active_zone['breakout_idx'] = i
-                    if 'datetime' in df.columns:
-                        active_zone['breakout_time'] = df['datetime'].iloc[i]
-                    zones.append(active_zone.copy())
-                    active_zone = None
-
-            # Extended zone: after 50 bars of low vol with no active zone
-            if active_zone is None and prev_count < self.extended_threshold and count_volatility >= self.extended_threshold:
-                active_zone = {
-                    'start_idx': max(0, i - self.zone_threshold),
-                    'start_time': df['datetime'].iloc[max(0, i - self.zone_threshold)] if 'datetime' in df.columns else None,
-                    'end_idx': i,
-                    'end_time': df['datetime'].iloc[i] if 'datetime' in df.columns else None,
-                    'top': zone_top,
-                    'bottom': zone_bottom,
-                    'breakout': None,
-                    'breakout_idx': None,
-                    'breakout_time': None,
-                }
-
-        # Add still-active zone (no breakout yet)
-        if active_zone and active_zone['breakout'] is None:
-            active_zone['breakout'] = 'pending'
-            zones.append(active_zone.copy())
-
-        # Current signal
-        current_signal = 'No Zone'
-        if zones:
-            last_zone = zones[-1]
-            if last_zone['breakout'] == 'pending':
-                current_signal = 'In Suppression Zone'
-            elif last_zone['breakout'] == 'bullish':
-                current_signal = 'Bullish Breakout'
-            elif last_zone['breakout'] == 'bearish':
-                current_signal = 'Bearish Breakout'
-
-        return {
-            'zones': zones,
-            'rsi': rsi,
-            'rsi_volatility': rsi_volatility,
-            'current_signal': current_signal,
-            'count_volatility': count_volatility,
-        }
-
-
-class UltimateRSI:
-    """
-    Ultimate RSI Indicator - Converted from Pine Script [LuxAlgo]
-
-    An augmented RSI that uses highest/lowest range to detect momentum shifts
-    more accurately than standard RSI. Includes signal line and OB/OS zones.
-
-    Key differences from standard RSI:
-    - Uses highest-lowest range as the diff when range expands/contracts
-    - Smoothed with selectable MA type (RMA default)
-    - Signal line (EMA of RSI) for crossover detection
-    """
-
-    def __init__(self, length=14, smo_type='RMA', signal_length=14, signal_type='EMA',
-                 ob_value=80, os_value=20):
-        self.length = length
-        self.smo_type = smo_type
-        self.signal_length = signal_length
-        self.signal_type = signal_type
-        self.ob_value = ob_value
-        self.os_value = os_value
-
-    @staticmethod
-    def _ma(series, length, ma_type):
-        """Moving average with selectable type"""
-        if ma_type == 'EMA':
-            return series.ewm(span=length, adjust=False).mean()
-        elif ma_type == 'SMA':
-            return series.rolling(window=length, min_periods=1).mean()
-        elif ma_type == 'RMA':
-            return series.ewm(alpha=1/length, adjust=False).mean()
-        elif ma_type == 'TMA':
-            sma1 = series.rolling(window=length, min_periods=1).mean()
-            return sma1.rolling(window=length, min_periods=1).mean()
-        return series
-
-    def calculate(self, df):
-        """
-        Calculate Ultimate RSI time series.
-
-        Returns:
-            dict with 'arsi' (Series), 'signal' (Series), 'ob', 'os',
-            'latest_arsi', 'latest_signal', 'zone', 'cross_signal'
-        """
-        if df.empty or len(df) < self.length + 5:
-            return None
-
-        src = df['close'].astype(float)
-        high = df['high'].astype(float)
-        low = df['low'].astype(float)
-
-        # Augmented RSI calculation (Pine Script logic)
-        upper = high.rolling(window=self.length, min_periods=1).max()
-        lower = low.rolling(window=self.length, min_periods=1).min()
-        r = upper - lower
-
-        d = src.diff()  # src - src[1]
-
-        # diff = upper > upper[1] ? r : lower < lower[1] ? -r : d
-        upper_expanded = upper > upper.shift(1)
-        lower_expanded = lower < lower.shift(1)
-
-        diff = pd.Series(np.where(
-            upper_expanded, r,
-            np.where(lower_expanded, -r, d)
-        ), index=df.index, dtype=float)
-
-        # num = ma(diff, length); den = ma(abs(diff), length)
-        num = self._ma(diff, self.length, self.smo_type)
-        den = self._ma(diff.abs(), self.length, self.smo_type)
-
-        # arsi = num/den * 50 + 50
-        arsi = (num / den.replace(0, np.nan) * 50 + 50).fillna(50)
-
-        # Signal line
-        signal = self._ma(arsi, self.signal_length, self.signal_type)
-
-        # Latest values
-        latest_arsi = arsi.iloc[-1]
-        latest_signal = signal.iloc[-1]
-
-        # Zone determination
-        if latest_arsi > self.ob_value:
-            zone = 'Overbought'
-        elif latest_arsi < self.os_value:
-            zone = 'Oversold'
-        else:
-            zone = 'Neutral'
-
-        # Crossover signals
-        prev_arsi = arsi.iloc[-2] if len(arsi) > 1 else 50
-        prev_signal = signal.iloc[-2] if len(signal) > 1 else 50
-
-        cross_signal = 'None'
-        if prev_arsi <= prev_signal and latest_arsi > latest_signal:
-            cross_signal = 'Bullish Cross'
-        elif prev_arsi >= prev_signal and latest_arsi < latest_signal:
-            cross_signal = 'Bearish Cross'
-
-        # Momentum direction
-        if latest_arsi > 50 and latest_arsi > latest_signal:
-            momentum = 'Bullish'
-        elif latest_arsi < 50 and latest_arsi < latest_signal:
-            momentum = 'Bearish'
-        else:
-            momentum = 'Neutral'
-
-        return {
-            'arsi': arsi,
-            'signal': signal,
-            'ob': self.ob_value,
-            'os': self.os_value,
-            'latest_arsi': round(latest_arsi, 2),
-            'latest_signal': round(latest_signal, 2),
-            'zone': zone,
-            'cross_signal': cross_signal,
-            'momentum': momentum,
-        }
 
 
 class FutureSwing:
@@ -1625,224 +1268,6 @@ class FutureSwing:
                 'calc_type': self.calc_type
             }
         }
-
-
-class VWAPIndicator:
-    """
-    Volume Weighted Average Price (VWAP) Indicator with Standard Deviation / Percentage Bands.
-
-    Converted from TradingView Pine Script v6.
-
-    Features:
-    - Session-anchored VWAP calculation using HLC/3 (typical price)
-    - Configurable anchor periods (Session default for intraday)
-    - Up to 3 configurable bands (Standard Deviation or Percentage mode)
-    - Hides on daily/weekly/monthly timeframes if configured
-    """
-
-    def __init__(self, src='hlc3', anchor='Session', calc_mode='Standard Deviation',
-                 show_band_1=True, band_mult_1=1.0,
-                 show_band_2=False, band_mult_2=2.0,
-                 show_band_3=False, band_mult_3=3.0):
-        self.src = src
-        self.anchor = anchor
-        self.calc_mode = calc_mode
-        self.show_band_1 = show_band_1
-        self.band_mult_1 = band_mult_1
-        self.show_band_2 = show_band_2
-        self.band_mult_2 = band_mult_2
-        self.show_band_3 = show_band_3
-        self.band_mult_3 = band_mult_3
-
-    @staticmethod
-    def _get_source(df, src='hlc3'):
-        """Calculate source price series"""
-        if src == 'hlc3':
-            return (df['high'] + df['low'] + df['close']) / 3
-        elif src == 'close':
-            return df['close']
-        elif src == 'open':
-            return df['open']
-        elif src == 'hl2':
-            return (df['high'] + df['low']) / 2
-        elif src == 'ohlc4':
-            return (df['open'] + df['high'] + df['low'] + df['close']) / 4
-        return (df['high'] + df['low'] + df['close']) / 3
-
-    @staticmethod
-    def _detect_new_period(df, anchor='Session'):
-        """Detect anchor period boundaries (new session/day start)"""
-        if df.empty or 'datetime' not in df.columns:
-            return pd.Series([False] * len(df), index=df.index)
-
-        dt = df['datetime']
-        new_period = pd.Series([False] * len(df), index=df.index)
-        new_period.iloc[0] = True  # First bar is always a new period
-
-        if anchor == 'Session':
-            # New session = new trading day
-            dates = dt.dt.date
-            new_period = dates != dates.shift(1)
-            new_period.iloc[0] = True
-        elif anchor == 'Week':
-            weeks = dt.dt.isocalendar().week.astype(int)
-            new_period = weeks != weeks.shift(1)
-            new_period.iloc[0] = True
-        elif anchor == 'Month':
-            months = dt.dt.month
-            new_period = months != months.shift(1)
-            new_period.iloc[0] = True
-        elif anchor == 'Quarter':
-            quarters = dt.dt.quarter
-            new_period = quarters != quarters.shift(1)
-            new_period.iloc[0] = True
-        elif anchor == 'Year':
-            years = dt.dt.year
-            new_period = years != years.shift(1)
-            new_period.iloc[0] = True
-
-        return new_period
-
-    def calculate(self, df):
-        """
-        Calculate VWAP with bands.
-
-        Returns dict with:
-        - vwap: VWAP series
-        - upper_band_1/2/3: Upper band series
-        - lower_band_1/2/3: Lower band series
-        - latest values for tabular display
-        """
-        if df.empty or 'volume' not in df.columns:
-            return None
-
-        df = df.copy()
-        src = self._get_source(df, self.src)
-        vol = df['volume'].values
-        new_period = self._detect_new_period(df, self.anchor).values
-
-        n = len(df)
-        vwap = np.full(n, np.nan)
-        upper_1 = np.full(n, np.nan)
-        lower_1 = np.full(n, np.nan)
-        upper_2 = np.full(n, np.nan)
-        lower_2 = np.full(n, np.nan)
-        upper_3 = np.full(n, np.nan)
-        lower_3 = np.full(n, np.nan)
-
-        cum_vol = 0.0
-        cum_tp_vol = 0.0
-        cum_tp2_vol = 0.0  # For standard deviation calculation
-
-        src_values = src.values
-
-        for i in range(n):
-            if new_period[i]:
-                cum_vol = 0.0
-                cum_tp_vol = 0.0
-                cum_tp2_vol = 0.0
-
-            v = vol[i]
-            s = src_values[i]
-
-            if np.isnan(v) or np.isnan(s) or v == 0:
-                if i > 0:
-                    vwap[i] = vwap[i-1]
-                continue
-
-            cum_vol += v
-            cum_tp_vol += s * v
-            cum_tp2_vol += s * s * v
-
-            if cum_vol > 0:
-                vwap_val = cum_tp_vol / cum_vol
-                vwap[i] = vwap_val
-
-                # Standard deviation: sqrt(E[X^2] - E[X]^2)
-                variance = (cum_tp2_vol / cum_vol) - (vwap_val * vwap_val)
-                stdev = np.sqrt(max(variance, 0))
-
-                if self.calc_mode == 'Standard Deviation':
-                    band_basis = stdev
-                else:  # Percentage
-                    band_basis = vwap_val * 0.01
-
-                if self.show_band_1:
-                    upper_1[i] = vwap_val + band_basis * self.band_mult_1
-                    lower_1[i] = vwap_val - band_basis * self.band_mult_1
-                if self.show_band_2:
-                    upper_2[i] = vwap_val + band_basis * self.band_mult_2
-                    lower_2[i] = vwap_val - band_basis * self.band_mult_2
-                if self.show_band_3:
-                    upper_3[i] = vwap_val + band_basis * self.band_mult_3
-                    lower_3[i] = vwap_val - band_basis * self.band_mult_3
-
-        # Build result
-        vwap_series = pd.Series(vwap, index=df.index)
-        result = {
-            'vwap': vwap_series,
-            'upper_band_1': pd.Series(upper_1, index=df.index) if self.show_band_1 else None,
-            'lower_band_1': pd.Series(lower_1, index=df.index) if self.show_band_1 else None,
-            'upper_band_2': pd.Series(upper_2, index=df.index) if self.show_band_2 else None,
-            'lower_band_2': pd.Series(lower_2, index=df.index) if self.show_band_2 else None,
-            'upper_band_3': pd.Series(upper_3, index=df.index) if self.show_band_3 else None,
-            'lower_band_3': pd.Series(lower_3, index=df.index) if self.show_band_3 else None,
-            'show_band_1': self.show_band_1,
-            'show_band_2': self.show_band_2,
-            'show_band_3': self.show_band_3,
-            'band_mult_1': self.band_mult_1,
-            'band_mult_2': self.band_mult_2,
-            'band_mult_3': self.band_mult_3,
-            'calc_mode': self.calc_mode,
-            'anchor': self.anchor,
-        }
-
-        # Latest values for tabular display
-        last_valid = vwap_series.last_valid_index()
-        if last_valid is not None:
-            idx = last_valid
-            result['latest_vwap'] = round(vwap_series[idx], 2)
-            result['latest_upper_1'] = round(upper_1[df.index.get_loc(idx)], 2) if self.show_band_1 else None
-            result['latest_lower_1'] = round(lower_1[df.index.get_loc(idx)], 2) if self.show_band_1 else None
-            result['latest_upper_2'] = round(upper_2[df.index.get_loc(idx)], 2) if self.show_band_2 else None
-            result['latest_lower_2'] = round(lower_2[df.index.get_loc(idx)], 2) if self.show_band_2 else None
-            result['latest_upper_3'] = round(upper_3[df.index.get_loc(idx)], 2) if self.show_band_3 else None
-            result['latest_lower_3'] = round(lower_3[df.index.get_loc(idx)], 2) if self.show_band_3 else None
-
-            # Price position relative to VWAP
-            if not df.empty:
-                current_price = df['close'].iloc[-1]
-                result['current_price'] = round(current_price, 2)
-                result['price_vs_vwap'] = round(current_price - result['latest_vwap'], 2)
-                result['price_vs_vwap_pct'] = round(((current_price / result['latest_vwap']) - 1) * 100, 3)
-
-                # Determine band position
-                if self.show_band_1 and result['latest_upper_1'] is not None:
-                    if current_price > result['latest_upper_1']:
-                        result['band_position'] = 'Above Band 1'
-                    elif current_price < result['latest_lower_1']:
-                        result['band_position'] = 'Below Band 1'
-                    else:
-                        result['band_position'] = 'Inside Band 1'
-
-                    if self.show_band_2 and result['latest_upper_2'] is not None:
-                        if current_price > result['latest_upper_2']:
-                            result['band_position'] = 'Above Band 2'
-                        elif current_price < result['latest_lower_2']:
-                            result['band_position'] = 'Below Band 2'
-
-                    if self.show_band_3 and result['latest_upper_3'] is not None:
-                        if current_price > result['latest_upper_3']:
-                            result['band_position'] = 'Above Band 3'
-                        elif current_price < result['latest_lower_3']:
-                            result['band_position'] = 'Below Band 3'
-                else:
-                    if current_price > result['latest_vwap']:
-                        result['band_position'] = 'Above VWAP'
-                    else:
-                        result['band_position'] = 'Below VWAP'
-
-        return result
 
 
 class ReversalDetector:
@@ -2420,223 +1845,260 @@ def calculate_max_pain(df_options, spot_price):
     return max_pain_strike, pain_df
 
 
-def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price, pivot_proximity,
-                                   poc_data=None, rsi_sz_data=None, gex_data=None, ultimate_rsi_data=None):
-    """
-    Unified Confluence Entry Signal — sends ONE Telegram alert only when ALL conditions align:
-
-    1. ATM Bias: Verdict is Strong Bullish or Strong Bearish (BiasScore >= 6 or <= -6)
-    2. PCR + GEX: Confluence strength >= 2
-    3. POC Alignment: Price position consistent with direction (above for bull, below for bear)
-    4. RSI Suppression Zone: Recent breakout in same direction (or active zone = pending entry)
-    5. Near Pivot Level: Price within proximity of HTF pivot S/R
-    6. Ultimate RSI: Momentum and zone aligned with direction
-    """
-    if df.empty or df_summary is None or len(df_summary) == 0 or not current_price:
+def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5):
+    """Trading signal detection with Normal Bias OR OI Dominance (both require full ATM bias alignment)."""
+    if df.empty or option_data is None or len(option_data) == 0 or not current_price:
         return
 
-    # Dedup: avoid sending same alert twice
-    if 'last_confluence_alert' not in st.session_state:
-        st.session_state.last_confluence_alert = None
+    try:
+        df_json = df.to_json()
+        pivots = cached_pivot_calculation(df_json, pivot_settings)
+    except:
+        pivots = PivotIndicator.get_all_pivots(df, pivot_settings)
+
+    # Calculate Reversal Detector signals
+    pivot_lows = [p['value'] for p in pivots if p['type'] == 'low']
+    reversal_score, reversal_signals, reversal_verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
+    
+    near_pivot = False
+    pivot_level = None
+    
+    for pivot in pivots:
+        if pivot['timeframe'] in ['3M', '5M', '10M', '15M']:
+            price_diff = current_price - pivot['value']
+            if abs(price_diff) <= pivot_proximity:
+                near_pivot = True
+                pivot_level = pivot
+                break
+    
+    if near_pivot and len(option_data) > 0:
+        atm_data = option_data[option_data['Zone'] == 'ATM']
+        
+        if not atm_data.empty:
+            row = atm_data.iloc[0]
+            
+            # Bias checks (including DeltaExp and GammaExp)
+            bullish_conditions = {
+                'Support Level': row.get('Level') == 'Support',
+                'ChgOI Bias': row.get('ChgOI_Bias') == 'Bullish',
+                'Volume Bias': row.get('Volume_Bias') == 'Bullish',
+                'AskQty Bias': row.get('AskQty_Bias') == 'Bullish',
+                'BidQty Bias': row.get('BidQty_Bias') == 'Bullish',
+                'Pressure Bias': row.get('PressureBias') == 'Bullish',
+                'Delta Exposure': row.get('DeltaExp') == 'Bullish',
+                'Gamma Exposure': row.get('GammaExp') == 'Bullish'
+            }
+
+            bearish_conditions = {
+                'Resistance Level': row.get('Level') == 'Resistance',
+                'ChgOI Bias': row.get('ChgOI_Bias') == 'Bearish',
+                'Volume Bias': row.get('Volume_Bias') == 'Bearish',
+                'AskQty Bias': row.get('AskQty_Bias') == 'Bearish',
+                'BidQty Bias': row.get('BidQty_Bias') == 'Bearish',
+                'Pressure Bias': row.get('PressureBias') == 'Bearish',
+                'Delta Exposure': row.get('DeltaExp') == 'Bearish',
+                'Gamma Exposure': row.get('GammaExp') == 'Bearish'
+            }
+            
+            atm_strike = row['Strike']
+            stop_loss_percent = 20
+            
+            # Change in OI
+            ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
+            pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
+
+            # OI dominance logic (flipped as per your request)
+            bullish_oi_confirm = pe_chg_oi > 1.5 * ce_chg_oi   # Bullish if Put ChgOI dominates
+            bearish_oi_confirm = ce_chg_oi > 1.5 * pe_chg_oi   # Bearish if Call ChgOI dominates
+
+            # === Bullish Call Signal (spot near pivot, above OR below) ===
+            if (
+                (all(bullish_conditions.values()) and abs(current_price - pivot_level['value']) <= pivot_proximity)
+                or (bullish_oi_confirm and all(bullish_conditions.values()) and abs(current_price - pivot_level['value']) <= pivot_proximity)
+            ):
+                trigger_type = "📊 Normal Bias Trigger" if not bullish_oi_confirm else "🔥 OI Dominance Trigger"
+                conditions_text = "\n".join([f"✅ {k}" for k, v in bullish_conditions.items() if v])
+                price_diff = current_price - pivot_level['value']
+                
+                # Build reversal analysis text
+                reversal_text = f"""
+🔄 <b>REVERSAL DETECTOR:</b>
+• Score: {reversal_signals.get('Reversal_Score', 0)}/6
+• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
+• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
+• Strong Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
+• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
+• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
+• {reversal_verdict}"""
+
+                message = f"""
+🚨 <b>NIFTY CALL SIGNAL ALERT</b> 🚨
+
+📍 <b>Spot Price:</b> ₹{current_price:.2f} ({'ABOVE' if price_diff > 0 else 'BELOW'} Pivot by {price_diff:+.2f} points)
+📌 <b>Near Pivot:</b> {pivot_level['timeframe']} Level at ₹{pivot_level['value']:.2f}
+🎯 <b>ATM Strike:</b> {atm_strike}
+
+<b>✅ BULLISH CONDITIONS MET:</b>
+{conditions_text}
+
+⚡ <b>{trigger_type}</b>
+⚡ <b>OI:</b> PE ChgOI {pe_chg_oi:,} vs CE ChgOI {ce_chg_oi:,}
+{reversal_text}
+
+📋 <b>SUGGESTED REVIEW:</b>
+• Strike: {atm_strike} CE
+• Stop Loss: {stop_loss_percent}%
+• Manual verification required
+
+🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
+"""
+                try:
+                    send_telegram_message_sync(message)
+                    st.success("🟢 Bullish signal notification sent!")
+                except Exception as e:
+                    st.error(f"Failed to send notification: {e}")
+            
+            # === Bearish Put Signal (spot near pivot, above OR below) ===
+            elif (
+                (all(bearish_conditions.values()) and abs(current_price - pivot_level['value']) <= pivot_proximity)
+                or (bearish_oi_confirm and all(bearish_conditions.values()) and abs(current_price - pivot_level['value']) <= pivot_proximity)
+            ):
+                trigger_type = "📊 Normal Bias Trigger" if not bearish_oi_confirm else "🔥 OI Dominance Trigger"
+                conditions_text = "\n".join([f"🔴 {k}" for k, v in bearish_conditions.items() if v])
+                price_diff = current_price - pivot_level['value']
+                
+                # Build reversal analysis text for bearish
+                reversal_text = f"""
+🔄 <b>REVERSAL DETECTOR:</b>
+• Score: {reversal_signals.get('Reversal_Score', 0)}/6
+• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
+• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
+• Strong Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
+• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
+• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
+• {reversal_verdict}"""
+
+                message = f"""
+🔴 <b>NIFTY PUT SIGNAL ALERT</b> 🔴
+
+📍 <b>Spot Price:</b> ₹{current_price:.2f} ({'ABOVE' if price_diff > 0 else 'BELOW'} Pivot by {price_diff:+.2f} points)
+📌 <b>Near Pivot:</b> {pivot_level['timeframe']} Level at ₹{pivot_level['value']:.2f}
+🎯 <b>ATM Strike:</b> {atm_strike}
+
+<b>🔴 BEARISH CONDITIONS MET:</b>
+{conditions_text}
+
+⚡ <b>{trigger_type}</b>
+⚡ <b>OI:</b> CE ChgOI {ce_chg_oi:,} vs PE ChgOI {pe_chg_oi:,}
+{reversal_text}
+
+📋 <b>SUGGESTED REVIEW:</b>
+• Strike: {atm_strike} PE
+• Stop Loss: {stop_loss_percent}%
+• Manual verification required
+
+🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
+"""
+                try:
+                    send_telegram_message_sync(message)
+                    st.success("🔴 Bearish signal notification sent!")
+                except Exception as e:
+                    st.error(f"Failed to send notification: {e}")
+
+
+def check_atm_verdict_alert(df_summary, underlying_price):
+    """Send Telegram alert when ATM strike verdict is Strong Bullish or Strong Bearish."""
+    if df_summary is None or len(df_summary) == 0 or not underlying_price:
+        return
+
+    # Find ATM strike row
+    atm_data = df_summary[df_summary['Zone'] == 'ATM']
+    if atm_data.empty:
+        return
+
+    row = atm_data.iloc[0]
+    verdict = row.get('Verdict', 'Neutral')
+    atm_strike = row.get('Strike', 0)
+    bias_score = row.get('BiasScore', 0)
+
+    # Only alert for Strong Bullish or Strong Bearish
+    if verdict not in ['Strong Bullish', 'Strong Bearish']:
+        return
+
+    # Avoid duplicate alerts using session state
+    alert_key = f"atm_verdict_{atm_strike}_{verdict}"
+    if 'last_atm_verdict_alert' not in st.session_state:
+        st.session_state.last_atm_verdict_alert = None
+
+    # Check if this is a new alert (different from last sent)
+    if st.session_state.last_atm_verdict_alert == alert_key:
+        return  # Same alert already sent, skip
+
+    # Get additional bias details
+    oi_bias = row.get('OI_Bias', 'N/A')
+    chgoi_bias = row.get('ChgOI_Bias', 'N/A')
+    volume_bias = row.get('Volume_Bias', 'N/A')
+    delta_exp = row.get('DeltaExp', 'N/A')
+    gamma_exp = row.get('GammaExp', 'N/A')
+    pressure_bias = row.get('PressureBias', 'N/A')
+    operator_entry = row.get('Operator_Entry', 'N/A')
+    scalp_moment = row.get('Scalp_Moment', 'N/A')
+
+    # Get OI and ChgOI values
+    ce_oi = row.get('openInterest_CE', 0)
+    pe_oi = row.get('openInterest_PE', 0)
+    ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
+    pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
+
+    # Build the message
+    if verdict == 'Strong Bullish':
+        emoji = "🟢🟢🟢"
+        direction = "BULLISH"
+        suggested_option = "CE"
+    else:
+        emoji = "🔴🔴🔴"
+        direction = "BEARISH"
+        suggested_option = "PE"
+
+    message = f"""
+{emoji} <b>ATM STRIKE STRONG {direction} ALERT</b> {emoji}
+
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+🎯 <b>ATM Strike:</b> {atm_strike}
+📊 <b>Verdict:</b> {verdict} (Score: {bias_score})
+
+<b>📈 BIAS BREAKDOWN:</b>
+• OI Bias: {oi_bias}
+• ChgOI Bias: {chgoi_bias}
+• Volume Bias: {volume_bias}
+• Delta Exp: {delta_exp}
+• Gamma Exp: {gamma_exp}
+• Pressure: {pressure_bias}
+
+<b>📊 OI DATA:</b>
+• CE OI: {ce_oi/100000:.1f}L | PE OI: {pe_oi/100000:.1f}L
+• CE ΔOI: {ce_chg_oi/1000:.1f}K | PE ΔOI: {pe_chg_oi/1000:.1f}K
+
+<b>⚡ SIGNALS:</b>
+• Operator Entry: {operator_entry}
+• Scalp/Momentum: {scalp_moment}
+
+📋 <b>SUGGESTED REVIEW:</b>
+• Strike: {atm_strike} {suggested_option}
+• Manual verification required
+
+🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}
+"""
 
     try:
-        # --- 1. ATM Bias Verdict ---
-        atm_data = df_summary[df_summary['Zone'] == 'ATM']
-        if atm_data.empty:
-            return
-        row = atm_data.iloc[0]
-        verdict = row.get('Verdict', 'Neutral')
-        bias_score = row.get('BiasScore', 0)
-        atm_strike = row.get('Strike', 0)
-
-        if verdict == 'Strong Bullish':
-            direction = 'bullish'
-        elif verdict == 'Strong Bearish':
-            direction = 'bearish'
-        else:
-            return  # No strong verdict → no alert
-
-        # --- 2. PCR + GEX Confluence ---
-        atm_pcr = row.get('PCR', 1.0)
-        confluence_badge, confluence_signal, confluence_strength = calculate_pcr_gex_confluence(atm_pcr, gex_data)
-        if confluence_strength < 2:
-            return  # Weak confluence → no alert
-
-        # Check confluence direction matches verdict
-        if direction == 'bullish' and 'BULL' not in confluence_badge:
-            return
-        if direction == 'bearish' and 'BEAR' not in confluence_badge:
-            return
-
-        # --- 3. POC Alignment (spot above POC = bull, below POC = bear) ---
-        poc_aligned = False
-        poc_detail = "N/A"
-        if poc_data:
-            above_count = 0
-            below_count = 0
-            total = 0
-            for poc_key in ['poc1', 'poc2', 'poc3']:
-                poc = poc_data.get(poc_key)
-                if poc and poc.get('poc'):
-                    total += 1
-                    if current_price > poc['poc']:
-                        above_count += 1
-                    else:
-                        below_count += 1
-
-            if direction == 'bullish' and above_count >= 2:
-                poc_aligned = True
-                poc_detail = f"Above {above_count}/{total} POCs (Bull)"
-            elif direction == 'bearish' and below_count >= 2:
-                poc_aligned = True
-                poc_detail = f"Below {below_count}/{total} POCs (Bear)"
-        else:
-            poc_aligned = True  # Skip if no POC data available
-            poc_detail = "POC data N/A"
-
-        if not poc_aligned:
-            return
-
-        # --- 4. RSI Suppression Zone ---
-        rsi_sz_signal = "N/A"
-        rsi_sz_aligned = False
-        if rsi_sz_data and rsi_sz_data.get('zones'):
-            last_zone = rsi_sz_data['zones'][-1]
-            breakout = last_zone.get('breakout', 'pending')
-            if direction == 'bullish' and breakout == 'bullish':
-                rsi_sz_aligned = True
-                rsi_sz_signal = "Bullish Breakout"
-            elif direction == 'bearish' and breakout == 'bearish':
-                rsi_sz_aligned = True
-                rsi_sz_signal = "Bearish Breakout"
-            elif breakout == 'pending':
-                rsi_sz_aligned = True  # Active zone = compression, accept it
-                rsi_sz_signal = "In Suppression (pending breakout)"
-        else:
-            rsi_sz_aligned = True  # Skip if no data
-            rsi_sz_signal = "RSI SZ data N/A"
-
-        if not rsi_sz_aligned:
-            return
-
-        # --- 5. Near Pivot Level ---
-        try:
-            df_json = df.to_json()
-            pivots = cached_pivot_calculation(df_json, pivot_settings)
-        except Exception:
-            pivots = PivotIndicator.get_all_pivots(df, pivot_settings)
-
-        near_pivot = False
-        pivot_level = None
-        for pivot in pivots:
-            if pivot['timeframe'] in ['3M', '5M', '10M', '15M']:
-                if abs(current_price - pivot['value']) <= pivot_proximity:
-                    near_pivot = True
-                    pivot_level = pivot
-                    break
-
-        if not near_pivot:
-            return
-
-        # --- 6. Ultimate RSI ---
-        ursi_detail = "N/A"
-        ursi_aligned = False
-        if ultimate_rsi_data:
-            ursi_momentum = ultimate_rsi_data.get('momentum', 'Neutral')
-            ursi_zone = ultimate_rsi_data.get('zone', 'Neutral')
-            ursi_val = ultimate_rsi_data.get('latest_arsi', 50)
-            ursi_sig_val = ultimate_rsi_data.get('latest_signal', 50)
-            ursi_cross = ultimate_rsi_data.get('cross_signal', 'None')
-
-            if direction == 'bullish' and ursi_momentum == 'Bullish':
-                ursi_aligned = True
-                ursi_detail = f"Bullish ({ursi_val:.0f} > Sig {ursi_sig_val:.0f})"
-            elif direction == 'bearish' and ursi_momentum == 'Bearish':
-                ursi_aligned = True
-                ursi_detail = f"Bearish ({ursi_val:.0f} < Sig {ursi_sig_val:.0f})"
-            elif ursi_cross == 'Bullish Cross' and direction == 'bullish':
-                ursi_aligned = True
-                ursi_detail = f"Bullish Cross ({ursi_val:.0f})"
-            elif ursi_cross == 'Bearish Cross' and direction == 'bearish':
-                ursi_aligned = True
-                ursi_detail = f"Bearish Cross ({ursi_val:.0f})"
-        else:
-            ursi_aligned = True  # Skip if no data
-            ursi_detail = "URSI data N/A"
-
-        if not ursi_aligned:
-            return
-
-        # ===== ALL CONDITIONS MET — BUILD AND SEND ALERT =====
-        ist = pytz.timezone('Asia/Kolkata')
-        now_str = datetime.now(ist).strftime('%H:%M:%S IST')
-        alert_key = f"confluence_{direction}_{atm_strike}_{datetime.now(ist).strftime('%Y%m%d_%H%M')}"
-
-        if st.session_state.last_confluence_alert == alert_key:
-            return  # Already sent this minute
-
-        # Gather all details
-        price_diff = current_price - pivot_level['value']
-        oi_bias = row.get('OI_Bias', 'N/A')
-        chgoi_bias = row.get('ChgOI_Bias', 'N/A')
-        volume_bias = row.get('Volume_Bias', 'N/A')
-        delta_exp = row.get('DeltaExp', 'N/A')
-        gamma_exp = row.get('GammaExp', 'N/A')
-        pressure_bias = row.get('PressureBias', 'N/A')
-        operator_entry = row.get('Operator_Entry', 'N/A')
-        ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
-        pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
-
-        net_gex = gex_data.get('total_gex', 0) if gex_data else 0
-        gex_signal_text = gex_data.get('gex_signal', 'N/A') if gex_data else 'N/A'
-        gex_magnet = gex_data.get('gex_magnet', 'N/A') if gex_data else 'N/A'
-
-        if direction == 'bullish':
-            emoji = "🟢🔥"
-            dir_label = "BULLISH"
-            option_type = "CE"
-        else:
-            emoji = "🔴🔥"
-            dir_label = "BEARISH"
-            option_type = "PE"
-
-        message = f"""
-{emoji} <b>CONFLUENCE ENTRY ALERT — {dir_label}</b> {emoji}
-
-📍 <b>Spot:</b> ₹{current_price:.2f} ({'ABOVE' if price_diff > 0 else 'BELOW'} Pivot by {price_diff:+.1f} pts)
-📌 <b>Pivot:</b> {pivot_level['timeframe']} at ₹{pivot_level['value']:.2f}
-🎯 <b>ATM Strike:</b> {atm_strike} {option_type}
-
-<b>✅ ALL 6 CONDITIONS MET:</b>
-1️⃣ ATM Verdict: {verdict} (Score: {bias_score})
-2️⃣ PCR×GEX: {confluence_badge} ({confluence_signal}) ★{confluence_strength}
-3️⃣ POC: {poc_detail}
-4️⃣ RSI SZ: {rsi_sz_signal}
-5️⃣ Pivot: {pivot_level['timeframe']} within {pivot_proximity} pts
-6️⃣ URSI: {ursi_detail}
-
-<b>📊 ATM BIAS:</b>
-• OI: {oi_bias} | ChgOI: {chgoi_bias} | Vol: {volume_bias}
-• Delta: {delta_exp} | Gamma: {gamma_exp} | Pressure: {pressure_bias}
-• Operator: {operator_entry}
-
-<b>📈 OI DATA:</b>
-• CE ΔOI: {ce_chg_oi/1000:.1f}K | PE ΔOI: {pe_chg_oi/1000:.1f}K | PCR: {atm_pcr:.2f}
-
-<b>🎯 GEX:</b>
-• Net: {net_gex:.2f}L | Regime: {gex_signal_text} | Magnet: {gex_magnet}
-
-🕐 {now_str}
-"""
         send_telegram_message_sync(message)
-        st.session_state.last_confluence_alert = alert_key
-        if direction == 'bullish':
-            st.success(f"🟢🔥 Confluence BULLISH entry alert sent! Strike {atm_strike} CE")
+        st.session_state.last_atm_verdict_alert = alert_key
+        if verdict == 'Strong Bullish':
+            st.success(f"🟢 ATM Strong Bullish alert sent for strike {atm_strike}!")
         else:
-            st.success(f"🔴🔥 Confluence BEARISH entry alert sent! Strike {atm_strike} PE")
-
+            st.success(f"🔴 ATM Strong Bearish alert sent for strike {atm_strike}!")
     except Exception as e:
-        pass  # Silently fail to avoid disrupting the app
+        st.error(f"Failed to send ATM verdict alert: {e}")
 
 
 def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
@@ -2748,6 +2210,138 @@ def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
     except Exception as e:
         return None
 
+
+def check_gex_alert(gex_data, df_summary, underlying_price):
+    """
+    Send Telegram alert when GEX changes significantly (ΔGEX alert).
+    Triggers on:
+    1. Total GEX sign flip (positive to negative or vice versa)
+    2. Large GEX change (>30% in 5 minutes)
+    3. Price crosses Gamma Flip level
+    """
+    if gex_data is None or 'gex_history' not in st.session_state:
+        return
+
+    try:
+        ist = pytz.timezone('Asia/Kolkata')
+        current_time = datetime.now(ist)
+
+        # Store current GEX in history
+        gex_entry = {
+            'time': current_time,
+            'total_gex': gex_data['total_gex'],
+            'gamma_flip': gex_data['gamma_flip_level'],
+            'spot': underlying_price,
+            'signal': gex_data['gex_signal']
+        }
+
+        # Check if we should add (avoid duplicates within 30 seconds)
+        should_add = True
+        if st.session_state.gex_history:
+            last_entry = st.session_state.gex_history[-1]
+            time_diff = (current_time - last_entry['time']).total_seconds()
+            if time_diff < 30:
+                should_add = False
+
+        if should_add:
+            st.session_state.gex_history.append(gex_entry)
+            # Keep only last 100 entries
+            if len(st.session_state.gex_history) > 100:
+                st.session_state.gex_history = st.session_state.gex_history[-100:]
+
+        # Need at least 2 entries to detect change
+        if len(st.session_state.gex_history) < 2:
+            return
+
+        prev_entry = st.session_state.gex_history[-2]
+
+        # Calculate ΔGEX (change in GEX)
+        delta_gex = gex_data['total_gex'] - prev_entry['total_gex']
+        gex_pct_change = abs(delta_gex / prev_entry['total_gex'] * 100) if prev_entry['total_gex'] != 0 else 0
+
+        # Detect alert conditions
+        alert_triggered = False
+        alert_type = None
+        alert_message = None
+
+        # Condition 1: GEX sign flip
+        if prev_entry['total_gex'] * gex_data['total_gex'] < 0:
+            alert_triggered = True
+            alert_type = "GEX SIGN FLIP"
+            flip_direction = "Positive → Negative" if prev_entry['total_gex'] > 0 else "Negative → Positive"
+            alert_message = f"""
+🔄 <b>GEX SIGN FLIP ALERT</b> 🔄
+
+📊 <b>Gamma Exposure Flipped:</b> {flip_direction}
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+
+<b>Previous GEX:</b> {prev_entry['total_gex']:.2f}L ({prev_entry['signal']})
+<b>Current GEX:</b> {gex_data['total_gex']:.2f}L ({gex_data['gex_signal']})
+<b>ΔGEX:</b> {delta_gex:+.2f}L
+
+<b>🎯 Market Implication:</b>
+{gex_data['gex_interpretation']}
+
+⚡ <b>ACTION:</b> {'Expect acceleration/trend moves!' if gex_data['total_gex'] < 0 else 'Expect mean reversion/pin!'}
+
+🕐 Time: {current_time.strftime('%H:%M:%S IST')}
+"""
+
+        # Condition 2: Large GEX change (>30%)
+        elif gex_pct_change > 30:
+            alert_triggered = True
+            alert_type = "LARGE ΔGEX"
+            alert_message = f"""
+⚡ <b>LARGE ΔGEX ALERT</b> ⚡
+
+📊 <b>Gamma Exposure Changed Significantly!</b>
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+
+<b>Previous GEX:</b> {prev_entry['total_gex']:.2f}L
+<b>Current GEX:</b> {gex_data['total_gex']:.2f}L
+<b>ΔGEX:</b> {delta_gex:+.2f}L ({gex_pct_change:.1f}%)
+
+<b>🎯 Market Regime:</b> {gex_data['gex_signal']}
+{gex_data['gex_interpretation']}
+
+🕐 Time: {current_time.strftime('%H:%M:%S IST')}
+"""
+
+        # Condition 3: Price crosses Gamma Flip level
+        elif gex_data['gamma_flip_level'] and prev_entry.get('gamma_flip'):
+            prev_above_flip = prev_entry['spot'] > prev_entry['gamma_flip']
+            curr_above_flip = underlying_price > gex_data['gamma_flip_level']
+
+            if prev_above_flip != curr_above_flip:
+                alert_triggered = True
+                alert_type = "GAMMA FLIP CROSSED"
+                cross_direction = "Crossed ABOVE" if curr_above_flip else "Crossed BELOW"
+                alert_message = f"""
+🎯 <b>GAMMA FLIP LEVEL CROSSED</b> 🎯
+
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+📊 <b>Gamma Flip Level:</b> ₹{gex_data['gamma_flip_level']:.2f}
+🔀 <b>Direction:</b> {cross_direction}
+
+<b>Current GEX:</b> {gex_data['total_gex']:.2f}L ({gex_data['gex_signal']})
+
+<b>🎯 Implication:</b>
+{'Above flip = More pinning/mean reversion' if curr_above_flip else 'Below flip = More trending/acceleration'}
+
+🕐 Time: {current_time.strftime('%H:%M:%S IST')}
+"""
+
+        # Send alert if triggered and not duplicate
+        if alert_triggered:
+            alert_key = f"{alert_type}_{current_time.strftime('%Y%m%d_%H%M')}"
+
+            if st.session_state.last_gex_alert != alert_key:
+                send_telegram_message_sync(alert_message)
+                st.session_state.last_gex_alert = alert_key
+                st.success(f"📊 {alert_type} alert sent!")
+
+    except Exception as e:
+        pass  # Silently fail GEX alerts
 
 
 def calculate_pcr_gex_confluence(pcr_value, gex_data, zone='ATM'):
@@ -2864,13 +2458,13 @@ def calculate_greeks(option_type, S, K, T, r, sigma):
         return 0, 0, 0, 0, 0
 
 def final_verdict(score):
-    if score >= 6:
+    if score >= 4:
         return "Strong Bullish"
-    elif score >= 3:
+    elif score >= 2:
         return "Bullish"
-    elif score <= -6:
+    elif score <= -4:
         return "Strong Bearish"
-    elif score <= -3:
+    elif score <= -2:
         return "Bearish"
     else:
         return "Neutral"
@@ -2987,13 +2581,13 @@ def color_score(val):
     """Color score based on value"""
     try:
         score = float(val)
-        if score >= 6:
+        if score >= 4:
             return 'background-color: #228B22; color: white'
-        elif score >= 3:
+        elif score >= 2:
             return 'background-color: #90EE90; color: black'
-        elif score <= -6:
+        elif score <= -4:
             return 'background-color: #DC143C; color: white'
-        elif score <= -3:
+        elif score <= -2:
             return 'background-color: #FFB6C1; color: black'
         else:
             return 'background-color: #FFFFE0; color: black'
@@ -3024,20 +2618,18 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None, vwap_data=None):
-    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, RSI Suppression Zones, Ultimate RSI, and VWAP with bands"""
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None):
+    """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, and Swing data"""
     if df.empty:
         return go.Figure()
-
-    has_ursi = ultimate_rsi_data is not None and ultimate_rsi_data.get('arsi') is not None
-
+    
     fig = make_subplots(
-        rows=3 if has_ursi else 2,
+        rows=2, 
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.03,
-        row_heights=[0.55, 0.2, 0.25] if has_ursi else [0.7, 0.3],
-        subplot_titles=(None, None, "Ultimate RSI") if has_ursi else None
+        vertical_spacing=0.05,
+        row_heights=[0.7, 0.3],
+        specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
     )
     
     fig.add_trace(
@@ -3120,114 +2712,21 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         except Exception as e:
             st.warning(f"Error adding pivot levels: {str(e)}")
 
-    # Add VWAP line with bands
+    # Add VWAP line
     try:
-        if vwap_data and vwap_data.get('vwap') is not None:
-            vwap_series = vwap_data['vwap']
-            valid_mask = vwap_series.notna()
-            if valid_mask.any():
-                dt = df.loc[valid_mask, 'datetime']
-                vwap_vals = vwap_series[valid_mask]
-
-                # Main VWAP line
-                fig.add_trace(
-                    go.Scatter(
-                        x=dt, y=vwap_vals,
-                        mode='lines',
-                        name='VWAP',
-                        line=dict(color='#2962FF', width=2),
-                        opacity=0.9,
-                        hovertemplate='VWAP: %{y:.2f}<extra></extra>'
-                    ),
-                    row=1, col=1
-                )
-
-                # Band 1 (green)
-                if vwap_data.get('show_band_1') and vwap_data.get('upper_band_1') is not None:
-                    ub1 = vwap_data['upper_band_1'][valid_mask]
-                    lb1 = vwap_data['lower_band_1'][valid_mask]
-                    fig.add_trace(
-                        go.Scatter(
-                            x=dt, y=ub1, mode='lines',
-                            name=f"Upper Band #1 ({vwap_data['band_mult_1']})",
-                            line=dict(color='#00C853', width=1),
-                            opacity=0.7,
-                            hovertemplate='UB1: %{y:.2f}<extra></extra>'
-                        ), row=1, col=1
-                    )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=dt, y=lb1, mode='lines',
-                            name=f"Lower Band #1 ({vwap_data['band_mult_1']})",
-                            line=dict(color='#00C853', width=1),
-                            opacity=0.7,
-                            fill='tonexty',
-                            fillcolor='rgba(0, 200, 83, 0.05)',
-                            hovertemplate='LB1: %{y:.2f}<extra></extra>'
-                        ), row=1, col=1
-                    )
-
-                # Band 2 (olive)
-                if vwap_data.get('show_band_2') and vwap_data.get('upper_band_2') is not None:
-                    ub2 = vwap_data['upper_band_2'][valid_mask]
-                    lb2 = vwap_data['lower_band_2'][valid_mask]
-                    fig.add_trace(
-                        go.Scatter(
-                            x=dt, y=ub2, mode='lines',
-                            name=f"Upper Band #2 ({vwap_data['band_mult_2']})",
-                            line=dict(color='#808000', width=1),
-                            opacity=0.7,
-                            hovertemplate='UB2: %{y:.2f}<extra></extra>'
-                        ), row=1, col=1
-                    )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=dt, y=lb2, mode='lines',
-                            name=f"Lower Band #2 ({vwap_data['band_mult_2']})",
-                            line=dict(color='#808000', width=1),
-                            opacity=0.7,
-                            fill='tonexty',
-                            fillcolor='rgba(128, 128, 0, 0.05)',
-                            hovertemplate='LB2: %{y:.2f}<extra></extra>'
-                        ), row=1, col=1
-                    )
-
-                # Band 3 (teal)
-                if vwap_data.get('show_band_3') and vwap_data.get('upper_band_3') is not None:
-                    ub3 = vwap_data['upper_band_3'][valid_mask]
-                    lb3 = vwap_data['lower_band_3'][valid_mask]
-                    fig.add_trace(
-                        go.Scatter(
-                            x=dt, y=ub3, mode='lines',
-                            name=f"Upper Band #3 ({vwap_data['band_mult_3']})",
-                            line=dict(color='#008080', width=1),
-                            opacity=0.7,
-                            hovertemplate='UB3: %{y:.2f}<extra></extra>'
-                        ), row=1, col=1
-                    )
-                    fig.add_trace(
-                        go.Scatter(
-                            x=dt, y=lb3, mode='lines',
-                            name=f"Lower Band #3 ({vwap_data['band_mult_3']})",
-                            line=dict(color='#008080', width=1),
-                            opacity=0.7,
-                            fill='tonexty',
-                            fillcolor='rgba(0, 128, 128, 0.05)',
-                            hovertemplate='LB3: %{y:.2f}<extra></extra>'
-                        ), row=1, col=1
-                    )
-        else:
-            # Fallback: simple VWAP from ReversalDetector
-            vwap = ReversalDetector.calculate_vwap(df)
-            if not vwap.empty:
-                fig.add_trace(
-                    go.Scatter(
-                        x=df['datetime'], y=vwap,
-                        mode='lines', name='VWAP',
-                        line=dict(color='#2962FF', width=2),
-                        opacity=0.8
-                    ), row=1, col=1
-                )
+        vwap = ReversalDetector.calculate_vwap(df)
+        if not vwap.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=df['datetime'],
+                    y=vwap,
+                    mode='lines',
+                    name='VWAP',
+                    line=dict(color='#FFD700', width=2, dash='dot'),
+                    opacity=0.8
+                ),
+                row=1, col=1
+            )
     except Exception as e:
         pass  # VWAP calculation failed, skip it
 
@@ -3299,9 +2798,12 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         except Exception as e:
             pass  # VOB drawing failed, skip it
 
-    # Add Triple POC steplines if provided
+    # Add Triple POC lines if provided
     if poc_data:
         try:
+            x_start = df['datetime'].min()
+            x_end = df['datetime'].max()
+
             poc_colors = {
                 'poc1': '#e91e63',  # Pink - Short-term
                 'poc2': '#2196f3',  # Blue - Medium-term
@@ -3309,85 +2811,30 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
             }
 
             for poc_key in ['poc1', 'poc2', 'poc3']:
-                series_key = f'{poc_key}_series'
-                series_data = poc_data.get(series_key)
-                poc_latest = poc_data.get(poc_key)
-
-                if series_data is not None:
+                poc = poc_data.get(poc_key)
+                if poc and poc.get('poc'):
                     color = poc_colors[poc_key]
                     period = poc_data.get('periods', {}).get(poc_key, '')
 
-                    poc_s = series_data['poc']
-                    upper_s = series_data['upper_poc']
-                    lower_s = series_data['lower_poc']
+                    # POC main line
+                    fig.add_shape(
+                        type="line",
+                        x0=x_start, x1=x_end,
+                        y0=poc['poc'], y1=poc['poc'],
+                        line=dict(color=color, width=2),
+                        row=1, col=1
+                    )
 
-                    # Filter out NaN values and align with datetime
-                    valid_mask = poc_s.notna()
-                    if valid_mask.any():
-                        dt = df.loc[valid_mask, 'datetime']
-                        poc_vals = poc_s[valid_mask]
-                        upper_vals = upper_s[valid_mask]
-                        lower_vals = lower_s[valid_mask]
-
-                        # Main POC stepline
-                        fig.add_trace(
-                            go.Scatter(
-                                x=dt, y=poc_vals,
-                                mode='lines',
-                                name=f'POC {poc_key[-1]} ({period})',
-                                line=dict(color=color, width=2, shape='hv'),
-                                showlegend=True,
-                                hovertemplate=f'POC{poc_key[-1]}: ₹%{{y:.2f}}<extra></extra>'
-                            ),
-                            row=1, col=1
-                        )
-
-                        # Upper POC channel (translucent)
-                        fig.add_trace(
-                            go.Scatter(
-                                x=dt, y=upper_vals,
-                                mode='lines',
-                                name=f'Upper POC {poc_key[-1]}',
-                                line=dict(color=color, width=1, shape='hv', dash='dot'),
-                                opacity=0.3,
-                                showlegend=False,
-                                hoverinfo='skip'
-                            ),
-                            row=1, col=1
-                        )
-
-                        # Lower POC channel (translucent) with fill to upper
-                        # Convert hex to rgba for fill
-                        hex_c = color.lstrip('#')
-                        r, g, b = int(hex_c[:2], 16), int(hex_c[2:4], 16), int(hex_c[4:6], 16)
-                        fill_rgba = f'rgba({r},{g},{b},0.08)'
-
-                        fig.add_trace(
-                            go.Scatter(
-                                x=dt, y=lower_vals,
-                                mode='lines',
-                                name=f'Lower POC {poc_key[-1]}',
-                                line=dict(color=color, width=1, shape='hv', dash='dot'),
-                                opacity=0.3,
-                                showlegend=False,
-                                fill='tonexty',
-                                fillcolor=fill_rgba,
-                                hoverinfo='skip'
-                            ),
-                            row=1, col=1
-                        )
-
-                        # Label at the end
-                        last_poc_val = poc_vals.iloc[-1]
-                        last_dt = dt.iloc[-1]
-                        fig.add_annotation(
-                            x=last_dt, y=last_poc_val,
-                            text=f"POC{poc_key[-1]} ({period}): ₹{last_poc_val:.0f}",
-                            showarrow=False,
-                            font=dict(color=color, size=10),
-                            xanchor="left",
-                            row=1, col=1
-                        )
+                    # POC annotation
+                    fig.add_annotation(
+                        x=x_end,
+                        y=poc['poc'],
+                        text=f"POC{poc_key[-1]} ({period}): ₹{poc['poc']:.0f}",
+                        showarrow=False,
+                        font=dict(color=color, size=10),
+                        xanchor="left",
+                        row=1, col=1
+                    )
 
         except Exception as e:
             pass  # POC drawing failed, skip it
@@ -3485,57 +2932,6 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         except Exception as e:
             pass  # Swing drawing failed, skip it
 
-    # ===== RSI VOLATILITY SUPPRESSION ZONES =====
-    if rsi_sz_data and rsi_sz_data.get('zones'):
-        try:
-            for zone in rsi_sz_data['zones']:
-                if zone.get('start_time') is None or zone.get('end_time') is None:
-                    continue
-
-                x_start = zone['start_time']
-                x_end = zone['end_time']
-                y_top = zone['top']
-                y_bottom = zone['bottom']
-                breakout = zone.get('breakout', 'pending')
-
-                # Colors based on breakout direction
-                if breakout == 'bullish':
-                    fill_color = 'rgba(0, 187, 212, 0.15)'
-                    border_color = 'rgba(0, 187, 212, 0.4)'
-                    symbol_text = "▲"
-                elif breakout == 'bearish':
-                    fill_color = 'rgba(155, 39, 176, 0.15)'
-                    border_color = 'rgba(155, 39, 176, 0.4)'
-                    symbol_text = "▼"
-                else:
-                    fill_color = 'rgba(128, 128, 128, 0.1)'
-                    border_color = 'rgba(128, 128, 128, 0.3)'
-                    symbol_text = "∿"
-
-                # Draw zone rectangle using shapes
-                fig.add_shape(
-                    type="rect",
-                    x0=x_start, x1=x_end,
-                    y0=y_bottom, y1=y_top,
-                    fillcolor=fill_color,
-                    line=dict(color=border_color, width=1),
-                    row=1, col=1
-                )
-
-                # Add label
-                fig.add_annotation(
-                    x=x_end,
-                    y=y_top,
-                    text=f"SZ {symbol_text}",
-                    showarrow=False,
-                    font=dict(color=border_color.replace('0.4', '1').replace('0.3', '1'), size=9),
-                    xanchor="right",
-                    yanchor="bottom",
-                    row=1, col=1
-                )
-        except Exception:
-            pass  # RSI SZ drawing failed, skip it
-
     volume_colors = ['#00ff88' if close >= open else '#ff4444'
                     for close, open in zip(df['close'], df['open'])]
     
@@ -3550,102 +2946,12 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         ),
         row=2, col=1
     )
-
-    # ===== ULTIMATE RSI SUBPLOT (Row 3) =====
-    if has_ursi:
-        try:
-            arsi = ultimate_rsi_data['arsi']
-            sig = ultimate_rsi_data['signal']
-            ob = ultimate_rsi_data['ob']
-            os_val = ultimate_rsi_data['os']
-
-            valid_mask = arsi.notna()
-            if valid_mask.any():
-                dt = df.loc[valid_mask, 'datetime']
-                arsi_vals = arsi[valid_mask]
-                sig_vals = sig[valid_mask]
-
-                # Color RSI by zone: green if OB, red if OS, white otherwise
-                arsi_colors = ['#089981' if v > ob else '#f23645' if v < os_val else '#c0c0c0'
-                               for v in arsi_vals]
-
-                # RSI line (colored segments via markers)
-                fig.add_trace(
-                    go.Scatter(
-                        x=dt, y=arsi_vals,
-                        mode='lines',
-                        name='Ultimate RSI',
-                        line=dict(color='#c0c0c0', width=1.5),
-                        showlegend=False,
-                        hovertemplate='URSI: %{y:.1f}<extra></extra>'
-                    ),
-                    row=3, col=1
-                )
-
-                # Signal line
-                fig.add_trace(
-                    go.Scatter(
-                        x=dt, y=sig_vals,
-                        mode='lines',
-                        name='Signal',
-                        line=dict(color='#ff5d00', width=1, dash='dot'),
-                        showlegend=False,
-                        hovertemplate='Signal: %{y:.1f}<extra></extra>'
-                    ),
-                    row=3, col=1
-                )
-
-                # OB fill (RSI above OB)
-                arsi_ob = arsi_vals.where(arsi_vals > ob, ob)
-                fig.add_trace(
-                    go.Scatter(x=dt, y=[ob]*len(dt), mode='lines',
-                               line=dict(color='rgba(0,0,0,0)', width=0),
-                               showlegend=False, hoverinfo='skip'),
-                    row=3, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=dt, y=arsi_ob, mode='lines',
-                               line=dict(color='rgba(0,0,0,0)', width=0),
-                               fill='tonexty', fillcolor='rgba(8,153,129,0.25)',
-                               showlegend=False, hoverinfo='skip'),
-                    row=3, col=1
-                )
-
-                # OS fill (RSI below OS)
-                arsi_os = arsi_vals.where(arsi_vals < os_val, os_val)
-                fig.add_trace(
-                    go.Scatter(x=dt, y=arsi_os, mode='lines',
-                               line=dict(color='rgba(0,0,0,0)', width=0),
-                               showlegend=False, hoverinfo='skip'),
-                    row=3, col=1
-                )
-                fig.add_trace(
-                    go.Scatter(x=dt, y=[os_val]*len(dt), mode='lines',
-                               line=dict(color='rgba(0,0,0,0)', width=0),
-                               fill='tonexty', fillcolor='rgba(242,54,69,0.25)',
-                               showlegend=False, hoverinfo='skip'),
-                    row=3, col=1
-                )
-
-                # Horizontal reference lines
-                for level, label in [(ob, 'OB'), (50, 'Mid'), (os_val, 'OS')]:
-                    fig.add_hline(y=level, line_dash="dot", line_color="#555555",
-                                  line_width=1, row=3, col=1,
-                                  annotation_text=label, annotation_position="right")
-
-                fig.update_yaxes(title_text="URSI", range=[0, 100],
-                                 showgrid=True, gridwidth=1, gridcolor='#333333',
-                                 row=3, col=1)
-                fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='#333333',
-                                 type='date', row=3, col=1)
-        except Exception:
-            pass  # Ultimate RSI drawing failed, skip it
-
+    
     fig.update_layout(
         title=title,
         template='plotly_dark',
         xaxis_rangeslider_visible=False,
-        height=850 if has_ursi else 700,
+        height=700,
         showlegend=False,
         margin=dict(l=0, r=0, t=40, b=0),
         font=dict(color='white'),
@@ -3979,25 +3285,15 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         row_data["BidAskPressure"] = bid_ask_pressure
         row_data["PressureBias"] = pressure_bias
 
-        # ===== Weighted Score Calculation (Bias Engine v2) =====
-        # Tier 1 (2.0): Institutional-grade signals
-        # Tier 2 (1.5): Strong directional signals
-        # Tier 3 (1.0): Medium reliability signals
-        # Tier 4 (0.5): Weak/noisy signals
-        # Theta_Bias excluded — not directionally reliable
-        bias_weights = {
-            'ChgOI_Bias': 2.0,  'DeltaExp': 2.0,  'GammaExp': 2.0,
-            'OI_Bias': 1.5,     'PressureBias': 1.5, 'DVP_Bias': 1.5,
-            'Volume_Bias': 1.0, 'LTP_Bias': 1.0,  'Delta_Bias': 1.0,
-            'AskQty_Bias': 0.5, 'BidQty_Bias': 0.5, 'AskBid_Bias': 0.5,
-            'Gamma_Bias': 0.5,  'IV_Bias': 0.5,
-        }
-        for k, weight in bias_weights.items():
-            bias_val = row_data.get(k)
-            if bias_val == "Bullish":
-                score += weight
-            elif bias_val == "Bearish":
-                score -= weight
+        # ===== Score Calculation =====
+        # Count all bias columns for scoring
+        for k in row_data:
+            if "_Bias" in k or k in ["DeltaExp", "GammaExp"]:
+                bias_val = row_data[k]
+                if bias_val == "Bullish":
+                    score += 1
+                elif bias_val == "Bearish":
+                    score -= 1
 
         row_data["BiasScore"] = score
         row_data["Verdict"] = final_verdict(score)
@@ -4012,25 +3308,25 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
             row_data["Operator_Entry"] = "No Entry"
 
         # Scalp/Momentum: Based on score strength
-        if score >= 6:
+        if score >= 4:
             row_data["Scalp_Moment"] = "Scalp Bull"
-        elif score >= 3:
+        elif score >= 2:
             row_data["Scalp_Moment"] = "Moment Bull"
-        elif score <= -6:
+        elif score <= -4:
             row_data["Scalp_Moment"] = "Scalp Bear"
-        elif score <= -3:
+        elif score <= -2:
             row_data["Scalp_Moment"] = "Moment Bear"
         else:
             row_data["Scalp_Moment"] = "No Signal"
 
         # FakeReal: Distinguish real moves from fake
-        if score >= 6:
+        if score >= 4:
             row_data["FakeReal"] = "Real Up"
-        elif 1.5 <= score < 6:
+        elif 1 <= score < 4:
             row_data["FakeReal"] = "Fake Up"
-        elif score <= -6:
+        elif score <= -4:
             row_data["FakeReal"] = "Real Down"
-        elif -6 < score <= -1.5:
+        elif -4 < score <= -1:
             row_data["FakeReal"] = "Fake Down"
         else:
             row_data["FakeReal"] = "No Move"
@@ -4656,7 +3952,7 @@ def main():
         "15 min": "15"
     }
     
-    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "1 min")
+    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "5 min")
     selected_timeframe = st.sidebar.selectbox(
         "Select Timeframe",
         list(timeframes.keys()),
@@ -4704,52 +4000,6 @@ def main():
             'show_3m': False, 'show_5m': False, 'show_10m': False, 'show_15m': False
         }
     
-    # VWAP Indicator Settings
-    st.sidebar.header("📈 VWAP Settings")
-    show_vwap = st.sidebar.checkbox("Show VWAP", value=True, help="Volume Weighted Average Price with bands")
-
-    if show_vwap:
-        vwap_anchor = st.sidebar.selectbox(
-            "Anchor Period",
-            ["Session", "Week", "Month", "Quarter", "Year"],
-            index=0,
-            help="Period to anchor/reset VWAP calculation"
-        )
-        vwap_src = st.sidebar.selectbox(
-            "Source",
-            ["hlc3", "close", "hl2", "ohlc4", "open"],
-            index=0,
-            help="Price source for VWAP calculation"
-        )
-        vwap_calc_mode = st.sidebar.selectbox(
-            "Bands Calculation Mode",
-            ["Standard Deviation", "Percentage"],
-            index=0,
-            help="Standard Deviation or Percentage-based bands. Percentage mode: multiplier 1 = 1%"
-        )
-
-        st.sidebar.subheader("Bands Settings")
-        vwap_show_band1 = st.sidebar.checkbox("Show Band #1", value=True, help="First standard deviation band (green)")
-        vwap_band_mult1 = st.sidebar.number_input("Band #1 Multiplier", min_value=0.0, value=1.0, step=0.5, format="%.1f") if vwap_show_band1 else 1.0
-        vwap_show_band2 = st.sidebar.checkbox("Show Band #2", value=False, help="Second standard deviation band (olive)")
-        vwap_band_mult2 = st.sidebar.number_input("Band #2 Multiplier", min_value=0.0, value=2.0, step=0.5, format="%.1f") if vwap_show_band2 else 2.0
-        vwap_show_band3 = st.sidebar.checkbox("Show Band #3", value=False, help="Third standard deviation band (teal)")
-        vwap_band_mult3 = st.sidebar.number_input("Band #3 Multiplier", min_value=0.0, value=3.0, step=0.5, format="%.1f") if vwap_show_band3 else 3.0
-
-        vwap_settings = {
-            'anchor': vwap_anchor,
-            'src': vwap_src,
-            'calc_mode': vwap_calc_mode,
-            'show_band_1': vwap_show_band1,
-            'band_mult_1': vwap_band_mult1,
-            'show_band_2': vwap_show_band2,
-            'band_mult_2': vwap_band_mult2,
-            'show_band_3': vwap_show_band3,
-            'band_mult_3': vwap_band_mult3,
-        }
-    else:
-        vwap_settings = None
-
     # Trading signal settings
     st.sidebar.header("🔔 Trading Signals")
     enable_signals = st.sidebar.checkbox("Enable Telegram Signals", value=True, help="Send notifications when conditions are met")
@@ -4926,43 +4176,6 @@ def main():
             except Exception:
                 swing_data_for_chart = None
 
-        # Calculate RSI Volatility Suppression Zones for chart display
-        rsi_sz_data_for_chart = None
-        if not df.empty and len(df) > 30:
-            try:
-                rsi_sz_calculator = RSIVolatilitySuppression(rsi_length=14, vol_length=5)
-                rsi_sz_data_for_chart = rsi_sz_calculator.analyze(df)
-            except Exception:
-                rsi_sz_data_for_chart = None
-
-        # Calculate Ultimate RSI for chart display
-        ultimate_rsi_data_for_chart = None
-        if not df.empty and len(df) > 20:
-            try:
-                ursi_calculator = UltimateRSI(length=7, smo_type='RMA', signal_length=14, signal_type='EMA', ob_value=70, os_value=40)
-                ultimate_rsi_data_for_chart = ursi_calculator.calculate(df)
-            except Exception:
-                ultimate_rsi_data_for_chart = None
-
-        # Calculate VWAP with bands for chart display
-        vwap_data_for_chart = None
-        if not df.empty and len(df) > 5 and vwap_settings is not None:
-            try:
-                vwap_calculator = VWAPIndicator(
-                    src=vwap_settings['src'],
-                    anchor=vwap_settings['anchor'],
-                    calc_mode=vwap_settings['calc_mode'],
-                    show_band_1=vwap_settings['show_band_1'],
-                    band_mult_1=vwap_settings['band_mult_1'],
-                    show_band_2=vwap_settings['show_band_2'],
-                    band_mult_2=vwap_settings['band_mult_2'],
-                    show_band_3=vwap_settings['show_band_3'],
-                    band_mult_3=vwap_settings['band_mult_3'],
-                )
-                vwap_data_for_chart = vwap_calculator.calculate(df)
-            except Exception:
-                vwap_data_for_chart = None
-
         # Create and display chart
         if not df.empty:
             fig = create_candlestick_chart(
@@ -4973,10 +4186,7 @@ def main():
                 pivot_settings=pivot_settings,
                 vob_blocks=vob_blocks_for_chart,
                 poc_data=poc_data_for_chart,
-                swing_data=swing_data_for_chart,
-                rsi_sz_data=rsi_sz_data_for_chart,
-                ultimate_rsi_data=ultimate_rsi_data_for_chart,
-                vwap_data=vwap_data_for_chart
+                swing_data=swing_data_for_chart
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -5114,127 +4324,6 @@ def main():
             except Exception as e:
                 st.warning(f"Reversal analysis unavailable: {str(e)}")
 
-            # ===== VWAP INDICATOR TABLE =====
-            if vwap_data_for_chart and vwap_data_for_chart.get('latest_vwap') is not None:
-                st.markdown("---")
-                st.markdown("## 📈 VWAP Indicator (Volume Weighted Average Price)")
-
-                try:
-                    vd = vwap_data_for_chart
-
-                    # Summary metrics row
-                    vwap_col1, vwap_col2, vwap_col3 = st.columns(3)
-
-                    with vwap_col1:
-                        vwap_val = vd['latest_vwap']
-                        price_diff = vd.get('price_vs_vwap', 0)
-                        diff_color = "#15dd7c" if price_diff >= 0 else "#eb7514"
-                        diff_icon = "Above" if price_diff >= 0 else "Below"
-                        st.markdown(f"""
-                        <div style="background-color: {diff_color}20; padding: 15px; border-radius: 10px; border: 2px solid {diff_color};">
-                            <h4 style="color: {diff_color}; margin: 0;">VWAP</h4>
-                            <h2 style="color: {diff_color}; margin: 5px 0;">₹{vwap_val:,.2f}</h2>
-                            <p style="color: white; margin: 0;">Anchor: {vd.get('anchor', 'Session')} | Mode: {vd.get('calc_mode', 'Std Dev')}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    with vwap_col2:
-                        price_pct = vd.get('price_vs_vwap_pct', 0)
-                        pct_color = "#15dd7c" if price_pct >= 0 else "#eb7514"
-                        pct_sign = "+" if price_pct >= 0 else ""
-                        st.markdown(f"""
-                        <div style="background-color: {pct_color}20; padding: 15px; border-radius: 10px; border: 2px solid {pct_color};">
-                            <h4 style="color: {pct_color}; margin: 0;">Price vs VWAP</h4>
-                            <h2 style="color: {pct_color}; margin: 5px 0;">{diff_icon} ({pct_sign}{price_pct:.3f}%)</h2>
-                            <p style="color: white; margin: 0;">Diff: {pct_sign}{price_diff:.2f} pts</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    with vwap_col3:
-                        band_pos = vd.get('band_position', 'N/A')
-                        if 'Above' in band_pos:
-                            bp_color = "#15dd7c"
-                            bp_icon = "🟢"
-                        elif 'Below' in band_pos:
-                            bp_color = "#eb7514"
-                            bp_icon = "🔴"
-                        else:
-                            bp_color = "#FFD700"
-                            bp_icon = "🟡"
-                        st.markdown(f"""
-                        <div style="background-color: {bp_color}20; padding: 15px; border-radius: 10px; border: 2px solid {bp_color};">
-                            <h4 style="color: {bp_color}; margin: 0;">Band Position</h4>
-                            <h2 style="color: {bp_color}; margin: 5px 0;">{bp_icon} {band_pos}</h2>
-                            <p style="color: white; margin: 0;">Price: ₹{vd.get('current_price', 0):,.2f}</p>
-                        </div>
-                        """, unsafe_allow_html=True)
-
-                    # Bands detail table
-                    vwap_table_data = []
-                    vwap_table_data.append({
-                        'Level': 'VWAP',
-                        'Value': f"₹{vd['latest_vwap']:,.2f}",
-                        'Upper': '-',
-                        'Lower': '-',
-                        'Multiplier': '-',
-                    })
-
-                    if vd.get('show_band_1') and vd.get('latest_upper_1') is not None:
-                        vwap_table_data.append({
-                            'Level': 'Band #1',
-                            'Value': f"₹{vd['latest_vwap']:,.2f}",
-                            'Upper': f"₹{vd['latest_upper_1']:,.2f}",
-                            'Lower': f"₹{vd['latest_lower_1']:,.2f}",
-                            'Multiplier': f"{vd['band_mult_1']}x",
-                        })
-
-                    if vd.get('show_band_2') and vd.get('latest_upper_2') is not None:
-                        vwap_table_data.append({
-                            'Level': 'Band #2',
-                            'Value': f"₹{vd['latest_vwap']:,.2f}",
-                            'Upper': f"₹{vd['latest_upper_2']:,.2f}",
-                            'Lower': f"₹{vd['latest_lower_2']:,.2f}",
-                            'Multiplier': f"{vd['band_mult_2']}x",
-                        })
-
-                    if vd.get('show_band_3') and vd.get('latest_upper_3') is not None:
-                        vwap_table_data.append({
-                            'Level': 'Band #3',
-                            'Value': f"₹{vd['latest_vwap']:,.2f}",
-                            'Upper': f"₹{vd['latest_upper_3']:,.2f}",
-                            'Lower': f"₹{vd['latest_lower_3']:,.2f}",
-                            'Multiplier': f"{vd['band_mult_3']}x",
-                        })
-
-                    vwap_df = pd.DataFrame(vwap_table_data)
-
-                    def style_vwap_level(val):
-                        if val == 'VWAP':
-                            return 'background-color: #2962FF40; color: white; font-weight: bold'
-                        elif 'Band #1' in str(val):
-                            return 'background-color: #00C85340; color: white'
-                        elif 'Band #2' in str(val):
-                            return 'background-color: #80800040; color: white'
-                        elif 'Band #3' in str(val):
-                            return 'background-color: #00808040; color: white'
-                        return ''
-
-                    styled_vwap = vwap_df.style.applymap(style_vwap_level, subset=['Level'])
-                    st.dataframe(styled_vwap, use_container_width=True, hide_index=True)
-
-                    st.markdown("""
-                    **VWAP Interpretation:**
-                    - **VWAP** (Blue line): Fair value price based on volume - institutional benchmark
-                    - **Above VWAP**: Bullish bias - buyers in control, VWAP acts as support
-                    - **Below VWAP**: Bearish bias - sellers in control, VWAP acts as resistance
-                    - **Band #1** (Green): 1 std dev - normal trading range, mean reversion zone
-                    - **Band #2** (Olive): 2 std dev - extended move, potential reversal area
-                    - **Band #3** (Teal): 3 std dev - extreme move, high probability reversal
-                    """)
-
-                except Exception as e:
-                    st.warning(f"VWAP table display error: {str(e)}")
-
             # ===== TRIPLE POC + FUTURE SWING ANALYSIS =====
             st.markdown("---")
             st.markdown("## 📊 Triple POC + Future Swing Analysis")
@@ -5251,14 +4340,16 @@ def main():
                     period = poc_data_for_chart.get('periods', {}).get(period_key, '')
 
                     if poc:
-                        # Determine position relative to POC line
-                        # Above POC = Bull, Below POC = Bear
-                        if current_price_for_poc > poc.get('poc', 0):
+                        # Determine position relative to POC
+                        if current_price_for_poc > poc.get('upper_poc', 0):
                             position = "🟢 Above"
                             signal = "Bullish"
-                        else:
+                        elif current_price_for_poc < poc.get('lower_poc', 0):
                             position = "🔴 Below"
                             signal = "Bearish"
+                        else:
+                            position = "🟡 Inside"
+                            signal = "Neutral"
 
                         poc_table_data.append({
                             'POC': f"POC {poc_key[-1]} ({period})",
@@ -5287,11 +4378,12 @@ def main():
 
                     st.markdown("""
                     **POC Interpretation:**
-                    - **POC 1 (10)**: Short-term volume profile - intraday support/resistance
-                    - **POC 2 (25)**: Medium-term volume profile - swing trading levels
-                    - **POC 3 (70)**: Long-term volume profile - major support/resistance
-                    - **Above POC**: Bullish — market is bull, POC acts as support
-                    - **Below POC**: Bearish — market is bear, POC acts as resistance
+                    - **POC 1 (25)**: Short-term volume profile - intraday support/resistance
+                    - **POC 2 (40)**: Medium-term volume profile - swing trading levels
+                    - **POC 3 (100)**: Long-term volume profile - major support/resistance
+                    - **Above POC**: Bullish bias - POC acts as support
+                    - **Below POC**: Bearish bias - POC acts as resistance
+                    - **Inside POC**: Neutral - price consolidating at high-volume zone
                     """)
 
             # Future Swing Table
@@ -5398,102 +4490,6 @@ def main():
                 - **Projected Target**: Based on average of historical swing percentages
                 """)
 
-            # ===== RSI VOLATILITY SUPPRESSION ZONES =====
-            if rsi_sz_data_for_chart and rsi_sz_data_for_chart.get('zones'):
-                st.markdown("---")
-                st.markdown("## ∿ RSI Volatility Suppression Zones")
-
-                current_signal = rsi_sz_data_for_chart.get('current_signal', 'No Zone')
-                count_vol = rsi_sz_data_for_chart.get('count_volatility', 0)
-
-                # Signal summary
-                sz_col1, sz_col2, sz_col3 = st.columns(3)
-                with sz_col1:
-                    signal_color = "normal" if current_signal == 'Bullish Breakout' else ("inverse" if current_signal == 'Bearish Breakout' else "off")
-                    st.metric("Current Signal", current_signal, delta=current_signal if current_signal != 'No Zone' else None, delta_color=signal_color)
-                with sz_col2:
-                    st.metric("Low Vol Bar Count", count_vol)
-                with sz_col3:
-                    total_zones = len(rsi_sz_data_for_chart['zones'])
-                    bullish_count = sum(1 for z in rsi_sz_data_for_chart['zones'] if z['breakout'] == 'bullish')
-                    bearish_count = sum(1 for z in rsi_sz_data_for_chart['zones'] if z['breakout'] == 'bearish')
-                    st.metric("Zones Detected", f"{total_zones} (▲{bullish_count} / ▼{bearish_count})")
-
-                # Zone table
-                zone_table_data = []
-                for idx, zone in enumerate(reversed(rsi_sz_data_for_chart['zones'][-10:]), 1):
-                    breakout = zone.get('breakout', 'pending')
-                    if breakout == 'bullish':
-                        signal = '▲ Bullish'
-                    elif breakout == 'bearish':
-                        signal = '▼ Bearish'
-                    else:
-                        signal = '∿ Pending'
-
-                    zone_table_data.append({
-                        '#': idx,
-                        'Zone Top': f"₹{zone['top']:.2f}",
-                        'Zone Bottom': f"₹{zone['bottom']:.2f}",
-                        'Range': f"₹{zone['top'] - zone['bottom']:.2f}",
-                        'Bars': zone['end_idx'] - zone['start_idx'],
-                        'Breakout': signal,
-                    })
-
-                if zone_table_data:
-                    sz_df = pd.DataFrame(zone_table_data)
-
-                    def style_sz_signal(val):
-                        if '▲' in str(val):
-                            return 'background-color: #00bbd440; color: white'
-                        elif '▼' in str(val):
-                            return 'background-color: #9b27b040; color: white'
-                        return 'background-color: #80808040; color: white'
-
-                    styled_sz = sz_df.style.applymap(style_sz_signal, subset=['Breakout'])
-                    st.dataframe(styled_sz, use_container_width=True, hide_index=True)
-
-                st.markdown("""
-                **RSI Suppression Zone Interpretation:**
-                - **Suppression Zone (∿)**: RSI volatility is low — price is consolidating
-                - **Bullish Breakout (▲)**: Price broke above zone — momentum shifting up
-                - **Bearish Breakout (▼)**: Price broke below zone — momentum shifting down
-                - Longer suppression zones often lead to stronger breakouts
-                - Use with POC and Swing levels for confluence-based entries
-                """)
-
-            # ===== ULTIMATE RSI [LuxAlgo] =====
-            if ultimate_rsi_data_for_chart:
-                st.markdown("---")
-                st.markdown("## 📈 Ultimate RSI [LuxAlgo]")
-
-                ursi_val = ultimate_rsi_data_for_chart.get('latest_arsi', 50)
-                ursi_sig = ultimate_rsi_data_for_chart.get('latest_signal', 50)
-                ursi_zone = ultimate_rsi_data_for_chart.get('zone', 'Neutral')
-                ursi_cross = ultimate_rsi_data_for_chart.get('cross_signal', 'None')
-                ursi_momentum = ultimate_rsi_data_for_chart.get('momentum', 'Neutral')
-
-                ursi_col1, ursi_col2, ursi_col3, ursi_col4 = st.columns(4)
-                with ursi_col1:
-                    delta_color = "normal" if ursi_momentum == 'Bullish' else ("inverse" if ursi_momentum == 'Bearish' else "off")
-                    st.metric("URSI Value", f"{ursi_val:.1f}", delta=ursi_momentum, delta_color=delta_color)
-                with ursi_col2:
-                    st.metric("Signal Line", f"{ursi_sig:.1f}")
-                with ursi_col3:
-                    zone_icon = "🟢" if ursi_zone == 'Overbought' else ("🔴" if ursi_zone == 'Oversold' else "⚪")
-                    st.metric("Zone", f"{zone_icon} {ursi_zone}")
-                with ursi_col4:
-                    cross_icon = "🔼" if 'Bullish' in ursi_cross else ("🔽" if 'Bearish' in ursi_cross else "➖")
-                    st.metric("Cross Signal", f"{cross_icon} {ursi_cross}")
-
-                st.markdown("""
-                **Ultimate RSI Interpretation:**
-                - **Above 70 (OB)**: Overbought — expect bearish reversal
-                - **Below 40 (OS)**: Oversold — expect bullish bounce
-                - **URSI > Signal + Above 50**: Bullish momentum confirmed
-                - **URSI < Signal + Below 50**: Bearish momentum confirmed
-                - **Bullish/Bearish Cross**: URSI crossing signal line = momentum shift
-                """)
-
         else:
             st.error("No data available. Please check your API credentials and try again.")
     
@@ -5508,6 +4504,13 @@ def main():
             df_summary = option_data['df_summary']
             st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
 
+            # Check for trading signals if enabled
+            if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
+                check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
+
+            # Check ATM strike verdict for Strong Bullish/Bearish alerts
+            if df_summary is not None and len(df_summary) > 0:
+                check_atm_verdict_alert(df_summary, underlying_price)
         else:
             option_data = None
 
@@ -5748,7 +4751,6 @@ def main():
         st.markdown("---")
         st.markdown("## 📊 Gamma Exposure (GEX) Analysis - Dealer Hedging Flow")
 
-        gex_data = None
         try:
             df_summary = option_data.get('df_summary')
             underlying_price = option_data.get('underlying')
@@ -5762,6 +4764,9 @@ def main():
 
                     # Save last valid GEX data
                     st.session_state.gex_last_valid_data = gex_data
+
+                    # Check for GEX alerts
+                    check_gex_alert(gex_data, df_summary, underlying_price)
 
                     # ===== GEX Summary Cards =====
                     gex_col1, gex_col2, gex_col3, gex_col4 = st.columns(4)
@@ -6220,26 +5225,6 @@ def main():
             file_name=f"nifty_options_summary_{option_data['expiry']}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv"
         )
-
-    # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
-    if enable_signals and option_data and option_data.get('underlying') and not df.empty:
-        try:
-            _df_summary = option_data.get('df_summary')
-            _underlying = option_data.get('underlying')
-            if _df_summary is not None and _underlying:
-                check_confluence_entry_signal(
-                    df=df,
-                    pivot_settings=pivot_settings,
-                    df_summary=_df_summary,
-                    current_price=_underlying,
-                    pivot_proximity=pivot_proximity,
-                    poc_data=poc_data_for_chart,
-                    rsi_sz_data=rsi_sz_data_for_chart,
-                    gex_data=gex_data,
-                    ultimate_rsi_data=ultimate_rsi_data_for_chart,
-                )
-        except Exception:
-            pass
 
     # Analytics dashboard below
     if show_analytics:
