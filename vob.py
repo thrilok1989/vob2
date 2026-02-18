@@ -2531,6 +2531,94 @@ def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
         return None
 
 
+def calculate_gamma_sequence(df_summary, spot_price, contract_multiplier=25):
+    """
+    Calculate Gamma Sequence - shows gamma exposure progression across strikes.
+
+    For each strike, computes:
+    - Cumulative gamma from lowest strike to current (running sum)
+    - Gamma profile shape (where gamma concentrates)
+    - Gamma acceleration (rate of change of cumulative gamma)
+
+    This helps identify zones where dealer hedging pressure intensifies or weakens.
+
+    Returns: dict with gamma_seq_df, gamma_profile, peak_gamma_strike, gamma_acceleration
+    """
+    if df_summary is None or df_summary.empty:
+        return None
+
+    try:
+        seq_data = []
+        for _, row in df_summary.iterrows():
+            strike = row.get('Strike', 0)
+            gamma_ce = row.get('Gamma_CE', 0) or 0
+            gamma_pe = row.get('Gamma_PE', 0) or 0
+            oi_ce = row.get('openInterest_CE', 0) or 0
+            oi_pe = row.get('openInterest_PE', 0) or 0
+
+            # Raw gamma exposure per strike (in Lakhs)
+            ce_gamma_exp = gamma_ce * oi_ce * contract_multiplier * spot_price / 100000
+            pe_gamma_exp = gamma_pe * oi_pe * contract_multiplier * spot_price / 100000
+            total_gamma = ce_gamma_exp + pe_gamma_exp
+            net_gamma = pe_gamma_exp - ce_gamma_exp  # Dealer perspective
+
+            seq_data.append({
+                'Strike': strike,
+                'CE_Gamma_Exp': round(ce_gamma_exp, 2),
+                'PE_Gamma_Exp': round(pe_gamma_exp, 2),
+                'Total_Gamma': round(total_gamma, 2),
+                'Net_Gamma': round(net_gamma, 2),
+                'Zone': row.get('Zone', '-')
+            })
+
+        gamma_seq_df = pd.DataFrame(seq_data).sort_values('Strike').reset_index(drop=True)
+
+        # Cumulative gamma from lowest strike upward
+        gamma_seq_df['Cumul_CE_Gamma'] = gamma_seq_df['CE_Gamma_Exp'].cumsum().round(2)
+        gamma_seq_df['Cumul_PE_Gamma'] = gamma_seq_df['PE_Gamma_Exp'].cumsum().round(2)
+        gamma_seq_df['Cumul_Net_Gamma'] = gamma_seq_df['Net_Gamma'].cumsum().round(2)
+
+        # Gamma acceleration (diff of cumulative = per-strike contribution rate)
+        gamma_seq_df['Gamma_Accel'] = gamma_seq_df['Cumul_Net_Gamma'].diff().fillna(0).round(2)
+
+        # Peak gamma strike (max total gamma exposure)
+        peak_idx = gamma_seq_df['Total_Gamma'].idxmax()
+        peak_gamma_strike = gamma_seq_df.loc[peak_idx, 'Strike']
+
+        # Gamma profile: where does gamma concentrate relative to spot?
+        above_spot = gamma_seq_df[gamma_seq_df['Strike'] > spot_price]['Total_Gamma'].sum()
+        below_spot = gamma_seq_df[gamma_seq_df['Strike'] < spot_price]['Total_Gamma'].sum()
+        total_gamma_all = gamma_seq_df['Total_Gamma'].sum()
+
+        if total_gamma_all > 0:
+            above_pct = (above_spot / total_gamma_all) * 100
+            below_pct = (below_spot / total_gamma_all) * 100
+        else:
+            above_pct = below_pct = 50
+
+        if above_pct > 60:
+            gamma_profile = "Gamma Heavy Above (Resistance Dominant)"
+            profile_color = "#ff4444"
+        elif below_pct > 60:
+            gamma_profile = "Gamma Heavy Below (Support Dominant)"
+            profile_color = "#00ff88"
+        else:
+            gamma_profile = "Gamma Balanced"
+            profile_color = "#FFD700"
+
+        return {
+            'gamma_seq_df': gamma_seq_df,
+            'peak_gamma_strike': peak_gamma_strike,
+            'gamma_profile': gamma_profile,
+            'profile_color': profile_color,
+            'above_pct': round(above_pct, 1),
+            'below_pct': round(below_pct, 1),
+            'total_gamma': round(total_gamma_all, 2)
+        }
+
+    except Exception as e:
+        return None
+
 
 def calculate_pcr_gex_confluence(pcr_value, gex_data, zone='ATM'):
     """
@@ -4264,6 +4352,18 @@ def main():
     if 'gex_current_strikes' not in st.session_state:
         st.session_state.gex_current_strikes = []
 
+    # Initialize session state for PCR of Total Change in OI history
+    if 'pcr_chgoi_history' not in st.session_state:
+        st.session_state.pcr_chgoi_history = []
+    if 'pcr_chgoi_last_valid' not in st.session_state:
+        st.session_state.pcr_chgoi_last_valid = None
+
+    # Initialize session state for Total GEX time-series history
+    if 'total_gex_history' not in st.session_state:
+        st.session_state.total_gex_history = []
+    if 'total_gex_last_valid' not in st.session_state:
+        st.session_state.total_gex_last_valid = None
+
     # Initialize Supabase
     try:
         if not supabase_url or not supabase_key:
@@ -5690,6 +5790,430 @@ def main():
 
         except Exception as e:
             st.warning(f"GEX analysis unavailable: {str(e)}")
+
+        # ===== PCR OF TOTAL CHANGE IN OI - TIME SERIES GRAPH =====
+        st.markdown("---")
+        st.markdown("## 📊 PCR of Total Change in OI - Time Series")
+
+        try:
+            df_summary_pcr = option_data.get('df_summary') if option_data else None
+            if df_summary_pcr is not None and 'changeinOpenInterest_CE' in df_summary_pcr.columns and 'changeinOpenInterest_PE' in df_summary_pcr.columns:
+                total_ce_chgoi = df_summary_pcr['changeinOpenInterest_CE'].sum()
+                total_pe_chgoi = df_summary_pcr['changeinOpenInterest_PE'].sum()
+
+                # PCR = Total PE ChgOI / Total CE ChgOI
+                if total_ce_chgoi != 0:
+                    pcr_chgoi = abs(total_pe_chgoi / total_ce_chgoi)
+                else:
+                    pcr_chgoi = 0
+
+                pcr_chgoi = round(pcr_chgoi, 3)
+
+                # Cache in session state
+                ist = pytz.timezone('Asia/Kolkata')
+                current_time = datetime.now(ist)
+
+                st.session_state.pcr_chgoi_last_valid = {
+                    'pcr': pcr_chgoi,
+                    'ce_chgoi': total_ce_chgoi,
+                    'pe_chgoi': total_pe_chgoi,
+                    'time': current_time
+                }
+
+                # Add to history (avoid duplicates within 30 seconds)
+                should_add = True
+                if st.session_state.pcr_chgoi_history:
+                    last_entry = st.session_state.pcr_chgoi_history[-1]
+                    time_diff = (current_time - last_entry['time']).total_seconds()
+                    if time_diff < 30:
+                        should_add = False
+
+                if should_add:
+                    st.session_state.pcr_chgoi_history.append({
+                        'time': current_time,
+                        'pcr': pcr_chgoi,
+                        'ce_chgoi': total_ce_chgoi,
+                        'pe_chgoi': total_pe_chgoi
+                    })
+                    if len(st.session_state.pcr_chgoi_history) > 200:
+                        st.session_state.pcr_chgoi_history = st.session_state.pcr_chgoi_history[-200:]
+
+            # Display graph from cached history
+            if len(st.session_state.pcr_chgoi_history) > 0:
+                pcr_chgoi_df = pd.DataFrame(st.session_state.pcr_chgoi_history)
+
+                # Summary cards
+                latest = st.session_state.pcr_chgoi_last_valid or {}
+                curr_pcr = latest.get('pcr', 0)
+                curr_ce = latest.get('ce_chgoi', 0)
+                curr_pe = latest.get('pe_chgoi', 0)
+
+                pcr_card1, pcr_card2, pcr_card3 = st.columns(3)
+                with pcr_card1:
+                    pcr_color = "#00ff88" if curr_pcr > 1.2 else "#ff4444" if curr_pcr < 0.7 else "#FFD700"
+                    pcr_label = "Bullish" if curr_pcr > 1.2 else "Bearish" if curr_pcr < 0.7 else "Neutral"
+                    st.markdown(f"""
+                    <div style="background-color: {pcr_color}20; padding: 15px; border-radius: 10px; border: 2px solid {pcr_color};">
+                        <h4 style="color: {pcr_color}; margin: 0;">PCR (ΔOI)</h4>
+                        <h2 style="color: {pcr_color}; margin: 5px 0;">{curr_pcr:.3f}</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{pcr_label}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with pcr_card2:
+                    ce_color = "#ff4444" if curr_ce > 0 else "#00ff88"
+                    st.markdown(f"""
+                    <div style="background-color: {ce_color}20; padding: 15px; border-radius: 10px; border: 2px solid {ce_color};">
+                        <h4 style="color: {ce_color}; margin: 0;">Total CE ΔOI</h4>
+                        <h2 style="color: {ce_color}; margin: 5px 0;">{curr_ce/100000:+.2f}L</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{'Call Writing ↑' if curr_ce > 0 else 'Call Unwinding ↓'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with pcr_card3:
+                    pe_color = "#00ff88" if curr_pe > 0 else "#ff4444"
+                    st.markdown(f"""
+                    <div style="background-color: {pe_color}20; padding: 15px; border-radius: 10px; border: 2px solid {pe_color};">
+                        <h4 style="color: {pe_color}; margin: 0;">Total PE ΔOI</h4>
+                        <h2 style="color: {pe_color}; margin: 5px 0;">{curr_pe/100000:+.2f}L</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{'Put Writing ↑' if curr_pe > 0 else 'Put Unwinding ↓'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                # PCR of ChgOI Time-Series Chart
+                fig_pcr_chgoi = go.Figure()
+
+                # Color the line based on PCR zones
+                fig_pcr_chgoi.add_trace(go.Scatter(
+                    x=pcr_chgoi_df['time'],
+                    y=pcr_chgoi_df['pcr'],
+                    mode='lines+markers',
+                    name='PCR (ΔOI)',
+                    line=dict(color='#00aaff', width=3),
+                    marker=dict(size=6, color=[
+                        '#00ff88' if v > 1.2 else '#ff4444' if v < 0.7 else '#FFD700'
+                        for v in pcr_chgoi_df['pcr']
+                    ]),
+                    fill='tozeroy',
+                    fillcolor='rgba(0, 170, 255, 0.1)'
+                ))
+
+                # Reference zones
+                fig_pcr_chgoi.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1,
+                                        annotation_text="1.0 (Neutral)", annotation_position="right")
+                fig_pcr_chgoi.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1,
+                                        annotation_text="1.2 (Bullish)", annotation_position="right")
+                fig_pcr_chgoi.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1,
+                                        annotation_text="0.7 (Bearish)", annotation_position="right")
+
+                # Add green/red shading zones
+                y_max = max(pcr_chgoi_df['pcr'].max() * 1.2, 1.5)
+                fig_pcr_chgoi.add_hrect(y0=1.2, y1=y_max, fillcolor="#00ff8810", line_width=0)
+                fig_pcr_chgoi.add_hrect(y0=0, y1=0.7, fillcolor="#ff444410", line_width=0)
+
+                fig_pcr_chgoi.update_layout(
+                    title=f"PCR of Total Change in OI | Current: {curr_pcr:.3f} ({pcr_label})",
+                    template='plotly_dark',
+                    height=400,
+                    showlegend=False,
+                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                    yaxis=dict(title='PCR (Total PE ΔOI / Total CE ΔOI)', rangemode='tozero'),
+                    plot_bgcolor='#1e1e1e',
+                    paper_bgcolor='#1e1e1e',
+                    margin=dict(l=50, r=50, t=60, b=50)
+                )
+
+                st.plotly_chart(fig_pcr_chgoi, use_container_width=True)
+
+                # Status bar
+                pcr_info1, pcr_info2 = st.columns([3, 1])
+                with pcr_info1:
+                    st.caption(f"🟢 Live | 📈 {len(st.session_state.pcr_chgoi_history)} data points | PCR > 1.2 = Bullish | PCR < 0.7 = Bearish")
+                with pcr_info2:
+                    if st.button("🗑️ Clear PCR ΔOI History"):
+                        st.session_state.pcr_chgoi_history = []
+                        st.session_state.pcr_chgoi_last_valid = None
+                        st.rerun()
+            else:
+                st.info("📊 PCR (ΔOI) history will build up as the app refreshes. Please wait for data collection...")
+
+        except Exception as e:
+            st.warning(f"PCR of ΔOI analysis unavailable: {str(e)}")
+
+        # ===== TOTAL GEX TIME-SERIES GRAPH =====
+        st.markdown("---")
+        st.markdown("## 📊 Total GEX (Gamma Exposure) - Time Series")
+
+        try:
+            df_summary_gex = option_data.get('df_summary') if option_data else None
+            underlying_price_gex = option_data.get('underlying') if option_data else None
+
+            if df_summary_gex is not None and underlying_price_gex:
+                gex_calc = calculate_dealer_gex(df_summary_gex, underlying_price_gex)
+                if gex_calc:
+                    total_gex_val = gex_calc['total_gex']
+                    gex_signal_val = gex_calc['gex_signal']
+                    gex_color_val = gex_calc['gex_color']
+                    gex_interp_val = gex_calc['gex_interpretation']
+                    flip_level = gex_calc.get('gamma_flip_level')
+
+                    # Cache in session state
+                    ist = pytz.timezone('Asia/Kolkata')
+                    current_time = datetime.now(ist)
+
+                    st.session_state.total_gex_last_valid = {
+                        'total_gex': total_gex_val,
+                        'signal': gex_signal_val,
+                        'color': gex_color_val,
+                        'interpretation': gex_interp_val,
+                        'flip_level': flip_level,
+                        'time': current_time
+                    }
+
+                    # Add to history
+                    should_add = True
+                    if st.session_state.total_gex_history:
+                        last_entry = st.session_state.total_gex_history[-1]
+                        time_diff = (current_time - last_entry['time']).total_seconds()
+                        if time_diff < 30:
+                            should_add = False
+
+                    if should_add:
+                        st.session_state.total_gex_history.append({
+                            'time': current_time,
+                            'total_gex': total_gex_val,
+                            'signal': gex_signal_val,
+                            'flip_level': flip_level
+                        })
+                        if len(st.session_state.total_gex_history) > 200:
+                            st.session_state.total_gex_history = st.session_state.total_gex_history[-200:]
+
+            # Display graph from cached history
+            if len(st.session_state.total_gex_history) > 0:
+                gex_ts_df = pd.DataFrame(st.session_state.total_gex_history)
+
+                latest_gex = st.session_state.total_gex_last_valid or {}
+                curr_gex = latest_gex.get('total_gex', 0)
+                curr_signal = latest_gex.get('signal', 'N/A')
+                curr_gex_color = latest_gex.get('color', '#FFD700')
+                curr_interp = latest_gex.get('interpretation', 'N/A')
+
+                # Total GEX Time-Series Chart
+                fig_total_gex = go.Figure()
+
+                # Color markers based on positive/negative
+                marker_colors = ['#00ff88' if v >= 0 else '#ff4444' for v in gex_ts_df['total_gex']]
+
+                fig_total_gex.add_trace(go.Scatter(
+                    x=gex_ts_df['time'],
+                    y=gex_ts_df['total_gex'],
+                    mode='lines+markers',
+                    name='Total GEX',
+                    line=dict(color=curr_gex_color, width=3),
+                    marker=dict(size=6, color=marker_colors),
+                    fill='tozeroy',
+                    fillcolor=f'{curr_gex_color}15'
+                ))
+
+                # Zero reference line (critical flip boundary)
+                fig_total_gex.add_hline(y=0, line_dash="solid", line_color="white", line_width=2,
+                                        annotation_text="0 (Gamma Flip)", annotation_position="right")
+
+                # Threshold lines
+                fig_total_gex.add_hline(y=50, line_dash="dot", line_color="#00ff88", line_width=1,
+                                        annotation_text="+50 (Strong Pin)", annotation_position="right")
+                fig_total_gex.add_hline(y=-50, line_dash="dot", line_color="#ff4444", line_width=1,
+                                        annotation_text="-50 (Strong Trend)", annotation_position="right")
+
+                # Shading zones
+                y_max_gex = max(abs(gex_ts_df['total_gex'].max()), abs(gex_ts_df['total_gex'].min()), 60) * 1.2
+                fig_total_gex.add_hrect(y0=50, y1=y_max_gex, fillcolor="#00ff8810", line_width=0)
+                fig_total_gex.add_hrect(y0=-y_max_gex, y1=-50, fillcolor="#ff444410", line_width=0)
+
+                fig_total_gex.update_layout(
+                    title=f"Total Net GEX | Current: {curr_gex:+.2f}L ({curr_signal})",
+                    template='plotly_dark',
+                    height=400,
+                    showlegend=False,
+                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                    yaxis=dict(
+                        title='Total Net GEX (Lakhs)',
+                        zeroline=True,
+                        zerolinecolor='white',
+                        zerolinewidth=2
+                    ),
+                    plot_bgcolor='#1e1e1e',
+                    paper_bgcolor='#1e1e1e',
+                    margin=dict(l=50, r=50, t=60, b=50)
+                )
+
+                st.plotly_chart(fig_total_gex, use_container_width=True)
+
+                # Interpretation box
+                st.markdown(f"""
+                <div style="background-color: #1e1e1e; padding: 15px; border-radius: 10px; border-left: 4px solid {curr_gex_color}; margin: 10px 0;">
+                    <b style="color: {curr_gex_color};">Current Regime:</b> {curr_interp}
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Status bar
+                gex_ts_info1, gex_ts_info2 = st.columns([3, 1])
+                with gex_ts_info1:
+                    st.caption(f"🟢 Live | 📈 {len(st.session_state.total_gex_history)} data points | +GEX = Pin/Chop | -GEX = Trend/Breakout")
+                with gex_ts_info2:
+                    if st.button("🗑️ Clear Total GEX History"):
+                        st.session_state.total_gex_history = []
+                        st.session_state.total_gex_last_valid = None
+                        st.rerun()
+            else:
+                st.info("📊 Total GEX history will build up as the app refreshes. Please wait for data collection...")
+
+        except Exception as e:
+            st.warning(f"Total GEX time-series unavailable: {str(e)}")
+
+        # ===== GAMMA SEQUENCE ANALYSIS =====
+        st.markdown("---")
+        st.markdown("## 📊 Gamma Sequence Analysis")
+
+        try:
+            df_summary_gs = option_data.get('df_summary') if option_data else None
+            underlying_price_gs = option_data.get('underlying') if option_data else None
+
+            if df_summary_gs is not None and underlying_price_gs:
+                gamma_seq = calculate_gamma_sequence(df_summary_gs, underlying_price_gs)
+
+                if gamma_seq:
+                    gs_df = gamma_seq['gamma_seq_df']
+
+                    # Summary cards
+                    gs_col1, gs_col2, gs_col3 = st.columns(3)
+                    with gs_col1:
+                        pcolor = gamma_seq['profile_color']
+                        st.markdown(f"""
+                        <div style="background-color: {pcolor}20; padding: 15px; border-radius: 10px; border: 2px solid {pcolor};">
+                            <h4 style="color: {pcolor}; margin: 0;">Gamma Profile</h4>
+                            <h2 style="color: {pcolor}; margin: 5px 0; font-size: 16px;">{gamma_seq['gamma_profile']}</h2>
+                            <p style="color: white; margin: 0; font-size: 12px;">Above: {gamma_seq['above_pct']}% | Below: {gamma_seq['below_pct']}%</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with gs_col2:
+                        st.markdown(f"""
+                        <div style="background-color: #FFD70020; padding: 15px; border-radius: 10px; border: 2px solid #FFD700;">
+                            <h4 style="color: #FFD700; margin: 0;">Peak Gamma</h4>
+                            <h2 style="color: #FFD700; margin: 5px 0;">₹{gamma_seq['peak_gamma_strike']:.0f}</h2>
+                            <p style="color: white; margin: 0; font-size: 12px;">Highest total gamma exposure</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with gs_col3:
+                        st.markdown(f"""
+                        <div style="background-color: #00aaff20; padding: 15px; border-radius: 10px; border: 2px solid #00aaff;">
+                            <h4 style="color: #00aaff; margin: 0;">Total Gamma</h4>
+                            <h2 style="color: #00aaff; margin: 5px 0;">{gamma_seq['total_gamma']:.2f}L</h2>
+                            <p style="color: white; margin: 0; font-size: 12px;">Sum of all strike gamma</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    # Gamma Sequence Chart - Stacked bar (CE vs PE gamma per strike)
+                    fig_gs = make_subplots(
+                        rows=2, cols=1,
+                        shared_xaxes=True,
+                        vertical_spacing=0.08,
+                        subplot_titles=('CE vs PE Gamma Exposure by Strike', 'Cumulative Net Gamma Sequence'),
+                        row_heights=[0.5, 0.5]
+                    )
+
+                    # Top: CE vs PE gamma bars
+                    fig_gs.add_trace(go.Bar(
+                        x=gs_df['Strike'],
+                        y=gs_df['CE_Gamma_Exp'],
+                        name='CE Gamma',
+                        marker_color='#ff4444',
+                        text=[f"{v:.1f}" for v in gs_df['CE_Gamma_Exp']],
+                        textposition='outside',
+                        textfont=dict(size=9)
+                    ), row=1, col=1)
+
+                    fig_gs.add_trace(go.Bar(
+                        x=gs_df['Strike'],
+                        y=gs_df['PE_Gamma_Exp'],
+                        name='PE Gamma',
+                        marker_color='#00ff88',
+                        text=[f"{v:.1f}" for v in gs_df['PE_Gamma_Exp']],
+                        textposition='outside',
+                        textfont=dict(size=9)
+                    ), row=1, col=1)
+
+                    # Bottom: Cumulative net gamma line
+                    fig_gs.add_trace(go.Scatter(
+                        x=gs_df['Strike'],
+                        y=gs_df['Cumul_Net_Gamma'],
+                        mode='lines+markers',
+                        name='Cumul Net Gamma',
+                        line=dict(color='#00aaff', width=3),
+                        marker=dict(size=8, color=[
+                            '#00ff88' if v >= 0 else '#ff4444' for v in gs_df['Cumul_Net_Gamma']
+                        ]),
+                        fill='tozeroy',
+                        fillcolor='rgba(0, 170, 255, 0.1)'
+                    ), row=2, col=1)
+
+                    fig_gs.add_hline(y=0, line_dash="dash", line_color="white", line_width=1, row=2, col=1)
+
+                    # Spot price vertical line on both subplots
+                    fig_gs.add_vline(
+                        x=underlying_price_gs,
+                        line_dash="solid",
+                        line_color="#FFD700",
+                        line_width=2,
+                        annotation_text=f"Spot: ₹{underlying_price_gs:.0f}",
+                        annotation_position="top",
+                        row=1, col=1
+                    )
+                    fig_gs.add_vline(
+                        x=underlying_price_gs,
+                        line_dash="solid",
+                        line_color="#FFD700",
+                        line_width=2,
+                        row=2, col=1
+                    )
+
+                    fig_gs.update_layout(
+                        template='plotly_dark',
+                        height=600,
+                        showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        plot_bgcolor='#1e1e1e',
+                        paper_bgcolor='#1e1e1e',
+                        margin=dict(l=50, r=50, t=80, b=50),
+                        barmode='group'
+                    )
+
+                    fig_gs.update_yaxes(title_text="Gamma Exp (L)", row=1, col=1)
+                    fig_gs.update_yaxes(title_text="Cumul Net Gamma (L)", row=2, col=1)
+                    fig_gs.update_xaxes(title_text="Strike Price", row=2, col=1)
+
+                    st.plotly_chart(fig_gs, use_container_width=True)
+
+                    # Gamma sequence table
+                    with st.expander("📋 Gamma Sequence Data"):
+                        gs_display = gs_df[['Strike', 'Zone', 'CE_Gamma_Exp', 'PE_Gamma_Exp', 'Net_Gamma',
+                                            'Cumul_Net_Gamma', 'Gamma_Accel']].copy()
+                        gs_display['Strike'] = gs_display['Strike'].apply(lambda x: f"₹{x:.0f}")
+                        st.dataframe(gs_display, use_container_width=True, hide_index=True)
+
+                        st.markdown("""
+                        **Gamma Sequence Interpretation:**
+                        - **CE Gamma (Red)**: Call gamma exposure per strike - higher = stronger resistance
+                        - **PE Gamma (Green)**: Put gamma exposure per strike - higher = stronger support
+                        - **Cumul Net Gamma**: Running sum of net gamma from lowest strike upward
+                        - **Gamma Accel**: Rate of change in cumulative gamma - spikes show gamma walls
+                        - **Peak Gamma**: Strike with highest total gamma - strongest hedging activity
+                        """)
+                else:
+                    st.warning("Unable to calculate gamma sequence. Check option chain data.")
+            else:
+                st.info("Gamma sequence requires option chain data.")
+
+        except Exception as e:
+            st.warning(f"Gamma sequence unavailable: {str(e)}")
 
         # Expandable section for detailed Greeks and raw values
         with st.expander("📊 Detailed Greeks & Raw Values"):
