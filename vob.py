@@ -5906,8 +5906,8 @@ def main():
 
                 # Add green/red shading zones
                 y_max = max(pcr_chgoi_df['pcr'].max() * 1.2, 1.5)
-                fig_pcr_chgoi.add_hrect(y0=1.2, y1=y_max, fillcolor="#00ff8810", line_width=0)
-                fig_pcr_chgoi.add_hrect(y0=0, y1=0.7, fillcolor="#ff444410", line_width=0)
+                fig_pcr_chgoi.add_hrect(y0=1.2, y1=y_max, fillcolor="rgba(0,255,136,0.06)", line_width=0)
+                fig_pcr_chgoi.add_hrect(y0=0, y1=0.7, fillcolor="rgba(255,68,68,0.06)", line_width=0)
 
                 fig_pcr_chgoi.update_layout(
                     title=f"PCR of Total Change in OI | Current: {curr_pcr:.3f} ({pcr_label})",
@@ -6010,7 +6010,7 @@ def main():
                     line=dict(color=curr_gex_color, width=3),
                     marker=dict(size=6, color=marker_colors),
                     fill='tozeroy',
-                    fillcolor=f'{curr_gex_color}15'
+                    fillcolor='rgba(0,255,136,0.08)' if curr_gex >= 0 else 'rgba(255,68,68,0.08)'
                 ))
 
                 # Zero reference line (critical flip boundary)
@@ -6025,8 +6025,8 @@ def main():
 
                 # Shading zones
                 y_max_gex = max(abs(gex_ts_df['total_gex'].max()), abs(gex_ts_df['total_gex'].min()), 60) * 1.2
-                fig_total_gex.add_hrect(y0=50, y1=y_max_gex, fillcolor="#00ff8810", line_width=0)
-                fig_total_gex.add_hrect(y0=-y_max_gex, y1=-50, fillcolor="#ff444410", line_width=0)
+                fig_total_gex.add_hrect(y0=50, y1=y_max_gex, fillcolor="rgba(0,255,136,0.06)", line_width=0)
+                fig_total_gex.add_hrect(y0=-y_max_gex, y1=-50, fillcolor="rgba(255,68,68,0.06)", line_width=0)
 
                 fig_total_gex.update_layout(
                     title=f"Total Net GEX | Current: {curr_gex:+.2f}L ({curr_signal})",
