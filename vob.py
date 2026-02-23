@@ -3676,9 +3676,9 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
 
     atm_strike = min(df['strikePrice'], key=lambda x: abs(x - underlying))
     
-    # Limit to ATM ± 2 strikes for faster UI (performance optimization)
-    atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]  # Assuming 50 point strikes
-    df = atm_plus_minus_2.copy()
+    # Limit to ATM ± 5 strikes for Strike Price / LTP table display
+    atm_plus_minus_5 = df[abs(df['strikePrice'] - atm_strike) <= 250]  # Assuming 50 point strikes
+    df = atm_plus_minus_5.copy()
     
     df['Zone'] = df['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
     df['Level'] = df.apply(determine_level, axis=1)
@@ -4231,6 +4231,7 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     # Return all data for external display
     return {
         'underlying': underlying,
+        'atm_strike': atm_strike,
         'df_summary': df_summary,
         'expiry_dates': expiry_dates,
         'expiry': expiry,
@@ -5115,6 +5116,54 @@ def main():
             st.metric("CALL ΔOI", f"{option_data['total_ce_change']:+.1f}L", delta_color="inverse")
         with oi_col2:
             st.metric("PUT ΔOI", f"{option_data['total_pe_change']:+.1f}L", delta_color="normal")
+
+        # ===== STRIKE PRICE vs LTP TABLE (ATM ± 5) =====
+        st.markdown("---")
+        st.markdown("## Strike Price vs LTP (ATM ± 5)")
+
+        df_summary_ltp = option_data.get('df_summary')
+        atm_strike_ltp = option_data.get('atm_strike')
+
+        if (df_summary_ltp is not None
+                and 'lastPrice_CE' in df_summary_ltp.columns
+                and 'lastPrice_PE' in df_summary_ltp.columns):
+
+            # Build CE LTP | STRIKE | PE LTP display sorted descending (OTM calls at top)
+            ltp_tbl = df_summary_ltp[['Strike', 'lastPrice_CE', 'lastPrice_PE', 'Zone']].copy()
+            ltp_tbl = ltp_tbl.sort_values('Strike', ascending=False).reset_index(drop=True)
+
+            zones_arr = ltp_tbl['Zone'].values
+
+            ltp_display = pd.DataFrame({
+                'CE LTP': ltp_tbl['lastPrice_CE'].apply(lambda x: f"{x:.2f}"),
+                'STRIKE': ltp_tbl['Strike'].apply(lambda x: f"{int(x)}"),
+                'PE LTP': ltp_tbl['lastPrice_PE'].apply(lambda x: f"{x:.2f}"),
+            })
+
+            def style_ltp_row(row):
+                zone = zones_arr[row.name]
+                if zone == 'ATM':
+                    return [
+                        'background-color:#1a3a1a; color:#00ff88; font-weight:bold',
+                        'background-color:#FFD700; color:#000000; font-weight:bold; text-align:center',
+                        'background-color:#3a1a1a; color:#ff6b6b; font-weight:bold',
+                    ]
+                else:
+                    return [
+                        'background-color:#0d1f0d; color:#00cc66',
+                        'background-color:#1a1a2e; color:#c0c0c0; text-align:center',
+                        'background-color:#1f0d0d; color:#ff6b6b',
+                    ]
+
+            styled_ltp = (
+                ltp_display.style
+                .apply(style_ltp_row, axis=1)
+                .set_properties(**{'text-align': 'center'})
+            )
+
+            col_ltp1, col_ltp2, col_ltp3 = st.columns([1, 1, 1])
+            with col_ltp2:
+                st.dataframe(styled_ltp, use_container_width=True, hide_index=True)
 
         # Option Chain Bias Summary Table
         st.markdown("## Option Chain Bias Summary")
