@@ -106,6 +106,9 @@ except Exception:
 NIFTY_UNDERLYING_SCRIP = 13
 NIFTY_UNDERLYING_SEG = "IDX_I"
 
+SENSEX_SCRIP_ID = "51"       # BSE Sensex security ID in Dhan API
+SENSEX_EXCHANGE_SEG = "IDX_I"  # BSE index segment
+
 # Cached functions for performance
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def cached_pivot_calculation(df_json, pivot_settings):
@@ -4337,6 +4340,79 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
             max_loss = analytics_df['price_change_pct'].min()
             st.metric("Max Daily Loss", f"{max_loss:.2f}%")
 
+def fetch_index_metrics(api, security_id, exchange_segment, interval="1", days_back=1):
+    """Fetch intraday OHLCV + LTP for an index and return a metrics dict."""
+    try:
+        data = api.get_intraday_data(
+            security_id=security_id,
+            exchange_segment=exchange_segment,
+            instrument="INDEX",
+            interval=interval,
+            days_back=days_back
+        )
+        df = process_candle_data(data, interval) if data else pd.DataFrame()
+        ltp_resp = api.get_ltp_data(security_id, exchange_segment)
+        current = None
+        if ltp_resp and 'data' in ltp_resp:
+            for _exc, _d in ltp_resp['data'].items():
+                for _sid, _pd in _d.items():
+                    current = _pd.get('last_price')
+                    break
+        if current is None and not df.empty:
+            current = float(df['close'].iloc[-1])
+        if df.empty or current is None:
+            return None
+        prev_close = float(df['close'].iloc[-2]) if len(df) > 1 else float(df['close'].iloc[0])
+        change = current - prev_close
+        change_pct = (change / prev_close) * 100 if prev_close else 0
+        return {
+            'current': current,
+            'change': change,
+            'change_pct': change_pct,
+            'day_high': float(df['high'].max()),
+            'day_low': float(df['low'].min()),
+            'day_open': float(df['open'].iloc[0]),
+            'volume': int(df['volume'].sum()),
+        }
+    except Exception:
+        return None
+
+
+def show_market_overview(api, interval="1", days_back=1):
+    """Render NIFTY 50 and SENSEX metrics in a tabbed table at the top of the page."""
+    st.markdown("### Market Overview")
+
+    tab_nifty, tab_sensex = st.tabs(["📈 NIFTY 50", "📊 SENSEX"])
+
+    def _render_metrics(m, label):
+        if m is None:
+            st.warning(f"Could not fetch {label} data.")
+            return
+        sign = "+" if m['change'] >= 0 else ""
+        arrow = "▲" if m['change'] >= 0 else "▼"
+        chg_color = "#00cc66" if m['change'] >= 0 else "#ff4444"
+        cols = st.columns(5)
+        cols[0].metric("Current Price", f"₹{m['current']:,.2f}")
+        cols[1].metric(
+            "Change",
+            f"{sign}{m['change']:,.2f}",
+            delta=f"{sign}{m['change_pct']:.2f}%"
+        )
+        cols[2].metric("Day High", f"₹{m['day_high']:,.2f}")
+        cols[3].metric("Day Low",  f"₹{m['day_low']:,.2f}")
+        cols[4].metric("Day Open", f"₹{m['day_open']:,.2f}")
+
+    with tab_nifty:
+        nifty_m = fetch_index_metrics(api, "13", "IDX_I", interval, days_back)
+        _render_metrics(nifty_m, "NIFTY 50")
+
+    with tab_sensex:
+        sensex_m = fetch_index_metrics(api, SENSEX_SCRIP_ID, SENSEX_EXCHANGE_SEG, interval, days_back)
+        _render_metrics(sensex_m, "SENSEX")
+
+    st.markdown("---")
+
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -4600,7 +4676,10 @@ def main():
     
     # Initialize API
     api = DhanAPI(access_token, client_id)
-    
+
+    # ===== MARKET OVERVIEW (NIFTY + SENSEX) =====
+    show_market_overview(api, interval=timeframes.get(selected_timeframe, "1"), days_back=days_back)
+
     # Main layout - Trading chart and Options analysis side by side
     col1, col2 = st.columns([2, 1])
 
