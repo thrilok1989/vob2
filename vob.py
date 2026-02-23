@@ -106,8 +106,8 @@ except Exception:
 NIFTY_UNDERLYING_SCRIP = 13
 NIFTY_UNDERLYING_SEG = "IDX_I"
 
-SENSEX_SCRIP_ID = "51"         # BSE Sensex security ID in Dhan API
-SENSEX_EXCHANGE_SEG = "BSE_IDX"  # BSE index segment (confirmed from Dhan API docs)
+SENSEX_SCRIP_ID = "51"        # BSE Sensex security ID in Dhan API
+SENSEX_EXCHANGE_SEG = "IDX_I"  # All indices (NSE + BSE) share IDX_I segment in Dhan API
 
 # Cached functions for performance
 @st.cache_data(ttl=300)  # Cache for 5 minutes
