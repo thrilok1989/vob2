@@ -3669,7 +3669,8 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         'top_ask_quantity': 'askQty',
         'top_bid_quantity': 'bidQty',
         'volume': 'totalTradedVolume',
-        'iv': 'impliedVolatility'
+        'iv': 'impliedVolatility',
+        'security_id': 'scrp_cd'  # Dhan v2 API returns security_id for each option contract
     }
     for old_col, new_col in column_mapping.items():
         if f"{old_col}_CE" in df.columns:
