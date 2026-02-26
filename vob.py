@@ -412,33 +412,6 @@ class DhanAPI:
             st.error(f"Error fetching LTP: {str(e)}")
             return None
 
-    def place_order(self, security_id, trading_symbol, transaction_type="BUY",
-                    quantity=65, exchange_segment="NSE_FNO", product_type="INTRADAY"):
-        """Place a market order for an options contract"""
-        url = f"{self.base_url}/orders"
-        payload = {
-            "dhanClientId": self.client_id,
-            "transactionType": transaction_type,
-            "exchangeSegment": exchange_segment,
-            "productType": product_type,
-            "orderType": "MARKET",
-            "validity": "DAY",
-            "tradingSymbol": trading_symbol,
-            "securityId": str(security_id),
-            "quantity": quantity,
-            "price": 0,
-            "disclosedQuantity": 0,
-            "afterMarketOrder": False
-        }
-        try:
-            response = requests.post(url, headers=self.headers, json=payload)
-            if response.status_code in (200, 201):
-                return True, response.json()
-            else:
-                return False, f"HTTP {response.status_code}: {response.text}"
-        except Exception as e:
-            return False, str(e)
-
 @st.cache_data(ttl=300)  # Cache expiry list for 5 minutes
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
     return get_dhan_expiry_list(underlying_scrip, underlying_seg)
@@ -3703,9 +3676,9 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
 
     atm_strike = min(df['strikePrice'], key=lambda x: abs(x - underlying))
     
-    # Limit to ATM ± 5 strikes for Strike Price / LTP table display
-    atm_plus_minus_5 = df[abs(df['strikePrice'] - atm_strike) <= 250]  # Assuming 50 point strikes
-    df = atm_plus_minus_5.copy()
+    # Limit to ATM ± 2 strikes for faster UI (performance optimization)
+    atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]  # Assuming 50 point strikes
+    df = atm_plus_minus_2.copy()
     
     df['Zone'] = df['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
     df['Level'] = df.apply(determine_level, axis=1)
@@ -3849,8 +3822,7 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     merge_cols = ['strikePrice', 'openInterest_CE', 'openInterest_PE', 'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
                   'lastPrice_CE', 'lastPrice_PE', 'totalTradedVolume_CE', 'totalTradedVolume_PE',
                   'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'Vega_CE', 'Vega_PE', 'Theta_CE', 'Theta_PE',
-                  'impliedVolatility_CE', 'impliedVolatility_PE', 'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE',
-                  'scrp_cd_CE', 'scrp_cd_PE']
+                  'impliedVolatility_CE', 'impliedVolatility_PE', 'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']
     merge_cols = [col for col in merge_cols if col in df.columns]
 
     df_summary = pd.merge(
@@ -4259,7 +4231,6 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     # Return all data for external display
     return {
         'underlying': underlying,
-        'atm_strike': atm_strike,
         'df_summary': df_summary,
         'expiry_dates': expiry_dates,
         'expiry': expiry,
@@ -5144,90 +5115,6 @@ def main():
             st.metric("CALL ΔOI", f"{option_data['total_ce_change']:+.1f}L", delta_color="inverse")
         with oi_col2:
             st.metric("PUT ΔOI", f"{option_data['total_pe_change']:+.1f}L", delta_color="normal")
-
-        # ===== STRIKE PRICE vs LTP TABLE (ATM ± 5) =====
-        st.markdown("---")
-        st.markdown("## Strike Price vs LTP (ATM ± 5)")
-
-        df_summary_ltp = option_data.get('df_summary')
-        atm_strike_ltp = option_data.get('atm_strike')
-
-        if (df_summary_ltp is not None
-                and 'lastPrice_CE' in df_summary_ltp.columns
-                and 'lastPrice_PE' in df_summary_ltp.columns):
-
-            NIFTY_LOT_SIZE = 65
-            _expiry = option_data.get('expiry', '')
-
-            # Collect scrp_cd columns if available (for order placement)
-            ltp_extra = [c for c in ('scrp_cd_CE', 'scrp_cd_PE') if c in df_summary_ltp.columns]
-            ltp_tbl = df_summary_ltp[['Strike', 'lastPrice_CE', 'lastPrice_PE', 'Zone'] + ltp_extra].copy()
-            ltp_tbl = ltp_tbl.sort_values('Strike', ascending=False).reset_index(drop=True)
-
-            has_scrp = 'scrp_cd_CE' in ltp_tbl.columns and 'scrp_cd_PE' in ltp_tbl.columns
-            if not has_scrp:
-                st.info("Security IDs (scrp_cd) not available in option chain data — Buy buttons disabled.")
-
-            # Build expiry suffix for trading symbol e.g. "25FEB27"
-            try:
-                from datetime import datetime as _dt
-                _exp_sfx = _dt.strptime(_expiry, "%Y-%m-%d").strftime('%y%b%d').upper()
-            except Exception:
-                _exp_sfx = ''
-
-            # Header row
-            hdr = st.columns([2, 1.5, 1, 2, 1, 2, 1.5])
-            for col_h, label, color in zip(
-                hdr,
-                ["CE LTP", "CE Val (x65)", "BUY CE", "STRIKE", "BUY PE", "PE LTP", "PE Val (x65)"],
-                ["#00cc66", "#00cc66", "#aaa", "#FFD700", "#aaa", "#ff6b6b", "#ff6b6b"]
-            ):
-                col_h.markdown(f"<b style='color:{color}'>{label}</b>", unsafe_allow_html=True)
-
-            st.markdown("<hr style='margin:4px 0; border-color:#333'>", unsafe_allow_html=True)
-
-            for _, row in ltp_tbl.iterrows():
-                strike = int(row['Strike'])
-                ce_ltp = float(row['lastPrice_CE'])
-                pe_ltp = float(row['lastPrice_PE'])
-                ce_val = ce_ltp * NIFTY_LOT_SIZE
-                pe_val = pe_ltp * NIFTY_LOT_SIZE
-                is_atm = row['Zone'] == 'ATM'
-                scrp_ce = str(row['scrp_cd_CE']) if has_scrp else ''
-                scrp_pe = str(row['scrp_cd_PE']) if has_scrp else ''
-                ts_ce = f"NIFTY{_exp_sfx}{strike}CE" if _exp_sfx else f"NIFTY{strike}CE"
-                ts_pe = f"NIFTY{_exp_sfx}{strike}PE" if _exp_sfx else f"NIFTY{strike}PE"
-
-                ce_color = "#00ff88" if is_atm else "#00cc66"
-                pe_color = "#ff8888" if is_atm else "#ff6b6b"
-                fw = "bold" if is_atm else "normal"
-                strike_style = "color:#FFD700; font-weight:bold; font-size:1.1em" if is_atm else "color:#c0c0c0"
-
-                r = st.columns([2, 1.5, 1, 2, 1, 2, 1.5])
-                r[0].markdown(f"<span style='color:{ce_color}; font-weight:{fw}'>{ce_ltp:.2f}</span>", unsafe_allow_html=True)
-                r[1].markdown(f"<span style='color:{ce_color}'>₹{ce_val:,.0f}</span>", unsafe_allow_html=True)
-                buy_ce = r[2].button("BUY", key=f"buy_ce_{strike}", type="primary",
-                                     disabled=not (has_scrp and scrp_ce))
-                r[3].markdown(f"<div style='text-align:center'><span style='{strike_style}'>{strike}</span></div>",
-                               unsafe_allow_html=True)
-                buy_pe = r[4].button("BUY", key=f"buy_pe_{strike}", type="primary",
-                                     disabled=not (has_scrp and scrp_pe))
-                r[5].markdown(f"<span style='color:{pe_color}; font-weight:{fw}'>{pe_ltp:.2f}</span>", unsafe_allow_html=True)
-                r[6].markdown(f"<span style='color:{pe_color}'>₹{pe_val:,.0f}</span>", unsafe_allow_html=True)
-
-                if buy_ce:
-                    ok, res = api.place_order(scrp_ce, ts_ce)
-                    if ok:
-                        st.success(f"CE BUY order placed for {ts_ce} | Order ID: {res.get('orderId', res)}")
-                    else:
-                        st.error(f"CE BUY failed for {ts_ce}: {res}")
-
-                if buy_pe:
-                    ok, res = api.place_order(scrp_pe, ts_pe)
-                    if ok:
-                        st.success(f"PE BUY order placed for {ts_pe} | Order ID: {res.get('orderId', res)}")
-                    else:
-                        st.error(f"PE BUY failed for {ts_pe}: {res}")
 
         # Option Chain Bias Summary Table
         st.markdown("## Option Chain Bias Summary")
