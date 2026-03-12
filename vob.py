@@ -3589,7 +3589,7 @@ def create_csv_download(df_summary):
     return output.getvalue()
 
 
-def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
+def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None, live_spot_price=None):
     """Enhanced options chain analysis with expiry selection, HTF pivot data, and VOB data"""
     now = datetime.now(timezone("Asia/Kolkata"))
     
@@ -3613,7 +3613,8 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         return {'underlying': None, 'df_summary': None, 'expiry_dates': expiry_dates, 'expiry': None, 'sr_data': [], 'max_pain_strike': None, 'styled_df': None, 'df_display': None, 'display_cols': [], 'bias_cols': [], 'total_ce_change': 0, 'total_pe_change': 0}
     
     data = option_chain_data['data']
-    underlying = data['last_price']
+    # Use live spot price from LTP API if available, as option chain's last_price can be stale
+    underlying = live_spot_price if live_spot_price and live_spot_price > 0 else data['last_price']
 
     oc_data = data['oc']
     calls, puts = [], []
@@ -5093,7 +5094,8 @@ def main():
         st.header("📊 Options Analysis")
 
         # Options chain analysis with expiry selection (pass pivot data and VOB data for HTF S/R table)
-        option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
+        # Pass live spot price from LTP API to avoid stale option chain last_price for ATM calculation
+        option_data = analyze_option_chain(selected_expiry, pivots, vob_data, live_spot_price=current_price)
 
         if option_data and option_data.get('underlying'):
             underlying_price = option_data['underlying']
