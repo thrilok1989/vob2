@@ -3497,6 +3497,78 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
     
     return fig
 
+def plot_depth_levels(df_summary, underlying_price=None):
+    """Diverging horizontal bar chart: top-3 PE bid qty (support) vs top-3 CE ask qty (resistance)."""
+    has_bid = 'bidQty_PE' in df_summary.columns and not df_summary['bidQty_PE'].isna().all()
+    has_ask = 'askQty_CE' in df_summary.columns and not df_summary['askQty_CE'].isna().all()
+    if not has_bid and not has_ask:
+        return None
+
+    rows = []
+    if has_bid:
+        top3_sup = df_summary.nlargest(3, 'bidQty_PE')[['Strike', 'bidQty_PE']].copy()
+        top3_sup = top3_sup.sort_values('Strike', ascending=False).reset_index(drop=True)
+        for i, r in top3_sup.iterrows():
+            rows.append({'price': r['Strike'], 'qty': r['bidQty_PE'], 'label': f'S{i+1}', 'side': 'support'})
+
+    if has_ask:
+        top3_res = df_summary.nlargest(3, 'askQty_CE')[['Strike', 'askQty_CE']].copy()
+        top3_res = top3_res.sort_values('Strike').reset_index(drop=True)
+        for i, r in top3_res.iterrows():
+            rows.append({'price': r['Strike'], 'qty': r['askQty_CE'], 'label': f'R{i+1}', 'side': 'resistance'})
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda x: x['price'])
+
+    fig = go.Figure()
+    for row in rows:
+        is_sup = row['side'] == 'support'
+        x_val = -row['qty'] if is_sup else row['qty']
+        color = '#00cc66' if is_sup else '#ff4444'
+        y_label = f"{row['label']}: ₹{row['price']:,.0f}"
+        fig.add_trace(go.Bar(
+            x=[x_val],
+            y=[y_label],
+            orientation='h',
+            marker_color=color,
+            showlegend=False,
+            text=[f"{row['qty']:,.0f}"],
+            textposition='outside',
+            hovertemplate=f"{row['label']} ₹{row['price']:,.0f}<br>Qty: {row['qty']:,.0f}<extra></extra>",
+        ))
+
+    max_qty = max(r['qty'] for r in rows)
+    fig.update_layout(
+        title=dict(text="Key Levels from Order Book Depth", font=dict(size=16)),
+        template='plotly_dark',
+        height=320,
+        barmode='overlay',
+        xaxis=dict(
+            title='← Support (PE Bid) &nbsp;&nbsp;|&nbsp;&nbsp; Resistance (CE Ask) →',
+            range=[-max_qty * 1.35, max_qty * 1.35],
+            zeroline=True,
+            zerolinecolor='#FFD700',
+            zerolinewidth=2,
+            tickformat=',.0f',
+            tickvals=[-max_qty, -max_qty // 2, 0, max_qty // 2, max_qty],
+            ticktext=[f"{max_qty:,.0f}", f"{max_qty//2:,.0f}", "0",
+                      f"{max_qty//2:,.0f}", f"{max_qty:,.0f}"],
+        ),
+        yaxis=dict(autorange=True, tickfont=dict(size=12)),
+        margin=dict(l=10, r=80, t=50, b=50),
+        plot_bgcolor='#1e1e1e',
+        paper_bgcolor='#1e1e1e',
+        annotations=[dict(
+            x=0.02, y=1.08, xref='paper', yref='paper',
+            text="🟢 Support Levels (Largest bid quantities) &nbsp;&nbsp; 🔴 Resistance Levels (Largest ask quantities)",
+            showarrow=False, font=dict(color='white', size=11)
+        )],
+    )
+    return fig
+
+
 def display_metrics(ltp_data, df, db, symbol="NIFTY50"):
     """Display price metrics and save analytics"""
     if ltp_data and 'data' in ltp_data and not df.empty:
@@ -5308,6 +5380,15 @@ def main():
                         st.success(f"PE BUY order placed for {ts_pe} | Order ID: {res.get('orderId', res)}")
                     else:
                         st.error(f"PE BUY failed for {ts_pe}: {res}")
+
+        # ===== KEY LEVELS FROM ORDER BOOK DEPTH CHART =====
+        st.markdown("---")
+        depth_fig = plot_depth_levels(
+            option_data.get('df_summary'),
+            option_data.get('underlying')
+        )
+        if depth_fig is not None:
+            st.plotly_chart(depth_fig, use_container_width=True)
 
         # Option Chain Bias Summary Table
         st.markdown("## Option Chain Bias Summary")
