@@ -4359,6 +4359,14 @@ def main():
     if 'pcr_chgoi_last_valid' not in st.session_state:
         st.session_state.pcr_chgoi_last_valid = None
 
+    # Initialize session state for PCR of Change in OI per ATM±2 strike history
+    if 'pcr_chgoi_strike_history' not in st.session_state:
+        st.session_state.pcr_chgoi_strike_history = []
+    if 'pcr_chgoi_strike_last_valid' not in st.session_state:
+        st.session_state.pcr_chgoi_strike_last_valid = None
+    if 'pcr_chgoi_strike_current_strikes' not in st.session_state:
+        st.session_state.pcr_chgoi_strike_current_strikes = []
+
     # Initialize session state for Total GEX time-series history
     if 'total_gex_history' not in st.session_state:
         st.session_state.total_gex_history = []
@@ -5939,6 +5947,190 @@ def main():
 
         except Exception as e:
             st.warning(f"PCR of ΔOI analysis unavailable: {str(e)}")
+
+        # ===== PCR OF CHANGE IN OI - TIME SERIES PER ATM ± 2 STRIKES =====
+        st.markdown("---")
+        st.markdown("## 📊 PCR of Change in OI - Time Series (ATM ± 2)")
+
+        # Helper function to create per-strike ChgOI PCR chart
+        def create_pcr_chgoi_strike_chart(history_df, col_name, color, title_prefix):
+            """Helper to create individual PCR of Change in OI chart per strike"""
+            if col_name and col_name in history_df.columns:
+                strike_val = col_name
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=history_df['time'],
+                    y=history_df[col_name],
+                    mode='lines+markers',
+                    name=f'₹{strike_val}',
+                    line=dict(color=color, width=2),
+                    marker=dict(size=4),
+                    fill='tozeroy',
+                    fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.1])}'
+                ))
+
+                # Reference lines
+                fig.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
+                fig.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
+                fig.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+
+                # Get current value
+                current_val = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
+
+                fig.update_layout(
+                    title=f"{title_prefix}<br>₹{strike_val}<br>PCR(ΔOI): {current_val:.2f}",
+                    template='plotly_dark',
+                    height=280,
+                    showlegend=False,
+                    margin=dict(l=10, r=10, t=70, b=30),
+                    xaxis=dict(tickformat='%H:%M', title=''),
+                    yaxis=dict(title='PCR (ΔOI)'),
+                    plot_bgcolor='#1e1e1e',
+                    paper_bgcolor='#1e1e1e'
+                )
+                return fig, current_val
+            return None, 0
+
+        # Try to get new data and add to history
+        pcr_chgoi_strike_available = False
+        pcr_chgoi_strike_df = None
+
+        df_summary_chgoi = option_data.get('df_summary') if option_data else None
+        if df_summary_chgoi is not None and 'Zone' in df_summary_chgoi.columns and 'changeinOpenInterest_CE' in df_summary_chgoi.columns and 'changeinOpenInterest_PE' in df_summary_chgoi.columns:
+            try:
+                # Find ATM index
+                atm_idx_chgoi = df_summary_chgoi[df_summary_chgoi['Zone'] == 'ATM'].index
+                if len(atm_idx_chgoi) > 0:
+                    atm_pos_chgoi = df_summary_chgoi.index.get_loc(atm_idx_chgoi[0])
+
+                    # Get ATM ± 2 strikes (5 strikes total)
+                    start_idx_chgoi = max(0, atm_pos_chgoi - 2)
+                    end_idx_chgoi = min(len(df_summary_chgoi), atm_pos_chgoi + 3)
+
+                    pcr_chgoi_strike_df = df_summary_chgoi.iloc[start_idx_chgoi:end_idx_chgoi][['Strike', 'Zone',
+                                                                   'changeinOpenInterest_CE', 'changeinOpenInterest_PE']].copy()
+
+                    # Calculate PCR of Change in OI per strike
+                    pcr_chgoi_strike_df['PCR_ChgOI'] = pcr_chgoi_strike_df.apply(
+                        lambda row: abs(row['changeinOpenInterest_PE'] / row['changeinOpenInterest_CE'])
+                        if row['changeinOpenInterest_CE'] != 0 else 0, axis=1
+                    )
+                    pcr_chgoi_strike_df['PCR_ChgOI'] = pcr_chgoi_strike_df['PCR_ChgOI'].round(3)
+                    pcr_chgoi_strike_df['PCR_ChgOI_Signal'] = np.where(
+                        pcr_chgoi_strike_df['PCR_ChgOI'] > 1.2, "Bullish",
+                        np.where(pcr_chgoi_strike_df['PCR_ChgOI'] < 0.7, "Bearish", "Neutral")
+                    )
+
+                    if not pcr_chgoi_strike_df.empty:
+                        pcr_chgoi_strike_available = True
+                        st.session_state.pcr_chgoi_strike_last_valid = pcr_chgoi_strike_df.copy()
+
+                        ist = pytz.timezone('Asia/Kolkata')
+                        current_time = datetime.now(ist)
+
+                        # Build history entry keyed by strike price
+                        chgoi_entry = {'time': current_time}
+                        for _, row in pcr_chgoi_strike_df.iterrows():
+                            strike_label = str(int(row['Strike']))
+                            chgoi_entry[strike_label] = row['PCR_ChgOI']
+
+                        # Store current strikes
+                        current_chgoi_strikes = pcr_chgoi_strike_df['Strike'].tolist()
+                        st.session_state.pcr_chgoi_strike_current_strikes = [int(s) for s in current_chgoi_strikes]
+
+                        # Deduplicate within 30 seconds
+                        should_add = True
+                        if st.session_state.pcr_chgoi_strike_history:
+                            last_entry = st.session_state.pcr_chgoi_strike_history[-1]
+                            time_diff = (current_time - last_entry['time']).total_seconds()
+                            if time_diff < 30:
+                                should_add = False
+
+                        if should_add:
+                            st.session_state.pcr_chgoi_strike_history.append(chgoi_entry)
+                            if len(st.session_state.pcr_chgoi_strike_history) > 200:
+                                st.session_state.pcr_chgoi_strike_history = st.session_state.pcr_chgoi_strike_history[-200:]
+
+            except Exception as e:
+                st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
+
+        # ALWAYS try to display graph if we have history
+        if len(st.session_state.pcr_chgoi_strike_history) > 0:
+            try:
+                chgoi_history_df = pd.DataFrame(st.session_state.pcr_chgoi_strike_history)
+
+                current_chgoi_strikes = getattr(st.session_state, 'pcr_chgoi_strike_current_strikes', [])
+
+                if not current_chgoi_strikes and st.session_state.pcr_chgoi_strike_last_valid is not None:
+                    current_chgoi_strikes = [int(s) for s in st.session_state.pcr_chgoi_strike_last_valid['Strike'].tolist()]
+
+                current_chgoi_strikes = sorted(current_chgoi_strikes)
+
+                # 5 columns for side-by-side display
+                chgoi_col1, chgoi_col2, chgoi_col3, chgoi_col4, chgoi_col5 = st.columns(5)
+
+                def display_pcr_chgoi_with_signal(container, fig, pcr_val):
+                    if fig:
+                        container.plotly_chart(fig, use_container_width=True)
+                        if pcr_val > 1.2:
+                            container.success("Bullish")
+                        elif pcr_val < 0.7:
+                            container.error("Bearish")
+                        else:
+                            container.warning("Neutral")
+
+                # Get zone info
+                chgoi_zone_info = {}
+                chgoi_zone_df = pcr_chgoi_strike_df if pcr_chgoi_strike_df is not None else st.session_state.pcr_chgoi_strike_last_valid
+                if chgoi_zone_df is not None:
+                    for _, row in chgoi_zone_df.iterrows():
+                        chgoi_zone_info[int(row['Strike'])] = row['Zone']
+
+                position_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+                position_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+                chgoi_columns = [chgoi_col1, chgoi_col2, chgoi_col3, chgoi_col4, chgoi_col5]
+
+                for i, col in enumerate(chgoi_columns):
+                    with col:
+                        if i < len(current_chgoi_strikes):
+                            strike = current_chgoi_strikes[i]
+                            strike_col = str(strike)
+                            zone = chgoi_zone_info.get(strike, position_labels[i].split()[-1])
+
+                            if strike_col in chgoi_history_df.columns:
+                                fig, pcr_val = create_pcr_chgoi_strike_chart(chgoi_history_df, strike_col, position_colors[i], f'{position_labels[i]}')
+                                display_pcr_chgoi_with_signal(st, fig, pcr_val)
+                            else:
+                                st.info(f"₹{strike} - Building history...")
+                        else:
+                            st.info(f"{position_labels[i]} N/A")
+
+                # Show current data table
+                st.markdown("### Current PCR of Change in OI Values")
+                display_chgoi_df = pcr_chgoi_strike_df if pcr_chgoi_strike_df is not None else st.session_state.pcr_chgoi_strike_last_valid
+                if display_chgoi_df is not None:
+                    chgoi_display = display_chgoi_df[['Strike', 'Zone', 'PCR_ChgOI', 'PCR_ChgOI_Signal']].copy()
+                    chgoi_display['CE ΔOI (L)'] = (display_chgoi_df['changeinOpenInterest_CE'] / 100000).round(2)
+                    chgoi_display['PE ΔOI (L)'] = (display_chgoi_df['changeinOpenInterest_PE'] / 100000).round(2)
+                    chgoi_display.rename(columns={'PCR_ChgOI': 'PCR (ΔOI)', 'PCR_ChgOI_Signal': 'Signal'}, inplace=True)
+                    st.dataframe(chgoi_display, use_container_width=True, hide_index=True)
+
+                # Status bar and clear button
+                chgoi_info1, chgoi_info2 = st.columns([3, 1])
+                with chgoi_info1:
+                    status = "🟢 Live" if pcr_chgoi_strike_available else "🟡 Using cached history"
+                    st.caption(f"{status} | 📈 {len(st.session_state.pcr_chgoi_strike_history)} data points | History preserved on refresh failures")
+                with chgoi_info2:
+                    if st.button("🗑️ Clear ΔOI Strike History"):
+                        st.session_state.pcr_chgoi_strike_history = []
+                        st.session_state.pcr_chgoi_strike_last_valid = None
+                        st.rerun()
+
+            except Exception as e:
+                st.warning(f"Error displaying PCR ΔOI strike charts: {str(e)}")
+        else:
+            st.info("📊 PCR of ΔOI per strike history will build up as the app refreshes. Please wait for data collection...")
 
         # ===== TOTAL GEX TIME-SERIES GRAPH =====
         st.markdown("---")
