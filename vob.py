@@ -4367,6 +4367,12 @@ def main():
     if 'pcr_chgoi_strike_current_strikes' not in st.session_state:
         st.session_state.pcr_chgoi_strike_current_strikes = []
 
+    # Initialize session state for Composite Direction Signal history
+    if 'composite_signal_history' not in st.session_state:
+        st.session_state.composite_signal_history = []
+    if 'composite_signal_last_valid' not in st.session_state:
+        st.session_state.composite_signal_last_valid = None
+
     # Initialize session state for Total GEX time-series history
     if 'total_gex_history' not in st.session_state:
         st.session_state.total_gex_history = []
@@ -6131,6 +6137,471 @@ def main():
                 st.warning(f"Error displaying PCR ΔOI strike charts: {str(e)}")
         else:
             st.info("📊 PCR of ΔOI per strike history will build up as the app refreshes. Please wait for data collection...")
+
+        # ===== COMPOSITE DIRECTIONAL SIGNAL: PCR + PCR(ΔOI) + GEX (ATM ± 2) =====
+        st.markdown("---")
+        st.markdown("## 🧭 Composite Direction Signal - PCR × ΔOI × GEX (ATM ± 2)")
+
+        try:
+            df_summary_comp = option_data.get('df_summary') if option_data else None
+            underlying_price_comp = option_data.get('underlying') if option_data else None
+            composite_data_available = False
+
+            if (df_summary_comp is not None and underlying_price_comp and
+                'Zone' in df_summary_comp.columns and 'PCR' in df_summary_comp.columns and
+                'changeinOpenInterest_CE' in df_summary_comp.columns and
+                'Gamma_CE' in df_summary_comp.columns):
+
+                # Find ATM ± 2 strikes
+                atm_idx_comp = df_summary_comp[df_summary_comp['Zone'] == 'ATM'].index
+                if len(atm_idx_comp) > 0:
+                    atm_pos_comp = df_summary_comp.index.get_loc(atm_idx_comp[0])
+                    start_comp = max(0, atm_pos_comp - 2)
+                    end_comp = min(len(df_summary_comp), atm_pos_comp + 3)
+                    comp_df = df_summary_comp.iloc[start_comp:end_comp].copy()
+
+                    # Calculate PCR of ΔOI per strike
+                    comp_df['PCR_ChgOI'] = comp_df.apply(
+                        lambda row: abs(row['changeinOpenInterest_PE'] / row['changeinOpenInterest_CE'])
+                        if row['changeinOpenInterest_CE'] != 0 else 0, axis=1
+                    )
+
+                    # Calculate per-strike GEX
+                    contract_multiplier = 25
+                    comp_df['Net_GEX'] = (
+                        -1 * comp_df.get('Gamma_CE', 0) * comp_df.get('openInterest_CE', 0) * contract_multiplier * underlying_price_comp / 100000
+                        + comp_df.get('Gamma_PE', 0) * comp_df.get('openInterest_PE', 0) * contract_multiplier * underlying_price_comp / 100000
+                    )
+
+                    # ---- Per-strike scoring ----
+                    strike_scores = []
+                    strike_details = []
+                    position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                    weights = [1.0, 1.5, 2.0, 1.5, 1.0]
+
+                    total_net_gex = comp_df['Net_GEX'].sum()
+
+                    # Per-strike history entries for individual tracking
+                    per_strike_scores = {}
+
+                    for i, (_, row) in enumerate(comp_df.iterrows()):
+                        pcr_val = row.get('PCR', 1.0)
+                        pcr_chgoi_val = row['PCR_ChgOI']
+                        net_gex_val = row['Net_GEX']
+
+                        pcr_score = 1 if pcr_val > 1.2 else (-1 if pcr_val < 0.7 else 0)
+                        chgoi_score = 1 if pcr_chgoi_val > 1.2 else (-1 if pcr_chgoi_val < 0.7 else 0)
+                        dir_score = pcr_score + chgoi_score
+
+                        w = weights[i] if i < len(weights) else 1.0
+                        strike_scores.append(dir_score * w)
+
+                        # Track per-strike score for history
+                        strike_label = str(int(row['Strike']))
+                        per_strike_scores[strike_label] = round(dir_score * w, 2)
+
+                        label = position_labels[i] if i < len(position_labels) else f"Strike {i}"
+                        pcr_sig = "Bull" if pcr_score > 0 else ("Bear" if pcr_score < 0 else "Neut")
+                        chgoi_sig = "Bull" if chgoi_score > 0 else ("Bear" if chgoi_score < 0 else "Neut")
+                        gex_sig = "Pin" if net_gex_val > 10 else ("Accel" if net_gex_val < -10 else "Neut")
+
+                        strike_details.append({
+                            'Position': label,
+                            'Strike': int(row['Strike']),
+                            'PCR (OI)': round(pcr_val, 2),
+                            'PCR Signal': pcr_sig,
+                            'PCR (ΔOI)': round(pcr_chgoi_val, 2),
+                            'ΔOI Signal': chgoi_sig,
+                            'Net GEX': round(net_gex_val, 2),
+                            'GEX Signal': gex_sig,
+                            'Score': round(dir_score * w, 1)
+                        })
+
+                    # ---- Aggregate verdict ----
+                    total_score = sum(strike_scores)
+                    max_possible = sum(w * 2 for w in weights)
+                    gex_trending = total_net_gex < -10
+                    gex_pinning = total_net_gex > 10
+                    score_pct = (total_score / max_possible) * 100 if max_possible > 0 else 0
+
+                    if abs(score_pct) < 15:
+                        if gex_pinning:
+                            verdict = "SIDEWAYS"
+                            verdict_icon = "↔️"
+                            verdict_color = "#FFD700"
+                            verdict_desc = "Mixed signals + Positive GEX = Range-bound / Choppy"
+                            verdict_numeric = 0
+                        else:
+                            verdict = "NEUTRAL"
+                            verdict_icon = "⚪"
+                            verdict_color = "#888888"
+                            verdict_desc = "No clear directional bias from ATM±2 strikes"
+                            verdict_numeric = 0
+                    elif score_pct > 0:
+                        if gex_trending:
+                            verdict = "STRONG UP"
+                            verdict_icon = "🟢🔥"
+                            verdict_color = "#00ff88"
+                            verdict_desc = "Bullish PCR + Fresh put writing + Negative GEX = Breakout UP"
+                            verdict_numeric = 3
+                        elif gex_pinning:
+                            verdict = "UP (CAPPED)"
+                            verdict_icon = "🟢📍"
+                            verdict_color = "#90EE90"
+                            verdict_desc = "Bullish bias but positive GEX may cap upside momentum"
+                            verdict_numeric = 1
+                        else:
+                            verdict = "UP"
+                            verdict_icon = "🟢"
+                            verdict_color = "#00ff88"
+                            verdict_desc = "Bullish PCR + Put writing activity across ATM±2 strikes"
+                            verdict_numeric = 2
+                    else:
+                        if gex_trending:
+                            verdict = "STRONG DOWN"
+                            verdict_icon = "🔴🔥"
+                            verdict_color = "#ff4444"
+                            verdict_desc = "Bearish PCR + Fresh call writing + Negative GEX = Breakdown"
+                            verdict_numeric = -3
+                        elif gex_pinning:
+                            verdict = "DOWN (SUPPORTED)"
+                            verdict_icon = "🔴📍"
+                            verdict_color = "#FFB6C1"
+                            verdict_desc = "Bearish bias but positive GEX may provide support"
+                            verdict_numeric = -1
+                        else:
+                            verdict = "DOWN"
+                            verdict_icon = "🔴"
+                            verdict_color = "#ff4444"
+                            verdict_desc = "Bearish PCR + Call writing activity across ATM±2 strikes"
+                            verdict_numeric = -2
+
+                    composite_data_available = True
+
+                    # ---- Store history ----
+                    ist = pytz.timezone('Asia/Kolkata')
+                    current_time = datetime.now(ist)
+
+                    avg_pcr = comp_df['PCR'].mean()
+                    avg_chgoi = comp_df['PCR_ChgOI'].mean()
+
+                    st.session_state.composite_signal_last_valid = {
+                        'verdict': verdict,
+                        'verdict_icon': verdict_icon,
+                        'verdict_color': verdict_color,
+                        'verdict_desc': verdict_desc,
+                        'total_score': total_score,
+                        'score_pct': score_pct,
+                        'total_net_gex': total_net_gex,
+                        'avg_pcr': avg_pcr,
+                        'avg_chgoi': avg_chgoi,
+                        'strike_details': strike_details,
+                        'per_strike_scores': per_strike_scores
+                    }
+
+                    # Add to history (deduplicate within 30 seconds)
+                    should_add = True
+                    if st.session_state.composite_signal_history:
+                        last_entry = st.session_state.composite_signal_history[-1]
+                        time_diff = (current_time - last_entry['time']).total_seconds()
+                        if time_diff < 30:
+                            should_add = False
+
+                    if should_add:
+                        history_entry = {
+                            'time': current_time,
+                            'score': round(total_score, 2),
+                            'score_pct': round(score_pct, 1),
+                            'verdict': verdict,
+                            'verdict_numeric': verdict_numeric,
+                            'avg_pcr': round(avg_pcr, 3),
+                            'avg_chgoi': round(avg_chgoi, 3),
+                            'total_gex': round(total_net_gex, 2),
+                        }
+                        # Add per-strike scores to history
+                        for k, v in per_strike_scores.items():
+                            history_entry[f'score_{k}'] = v
+                        st.session_state.composite_signal_history.append(history_entry)
+                        if len(st.session_state.composite_signal_history) > 200:
+                            st.session_state.composite_signal_history = st.session_state.composite_signal_history[-200:]
+
+            # ---- Display section (always show if history exists) ----
+            # Use last valid data for verdict card if current fetch failed
+            last_valid = st.session_state.composite_signal_last_valid
+            if last_valid:
+                verdict = last_valid['verdict']
+                verdict_icon = last_valid['verdict_icon']
+                verdict_color = last_valid['verdict_color']
+                verdict_desc = last_valid['verdict_desc']
+                total_score = last_valid['total_score']
+                score_pct = last_valid['score_pct']
+                total_net_gex = last_valid['total_net_gex']
+                avg_pcr = last_valid['avg_pcr']
+                avg_chgoi = last_valid['avg_chgoi']
+                strike_details = last_valid.get('strike_details', [])
+                gex_trending = total_net_gex < -10
+                gex_pinning = total_net_gex > 10
+                max_possible = 14.0  # sum(w*2 for w in [1,1.5,2,1.5,1])
+
+                # Main verdict card
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, {verdict_color}15, {verdict_color}30);
+                            padding: 25px; border-radius: 15px; border: 3px solid {verdict_color};
+                            text-align: center; margin-bottom: 20px;">
+                    <h1 style="color: {verdict_color}; margin: 0; font-size: 48px;">{verdict_icon} {verdict}</h1>
+                    <p style="color: #cccccc; margin: 10px 0 0 0; font-size: 16px;">{verdict_desc}</p>
+                    <p style="color: {verdict_color}; margin: 5px 0 0 0; font-size: 14px;">
+                        Composite Score: {total_score:+.1f} / {max_possible:.0f} ({score_pct:+.0f}%) |
+                        Net GEX: {total_net_gex:.1f}L ({'Trending' if gex_trending else 'Pinning' if gex_pinning else 'Neutral'})
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Three metric cards
+                met1, met2, met3 = st.columns(3)
+                with met1:
+                    pcr_c = "#00ff88" if avg_pcr > 1.2 else "#ff4444" if avg_pcr < 0.7 else "#FFD700"
+                    st.markdown(f"""
+                    <div style="background-color: {pcr_c}20; padding: 12px; border-radius: 10px; border: 2px solid {pcr_c}; text-align: center;">
+                        <h4 style="color: {pcr_c}; margin: 0;">Avg PCR (OI)</h4>
+                        <h2 style="color: {pcr_c}; margin: 5px 0;">{avg_pcr:.2f}</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{'Bullish' if avg_pcr > 1.2 else 'Bearish' if avg_pcr < 0.7 else 'Neutral'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with met2:
+                    chg_c = "#00ff88" if avg_chgoi > 1.2 else "#ff4444" if avg_chgoi < 0.7 else "#FFD700"
+                    st.markdown(f"""
+                    <div style="background-color: {chg_c}20; padding: 12px; border-radius: 10px; border: 2px solid {chg_c}; text-align: center;">
+                        <h4 style="color: {chg_c}; margin: 0;">Avg PCR (ΔOI)</h4>
+                        <h2 style="color: {chg_c}; margin: 5px 0;">{avg_chgoi:.2f}</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{'Bullish' if avg_chgoi > 1.2 else 'Bearish' if avg_chgoi < 0.7 else 'Neutral'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with met3:
+                    gex_c = "#00ff88" if total_net_gex > 10 else "#ff4444" if total_net_gex < -10 else "#FFD700"
+                    st.markdown(f"""
+                    <div style="background-color: {gex_c}20; padding: 12px; border-radius: 10px; border: 2px solid {gex_c}; text-align: center;">
+                        <h4 style="color: {gex_c}; margin: 0;">Total GEX (ATM±2)</h4>
+                        <h2 style="color: {gex_c}; margin: 5px 0;">{total_net_gex:.1f}L</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{'Pin/Chop' if total_net_gex > 10 else 'Trend/Accel' if total_net_gex < -10 else 'Neutral'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # ---- Time-Series Charts ----
+            if len(st.session_state.composite_signal_history) > 0:
+                comp_hist_df = pd.DataFrame(st.session_state.composite_signal_history)
+
+                # === Chart 1: Composite Score over time ===
+                st.markdown("### 📈 Composite Score & Verdict - Time Series")
+
+                fig_score = go.Figure()
+
+                # Color markers by verdict
+                marker_colors = []
+                for _, hrow in comp_hist_df.iterrows():
+                    vn = hrow.get('verdict_numeric', 0)
+                    if vn >= 2:
+                        marker_colors.append('#00ff88')   # Strong/Normal UP = green
+                    elif vn == 1:
+                        marker_colors.append('#90EE90')   # UP CAPPED = light green
+                    elif vn <= -2:
+                        marker_colors.append('#ff4444')   # Strong/Normal DOWN = red
+                    elif vn == -1:
+                        marker_colors.append('#FFB6C1')   # DOWN SUPPORTED = light red
+                    else:
+                        marker_colors.append('#FFD700')   # NEUTRAL/SIDEWAYS = yellow
+
+                fig_score.add_trace(go.Scatter(
+                    x=comp_hist_df['time'],
+                    y=comp_hist_df['score_pct'],
+                    mode='lines+markers',
+                    name='Score %',
+                    line=dict(color='#00aaff', width=3),
+                    marker=dict(size=8, color=marker_colors),
+                    fill='tozeroy',
+                    fillcolor='rgba(0, 170, 255, 0.08)'
+                ))
+
+                # Reference zones
+                fig_score.add_hline(y=0, line_dash="dash", line_color="white", line_width=1.5,
+                                    annotation_text="Neutral (0%)", annotation_position="right")
+                fig_score.add_hline(y=15, line_dash="dot", line_color="#00ff88", line_width=1,
+                                    annotation_text="Bullish Zone", annotation_position="right")
+                fig_score.add_hline(y=-15, line_dash="dot", line_color="#ff4444", line_width=1,
+                                    annotation_text="Bearish Zone", annotation_position="right")
+
+                # Shaded zones
+                y_max_s = max(abs(comp_hist_df['score_pct'].max()), abs(comp_hist_df['score_pct'].min()), 30) * 1.2
+                fig_score.add_hrect(y0=15, y1=y_max_s, fillcolor="rgba(0,255,136,0.06)", line_width=0)
+                fig_score.add_hrect(y0=-y_max_s, y1=-15, fillcolor="rgba(255,68,68,0.06)", line_width=0)
+
+                # Add verdict text annotations at each point
+                for idx, hrow in comp_hist_df.iterrows():
+                    if idx % max(1, len(comp_hist_df) // 10) == 0:  # Show every ~10th label to avoid clutter
+                        fig_score.add_annotation(
+                            x=hrow['time'], y=hrow['score_pct'],
+                            text=hrow['verdict'], showarrow=False,
+                            yshift=15, font=dict(size=8, color='white'),
+                            bgcolor='rgba(0,0,0,0.5)', borderpad=2
+                        )
+
+                fig_score.update_layout(
+                    title=f"Composite Direction Score | Current: {score_pct:+.0f}% ({verdict})",
+                    template='plotly_dark',
+                    height=400,
+                    showlegend=False,
+                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                    yaxis=dict(title='Score %', zeroline=True, zerolinecolor='white', zerolinewidth=1),
+                    plot_bgcolor='#1e1e1e',
+                    paper_bgcolor='#1e1e1e',
+                    margin=dict(l=50, r=50, t=60, b=50)
+                )
+                st.plotly_chart(fig_score, use_container_width=True)
+
+                # === Chart 2: Three indicators over time (Avg PCR, Avg ΔOI PCR, GEX) ===
+                st.markdown("### 📊 Component Indicators - Time Series")
+                ind_col1, ind_col2 = st.columns(2)
+
+                with ind_col1:
+                    # PCR OI + PCR ΔOI over time
+                    fig_pcr_ts = go.Figure()
+                    fig_pcr_ts.add_trace(go.Scatter(
+                        x=comp_hist_df['time'], y=comp_hist_df['avg_pcr'],
+                        mode='lines+markers', name='Avg PCR (OI)',
+                        line=dict(color='#00aaff', width=2), marker=dict(size=4)
+                    ))
+                    fig_pcr_ts.add_trace(go.Scatter(
+                        x=comp_hist_df['time'], y=comp_hist_df['avg_chgoi'],
+                        mode='lines+markers', name='Avg PCR (ΔOI)',
+                        line=dict(color='#ff44ff', width=2), marker=dict(size=4)
+                    ))
+                    fig_pcr_ts.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
+                    fig_pcr_ts.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
+                    fig_pcr_ts.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+                    fig_pcr_ts.update_layout(
+                        title="Avg PCR (OI) vs Avg PCR (ΔOI)",
+                        template='plotly_dark', height=320, showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        xaxis=dict(tickformat='%H:%M', title=''),
+                        yaxis=dict(title='PCR'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        margin=dict(l=40, r=10, t=60, b=30)
+                    )
+                    st.plotly_chart(fig_pcr_ts, use_container_width=True)
+
+                with ind_col2:
+                    # GEX over time
+                    fig_gex_ts = go.Figure()
+                    gex_colors = ['#00ff88' if g > 10 else '#ff4444' if g < -10 else '#FFD700'
+                                  for g in comp_hist_df['total_gex']]
+                    fig_gex_ts.add_trace(go.Scatter(
+                        x=comp_hist_df['time'], y=comp_hist_df['total_gex'],
+                        mode='lines+markers', name='Total GEX',
+                        line=dict(color='#FFD700', width=2),
+                        marker=dict(size=5, color=gex_colors),
+                        fill='tozeroy', fillcolor='rgba(255,215,0,0.08)'
+                    ))
+                    fig_gex_ts.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                    fig_gex_ts.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1,
+                                          annotation_text="Pin Zone", annotation_position="right")
+                    fig_gex_ts.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1,
+                                          annotation_text="Accel Zone", annotation_position="right")
+                    fig_gex_ts.update_layout(
+                        title="Total GEX (ATM±2) Over Time",
+                        template='plotly_dark', height=320, showlegend=False,
+                        xaxis=dict(tickformat='%H:%M', title=''),
+                        yaxis=dict(title='GEX (Lakhs)', zeroline=True, zerolinecolor='white'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        margin=dict(l=40, r=10, t=60, b=30)
+                    )
+                    st.plotly_chart(fig_gex_ts, use_container_width=True)
+
+                # === Chart 3: Per-strike score over time ===
+                # Find score columns in history
+                score_cols = [c for c in comp_hist_df.columns if c.startswith('score_')]
+                if score_cols:
+                    st.markdown("### 🎯 Per-Strike Score - Time Series")
+                    fig_strike_ts = go.Figure()
+                    strike_colors_map = {'0': '#ff44ff', '1': '#cc44cc', '2': '#ffaa00', '3': '#00aaff', '4': '#0088dd'}
+                    for idx_s, sc in enumerate(sorted(score_cols)):
+                        strike_num = sc.replace('score_', '')
+                        color = strike_colors_map.get(str(idx_s), '#ffffff')
+                        # Determine label from position
+                        pos_lbl = position_labels[idx_s] if idx_s < len(position_labels) else strike_num
+                        fig_strike_ts.add_trace(go.Scatter(
+                            x=comp_hist_df['time'], y=comp_hist_df[sc],
+                            mode='lines+markers', name=f'{pos_lbl} (₹{strike_num})',
+                            line=dict(color=color, width=2), marker=dict(size=3)
+                        ))
+                    fig_strike_ts.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                    fig_strike_ts.update_layout(
+                        title="Per-Strike Weighted Score Over Time",
+                        template='plotly_dark', height=350, showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        xaxis=dict(tickformat='%H:%M', title='Time'),
+                        yaxis=dict(title='Weighted Score', zeroline=True, zerolinecolor='white'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        margin=dict(l=50, r=20, t=60, b=40)
+                    )
+                    st.plotly_chart(fig_strike_ts, use_container_width=True)
+
+                # Per-strike breakdown table
+                if strike_details:
+                    st.markdown("### Per-Strike Breakdown")
+                    detail_df = pd.DataFrame(strike_details)
+                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+                # Status bar and clear button
+                comp_info1, comp_info2 = st.columns([3, 1])
+                with comp_info1:
+                    status = "🟢 Live" if composite_data_available else "🟡 Using cached data"
+                    st.caption(f"{status} | 📈 {len(st.session_state.composite_signal_history)} data points | Updates every ~30s")
+                with comp_info2:
+                    if st.button("🗑️ Clear Composite History"):
+                        st.session_state.composite_signal_history = []
+                        st.session_state.composite_signal_last_valid = None
+                        st.rerun()
+
+                # Signal interpretation guide
+                with st.expander("📖 How This Works"):
+                    st.markdown("""
+                    **Three indicators are combined for each ATM±2 strike:**
+
+                    | Indicator | Bullish (+1) | Bearish (-1) | Neutral (0) |
+                    |-----------|-------------|-------------|-------------|
+                    | **PCR (OI)** | > 1.2 (Heavy puts = support) | < 0.7 (Heavy calls = resistance) | 0.7 - 1.2 |
+                    | **PCR (ΔOI)** | > 1.2 (Fresh put writing) | < 0.7 (Fresh call writing) | 0.7 - 1.2 |
+                    | **GEX** | Determines trend vs chop | Determines trend vs chop | - |
+
+                    **Weighting:** ATM = 2x, ±1 strikes = 1.5x, ±2 strikes = 1x
+
+                    **GEX Role:** GEX doesn't determine direction — it determines **conviction**:
+                    - **Negative GEX** (< -10L): Dealers short gamma → moves amplified → **STRONG** trend signal
+                    - **Positive GEX** (> 10L): Dealers long gamma → moves dampened → **SIDEWAYS/CAPPED**
+                    - **Neutral GEX**: Normal market conditions
+
+                    **Verdict Logic:**
+                    - 🟢🔥 **STRONG UP**: Bullish PCR+ΔOI + Negative GEX = Breakout rally
+                    - 🟢📍 **UP (CAPPED)**: Bullish PCR+ΔOI + Positive GEX = Upside but range-bound
+                    - 🟢 **UP**: Bullish PCR+ΔOI + Neutral GEX
+                    - 🔴🔥 **STRONG DOWN**: Bearish PCR+ΔOI + Negative GEX = Breakdown selloff
+                    - 🔴📍 **DOWN (SUPPORTED)**: Bearish PCR+ΔOI + Positive GEX = Downside but supported
+                    - 🔴 **DOWN**: Bearish PCR+ΔOI + Neutral GEX
+                    - ↔️ **SIDEWAYS**: Mixed signals + Positive GEX = Choppy range
+                    - ⚪ **NEUTRAL**: No clear signal
+
+                    **Time-Series Charts:**
+                    - **Composite Score**: Shows overall direction score (%) over time — green zone (>15%) = bullish, red zone (<-15%) = bearish
+                    - **Avg PCR vs Avg ΔOI PCR**: Tracks positioning vs fresh activity — divergence signals shift in progress
+                    - **Total GEX**: Shows if market is in Pin mode (>10) or Acceleration mode (<-10)
+                    - **Per-Strike Score**: Shows which individual strikes are driving the signal — useful for spotting strike-level shifts
+                    """)
+
+            elif not last_valid:
+                st.info("📊 Composite signal history will build up as the app refreshes. Please wait for data collection...")
+
+        except Exception as e:
+            st.warning(f"Composite direction signal unavailable: {str(e)}")
 
         # ===== TOTAL GEX TIME-SERIES GRAPH =====
         st.markdown("---")
