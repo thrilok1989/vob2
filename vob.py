@@ -6132,6 +6132,228 @@ def main():
         else:
             st.info("📊 PCR of ΔOI per strike history will build up as the app refreshes. Please wait for data collection...")
 
+        # ===== COMPOSITE DIRECTIONAL SIGNAL: PCR + PCR(ΔOI) + GEX (ATM ± 2) =====
+        st.markdown("---")
+        st.markdown("## 🧭 Composite Direction Signal - PCR × ΔOI × GEX (ATM ± 2)")
+
+        try:
+            df_summary_comp = option_data.get('df_summary') if option_data else None
+            underlying_price_comp = option_data.get('underlying') if option_data else None
+
+            if (df_summary_comp is not None and underlying_price_comp and
+                'Zone' in df_summary_comp.columns and 'PCR' in df_summary_comp.columns and
+                'changeinOpenInterest_CE' in df_summary_comp.columns and
+                'Gamma_CE' in df_summary_comp.columns):
+
+                # Find ATM ± 2 strikes
+                atm_idx_comp = df_summary_comp[df_summary_comp['Zone'] == 'ATM'].index
+                if len(atm_idx_comp) > 0:
+                    atm_pos_comp = df_summary_comp.index.get_loc(atm_idx_comp[0])
+                    start_comp = max(0, atm_pos_comp - 2)
+                    end_comp = min(len(df_summary_comp), atm_pos_comp + 3)
+                    comp_df = df_summary_comp.iloc[start_comp:end_comp].copy()
+
+                    # Calculate PCR of ΔOI per strike
+                    comp_df['PCR_ChgOI'] = comp_df.apply(
+                        lambda row: abs(row['changeinOpenInterest_PE'] / row['changeinOpenInterest_CE'])
+                        if row['changeinOpenInterest_CE'] != 0 else 0, axis=1
+                    )
+
+                    # Calculate per-strike GEX
+                    contract_multiplier = 25
+                    comp_df['Net_GEX'] = (
+                        -1 * comp_df.get('Gamma_CE', 0) * comp_df.get('openInterest_CE', 0) * contract_multiplier * underlying_price_comp / 100000
+                        + comp_df.get('Gamma_PE', 0) * comp_df.get('openInterest_PE', 0) * contract_multiplier * underlying_price_comp / 100000
+                    )
+
+                    # ---- Per-strike scoring ----
+                    # PCR OI: >1.2 = Bullish(+1), <0.7 = Bearish(-1), else Neutral(0)
+                    # PCR ΔOI: >1.2 = Bullish(+1), <0.7 = Bearish(-1), else Neutral(0)
+                    # GEX: <-10 = Trending(amplifier), >10 = Pinning(dampener)
+                    strike_scores = []
+                    strike_details = []
+                    position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                    # Weight: ATM gets 2x, adjacent ±1 get 1.5x, ±2 get 1x
+                    weights = [1.0, 1.5, 2.0, 1.5, 1.0]
+
+                    total_net_gex = comp_df['Net_GEX'].sum()
+
+                    for i, (_, row) in enumerate(comp_df.iterrows()):
+                        pcr_val = row.get('PCR', 1.0)
+                        pcr_chgoi_val = row['PCR_ChgOI']
+                        net_gex_val = row['Net_GEX']
+
+                        # Direction score from PCR OI
+                        pcr_score = 1 if pcr_val > 1.2 else (-1 if pcr_val < 0.7 else 0)
+                        # Direction score from PCR ΔOI
+                        chgoi_score = 1 if pcr_chgoi_val > 1.2 else (-1 if pcr_chgoi_val < 0.7 else 0)
+                        # Combined direction for this strike
+                        dir_score = pcr_score + chgoi_score
+
+                        w = weights[i] if i < len(weights) else 1.0
+                        strike_scores.append(dir_score * w)
+
+                        label = position_labels[i] if i < len(position_labels) else f"Strike {i}"
+                        pcr_sig = "Bull" if pcr_score > 0 else ("Bear" if pcr_score < 0 else "Neut")
+                        chgoi_sig = "Bull" if chgoi_score > 0 else ("Bear" if chgoi_score < 0 else "Neut")
+                        gex_sig = "Pin" if net_gex_val > 10 else ("Accel" if net_gex_val < -10 else "Neut")
+
+                        strike_details.append({
+                            'Position': label,
+                            'Strike': int(row['Strike']),
+                            'PCR (OI)': round(pcr_val, 2),
+                            'PCR Signal': pcr_sig,
+                            'PCR (ΔOI)': round(pcr_chgoi_val, 2),
+                            'ΔOI Signal': chgoi_sig,
+                            'Net GEX': round(net_gex_val, 2),
+                            'GEX Signal': gex_sig,
+                            'Score': round(dir_score * w, 1)
+                        })
+
+                    # ---- Aggregate verdict ----
+                    total_score = sum(strike_scores)
+                    max_possible = sum(w * 2 for w in weights)  # max ±2 per strike × weight
+
+                    # GEX determines trend vs sideways
+                    gex_trending = total_net_gex < -10  # Dealers short gamma = trend amplified
+                    gex_pinning = total_net_gex > 10    # Dealers long gamma = sideways/chop
+
+                    # Determine verdict
+                    score_pct = (total_score / max_possible) * 100 if max_possible > 0 else 0
+
+                    if abs(score_pct) < 15:
+                        if gex_pinning:
+                            verdict = "SIDEWAYS"
+                            verdict_icon = "↔️"
+                            verdict_color = "#FFD700"
+                            verdict_desc = "Mixed signals + Positive GEX = Range-bound / Choppy"
+                        else:
+                            verdict = "NEUTRAL"
+                            verdict_icon = "⚪"
+                            verdict_color = "#888888"
+                            verdict_desc = "No clear directional bias from ATM±2 strikes"
+                    elif score_pct > 0:
+                        if gex_trending:
+                            verdict = "STRONG UP"
+                            verdict_icon = "🟢🔥"
+                            verdict_color = "#00ff88"
+                            verdict_desc = "Bullish PCR + Fresh put writing + Negative GEX = Breakout UP"
+                        elif gex_pinning:
+                            verdict = "UP (CAPPED)"
+                            verdict_icon = "🟢📍"
+                            verdict_color = "#90EE90"
+                            verdict_desc = "Bullish bias but positive GEX may cap upside momentum"
+                        else:
+                            verdict = "UP"
+                            verdict_icon = "🟢"
+                            verdict_color = "#00ff88"
+                            verdict_desc = "Bullish PCR + Put writing activity across ATM±2 strikes"
+                    else:
+                        if gex_trending:
+                            verdict = "STRONG DOWN"
+                            verdict_icon = "🔴🔥"
+                            verdict_color = "#ff4444"
+                            verdict_desc = "Bearish PCR + Fresh call writing + Negative GEX = Breakdown"
+                        elif gex_pinning:
+                            verdict = "DOWN (SUPPORTED)"
+                            verdict_icon = "🔴📍"
+                            verdict_color = "#FFB6C1"
+                            verdict_desc = "Bearish bias but positive GEX may provide support"
+                        else:
+                            verdict = "DOWN"
+                            verdict_icon = "🔴"
+                            verdict_color = "#ff4444"
+                            verdict_desc = "Bearish PCR + Call writing activity across ATM±2 strikes"
+
+                    # ---- Display ----
+                    # Main verdict card
+                    st.markdown(f"""
+                    <div style="background: linear-gradient(135deg, {verdict_color}15, {verdict_color}30);
+                                padding: 25px; border-radius: 15px; border: 3px solid {verdict_color};
+                                text-align: center; margin-bottom: 20px;">
+                        <h1 style="color: {verdict_color}; margin: 0; font-size: 48px;">{verdict_icon} {verdict}</h1>
+                        <p style="color: #cccccc; margin: 10px 0 0 0; font-size: 16px;">{verdict_desc}</p>
+                        <p style="color: {verdict_color}; margin: 5px 0 0 0; font-size: 14px;">
+                            Composite Score: {total_score:+.1f} / {max_possible:.0f} ({score_pct:+.0f}%) |
+                            Net GEX: {total_net_gex:.1f}L ({'Trending' if gex_trending else 'Pinning' if gex_pinning else 'Neutral'})
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # Three metric cards
+                    met1, met2, met3 = st.columns(3)
+                    with met1:
+                        avg_pcr = comp_df['PCR'].mean()
+                        pcr_c = "#00ff88" if avg_pcr > 1.2 else "#ff4444" if avg_pcr < 0.7 else "#FFD700"
+                        st.markdown(f"""
+                        <div style="background-color: {pcr_c}20; padding: 12px; border-radius: 10px; border: 2px solid {pcr_c}; text-align: center;">
+                            <h4 style="color: {pcr_c}; margin: 0;">Avg PCR (OI)</h4>
+                            <h2 style="color: {pcr_c}; margin: 5px 0;">{avg_pcr:.2f}</h2>
+                            <p style="color: white; margin: 0; font-size: 12px;">{'Bullish' if avg_pcr > 1.2 else 'Bearish' if avg_pcr < 0.7 else 'Neutral'}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with met2:
+                        avg_chgoi = comp_df['PCR_ChgOI'].mean()
+                        chg_c = "#00ff88" if avg_chgoi > 1.2 else "#ff4444" if avg_chgoi < 0.7 else "#FFD700"
+                        st.markdown(f"""
+                        <div style="background-color: {chg_c}20; padding: 12px; border-radius: 10px; border: 2px solid {chg_c}; text-align: center;">
+                            <h4 style="color: {chg_c}; margin: 0;">Avg PCR (ΔOI)</h4>
+                            <h2 style="color: {chg_c}; margin: 5px 0;">{avg_chgoi:.2f}</h2>
+                            <p style="color: white; margin: 0; font-size: 12px;">{'Bullish' if avg_chgoi > 1.2 else 'Bearish' if avg_chgoi < 0.7 else 'Neutral'}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with met3:
+                        gex_c = "#00ff88" if total_net_gex > 10 else "#ff4444" if total_net_gex < -10 else "#FFD700"
+                        st.markdown(f"""
+                        <div style="background-color: {gex_c}20; padding: 12px; border-radius: 10px; border: 2px solid {gex_c}; text-align: center;">
+                            <h4 style="color: {gex_c}; margin: 0;">Total GEX (ATM±2)</h4>
+                            <h2 style="color: {gex_c}; margin: 5px 0;">{total_net_gex:.1f}L</h2>
+                            <p style="color: white; margin: 0; font-size: 12px;">{'Pin/Chop' if total_net_gex > 10 else 'Trend/Accel' if total_net_gex < -10 else 'Neutral'}</p>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    # Per-strike breakdown table
+                    st.markdown("### Per-Strike Breakdown")
+                    detail_df = pd.DataFrame(strike_details)
+                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+                    # Signal interpretation guide
+                    with st.expander("📖 How This Works"):
+                        st.markdown("""
+                        **Three indicators are combined for each ATM±2 strike:**
+
+                        | Indicator | Bullish (+1) | Bearish (-1) | Neutral (0) |
+                        |-----------|-------------|-------------|-------------|
+                        | **PCR (OI)** | > 1.2 (Heavy puts = support) | < 0.7 (Heavy calls = resistance) | 0.7 - 1.2 |
+                        | **PCR (ΔOI)** | > 1.2 (Fresh put writing) | < 0.7 (Fresh call writing) | 0.7 - 1.2 |
+                        | **GEX** | Determines trend vs chop | Determines trend vs chop | - |
+
+                        **Weighting:** ATM = 2x, ±1 strikes = 1.5x, ±2 strikes = 1x
+
+                        **GEX Role:** GEX doesn't determine direction — it determines **conviction**:
+                        - **Negative GEX** (< -10L): Dealers short gamma → moves amplified → **STRONG** trend signal
+                        - **Positive GEX** (> 10L): Dealers long gamma → moves dampened → **SIDEWAYS/CAPPED**
+                        - **Neutral GEX**: Normal market conditions
+
+                        **Verdict Logic:**
+                        - 🟢🔥 **STRONG UP**: Bullish PCR+ΔOI + Negative GEX = Breakout rally
+                        - 🟢📍 **UP (CAPPED)**: Bullish PCR+ΔOI + Positive GEX = Upside but range-bound
+                        - 🟢 **UP**: Bullish PCR+ΔOI + Neutral GEX
+                        - 🔴🔥 **STRONG DOWN**: Bearish PCR+ΔOI + Negative GEX = Breakdown selloff
+                        - 🔴📍 **DOWN (SUPPORTED)**: Bearish PCR+ΔOI + Positive GEX = Downside but supported
+                        - 🔴 **DOWN**: Bearish PCR+ΔOI + Neutral GEX
+                        - ↔️ **SIDEWAYS**: Mixed signals + Positive GEX = Choppy range
+                        - ⚪ **NEUTRAL**: No clear signal
+                        """)
+
+                else:
+                    st.info("⏳ Waiting for ATM data to calculate composite signal...")
+            else:
+                st.info("⏳ Waiting for option chain data with PCR, ΔOI, and Greeks...")
+
+        except Exception as e:
+            st.warning(f"Composite direction signal unavailable: {str(e)}")
+
         # ===== TOTAL GEX TIME-SERIES GRAPH =====
         st.markdown("---")
         st.markdown("## 📊 Total GEX (Gamma Exposure) - Time Series")
