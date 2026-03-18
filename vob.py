@@ -6094,6 +6094,14 @@ def main():
                             line=dict(color='#00cc66', width=1, dash='dot'),
                             hovertemplate='PE: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
                         ))
+                    # Dynamic Y range: all 3 traces (Straddle, CE, PE) combined
+                    _sy_vals = _st_df[_skey].dropna().tolist()
+                    if _cekey in _st_df.columns:
+                        _sy_vals += _st_df[_cekey].dropna().tolist()
+                    if _pekey in _st_df.columns:
+                        _sy_vals += _st_df[_pekey].dropna().tolist()
+                    _sy_min = max(0.0, min(_sy_vals) * 0.9) if _sy_vals else 0
+                    _sy_max = max(_sy_vals) * 1.1 if _sy_vals else 10
                     _sfig.update_layout(
                         title=dict(text=f"{_pos_labels[_si]}<br>₹{_sstrike}<br>{_st_icon} ₹{_st_cur:.1f} (Δ{_st_delta:+.1f})",
                                    font=dict(size=11)),
@@ -6103,7 +6111,7 @@ def main():
                                     xanchor='center', x=0.5, font=dict(size=8)),
                         margin=dict(l=5, r=10, t=75, b=30),
                         xaxis=dict(tickformat='%H:%M', title=''),
-                        yaxis=dict(title='Premium (₹)'),
+                        yaxis=dict(title='Premium (₹)', range=[_sy_min, _sy_max]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     )
                     st.plotly_chart(_sfig, use_container_width=True)
