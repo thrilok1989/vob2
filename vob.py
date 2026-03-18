@@ -5492,7 +5492,7 @@ def main():
             st.dataframe(option_data['styled_df'], use_container_width=True)
 
         # ── ATM ±3 Strike Data Tabulation ──
-        st.markdown("### 📋 ATM ±3 Strike Data — PCR · Straddle · OI · Vol · GEX · Bias")
+        st.markdown("### 📋 ATM ±3 Strike Data — PCR · Straddle · OI · Vol · GEX · Bias · OI Type")
         try:
             _bs_src = option_data.get('df_summary') if option_data else None
             if _bs_src is not None:
@@ -5509,6 +5509,20 @@ def main():
                     def _bs_zone(i):
                         d = i - _bs_atm_i
                         return '🟡 ATM' if d == 0 else (f'🟣 ITM{d}' if d < 0 else f'🔵 OTM+{d}')
+
+                    # Underlying price direction for OI type classification
+                    _bs_und = option_data.get('underlying', 0) or 0
+                    if '_oi_prev_underlying' not in st.session_state:
+                        st.session_state['_oi_prev_underlying'] = _bs_und
+                    _bs_und_up = _bs_und >= st.session_state['_oi_prev_underlying']
+                    st.session_state['_oi_prev_underlying'] = _bs_und
+
+                    def _oi_type(chgoi, price_up):
+                        oi_up = (chgoi or 0) > 0
+                        if price_up and oi_up:    return "🟢 Long Build-up"
+                        if not price_up and oi_up: return "🔴 Short Build-up"
+                        if price_up and not oi_up: return "🟡 Short Covering"
+                        return "🟠 Long Unwinding"
 
                     _bt = pd.DataFrame()
                     _bt['Strike']   = _bs['Strike']
@@ -5544,10 +5558,14 @@ def main():
                         _bt['CE OI(L)'] = (_bs['openInterest_CE'] / 100000).round(2)
                         _bt['PE OI(L)'] = (_bs['openInterest_PE'] / 100000).round(2)
 
-                    # ΔOI
+                    # ΔOI + OI Type (separately for CE and PE)
                     if 'changeinOpenInterest_CE' in _bs.columns:
-                        _bt['CE ΔOI']   = _bs['changeinOpenInterest_CE'].fillna(0).astype(int)
-                        _bt['PE ΔOI']   = _bs['changeinOpenInterest_PE'].fillna(0).astype(int)
+                        _bt['CE ΔOI']    = _bs['changeinOpenInterest_CE'].fillna(0).astype(int)
+                        _bt['CE OI Type'] = _bs['changeinOpenInterest_CE'].apply(
+                            lambda v: _oi_type(v, _bs_und_up))
+                        _bt['PE ΔOI']    = _bs['changeinOpenInterest_PE'].fillna(0).astype(int)
+                        _bt['PE OI Type'] = _bs['changeinOpenInterest_PE'].apply(
+                            lambda v: _oi_type(v, _bs_und_up))
 
                     # IV
                     if 'impliedVolatility_CE' in _bs.columns:
@@ -5580,14 +5598,18 @@ def main():
                         use_container_width=True,
                         hide_index=True,
                     )
-                    st.caption(f"📍 ATM ₹{_bs_atm_strike} · ATM±3 ({len(_bt)} strikes) · "
-                               f"🟡 ATM highlighted · 🟢 PCR>1.2 Bull · 🔴 PCR<0.7 Bear")
+                    _und_dir = "↑" if _bs_und_up else "↓"
+                    st.caption(
+                        f"📍 ATM ₹{_bs_atm_strike} · ATM±3 ({len(_bt)} strikes) · "
+                        f"Underlying {_und_dir} ₹{_bs_und:.0f} · "
+                        f"🟢 Long Build-up  🔴 Short Build-up  🟡 Short Covering  🟠 Long Unwinding"
+                    )
                 else:
                     st.info("ATM strike not found.")
             else:
                 st.info("Option data not available.")
         except Exception as _bs_exc:
-            st.warning(f"ATM ±5 table error: {str(_bs_exc)[:120]}")
+            st.warning(f"ATM ±3 table error: {str(_bs_exc)[:120]}")
 
         # ===== HTF SUPPORT & RESISTANCE TABLES (SPLIT) =====
         st.markdown("---")
@@ -6027,13 +6049,27 @@ def main():
                     _t5_end     = min(len(_t5_src), _t5_atm_pos + 4)
                     _t5         = _t5_src.iloc[_t5_start:_t5_end].copy().reset_index(drop=True)
 
-                    # Zone labels: ITM-5 … ATM … OTM+5
                     _t5_atm_strike  = _t5[_t5['Zone'] == 'ATM']['Strike'].values[0]
                     _t5_stk_list    = _t5['Strike'].tolist()
                     _t5_atm_i       = _t5_stk_list.index(_t5_atm_strike)
                     def _t5_zone(i):
                         d = i - _t5_atm_i
                         return '🟡 ATM' if d == 0 else (f'🟣 ITM{d}' if d < 0 else f'🔵 OTM+{d}')
+
+                    # Underlying direction for OI type
+                    _t5_und = option_data.get('underlying', 0) or 0
+                    if '_oi_prev_underlying' not in st.session_state:
+                        st.session_state['_oi_prev_underlying'] = _t5_und
+                    _t5_und_up = _t5_und >= st.session_state['_oi_prev_underlying']
+                    st.session_state['_oi_prev_underlying'] = _t5_und
+
+                    def _t5_oi_type(chgoi, price_up):
+                        oi_up = (chgoi or 0) > 0
+                        if price_up and oi_up:     return "🟢 Long Build-up"
+                        if not price_up and oi_up: return "🔴 Short Build-up"
+                        if price_up and not oi_up: return "🟡 Short Covering"
+                        return "🟠 Long Unwinding"
+
                     _t5_tbl = pd.DataFrame()
                     _t5_tbl['Strike']   = _t5['Strike']
                     _t5_tbl['Zone']     = [_t5_zone(i) for i in range(len(_t5))]
@@ -6068,10 +6104,14 @@ def main():
                         _t5_tbl['CE OI(L)'] = (_t5['openInterest_CE'] / 100000).round(2)
                         _t5_tbl['PE OI(L)'] = (_t5['openInterest_PE'] / 100000).round(2)
 
-                    # Change in OI
+                    # ΔOI + OI Type (separately for CE and PE)
                     if 'changeinOpenInterest_CE' in _t5.columns:
-                        _t5_tbl['CE ΔOI']   = _t5['changeinOpenInterest_CE'].fillna(0).astype(int)
-                        _t5_tbl['PE ΔOI']   = _t5['changeinOpenInterest_PE'].fillna(0).astype(int)
+                        _t5_tbl['CE ΔOI']    = _t5['changeinOpenInterest_CE'].fillna(0).astype(int)
+                        _t5_tbl['CE OI Type'] = _t5['changeinOpenInterest_CE'].apply(
+                            lambda v: _t5_oi_type(v, _t5_und_up))
+                        _t5_tbl['PE ΔOI']    = _t5['changeinOpenInterest_PE'].fillna(0).astype(int)
+                        _t5_tbl['PE OI Type'] = _t5['changeinOpenInterest_PE'].apply(
+                            lambda v: _t5_oi_type(v, _t5_und_up))
 
                     # IV
                     if 'impliedVolatility_CE' in _t5.columns:
@@ -6088,7 +6128,7 @@ def main():
                     if 'Verdict' in _t5.columns:
                         _t5_tbl['Verdict']  = _t5['Verdict']
 
-                    # Row styling: ATM = amber, Bull rows = faint green, Bear = faint red
+                    # Row styling
                     def _t5_style(row):
                         if row['Zone'] == '🟡 ATM':
                             return ['background-color: rgba(255,200,0,0.18)'] * len(row)
@@ -6104,14 +6144,18 @@ def main():
                         use_container_width=True,
                         hide_index=True,
                     )
-                    st.caption(f"📍 ATM ₹{_t5_atm_strike} · ATM±3 ({len(_t5_tbl)} strikes) · "
-                               f"{'🟢 Live' if option_data else '🟡 Cached'}")
+                    _t5_und_dir = "↑" if _t5_und_up else "↓"
+                    st.caption(
+                        f"📍 ATM ₹{_t5_atm_strike} · ATM±3 ({len(_t5_tbl)} strikes) · "
+                        f"Underlying {_t5_und_dir} ₹{_t5_und:.0f} · "
+                        f"🟢 Long Build-up  🔴 Short Build-up  🟡 Short Covering  🟠 Long Unwinding"
+                    )
                 else:
                     st.info("ATM strike not identified in current data.")
             else:
                 st.info("Option data not available yet — wait for first refresh.")
         except Exception as _t5_exc:
-            st.warning(f"ATM ±5 table error: {str(_t5_exc)[:120]}")
+            st.warning(f"ATM ±3 table error: {str(_t5_exc)[:120]}")
 
         # ===== VOLUME PCR + STRADDLE + COMBINED SIGNAL (ATM ± 2) =====
         st.markdown("---")
