@@ -5008,6 +5008,39 @@ def main():
             except Exception as e:
                 st.warning(f"Reversal analysis unavailable: {str(e)}")
 
+            # ===== ULTIMATE RSI [LuxAlgo] =====
+            if ultimate_rsi_data_for_chart:
+                st.markdown("---")
+                st.markdown("## 📈 Ultimate RSI [LuxAlgo]")
+
+                ursi_val = ultimate_rsi_data_for_chart.get('latest_arsi', 50)
+                ursi_sig = ultimate_rsi_data_for_chart.get('latest_signal', 50)
+                ursi_zone = ultimate_rsi_data_for_chart.get('zone', 'Neutral')
+                ursi_cross = ultimate_rsi_data_for_chart.get('cross_signal', 'None')
+                ursi_momentum = ultimate_rsi_data_for_chart.get('momentum', 'Neutral')
+
+                ursi_col1, ursi_col2, ursi_col3, ursi_col4 = st.columns(4)
+                with ursi_col1:
+                    delta_color = "normal" if ursi_momentum == 'Bullish' else ("inverse" if ursi_momentum == 'Bearish' else "off")
+                    st.metric("URSI Value", f"{ursi_val:.1f}", delta=ursi_momentum, delta_color=delta_color)
+                with ursi_col2:
+                    st.metric("Signal Line", f"{ursi_sig:.1f}")
+                with ursi_col3:
+                    zone_icon = "🟢" if ursi_zone == 'Overbought' else ("🔴" if ursi_zone == 'Oversold' else "⚪")
+                    st.metric("Zone", f"{zone_icon} {ursi_zone}")
+                with ursi_col4:
+                    cross_icon = "🔼" if 'Bullish' in ursi_cross else ("🔽" if 'Bearish' in ursi_cross else "➖")
+                    st.metric("Cross Signal", f"{cross_icon} {ursi_cross}")
+
+                st.markdown("""
+                **Ultimate RSI Interpretation:**
+                - **Above 70 (OB)**: Overbought — expect bearish reversal
+                - **Below 40 (OS)**: Oversold — expect bullish bounce
+                - **URSI > Signal + Above 50**: Bullish momentum confirmed
+                - **URSI < Signal + Below 50**: Bearish momentum confirmed
+                - **Bullish/Bearish Cross**: URSI crossing signal line = momentum shift
+                """)
+
             # ===== TRIPLE POC + FUTURE SWING ANALYSIS =====
             st.markdown("---")
             st.markdown("## 📊 Triple POC + Future Swing Analysis")
@@ -5234,39 +5267,6 @@ def main():
                 - Use with POC and Swing levels for confluence-based entries
                 """)
 
-            # ===== ULTIMATE RSI [LuxAlgo] =====
-            if ultimate_rsi_data_for_chart:
-                st.markdown("---")
-                st.markdown("## 📈 Ultimate RSI [LuxAlgo]")
-
-                ursi_val = ultimate_rsi_data_for_chart.get('latest_arsi', 50)
-                ursi_sig = ultimate_rsi_data_for_chart.get('latest_signal', 50)
-                ursi_zone = ultimate_rsi_data_for_chart.get('zone', 'Neutral')
-                ursi_cross = ultimate_rsi_data_for_chart.get('cross_signal', 'None')
-                ursi_momentum = ultimate_rsi_data_for_chart.get('momentum', 'Neutral')
-
-                ursi_col1, ursi_col2, ursi_col3, ursi_col4 = st.columns(4)
-                with ursi_col1:
-                    delta_color = "normal" if ursi_momentum == 'Bullish' else ("inverse" if ursi_momentum == 'Bearish' else "off")
-                    st.metric("URSI Value", f"{ursi_val:.1f}", delta=ursi_momentum, delta_color=delta_color)
-                with ursi_col2:
-                    st.metric("Signal Line", f"{ursi_sig:.1f}")
-                with ursi_col3:
-                    zone_icon = "🟢" if ursi_zone == 'Overbought' else ("🔴" if ursi_zone == 'Oversold' else "⚪")
-                    st.metric("Zone", f"{zone_icon} {ursi_zone}")
-                with ursi_col4:
-                    cross_icon = "🔼" if 'Bullish' in ursi_cross else ("🔽" if 'Bearish' in ursi_cross else "➖")
-                    st.metric("Cross Signal", f"{cross_icon} {ursi_cross}")
-
-                st.markdown("""
-                **Ultimate RSI Interpretation:**
-                - **Above 70 (OB)**: Overbought — expect bearish reversal
-                - **Below 40 (OS)**: Oversold — expect bullish bounce
-                - **URSI > Signal + Above 50**: Bullish momentum confirmed
-                - **URSI < Signal + Below 50**: Bearish momentum confirmed
-                - **Bullish/Bearish Cross**: URSI crossing signal line = momentum shift
-                """)
-
         else:
             st.error("No data available. Please check your API credentials and try again.")
     
@@ -5381,115 +5381,6 @@ def main():
                         st.success(f"PE BUY order placed for {ts_pe} | Order ID: {res.get('orderId', res)}")
                     else:
                         st.error(f"PE BUY failed for {ts_pe}: {res}")
-
-        # ===== KEY LEVELS FROM ORDER BOOK DEPTH CHART (time-series) =====
-        st.markdown("---")
-        _depth_df_summary = option_data.get('df_summary')
-        if _depth_df_summary is not None:
-            _has_bid = 'bidQty_PE' in _depth_df_summary.columns and not _depth_df_summary['bidQty_PE'].isna().all()
-            _has_ask = 'askQty_CE' in _depth_df_summary.columns and not _depth_df_summary['askQty_CE'].isna().all()
-            if _has_bid or _has_ask:
-                _ist = pytz.timezone('Asia/Kolkata')
-                _depth_now = datetime.now(_ist)
-                _depth_entry = {'time': _depth_now}
-                if _has_bid:
-                    _top3_sup = _depth_df_summary.nlargest(3, 'bidQty_PE')[['Strike', 'bidQty_PE']].copy()
-                    _top3_sup = _top3_sup.sort_values('Strike', ascending=False).reset_index(drop=True)
-                    for _i, _r in _top3_sup.iterrows():
-                        _depth_entry[f'S{_i+1}_qty'] = _r['bidQty_PE']
-                        _depth_entry[f'S{_i+1}_price'] = _r['Strike']
-                if _has_ask:
-                    _top3_res = _depth_df_summary.nlargest(3, 'askQty_CE')[['Strike', 'askQty_CE']].copy()
-                    _top3_res = _top3_res.sort_values('Strike').reset_index(drop=True)
-                    for _i, _r in _top3_res.iterrows():
-                        _depth_entry[f'R{_i+1}_qty'] = _r['askQty_CE']
-                        _depth_entry[f'R{_i+1}_price'] = _r['Strike']
-                # Avoid duplicates within 30 seconds
-                _should_add_depth = True
-                if st.session_state.depth_history:
-                    _last_depth = st.session_state.depth_history[-1]
-                    if (_depth_now - _last_depth['time']).total_seconds() < 30:
-                        _should_add_depth = False
-                if _should_add_depth:
-                    st.session_state.depth_history.append(_depth_entry)
-                    if len(st.session_state.depth_history) > 200:
-                        st.session_state.depth_history = st.session_state.depth_history[-200:]
-
-        st.markdown("### 📊 Key Levels from Order Book Depth")
-        if st.session_state.depth_history:
-            _depth_hist_df = pd.DataFrame(st.session_state.depth_history)
-            _support_colors = ['#00cc66', '#00aa55', '#008844']
-            _resist_colors  = ['#ff4444', '#dd3333', '#bb2222']
-            _depth_levels = (
-                [('S', i+1, _support_colors[i], 'Support', 'bidQty_PE') for i in range(3)] +
-                [('R', i+1, _resist_colors[i],  'Resistance', 'askQty_CE') for i in range(3)]
-            )
-            _depth_cols = st.columns(6)
-            for _col_idx, (_col, (_side, _n, _clr, _label, _)) in enumerate(zip(_depth_cols, _depth_levels)):
-                with _col:
-                    _qty_col   = f'{_side}{_n}_qty'
-                    _price_col = f'{_side}{_n}_price'
-                    if _qty_col not in _depth_hist_df.columns:
-                        st.info(f"{_side}{_n} N/A")
-                        continue
-                    _cur_qty = _depth_hist_df[_qty_col].iloc[-1]
-                    _cur_price = (
-                        _depth_hist_df[_price_col].iloc[-1]
-                        if _price_col in _depth_hist_df.columns else None
-                    )
-                    _price_str = f'₹{_cur_price:,.0f}' if _cur_price is not None else ''
-                    _rgb = tuple(int(_clr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
-                    _fill = f'rgba({_rgb[0]},{_rgb[1]},{_rgb[2]},0.15)'
-                    _qty_vals = _depth_hist_df[_qty_col].dropna()
-                    _max_qty = _qty_vals.max() if len(_qty_vals) > 0 else 1
-                    _fig_d = go.Figure()
-                    _fig_d.add_trace(go.Scatter(
-                        x=_depth_hist_df['time'],
-                        y=_depth_hist_df[_qty_col],
-                        mode='lines+markers',
-                        name=_label,
-                        line=dict(color=_clr, width=2),
-                        marker=dict(size=3),
-                        fill='tozeroy',
-                        fillcolor=_fill,
-                        hovertemplate=f'{_side}{_n} {_label}<br>Qty: %{{y:,.0f}}<br>Time: %{{x|%H:%M}}<extra></extra>',
-                    ))
-                    _fig_d.update_layout(
-                        title=dict(
-                            text=f"{'🟢' if _side=='S' else '🔴'} {_side}{_n} {_label}<br>{_price_str}<br>Qty: {_cur_qty:,.0f}",
-                            font=dict(size=11)
-                        ),
-                        template='plotly_dark',
-                        height=300,
-                        showlegend=False,
-                        margin=dict(l=5, r=10, t=70, b=30),
-                        xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
-                        yaxis=dict(
-                            title='Bid Qty' if _side == 'S' else 'Ask Qty',
-                            tickformat=',.0f',
-                            range=[0, _max_qty * 1.2],
-                            title_font=dict(color=_clr, size=9),
-                            tickfont=dict(size=8),
-                        ),
-                        plot_bgcolor='#1e1e1e',
-                        paper_bgcolor='#1e1e1e',
-                    )
-                    st.plotly_chart(_fig_d, use_container_width=True)
-                    _caption = f"{'PE Bid' if _side=='S' else 'CE Ask'} {_cur_qty:,.0f}"
-                    if _cur_price is not None:
-                        _caption += f" @ {_price_str}"
-                    st.caption(_caption)
-        else:
-            depth_fig = plot_depth_levels(
-                option_data.get('df_summary'),
-                option_data.get('underlying')
-            )
-            if depth_fig is not None:
-                st.plotly_chart(depth_fig, use_container_width=True)
-        # Option Chain Bias Summary Table
-        st.markdown("## Option Chain Bias Summary")
-        if option_data.get('styled_df') is not None:
-            st.dataframe(option_data['styled_df'], use_container_width=True)
 
         # ===== ATM ±3 STRIKE DATA TABLE =====
         st.markdown("---")
@@ -5612,6 +5503,12 @@ def main():
         except Exception as _t5_exc:
             st.warning(f"ATM ±3 table error: {str(_t5_exc)[:120]}")
 
+        # Option Chain Bias Summary Table
+        st.markdown("---")
+        st.markdown("## Option Chain Bias Summary")
+        if option_data.get('styled_df') is not None:
+            st.dataframe(option_data['styled_df'], use_container_width=True)
+
         # ===== HTF SUPPORT & RESISTANCE TABLES (SPLIT) =====
         st.markdown("---")
         st.markdown("## 📈 HTF Support & Resistance Levels")
@@ -5645,6 +5542,110 @@ def main():
             # Max Pain summary
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
+
+        # ===== KEY LEVELS FROM ORDER BOOK DEPTH CHART (time-series) =====
+        st.markdown("---")
+        _depth_df_summary = option_data.get('df_summary')
+        if _depth_df_summary is not None:
+            _has_bid = 'bidQty_PE' in _depth_df_summary.columns and not _depth_df_summary['bidQty_PE'].isna().all()
+            _has_ask = 'askQty_CE' in _depth_df_summary.columns and not _depth_df_summary['askQty_CE'].isna().all()
+            if _has_bid or _has_ask:
+                _ist = pytz.timezone('Asia/Kolkata')
+                _depth_now = datetime.now(_ist)
+                _depth_entry = {'time': _depth_now}
+                if _has_bid:
+                    _top3_sup = _depth_df_summary.nlargest(3, 'bidQty_PE')[['Strike', 'bidQty_PE']].copy()
+                    _top3_sup = _top3_sup.sort_values('Strike', ascending=False).reset_index(drop=True)
+                    for _i, _r in _top3_sup.iterrows():
+                        _depth_entry[f'S{_i+1}_qty'] = _r['bidQty_PE']
+                        _depth_entry[f'S{_i+1}_price'] = _r['Strike']
+                if _has_ask:
+                    _top3_res = _depth_df_summary.nlargest(3, 'askQty_CE')[['Strike', 'askQty_CE']].copy()
+                    _top3_res = _top3_res.sort_values('Strike').reset_index(drop=True)
+                    for _i, _r in _top3_res.iterrows():
+                        _depth_entry[f'R{_i+1}_qty'] = _r['askQty_CE']
+                        _depth_entry[f'R{_i+1}_price'] = _r['Strike']
+                _should_add_depth = True
+                if st.session_state.depth_history:
+                    _last_depth = st.session_state.depth_history[-1]
+                    if (_depth_now - _last_depth['time']).total_seconds() < 30:
+                        _should_add_depth = False
+                if _should_add_depth:
+                    st.session_state.depth_history.append(_depth_entry)
+                    if len(st.session_state.depth_history) > 200:
+                        st.session_state.depth_history = st.session_state.depth_history[-200:]
+
+        st.markdown("### 📊 Key Levels from Order Book Depth")
+        if st.session_state.depth_history:
+            _depth_hist_df = pd.DataFrame(st.session_state.depth_history)
+            _support_colors = ['#00cc66', '#00aa55', '#008844']
+            _resist_colors  = ['#ff4444', '#dd3333', '#bb2222']
+            _depth_levels = (
+                [('S', i+1, _support_colors[i], 'Support', 'bidQty_PE') for i in range(3)] +
+                [('R', i+1, _resist_colors[i],  'Resistance', 'askQty_CE') for i in range(3)]
+            )
+            _depth_cols = st.columns(6)
+            for _col_idx, (_col, (_side, _n, _clr, _label, _)) in enumerate(zip(_depth_cols, _depth_levels)):
+                with _col:
+                    _qty_col   = f'{_side}{_n}_qty'
+                    _price_col = f'{_side}{_n}_price'
+                    if _qty_col not in _depth_hist_df.columns:
+                        st.info(f"{_side}{_n} N/A")
+                        continue
+                    _cur_qty = _depth_hist_df[_qty_col].iloc[-1]
+                    _cur_price = (
+                        _depth_hist_df[_price_col].iloc[-1]
+                        if _price_col in _depth_hist_df.columns else None
+                    )
+                    _price_str = f'₹{_cur_price:,.0f}' if _cur_price is not None else ''
+                    _rgb = tuple(int(_clr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+                    _fill = f'rgba({_rgb[0]},{_rgb[1]},{_rgb[2]},0.15)'
+                    _qty_vals = _depth_hist_df[_qty_col].dropna()
+                    _max_qty = _qty_vals.max() if len(_qty_vals) > 0 else 1
+                    _fig_d = go.Figure()
+                    _fig_d.add_trace(go.Scatter(
+                        x=_depth_hist_df['time'],
+                        y=_depth_hist_df[_qty_col],
+                        mode='lines+markers',
+                        name=_label,
+                        line=dict(color=_clr, width=2),
+                        marker=dict(size=3),
+                        fill='tozeroy',
+                        fillcolor=_fill,
+                        hovertemplate=f'{_side}{_n} {_label}<br>Qty: %{{y:,.0f}}<br>Time: %{{x|%H:%M}}<extra></extra>',
+                    ))
+                    _fig_d.update_layout(
+                        title=dict(
+                            text=f"{'🟢' if _side=='S' else '🔴'} {_side}{_n} {_label}<br>{_price_str}<br>Qty: {_cur_qty:,.0f}",
+                            font=dict(size=11)
+                        ),
+                        template='plotly_dark',
+                        height=300,
+                        showlegend=False,
+                        margin=dict(l=5, r=10, t=70, b=30),
+                        xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                        yaxis=dict(
+                            title='Bid Qty' if _side == 'S' else 'Ask Qty',
+                            tickformat=',.0f',
+                            range=[0, _max_qty * 1.2],
+                            title_font=dict(color=_clr, size=9),
+                            tickfont=dict(size=8),
+                        ),
+                        plot_bgcolor='#1e1e1e',
+                        paper_bgcolor='#1e1e1e',
+                    )
+                    st.plotly_chart(_fig_d, use_container_width=True)
+                    _caption = f"{'PE Bid' if _side=='S' else 'CE Ask'} {_cur_qty:,.0f}"
+                    if _cur_price is not None:
+                        _caption += f" @ {_price_str}"
+                    st.caption(_caption)
+        else:
+            depth_fig = plot_depth_levels(
+                option_data.get('df_summary'),
+                option_data.get('underlying')
+            )
+            if depth_fig is not None:
+                st.plotly_chart(depth_fig, use_container_width=True)
 
         # ===== PRE-COMPUTE GEX + TRACK HISTORY (before comparison view) =====
         _gex_pre_summary = option_data.get('df_summary')
