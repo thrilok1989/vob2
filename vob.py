@@ -4542,6 +4542,12 @@ def main():
     if 'straddle_history' not in st.session_state:
         st.session_state.straddle_history = []
 
+    # Initialize session state for Delta & Gamma per-strike history
+    if 'delta_gamma_history' not in st.session_state:
+        st.session_state.delta_gamma_history = []
+    if 'delta_gamma_last_valid' not in st.session_state:
+        st.session_state.delta_gamma_last_valid = None
+
     # Initialize session state for IV Skew & Pressure history
     if 'iv_skew_history' not in st.session_state:
         st.session_state.iv_skew_history = []
@@ -8300,6 +8306,301 @@ def main():
 
         except Exception as _ae_e:
             st.warning(f"Auto Entry Engine unavailable: {str(_ae_e)}")
+
+        # ===== DELTA & GAMMA ENGINE (PER STRIKE + OVERALL) =====
+        st.markdown("---")
+        st.markdown("## ⚡ Delta & Gamma Engine — Per Strike + Overall (ATM ± 2)")
+
+        try:
+            _dg_df = option_data.get('df_summary') if option_data else None
+            _dg_underlying = option_data.get('underlying') if option_data else None
+
+            _dg_required = ['Zone', 'Strike', 'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE',
+                            'openInterest_CE', 'openInterest_PE']
+
+            if (_dg_df is not None and _dg_underlying and
+                    all(c in _dg_df.columns for c in _dg_required)):
+
+                # --- ATM ± 2 slice ---
+                _dg_atm_idx = _dg_df[_dg_df['Zone'] == 'ATM'].index
+                if len(_dg_atm_idx) > 0:
+                    _dg_atm_pos = _dg_df.index.get_loc(_dg_atm_idx[0])
+                    _dg_start = max(0, _dg_atm_pos - 2)
+                    _dg_end   = min(len(_dg_df), _dg_atm_pos + 3)
+                    _dg_slice = _dg_df.iloc[_dg_start:_dg_end].copy()
+
+                    _dg_strikes_sorted = sorted(_dg_slice['Strike'].unique())
+                    _dg_step = int(_dg_strikes_sorted[1] - _dg_strikes_sorted[0]) if len(_dg_strikes_sorted) >= 2 else 50
+                    _dg_atm_val = float(_dg_df[_dg_df['Zone'] == 'ATM']['Strike'].values[0])
+
+                    # Strike position labels
+                    def _dg_label(s):
+                        diff = int(round((s - _dg_atm_val) / _dg_step))
+                        if diff == 0:   return "ATM"
+                        if diff > 0:    return f"ATM+{diff}"
+                        return f"ATM{diff}"
+
+                    # --- PER STRIKE delta & gamma ---
+                    _dg_delta_per = {}
+                    _dg_gamma_per = {}
+                    _contract_mult = 25
+
+                    for _, _r in _dg_slice.iterrows():
+                        _s = float(_r['Strike'])
+                        _lbl = _dg_label(_s)
+                        _d_ce = float(_r.get('Delta_CE', 0) or 0)
+                        _d_pe = float(_r.get('Delta_PE', 0) or 0)
+                        _g_ce = float(_r.get('Gamma_CE', 0) or 0)
+                        _g_pe = float(_r.get('Gamma_PE', 0) or 0)
+                        _oi_ce = float(_r.get('openInterest_CE', 0) or 0)
+                        _oi_pe = float(_r.get('openInterest_PE', 0) or 0)
+
+                        _dg_delta_per[_lbl] = round(_d_ce + _d_pe, 4)
+                        # Gamma per strike in Lakhs (PE builds − CE pins)
+                        _dg_gamma_per[_lbl] = round(
+                            (_g_pe * _oi_pe - _g_ce * _oi_ce) * _contract_mult * _dg_underlying / 100000, 2
+                        )
+
+                    # --- OVERALL NET ---
+                    _all_d_ce = [float(_r.get('Delta_CE', 0) or 0) for _, _r in _dg_slice.iterrows()]
+                    _all_d_pe = [float(_r.get('Delta_PE', 0) or 0) for _, _r in _dg_slice.iterrows()]
+                    _avg_d_ce = sum(_all_d_ce) / len(_all_d_ce) if _all_d_ce else 0
+                    _avg_d_pe = sum(_all_d_pe) / len(_all_d_pe) if _all_d_pe else 0
+                    _net_delta = round(_avg_d_ce + _avg_d_pe, 4)
+                    _net_gamma = round(sum(_dg_gamma_per.values()), 2)
+
+                    # --- HISTORY (time-series) ---
+                    _dg_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                    _dg_should_append = (
+                        not st.session_state.delta_gamma_history or
+                        (_dg_now - st.session_state.delta_gamma_history[-1]['time']).total_seconds() >= 30
+                    )
+                    if _dg_should_append:
+                        st.session_state.delta_gamma_history.append({
+                            'time': _dg_now,
+                            'net_delta': _net_delta,
+                            'net_gamma': _net_gamma,
+                            **{f"delta_{k}": v for k, v in _dg_delta_per.items()},
+                            **{f"gamma_{k}": v for k, v in _dg_gamma_per.items()},
+                        })
+                        if len(st.session_state.delta_gamma_history) > 200:
+                            st.session_state.delta_gamma_history = st.session_state.delta_gamma_history[-200:]
+
+                    # --- CHANGE vs PREVIOUS ---
+                    _prev_dg = st.session_state.delta_gamma_history
+                    _prev_nd = _prev_dg[-2]['net_delta'] if len(_prev_dg) >= 2 else _net_delta
+                    _prev_ng = _prev_dg[-2]['net_gamma'] if len(_prev_dg) >= 2 else _net_gamma
+                    _delta_change = round(_net_delta - _prev_nd, 4)
+                    _gamma_change = round(_net_gamma - _prev_ng, 2)
+
+                    # --- HOT STRIKE (highest abs gamma) ---
+                    _hot_lbl = max(_dg_gamma_per, key=lambda k: abs(_dg_gamma_per[k])) if _dg_gamma_per else "ATM"
+                    _hot_val = _dg_gamma_per.get(_hot_lbl, 0)
+
+                    if _hot_lbl in ("ATM+1", "ATM+2") and _hot_val > 0:
+                        _hot_signal = "🚀 Bullish Build Above ATM"
+                        _hot_color  = "#00C853"
+                    elif _hot_lbl in ("ATM-1", "ATM-2") and _hot_val < 0:
+                        _hot_signal = "🔥 Bearish Build Below ATM"
+                        _hot_color  = "#FF5252"
+                    elif _hot_lbl == "ATM":
+                        _hot_signal = "📌 Pinned at ATM"
+                        _hot_color  = "#FFD740"
+                    else:
+                        _hot_signal = "➡️ Neutral"
+                        _hot_color  = "#888888"
+
+                    # --- MAIN SIGNAL ---
+                    if _net_delta > 0.15 and _gamma_change > 0:
+                        _dg_main_signal = "🚀 Bullish Momentum"
+                        _dg_main_color  = "#00C853"
+                    elif _net_delta < -0.15 and _gamma_change > 0:
+                        _dg_main_signal = "🔥 Bearish Momentum"
+                        _dg_main_color  = "#FF5252"
+                    elif _net_delta > 0.05:
+                        _dg_main_signal = "🟡 Mild Bullish"
+                        _dg_main_color  = "#FFD740"
+                    elif _net_delta < -0.05:
+                        _dg_main_signal = "🟡 Mild Bearish"
+                        _dg_main_color  = "#FFD740"
+                    else:
+                        _dg_main_signal = "⏳ No Clear Trend"
+                        _dg_main_color  = "#888888"
+
+                    # --- EARLY ENTRY ENGINE ---
+                    if _net_delta > 0 and _gamma_change > 0 and _hot_lbl in ("ATM+1", "ATM+2"):
+                        _dg_entry = "🚀 ENTER CE — Early Breakout"
+                        _dg_entry_color = "#00C853"
+                    elif _net_delta < 0 and _gamma_change > 0 and _hot_lbl in ("ATM-1", "ATM-2"):
+                        _dg_entry = "🔥 ENTER PE — Early Breakdown"
+                        _dg_entry_color = "#FF5252"
+                    elif _gamma_change > 0:
+                        _dg_entry = "⚡ Gamma Rising — Watch for breakout"
+                        _dg_entry_color = "#FFD740"
+                    else:
+                        _dg_entry = "WAIT ⏳"
+                        _dg_entry_color = "#888888"
+
+                    # ======== UI OUTPUT ========
+                    _dg_c1, _dg_c2, _dg_c3, _dg_c4 = st.columns(4)
+                    with _dg_c1:
+                        _nd_color = "#00C853" if _net_delta > 0.05 else ("#FF5252" if _net_delta < -0.05 else "#FFD740")
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid {_nd_color};">
+                        <div style="color:#aaa;font-size:11px;">NET DELTA</div>
+                        <div style="font-size:22px;font-weight:bold;color:{_nd_color};">{_net_delta:+.4f}</div>
+                        <div style="font-size:12px;color:#aaa;margin-top:4px;">Δ change: {_delta_change:+.4f}</div>
+                        <div style="font-size:11px;color:#777;">avg CE Δ: {_avg_d_ce:+.3f} &nbsp; PE Δ: {_avg_d_pe:+.3f}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with _dg_c2:
+                        _ng_color = "#00C853" if _net_gamma > 5 else ("#FF5252" if _net_gamma < -5 else "#FFD740")
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid {_ng_color};">
+                        <div style="color:#aaa;font-size:11px;">NET GAMMA (Lakhs)</div>
+                        <div style="font-size:22px;font-weight:bold;color:{_ng_color};">{_net_gamma:+.2f}L</div>
+                        <div style="font-size:12px;color:#aaa;margin-top:4px;">Δ change: {_gamma_change:+.2f}L</div>
+                        <div style="font-size:11px;color:#777;">{"⬆️ Gamma expanding" if _gamma_change > 0 else "⬇️ Gamma contracting"}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with _dg_c3:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid {_hot_color};">
+                        <div style="color:#aaa;font-size:11px;">HOT STRIKE</div>
+                        <div style="font-size:20px;font-weight:bold;color:{_hot_color};">{_hot_lbl}</div>
+                        <div style="font-size:12px;margin-top:4px;">{_hot_signal}</div>
+                        <div style="font-size:11px;color:#777;margin-top:2px;">Gamma: {_hot_val:+.2f}L</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with _dg_c4:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:2px solid {_dg_main_color};">
+                        <div style="color:#aaa;font-size:11px;">SIGNAL &amp; ENTRY</div>
+                        <div style="font-size:14px;font-weight:bold;color:{_dg_main_color};margin-top:4px;">{_dg_main_signal}</div>
+                        <div style="font-size:13px;color:{_dg_entry_color};margin-top:6px;">{_dg_entry}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+
+                    # ---- Per-Strike Current Snapshot ----
+                    _dg_snap_rows = []
+                    for _lk in sorted(_dg_delta_per.keys(), key=lambda x: (
+                        -99 if x == 'ATM-2' else -1 if x == 'ATM-1' else 0 if x == 'ATM' else 1 if x == 'ATM+1' else 2
+                    )):
+                        _dg_snap_rows.append({
+                            'Strike': _lk,
+                            'Net Delta': f"{_dg_delta_per[_lk]:+.4f}",
+                            'Net Gamma (L)': f"{_dg_gamma_per.get(_lk, 0):+.2f}",
+                            'Hot': '🔥' if _lk == _hot_lbl else ''
+                        })
+                    if _dg_snap_rows:
+                        _dg_snap_df = pd.DataFrame(_dg_snap_rows)
+                        st.dataframe(_dg_snap_df, use_container_width=True, hide_index=True)
+
+                    # ---- Overall Delta & Gamma Time-Series ----
+                    if len(st.session_state.delta_gamma_history) >= 2:
+                        _dgh = pd.DataFrame(st.session_state.delta_gamma_history)
+                        _fig_dg = go.Figure()
+                        _fig_dg.add_trace(go.Scatter(
+                            x=_dgh['time'], y=_dgh['net_delta'],
+                            mode='lines+markers', name='Net Delta',
+                            line=dict(color='#00C853', width=2),
+                            marker=dict(size=4), yaxis='y1'
+                        ))
+                        _fig_dg.add_trace(go.Scatter(
+                            x=_dgh['time'], y=_dgh['net_gamma'],
+                            mode='lines+markers', name='Net Gamma (L)',
+                            line=dict(color='#FFD740', width=2, dash='dot'),
+                            marker=dict(size=4), yaxis='y2'
+                        ))
+                        _fig_dg.add_hline(y=0.15, line_dash='dash', line_color='#00C853',
+                                          annotation_text='Bull Δ 0.15', annotation_position='bottom right',
+                                          yref='y1')
+                        _fig_dg.add_hline(y=-0.15, line_dash='dash', line_color='#FF5252',
+                                          annotation_text='Bear Δ -0.15', annotation_position='top right',
+                                          yref='y1')
+                        _fig_dg.update_layout(
+                            title='Net Delta & Net Gamma Over Time (ATM ± 2)',
+                            height=280, margin=dict(l=40, r=60, t=40, b=30),
+                            paper_bgcolor='#111', plot_bgcolor='#111',
+                            font=dict(color='#ccc'),
+                            xaxis=dict(gridcolor='#333'),
+                            yaxis=dict(title='Net Delta', gridcolor='#333', titlefont=dict(color='#00C853')),
+                            yaxis2=dict(title='Net Gamma (L)', overlaying='y', side='right',
+                                        titlefont=dict(color='#FFD740'), showgrid=False),
+                            showlegend=True, legend=dict(orientation='h', y=-0.3)
+                        )
+                        st.plotly_chart(_fig_dg, use_container_width=True)
+
+                        # ---- Per-Strike Delta Time-Series ----
+                        _dg_strike_labels = [k for k in _dg_delta_per.keys()]
+                        _dg_has_ps = all(f"delta_{k}" in _dgh.columns for k in _dg_strike_labels)
+                        if _dg_has_ps:
+                            _fig_ps = go.Figure()
+                            _ps_colors = ['#FF5252', '#FF9800', '#FFD740', '#69F0AE', '#00BCD4']
+                            for _i, _lk in enumerate(sorted(_dg_strike_labels, key=lambda x: (
+                                -2 if x=='ATM-2' else -1 if x=='ATM-1' else 0 if x=='ATM' else 1 if x=='ATM+1' else 2
+                            ))):
+                                _col_key = f"delta_{_lk}"
+                                if _col_key in _dgh.columns:
+                                    _fig_ps.add_trace(go.Scatter(
+                                        x=_dgh['time'], y=_dgh[_col_key],
+                                        mode='lines', name=_lk,
+                                        line=dict(color=_ps_colors[_i % len(_ps_colors)], width=1.5)
+                                    ))
+                            _fig_ps.add_hline(y=0, line_color='#555', line_width=1)
+                            _fig_ps.update_layout(
+                                title='Net Delta Per Strike Over Time',
+                                height=250, margin=dict(l=40, r=20, t=40, b=30),
+                                paper_bgcolor='#111', plot_bgcolor='#111',
+                                font=dict(color='#ccc'),
+                                xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333'),
+                                showlegend=True, legend=dict(orientation='h', y=-0.3)
+                            )
+                            st.plotly_chart(_fig_ps, use_container_width=True)
+
+                        # ---- Per-Strike Gamma Time-Series ----
+                        _dg_has_gs = all(f"gamma_{k}" in _dgh.columns for k in _dg_strike_labels)
+                        if _dg_has_gs:
+                            _fig_gps = go.Figure()
+                            for _i, _lk in enumerate(sorted(_dg_strike_labels, key=lambda x: (
+                                -2 if x=='ATM-2' else -1 if x=='ATM-1' else 0 if x=='ATM' else 1 if x=='ATM+1' else 2
+                            ))):
+                                _col_key = f"gamma_{_lk}"
+                                if _col_key in _dgh.columns:
+                                    _is_hot = _lk == _hot_lbl
+                                    _fig_gps.add_trace(go.Scatter(
+                                        x=_dgh['time'], y=_dgh[_col_key],
+                                        mode='lines', name=f"{_lk}{'🔥' if _is_hot else ''}",
+                                        line=dict(color=_ps_colors[_i % len(_ps_colors)],
+                                                  width=2.5 if _is_hot else 1.5)
+                                    ))
+                            _fig_gps.add_hline(y=0, line_color='#555', line_width=1)
+                            _fig_gps.update_layout(
+                                title='Gamma Per Strike Over Time (Lakhs) — Hot Strike Highlighted',
+                                height=250, margin=dict(l=40, r=20, t=40, b=30),
+                                paper_bgcolor='#111', plot_bgcolor='#111',
+                                font=dict(color='#ccc'),
+                                xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333'),
+                                showlegend=True, legend=dict(orientation='h', y=-0.3)
+                            )
+                            st.plotly_chart(_fig_gps, use_container_width=True)
+
+                    _dg_col_l, _dg_col_r = st.columns([3, 1])
+                    with _dg_col_l:
+                        st.caption(f"⚡ Delta/Gamma pts: {len(st.session_state.delta_gamma_history)}")
+                    with _dg_col_r:
+                        if st.button("🗑️ Clear Delta/Gamma History"):
+                            st.session_state.delta_gamma_history = []
+                            st.rerun()
+                else:
+                    st.info("ATM strike not identified — Delta & Gamma Engine unavailable.")
+            else:
+                st.info("Option chain data with Greeks required for Delta & Gamma Engine.")
+
+        except Exception as _dg_e:
+            st.warning(f"Delta & Gamma Engine unavailable: {str(_dg_e)}")
 
         # Expandable section for detailed Greeks and raw values
         with st.expander("📊 Detailed Greeks & Raw Values"):
