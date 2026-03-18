@@ -5544,7 +5544,7 @@ def main():
 
         # ===== ATM ±2 STRIKE COMPARISON: PCR / ChgOI PCR / GEX =====
         st.markdown("---")
-        st.markdown("## 📊 ATM ±2 Strike Comparison — PCR · ChgOI PCR · GEX")
+        st.markdown("## 📊 ATM ±2 Strike Comparison — PCR · ChgOI PCR")
 
         # Helper function to create PCR chart (defined outside try block for reuse)
         def create_pcr_chart(history_df, col_name, color, title_prefix):
@@ -5714,18 +5714,9 @@ def main():
                 position_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
                 position_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
 
-                # ── COMBINED: PCR OI + ChgOI PCR + GEX per strike ──
+                # ── PCR OI + ChgOI PCR per strike ──
                 chgoi_hist = st.session_state.pcr_chgoi_strike_history
                 chgoi_history_df = pd.DataFrame(chgoi_hist) if chgoi_hist else None
-
-                has_gex_hist = len(st.session_state.gex_history) > 0
-                gex_hist_df = pd.DataFrame(st.session_state.gex_history) if has_gex_hist else None
-                gex_current_strikes = sorted(getattr(st.session_state, 'gex_current_strikes', current_strikes))
-
-                cur_gex_vals = {}
-                if gex_data_pre and 'gex_df' in gex_data_pre:
-                    for _, gr in gex_data_pre['gex_df'].iterrows():
-                        cur_gex_vals[int(gr['Strike'])] = gr['Net_GEX']
 
                 combined_cols = st.columns(5)
                 for i, col in enumerate(combined_cols):
@@ -5736,11 +5727,10 @@ def main():
 
                         strike = current_strikes[i]
                         strike_col = str(strike)
-                        clr = position_colors[i]
 
-                        fig = make_subplots(specs=[[{"secondary_y": True}]])
+                        fig = go.Figure()
 
-                        # ── PCR OI (left Y, solid blue) ──
+                        # ── PCR OI (solid blue) ──
                         if strike_col in history_df.columns:
                             fig.add_trace(go.Scatter(
                                 x=history_df['time'],
@@ -5749,9 +5739,9 @@ def main():
                                 name='PCR OI',
                                 line=dict(color='#00ccff', width=2),
                                 marker=dict(size=3),
-                            ), secondary_y=False)
+                            ))
 
-                        # ── ChgOI PCR (left Y, dashed orange) ──
+                        # ── ChgOI PCR (dashed orange) ──
                         if chgoi_history_df is not None and strike_col in chgoi_history_df.columns:
                             fig.add_trace(go.Scatter(
                                 x=chgoi_history_df['time'],
@@ -5760,26 +5750,86 @@ def main():
                                 name='PCR ChgOI',
                                 line=dict(color='#ffaa00', width=2, dash='dash'),
                                 marker=dict(size=3),
-                            ), secondary_y=False)
+                            ))
 
-                        # ── GEX (right Y, strike color, filled area) ──
-                        cur_gex = cur_gex_vals.get(strike, 0)
+                        # PCR reference lines
+                        fig.add_hline(y=1.2, line_dash="dot", line_color="rgba(0,255,136,0.533)", line_width=1,
+                                      annotation_text="Bull 1.2", annotation_position="right",
+                                      annotation_font_size=8, annotation_font_color="#00ff88")
+                        fig.add_hline(y=0.7, line_dash="dot", line_color="rgba(255,68,68,0.533)", line_width=1,
+                                      annotation_text="Bear 0.7", annotation_position="right",
+                                      annotation_font_size=8, annotation_font_color="#ff4444")
+
+                        fig.update_layout(
+                            title=dict(text=f"{position_labels[i]}<br>₹{strike}", font=dict(size=11)),
+                            template='plotly_dark',
+                            height=300,
+                            showlegend=True,
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                                        xanchor='center', x=0.5, font=dict(size=8)),
+                            margin=dict(l=5, r=10, t=70, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                            yaxis=dict(title='PCR', range=[0, 3],
+                                       title_font=dict(color='#00ccff', size=9),
+                                       tickfont=dict(size=8)),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                        )
+
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        # Signal summary below chart
+                        cur_pcr = history_df[strike_col].iloc[-1] if (
+                            strike_col in history_df.columns and len(history_df) > 0) else 1.0
+                        pcr_sig = "🟢 Bull" if cur_pcr > 1.2 else ("🔴 Bear" if cur_pcr < 0.7 else "🟡 Ntrl")
+                        st.caption(f"PCR {cur_pcr:.2f} {pcr_sig}")
+
+                # ── ATM ±2 Strike GEX (separate row) ──
+                st.markdown("---")
+                st.markdown("### 📊 ATM ±2 Strike GEX")
+                has_gex_hist = len(st.session_state.gex_history) > 0
+                gex_hist_df = pd.DataFrame(st.session_state.gex_history) if has_gex_hist else None
+                gex_current_strikes = sorted(getattr(st.session_state, 'gex_current_strikes', current_strikes))
+
+                cur_gex_vals = {}
+                if gex_data_pre and 'gex_df' in gex_data_pre:
+                    for _, gr in gex_data_pre['gex_df'].iterrows():
+                        cur_gex_vals[int(gr['Strike'])] = gr['Net_GEX']
+
+                gex_cols = st.columns(5)
+                for i, col in enumerate(gex_cols):
+                    with col:
+                        if i >= len(current_strikes):
+                            st.info(f"{position_labels[i]} N/A")
+                            continue
+                        strike = current_strikes[i]
+                        strike_col = str(strike)
+                        clr = position_colors[i]
                         _rgb = tuple(int(clr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
                         _fill = f'rgba({_rgb[0]},{_rgb[1]},{_rgb[2]},0.15)'
+                        fig_gex = go.Figure()
+                        cur_gex = cur_gex_vals.get(strike, 0)
                         if has_gex_hist and gex_hist_df is not None and strike_col in gex_hist_df.columns:
                             gex_series = gex_hist_df[strike_col]
                             cur_gex = gex_series.iloc[-1]
-                            fig.add_trace(go.Scatter(
+                            gex_vals = gex_series.dropna()
+                            max_abs = max(abs(gex_vals.max()), abs(gex_vals.min()), 15) if len(gex_vals) > 0 else 20
+                            fig_gex.add_trace(go.Scatter(
                                 x=gex_hist_df['time'],
                                 y=gex_series,
-                                mode='lines',
+                                mode='lines+markers',
                                 name='GEX (L)',
-                                line=dict(color=clr, width=1.5),
+                                line=dict(color=clr, width=2),
+                                marker=dict(size=3),
                                 fill='tozeroy',
                                 fillcolor=_fill,
-                            ), secondary_y=True)
+                            ))
+                            fig_gex.update_layout(yaxis=dict(
+                                range=[-max_abs * 1.1, max_abs * 1.1],
+                                zeroline=True, zerolinecolor='white', zerolinewidth=2,
+                            ))
                         elif strike in cur_gex_vals:
-                            fig.add_trace(go.Scatter(
+                            fig_gex.add_trace(go.Scatter(
                                 x=[datetime.now(pytz.timezone('Asia/Kolkata'))],
                                 y=[cur_gex],
                                 mode='markers+text',
@@ -5788,52 +5838,31 @@ def main():
                                 text=[f'{cur_gex:+.1f}L'],
                                 textposition='top center',
                                 textfont=dict(size=10, color='white'),
-                            ), secondary_y=True)
-
-                        # PCR reference lines (left Y)
-                        fig.add_hline(y=1.2, line_dash="dot", line_color="rgba(0,255,136,0.533)", line_width=1,
-                                      annotation_text="Bull 1.2", annotation_position="right",
-                                      annotation_font_size=8, annotation_font_color="#00ff88")
-                        fig.add_hline(y=0.7, line_dash="dot", line_color="rgba(255,68,68,0.533)", line_width=1,
-                                      annotation_text="Bear 0.7", annotation_position="right",
-                                      annotation_font_size=8, annotation_font_color="#ff4444")
-                        # GEX reference lines (right Y)
-                        fig.add_hline(y=0, line_dash="solid", line_color="rgba(255,255,255,0.251)", line_width=1,
-                                      secondary_y=True)
-                        fig.add_hline(y=10, line_dash="dot", line_color="rgba(0,255,136,0.4)", line_width=1,
-                                      secondary_y=True)
-                        fig.add_hline(y=-10, line_dash="dot", line_color="rgba(255,68,68,0.4)", line_width=1,
-                                      secondary_y=True)
-
-                        fig.update_layout(
-                            title=dict(text=f"{position_labels[i]}<br>₹{strike}", font=dict(size=11)),
+                            ))
+                        fig_gex.add_hline(y=0, line_dash="solid", line_color="rgba(255,255,255,0.4)", line_width=1)
+                        fig_gex.add_hline(y=10, line_dash="dot", line_color="rgba(0,255,136,0.4)", line_width=1,
+                                          annotation_text="+10", annotation_position="right",
+                                          annotation_font_size=8, annotation_font_color="#00ff88")
+                        fig_gex.add_hline(y=-10, line_dash="dot", line_color="rgba(255,68,68,0.4)", line_width=1,
+                                          annotation_text="-10", annotation_position="right",
+                                          annotation_font_size=8, annotation_font_color="#ff4444")
+                        fig_gex.update_layout(
+                            title=dict(text=f"{position_labels[i]}<br>₹{strike}<br>GEX: {cur_gex:+.1f}L",
+                                       font=dict(size=11)),
                             template='plotly_dark',
-                            height=330,
-                            showlegend=True,
-                            legend=dict(orientation='h', yanchor='bottom', y=1.02,
-                                        xanchor='center', x=0.5, font=dict(size=8)),
-                            margin=dict(l=5, r=40, t=70, b=30),
+                            height=300,
+                            showlegend=False,
+                            margin=dict(l=5, r=10, t=70, b=30),
                             xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                            yaxis=dict(title='GEX (L)',
+                                       title_font=dict(color=clr, size=9),
+                                       tickfont=dict(size=8)),
                             plot_bgcolor='#1e1e1e',
                             paper_bgcolor='#1e1e1e',
                         )
-                        fig.update_yaxes(title_text='PCR', secondary_y=False,
-                                         title_font=dict(color='#00ccff', size=9),
-                                         tickfont=dict(color='#00ccff', size=8),
-                                         range=[0, 3])
-                        fig.update_yaxes(title_text='GEX(L)', secondary_y=True,
-                                         zeroline=True, zerolinecolor='white', zerolinewidth=1,
-                                         title_font=dict(color=clr, size=9),
-                                         tickfont=dict(color=clr, size=8))
-
-                        st.plotly_chart(fig, use_container_width=True)
-
-                        # Signal summary below chart
-                        cur_pcr = history_df[strike_col].iloc[-1] if (
-                            strike_col in history_df.columns and len(history_df) > 0) else 1.0
-                        pcr_sig = "🟢 Bull" if cur_pcr > 1.2 else ("🔴 Bear" if cur_pcr < 0.7 else "🟡 Ntrl")
+                        st.plotly_chart(fig_gex, use_container_width=True)
                         gex_sig = "📍 Pin" if cur_gex > 10 else ("⚡ Accel" if cur_gex < -10 else "➡️ Ntrl")
-                        st.caption(f"PCR {cur_pcr:.2f} {pcr_sig} | GEX {cur_gex:+.1f}L {gex_sig}")
+                        st.caption(f"GEX {cur_gex:+.1f}L {gex_sig}")
 
                 # ── Summary table + status ──
                 st.markdown("### Current PCR Values")
@@ -5848,8 +5877,7 @@ def main():
                 with col_info1:
                     status = "🟢 Live" if pcr_data_available else "🟡 Using cached history"
                     st.caption(f"{status} | 📈 {len(st.session_state.pcr_history)} PCR pts · "
-                               f"{len(chgoi_hist)} ChgOI pts · "
-                               f"{len(st.session_state.gex_history)} GEX pts")
+                               f"{len(chgoi_hist)} ChgOI pts")
                 with col_info2:
                     if st.button("🗑️ Clear History"):
                         st.session_state.pcr_history = []
