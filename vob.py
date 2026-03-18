@@ -5692,18 +5692,18 @@ def main():
                             ), secondary_y=True)
 
                         # PCR reference lines (left Y)
-                        fig.add_hline(y=1.2, line_dash="dot", line_color="#00ff8888", line_width=1,
+                        fig.add_hline(y=1.2, line_dash="dot", line_color="rgba(0,255,136,0.533)", line_width=1,
                                       annotation_text="Bull 1.2", annotation_position="right",
                                       annotation_font_size=8, annotation_font_color="#00ff88")
-                        fig.add_hline(y=0.7, line_dash="dot", line_color="#ff444488", line_width=1,
+                        fig.add_hline(y=0.7, line_dash="dot", line_color="rgba(255,68,68,0.533)", line_width=1,
                                       annotation_text="Bear 0.7", annotation_position="right",
                                       annotation_font_size=8, annotation_font_color="#ff4444")
                         # GEX reference lines (right Y)
-                        fig.add_hline(y=0, line_dash="solid", line_color="#ffffff40", line_width=1,
+                        fig.add_hline(y=0, line_dash="solid", line_color="rgba(255,255,255,0.251)", line_width=1,
                                       secondary_y=True)
-                        fig.add_hline(y=10, line_dash="dot", line_color="#00ff8866", line_width=1,
+                        fig.add_hline(y=10, line_dash="dot", line_color="rgba(0,255,136,0.4)", line_width=1,
                                       secondary_y=True)
-                        fig.add_hline(y=-10, line_dash="dot", line_color="#ff444466", line_width=1,
+                        fig.add_hline(y=-10, line_dash="dot", line_color="rgba(255,68,68,0.4)", line_width=1,
                                       secondary_y=True)
 
                         fig.update_layout(
