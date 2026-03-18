@@ -5932,16 +5932,21 @@ def main():
                         _vp_entry[_sk] = round(_pe_vol / _ce_vol, 3) if _ce_vol > 0 else 0.0
                     st.session_state.vol_pcr_current_strikes = sorted([int(_r['Strike']) for _, _r in _vp_slice.iterrows()])
 
-                    # ATM Straddle entry (CE LTP + PE LTP at ATM)
-                    _atm_row = _vp_slice[_vp_slice['Zone'] == 'ATM']
+                    # Straddle entry for all ATM±2 strikes (CE LTP + PE LTP per strike)
                     _st_entry = {'time': _vp_now}
+                    for _, _srow in _vp_slice.iterrows():
+                        _sk_int = int(_srow['Strike'])
+                        _ce_ltp = float(_srow.get('lastPrice_CE', 0) or 0)
+                        _pe_ltp = float(_srow.get('lastPrice_PE', 0) or 0)
+                        _st_entry[f'straddle_{_sk_int}'] = round(_ce_ltp + _pe_ltp, 2)
+                        _st_entry[f'ce_{_sk_int}']       = round(_ce_ltp, 2)
+                        _st_entry[f'pe_{_sk_int}']       = round(_pe_ltp, 2)
+                    # Keep ATM straddle as 'straddle' for Combined Signal
+                    _atm_row = _vp_slice[_vp_slice['Zone'] == 'ATM']
                     if len(_atm_row) > 0:
-                        _ce_ltp = float(_atm_row.iloc[0].get('lastPrice_CE', 0) or 0)
-                        _pe_ltp = float(_atm_row.iloc[0].get('lastPrice_PE', 0) or 0)
-                        _st_entry['straddle'] = round(_ce_ltp + _pe_ltp, 2)
-                        _st_entry['ce_ltp']   = round(_ce_ltp, 2)
-                        _st_entry['pe_ltp']   = round(_pe_ltp, 2)
-                        _st_entry['atm_strike'] = int(_atm_row.iloc[0]['Strike'])
+                        _atm_sk = int(_atm_row.iloc[0]['Strike'])
+                        _st_entry['straddle']   = _st_entry.get(f'straddle_{_atm_sk}', 0)
+                        _st_entry['atm_strike'] = _atm_sk
 
                     # Avoid duplicates within 30 seconds
                     _vp_add = True
@@ -6014,67 +6019,75 @@ def main():
         else:
             st.info("📊 Volume PCR history building… wait for a few refreshes.")
 
-        # ── Panel 2: ATM Straddle ──
+        # ── Panel 2: Straddle per strike (ATM±2) ──
         st.markdown("---")
-        st.markdown("### 🎯 ATM Straddle (CE LTP + PE LTP) — Movement Intensity")
+        st.markdown("### 🎯 Straddle (CE LTP + PE LTP) — Movement Intensity (ATM ± 2)")
         _st_hist = st.session_state.straddle_history
-        if _st_hist:
+        _st_strikes = sorted(getattr(st.session_state, 'vol_pcr_current_strikes', []))
+        _st_color_map = {'rising': '#ff9944', 'falling': '#44aaff', 'flat': '#888888'}
+        if _st_hist and _st_strikes:
             _st_df = pd.DataFrame(_st_hist)
-            _st_cur = _st_df['straddle'].iloc[-1]
-            # Direction of last 3 bars
-            _st_vals = _st_df['straddle'].dropna().tolist()
-            if len(_st_vals) >= 3:
-                _st_delta = _st_vals[-1] - _st_vals[-3]
-                _st_dir = "rising" if _st_delta > 0.5 else ("falling" if _st_delta < -0.5 else "flat")
-            else:
-                _st_delta = 0
-                _st_dir = "flat"
-            _st_color_map = {'rising': '#ff9944', 'falling': '#44aaff', 'flat': '#888888'}
-            _st_clr = _st_color_map[_st_dir]
-            _st_rgb = tuple(int(_st_clr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+            _st_cols = st.columns(5)
+            for _si, _scol in enumerate(_st_cols):
+                with _scol:
+                    if _si >= len(_st_strikes):
+                        st.info(f"{_pos_labels[_si]} N/A")
+                        continue
+                    _sstrike = _st_strikes[_si]
+                    _skey = f'straddle_{_sstrike}'
+                    _cekey = f'ce_{_sstrike}'
+                    _pekey = f'pe_{_sstrike}'
+                    if _skey not in _st_df.columns:
+                        st.info(f"₹{_sstrike} — building…")
+                        continue
+                    _st_vals = _st_df[_skey].dropna().tolist()
+                    _st_cur  = _st_vals[-1] if _st_vals else 0
+                    if len(_st_vals) >= 3:
+                        _st_delta = _st_vals[-1] - _st_vals[-3]
+                        _st_dir = "rising" if _st_delta > 0.5 else ("falling" if _st_delta < -0.5 else "flat")
+                    else:
+                        _st_delta, _st_dir = 0, "flat"
+                    _st_clr = _st_color_map[_st_dir]
+                    _st_rgb = tuple(int(_st_clr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+                    _st_icon = "📈" if _st_dir == "rising" else ("📉" if _st_dir == "falling" else "➡️")
 
-            _st_fig = go.Figure()
-            _st_fig.add_trace(go.Scatter(
-                x=_st_df['time'], y=_st_df['straddle'],
-                mode='lines+markers', name='Straddle',
-                line=dict(color=_st_clr, width=2),
-                marker=dict(size=4),
-                fill='tozeroy', fillcolor=f'rgba({_st_rgb[0]},{_st_rgb[1]},{_st_rgb[2]},0.15)',
-                hovertemplate='Straddle: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
-            ))
-            # CE LTP and PE LTP as thinner lines
-            if 'ce_ltp' in _st_df.columns:
-                _st_fig.add_trace(go.Scatter(
-                    x=_st_df['time'], y=_st_df['ce_ltp'],
-                    mode='lines', name='CE LTP',
-                    line=dict(color='#ff4444', width=1, dash='dot'),
-                    hovertemplate='CE LTP: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
-                ))
-            if 'pe_ltp' in _st_df.columns:
-                _st_fig.add_trace(go.Scatter(
-                    x=_st_df['time'], y=_st_df['pe_ltp'],
-                    mode='lines', name='PE LTP',
-                    line=dict(color='#00cc66', width=1, dash='dot'),
-                    hovertemplate='PE LTP: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
-                ))
-            _atm_str = f"ATM ₹{int(_st_df['atm_strike'].iloc[-1])}" if 'atm_strike' in _st_df.columns else "ATM"
-            _st_icon = "📈" if _st_dir == "rising" else ("📉" if _st_dir == "falling" else "➡️")
-            _st_fig.update_layout(
-                title=dict(text=f"{_st_icon} {_atm_str} Straddle — ₹{_st_cur:.2f} ({_st_dir.upper()}, Δ{_st_delta:+.1f})",
-                           font=dict(size=14)),
-                template='plotly_dark', height=280,
-                showlegend=True,
-                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
-                margin=dict(l=10, r=20, t=60, b=30),
-                xaxis=dict(tickformat='%H:%M', title=''),
-                yaxis=dict(title='Premium (₹)'),
-                plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
-            )
-            st.plotly_chart(_st_fig, use_container_width=True)
-
-            _move_type = ("💥 Explosive" if _st_dir == "rising" else
-                          ("🐌 Slow / Grinding" if _st_dir == "falling" else "⬛ Sideways / Range"))
-            st.caption(f"Move intensity → {_move_type} | Straddle Δ last 3 bars: {_st_delta:+.2f}")
+                    _sfig = go.Figure()
+                    _sfig.add_trace(go.Scatter(
+                        x=_st_df['time'], y=_st_df[_skey],
+                        mode='lines+markers', name='Straddle',
+                        line=dict(color=_st_clr, width=2), marker=dict(size=3),
+                        fill='tozeroy', fillcolor=f'rgba({_st_rgb[0]},{_st_rgb[1]},{_st_rgb[2]},0.15)',
+                        hovertemplate='Straddle: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
+                    ))
+                    if _cekey in _st_df.columns:
+                        _sfig.add_trace(go.Scatter(
+                            x=_st_df['time'], y=_st_df[_cekey],
+                            mode='lines', name='CE',
+                            line=dict(color='#ff4444', width=1, dash='dot'),
+                            hovertemplate='CE: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
+                        ))
+                    if _pekey in _st_df.columns:
+                        _sfig.add_trace(go.Scatter(
+                            x=_st_df['time'], y=_st_df[_pekey],
+                            mode='lines', name='PE',
+                            line=dict(color='#00cc66', width=1, dash='dot'),
+                            hovertemplate='PE: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
+                        ))
+                    _sfig.update_layout(
+                        title=dict(text=f"{_pos_labels[_si]}<br>₹{_sstrike}<br>{_st_icon} ₹{_st_cur:.1f} (Δ{_st_delta:+.1f})",
+                                   font=dict(size=11)),
+                        template='plotly_dark', height=300,
+                        showlegend=True,
+                        legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                                    xanchor='center', x=0.5, font=dict(size=8)),
+                        margin=dict(l=5, r=10, t=75, b=30),
+                        xaxis=dict(tickformat='%H:%M', title=''),
+                        yaxis=dict(title='Premium (₹)'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                    )
+                    st.plotly_chart(_sfig, use_container_width=True)
+                    _move_lbl = "💥 Explosive" if _st_dir == "rising" else ("🐌 Grinding" if _st_dir == "falling" else "⬛ Range")
+                    st.caption(f"₹{_st_cur:.1f} → {_move_lbl}")
         else:
             st.info("📊 Straddle history building… wait for a few refreshes.")
 
