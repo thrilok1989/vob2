@@ -4532,6 +4532,16 @@ def main():
     if 'depth_history' not in st.session_state:
         st.session_state.depth_history = []
 
+    # Initialize session state for Volume PCR per-strike history (ATM±2)
+    if 'vol_pcr_history' not in st.session_state:
+        st.session_state.vol_pcr_history = []
+    if 'vol_pcr_current_strikes' not in st.session_state:
+        st.session_state.vol_pcr_current_strikes = []
+
+    # Initialize session state for ATM Straddle history
+    if 'straddle_history' not in st.session_state:
+        st.session_state.straddle_history = []
+
     # Initialize Supabase
     try:
         if not supabase_url or not supabase_key:
@@ -5889,6 +5899,334 @@ def main():
                 st.warning(f"Error displaying comparison charts: {str(e)}")
         else:
             st.info("📊 History will build up as the app refreshes. Please wait for data collection…")
+
+        # ===== VOLUME PCR + STRADDLE + COMBINED SIGNAL (ATM ± 2) =====
+        st.markdown("---")
+        st.markdown("## 📊 Volume PCR · Straddle · Combined Signal (ATM ± 2)")
+
+        # ── Collect Volume PCR + Straddle data ──
+        _vp_df_src = option_data.get('df_summary') if option_data else None
+        _vp_data_ok = False
+        if (_vp_df_src is not None and 'Zone' in _vp_df_src.columns
+                and 'totalTradedVolume_CE' in _vp_df_src.columns
+                and 'totalTradedVolume_PE' in _vp_df_src.columns
+                and 'lastPrice_CE' in _vp_df_src.columns
+                and 'lastPrice_PE' in _vp_df_src.columns):
+            try:
+                _vp_atm = _vp_df_src[_vp_df_src['Zone'] == 'ATM'].index
+                if len(_vp_atm) > 0:
+                    _vp_atm_pos = _vp_df_src.index.get_loc(_vp_atm[0])
+                    _vp_start = max(0, _vp_atm_pos - 2)
+                    _vp_end   = min(len(_vp_df_src), _vp_atm_pos + 3)
+                    _vp_slice = _vp_df_src.iloc[_vp_start:_vp_end].copy()
+
+                    _ist_vp = pytz.timezone('Asia/Kolkata')
+                    _vp_now = datetime.now(_ist_vp)
+
+                    # Per-strike Volume PCR entry
+                    _vp_entry = {'time': _vp_now}
+                    for _, _vrow in _vp_slice.iterrows():
+                        _sk = str(int(_vrow['Strike']))
+                        _ce_vol = _vrow.get('totalTradedVolume_CE', 0) or 0
+                        _pe_vol = _vrow.get('totalTradedVolume_PE', 0) or 0
+                        _vp_entry[_sk] = round(_pe_vol / _ce_vol, 3) if _ce_vol > 0 else 0.0
+                    st.session_state.vol_pcr_current_strikes = sorted([int(_r['Strike']) for _, _r in _vp_slice.iterrows()])
+
+                    # ATM Straddle entry (CE LTP + PE LTP at ATM)
+                    _atm_row = _vp_slice[_vp_slice['Zone'] == 'ATM']
+                    _st_entry = {'time': _vp_now}
+                    if len(_atm_row) > 0:
+                        _ce_ltp = float(_atm_row.iloc[0].get('lastPrice_CE', 0) or 0)
+                        _pe_ltp = float(_atm_row.iloc[0].get('lastPrice_PE', 0) or 0)
+                        _st_entry['straddle'] = round(_ce_ltp + _pe_ltp, 2)
+                        _st_entry['ce_ltp']   = round(_ce_ltp, 2)
+                        _st_entry['pe_ltp']   = round(_pe_ltp, 2)
+                        _st_entry['atm_strike'] = int(_atm_row.iloc[0]['Strike'])
+
+                    # Avoid duplicates within 30 seconds
+                    _vp_add = True
+                    if st.session_state.vol_pcr_history:
+                        if (_vp_now - st.session_state.vol_pcr_history[-1]['time']).total_seconds() < 30:
+                            _vp_add = False
+                    if _vp_add:
+                        st.session_state.vol_pcr_history.append(_vp_entry)
+                        if len(st.session_state.vol_pcr_history) > 200:
+                            st.session_state.vol_pcr_history = st.session_state.vol_pcr_history[-200:]
+                        if len(_st_entry) > 1:
+                            st.session_state.straddle_history.append(_st_entry)
+                            if len(st.session_state.straddle_history) > 200:
+                                st.session_state.straddle_history = st.session_state.straddle_history[-200:]
+                    _vp_data_ok = True
+            except Exception as _vp_exc:
+                st.caption(f"⚠️ Vol PCR fetch: {str(_vp_exc)[:60]}")
+
+        # ── Panel 1: Volume PCR per strike ──
+        st.markdown("### 📈 Volume PCR per Strike (ATM ± 2)")
+        _vp_hist = st.session_state.vol_pcr_history
+        _vp_strikes = sorted(getattr(st.session_state, 'vol_pcr_current_strikes', []))
+        _pos_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+        _pos_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+
+        if _vp_hist:
+            _vp_hist_df = pd.DataFrame(_vp_hist)
+            _vp_cols = st.columns(5)
+            for _vi, _vcol in enumerate(_vp_cols):
+                with _vcol:
+                    if _vi >= len(_vp_strikes):
+                        st.info(f"{_pos_labels[_vi]} N/A")
+                        continue
+                    _vstrike = _vp_strikes[_vi]
+                    _vscol = str(_vstrike)
+                    _vclr = _pos_colors[_vi]
+                    _vrgb = tuple(int(_vclr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+                    _vfill = f'rgba({_vrgb[0]},{_vrgb[1]},{_vrgb[2]},0.12)'
+                    if _vscol not in _vp_hist_df.columns:
+                        st.info(f"₹{_vstrike} — building…")
+                        continue
+                    _vcur = _vp_hist_df[_vscol].iloc[-1]
+                    _vfig = go.Figure()
+                    _vfig.add_trace(go.Scatter(
+                        x=_vp_hist_df['time'], y=_vp_hist_df[_vscol],
+                        mode='lines+markers', name='Vol PCR',
+                        line=dict(color=_vclr, width=2),
+                        marker=dict(size=3),
+                        fill='tozeroy', fillcolor=_vfill,
+                        hovertemplate='Vol PCR: %{y:.2f}<br>%{x|%H:%M}<extra></extra>',
+                    ))
+                    _vfig.add_hline(y=1.2, line_dash="dot", line_color="rgba(0,255,136,0.5)", line_width=1,
+                                    annotation_text="Bull 1.2", annotation_position="right",
+                                    annotation_font_size=8, annotation_font_color="#00ff88")
+                    _vfig.add_hline(y=0.7, line_dash="dot", line_color="rgba(255,68,68,0.5)", line_width=1,
+                                    annotation_text="Bear 0.7", annotation_position="right",
+                                    annotation_font_size=8, annotation_font_color="#ff4444")
+                    _vfig.add_hline(y=1.0, line_dash="dash", line_color="rgba(255,255,255,0.3)", line_width=1)
+                    _vfig.update_layout(
+                        title=dict(text=f"{_pos_labels[_vi]}<br>₹{_vstrike}<br>Vol PCR: {_vcur:.2f}", font=dict(size=11)),
+                        template='plotly_dark', height=280, showlegend=False,
+                        margin=dict(l=5, r=10, t=70, b=30),
+                        xaxis=dict(tickformat='%H:%M', title=''),
+                        yaxis=dict(title='Vol PCR'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                    )
+                    st.plotly_chart(_vfig, use_container_width=True)
+                    _vsig = "🟢 Bull" if _vcur > 1.2 else ("🔴 Bear" if _vcur < 0.7 else "🟡 Ntrl")
+                    st.caption(f"Vol PCR {_vcur:.2f} {_vsig}")
+        else:
+            st.info("📊 Volume PCR history building… wait for a few refreshes.")
+
+        # ── Panel 2: ATM Straddle ──
+        st.markdown("---")
+        st.markdown("### 🎯 ATM Straddle (CE LTP + PE LTP) — Movement Intensity")
+        _st_hist = st.session_state.straddle_history
+        if _st_hist:
+            _st_df = pd.DataFrame(_st_hist)
+            _st_cur = _st_df['straddle'].iloc[-1]
+            # Direction of last 3 bars
+            _st_vals = _st_df['straddle'].dropna().tolist()
+            if len(_st_vals) >= 3:
+                _st_delta = _st_vals[-1] - _st_vals[-3]
+                _st_dir = "rising" if _st_delta > 0.5 else ("falling" if _st_delta < -0.5 else "flat")
+            else:
+                _st_delta = 0
+                _st_dir = "flat"
+            _st_color_map = {'rising': '#ff9944', 'falling': '#44aaff', 'flat': '#888888'}
+            _st_clr = _st_color_map[_st_dir]
+            _st_rgb = tuple(int(_st_clr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+
+            _st_fig = go.Figure()
+            _st_fig.add_trace(go.Scatter(
+                x=_st_df['time'], y=_st_df['straddle'],
+                mode='lines+markers', name='Straddle',
+                line=dict(color=_st_clr, width=2),
+                marker=dict(size=4),
+                fill='tozeroy', fillcolor=f'rgba({_st_rgb[0]},{_st_rgb[1]},{_st_rgb[2]},0.15)',
+                hovertemplate='Straddle: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
+            ))
+            # CE LTP and PE LTP as thinner lines
+            if 'ce_ltp' in _st_df.columns:
+                _st_fig.add_trace(go.Scatter(
+                    x=_st_df['time'], y=_st_df['ce_ltp'],
+                    mode='lines', name='CE LTP',
+                    line=dict(color='#ff4444', width=1, dash='dot'),
+                    hovertemplate='CE LTP: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
+                ))
+            if 'pe_ltp' in _st_df.columns:
+                _st_fig.add_trace(go.Scatter(
+                    x=_st_df['time'], y=_st_df['pe_ltp'],
+                    mode='lines', name='PE LTP',
+                    line=dict(color='#00cc66', width=1, dash='dot'),
+                    hovertemplate='PE LTP: ₹%{y:.2f}<br>%{x|%H:%M}<extra></extra>',
+                ))
+            _atm_str = f"ATM ₹{int(_st_df['atm_strike'].iloc[-1])}" if 'atm_strike' in _st_df.columns else "ATM"
+            _st_icon = "📈" if _st_dir == "rising" else ("📉" if _st_dir == "falling" else "➡️")
+            _st_fig.update_layout(
+                title=dict(text=f"{_st_icon} {_atm_str} Straddle — ₹{_st_cur:.2f} ({_st_dir.upper()}, Δ{_st_delta:+.1f})",
+                           font=dict(size=14)),
+                template='plotly_dark', height=280,
+                showlegend=True,
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                margin=dict(l=10, r=20, t=60, b=30),
+                xaxis=dict(tickformat='%H:%M', title=''),
+                yaxis=dict(title='Premium (₹)'),
+                plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+            )
+            st.plotly_chart(_st_fig, use_container_width=True)
+
+            _move_type = ("💥 Explosive" if _st_dir == "rising" else
+                          ("🐌 Slow / Grinding" if _st_dir == "falling" else "⬛ Sideways / Range"))
+            st.caption(f"Move intensity → {_move_type} | Straddle Δ last 3 bars: {_st_delta:+.2f}")
+        else:
+            st.info("📊 Straddle history building… wait for a few refreshes.")
+
+        # ── Panel 3: Combined Trend / Strength / Move Type Signal ──
+        st.markdown("---")
+        st.markdown("### 🧠 Combined Signal — Trend · Strength · Move Type")
+        try:
+            _cs_oi_hist   = st.session_state.pcr_history
+            _cs_vol_hist  = st.session_state.vol_pcr_history
+            _cs_gex_hist  = st.session_state.gex_history
+            _cs_st_hist   = st.session_state.straddle_history
+            _cs_strikes   = sorted(getattr(st.session_state, 'vol_pcr_current_strikes', []))
+
+            _cs_ready = (_cs_oi_hist and _cs_vol_hist and len(_cs_strikes) > 0)
+            if _cs_ready:
+                _cs_oi_df  = pd.DataFrame(_cs_oi_hist)
+                _cs_vol_df = pd.DataFrame(_cs_vol_hist)
+
+                # Average OI PCR + Vol PCR across ATM±2 strikes (latest row)
+                _cs_oi_vals  = [_cs_oi_df[str(s)].iloc[-1]  for s in _cs_strikes if str(s) in _cs_oi_df.columns]
+                _cs_vol_vals = [_cs_vol_df[str(s)].iloc[-1] for s in _cs_strikes if str(s) in _cs_vol_df.columns]
+                _avg_oi_pcr  = sum(_cs_oi_vals)  / len(_cs_oi_vals)  if _cs_oi_vals  else 1.0
+                _avg_vol_pcr = sum(_cs_vol_vals) / len(_cs_vol_vals) if _cs_vol_vals else 1.0
+
+                # OI PCR signal
+                _oi_sig  = "bull" if _avg_oi_pcr  > 1.2 else ("bear" if _avg_oi_pcr  < 0.7 else "neut")
+                _vol_sig = "bull" if _avg_vol_pcr > 1.2 else ("bear" if _avg_vol_pcr < 0.7 else "neut")
+
+                # Trend logic (OI = positioning, Vol = live action)
+                if _oi_sig == "bull" and _vol_sig == "bull":
+                    _trend = "🟢 Strong Bullish"
+                    _trend_clr = "#00ff88"
+                elif _oi_sig == "bear" and _vol_sig == "bear":
+                    _trend = "🔴 Strong Bearish"
+                    _trend_clr = "#ff4444"
+                elif _oi_sig == "bull" and _vol_sig == "bear":
+                    _trend = "⚠️ Trap / Fake Bull"
+                    _trend_clr = "#ff9900"
+                elif _oi_sig == "bear" and _vol_sig == "bull":
+                    _trend = "🔄 Possible Reversal"
+                    _trend_clr = "#ffdd44"
+                elif _oi_sig == "bull":
+                    _trend = "🟢 Bullish (positioning)"
+                    _trend_clr = "#00cc88"
+                elif _oi_sig == "bear":
+                    _trend = "🔴 Bearish (positioning)"
+                    _trend_clr = "#dd4444"
+                else:
+                    _trend = "⚪ Neutral"
+                    _trend_clr = "#888888"
+
+                # Strength from GEX
+                _cs_gex_df = pd.DataFrame(_cs_gex_hist) if _cs_gex_hist else None
+                _cs_gex_cols = [str(s) for s in _cs_strikes if _cs_gex_df is not None and str(s) in _cs_gex_df.columns]
+                if _cs_gex_cols and _cs_gex_df is not None:
+                    _total_gex = sum(_cs_gex_df[c].iloc[-1] for c in _cs_gex_cols)
+                else:
+                    _total_gex = 0
+                if _total_gex < -10:
+                    _strength = "⚡ Strong (Negative GEX — trending)"
+                    _strength_clr = "#ff9900"
+                elif _total_gex > 10:
+                    _strength = "📍 Weak / Capped (Positive GEX — pinning)"
+                    _strength_clr = "#aaaaaa"
+                else:
+                    _strength = "➡️ Normal"
+                    _strength_clr = "#cccccc"
+
+                # Move type from Straddle
+                if _cs_st_hist:
+                    _cs_st_df = pd.DataFrame(_cs_st_hist)
+                    _cs_st_vals = _cs_st_df['straddle'].dropna().tolist()
+                    if len(_cs_st_vals) >= 3:
+                        _cs_st_delta = _cs_st_vals[-1] - _cs_st_vals[-3]
+                        _cs_st_dir = "rising" if _cs_st_delta > 0.5 else ("falling" if _cs_st_delta < -0.5 else "flat")
+                    else:
+                        _cs_st_dir = "flat"
+                    _move_map = {'rising': "💥 Explosive", 'falling': "🐌 Slow / Grinding", 'flat': "⬛ Range / Sideways"}
+                    _move_type_s = _move_map[_cs_st_dir]
+                else:
+                    _move_type_s = "⬛ Range / Sideways"
+
+                # Render signal card
+                _sig_c1, _sig_c2, _sig_c3, _sig_c4 = st.columns(4)
+                with _sig_c1:
+                    st.markdown(f"""
+                    <div style="background:#1e1e1e;border:1px solid {_trend_clr};border-radius:8px;padding:16px;text-align:center">
+                        <div style="color:#888;font-size:11px;margin-bottom:4px">TREND</div>
+                        <div style="color:{_trend_clr};font-size:18px;font-weight:bold">{_trend}</div>
+                        <div style="color:#aaa;font-size:11px;margin-top:6px">OI PCR {_avg_oi_pcr:.2f} · Vol PCR {_avg_vol_pcr:.2f}</div>
+                    </div>""", unsafe_allow_html=True)
+                with _sig_c2:
+                    st.markdown(f"""
+                    <div style="background:#1e1e1e;border:1px solid {_strength_clr};border-radius:8px;padding:16px;text-align:center">
+                        <div style="color:#888;font-size:11px;margin-bottom:4px">STRENGTH</div>
+                        <div style="color:{_strength_clr};font-size:18px;font-weight:bold">{_strength}</div>
+                        <div style="color:#aaa;font-size:11px;margin-top:6px">Total GEX: {_total_gex:+.1f}L</div>
+                    </div>""", unsafe_allow_html=True)
+                with _sig_c3:
+                    st.markdown(f"""
+                    <div style="background:#1e1e1e;border:1px solid #888;border-radius:8px;padding:16px;text-align:center">
+                        <div style="color:#888;font-size:11px;margin-bottom:4px">MOVE TYPE</div>
+                        <div style="color:#ffffff;font-size:18px;font-weight:bold">{_move_type_s}</div>
+                        <div style="color:#aaa;font-size:11px;margin-top:6px">From ATM Straddle trend</div>
+                    </div>""", unsafe_allow_html=True)
+                with _sig_c4:
+                    # Composite interpretation
+                    if "Bullish" in _trend and "Explosive" in _move_type_s and "Strong" in _strength:
+                        _interp = "🚀 BREAKOUT UP"
+                        _interp_clr = "#00ff88"
+                    elif "Bearish" in _trend and "Explosive" in _move_type_s and "Strong" in _strength:
+                        _interp = "💥 BREAKDOWN"
+                        _interp_clr = "#ff4444"
+                    elif "Trap" in _trend:
+                        _interp = "⚠️ CAUTION / TRAP"
+                        _interp_clr = "#ff9900"
+                    elif "Reversal" in _trend:
+                        _interp = "🔄 REVERSAL WATCH"
+                        _interp_clr = "#ffdd44"
+                    elif "Bullish" in _trend and "Grinding" in _move_type_s:
+                        _interp = "📈 SLOW GRIND UP"
+                        _interp_clr = "#88ff88"
+                    elif "Bearish" in _trend and "Grinding" in _move_type_s:
+                        _interp = "📉 SLOW GRIND DOWN"
+                        _interp_clr = "#ff8888"
+                    elif "Capped" in _strength or "Range" in _move_type_s:
+                        _interp = "⬛ RANGE BOUND"
+                        _interp_clr = "#888888"
+                    else:
+                        _interp = "➡️ WAIT / UNCLEAR"
+                        _interp_clr = "#aaaaaa"
+                    st.markdown(f"""
+                    <div style="background:#1e1e1e;border:2px solid {_interp_clr};border-radius:8px;padding:16px;text-align:center">
+                        <div style="color:#888;font-size:11px;margin-bottom:4px">VERDICT</div>
+                        <div style="color:{_interp_clr};font-size:20px;font-weight:bold">{_interp}</div>
+                        <div style="color:#aaa;font-size:10px;margin-top:6px">OI+Vol+GEX+Straddle</div>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.info("📊 Combined signal will appear once history builds for Volume PCR. Wait a few refreshes.")
+        except Exception as _cs_exc:
+            st.warning(f"Combined signal error: {str(_cs_exc)[:80]}")
+
+        # ── Clear buttons ──
+        _vp_c1, _vp_c2 = st.columns([3, 1])
+        with _vp_c1:
+            _vp_status = "🟢 Live" if _vp_data_ok else "🟡 Cached"
+            st.caption(f"{_vp_status} | Vol PCR: {len(_vp_hist)} pts · Straddle: {len(_st_hist)} pts")
+        with _vp_c2:
+            if st.button("🗑️ Clear Vol/Straddle History"):
+                st.session_state.vol_pcr_history = []
+                st.session_state.straddle_history = []
+                st.rerun()
 
         # ===== GEX (GAMMA EXPOSURE) ANALYSIS SECTION =====
         st.markdown("---")
