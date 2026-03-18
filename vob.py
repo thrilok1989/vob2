@@ -5405,69 +5405,70 @@ def main():
                     if len(st.session_state.depth_history) > 200:
                         st.session_state.depth_history = st.session_state.depth_history[-200:]
 
+        st.markdown("### 📊 Key Levels from Order Book Depth")
         if st.session_state.depth_history:
             _depth_hist_df = pd.DataFrame(st.session_state.depth_history)
-            _depth_fig_ts = go.Figure()
             _support_colors = ['#00cc66', '#00aa55', '#008844']
             _resist_colors  = ['#ff4444', '#dd3333', '#bb2222']
-            for _i, (_sc, _rc) in enumerate(zip(_support_colors, _resist_colors)):
-                _scol = f'S{_i+1}_qty'
-                _rcol = f'R{_i+1}_qty'
-                if _scol in _depth_hist_df.columns:
-                    # Build hover text with price info
-                    _s_price_col = f'S{_i+1}_price'
-                    _s_hover = (
-                        _depth_hist_df[_s_price_col].apply(lambda p: f'₹{p:,.0f}')
-                        if _s_price_col in _depth_hist_df.columns
-                        else None
-                    )
-                    _depth_fig_ts.add_trace(go.Scatter(
-                        x=_depth_hist_df['time'],
-                        y=_depth_hist_df[_scol],
-                        mode='lines+markers',
-                        name=f'S{_i+1} (Support)',
-                        line=dict(color=_sc, width=2),
-                        marker=dict(size=4),
-                        customdata=_s_hover if _s_hover is not None else None,
-                        hovertemplate=(
-                            f'S{_i+1} Support<br>Qty: %{{y:,.0f}}<br>Strike: %{{customdata}}<br>Time: %{{x|%H:%M}}<extra></extra>'
-                            if _s_hover is not None else
-                            f'S{_i+1} Support<br>Qty: %{{y:,.0f}}<br>Time: %{{x|%H:%M}}<extra></extra>'
-                        ),
-                    ))
-                if _rcol in _depth_hist_df.columns:
-                    _r_price_col = f'R{_i+1}_price'
-                    _r_hover = (
-                        _depth_hist_df[_r_price_col].apply(lambda p: f'₹{p:,.0f}')
-                        if _r_price_col in _depth_hist_df.columns
-                        else None
-                    )
-                    _depth_fig_ts.add_trace(go.Scatter(
-                        x=_depth_hist_df['time'],
-                        y=_depth_hist_df[_rcol],
-                        mode='lines+markers',
-                        name=f'R{_i+1} (Resistance)',
-                        line=dict(color=_rc, width=2, dash='dot'),
-                        marker=dict(size=4),
-                        customdata=_r_hover if _r_hover is not None else None,
-                        hovertemplate=(
-                            f'R{_i+1} Resistance<br>Qty: %{{y:,.0f}}<br>Strike: %{{customdata}}<br>Time: %{{x|%H:%M}}<extra></extra>'
-                            if _r_hover is not None else
-                            f'R{_i+1} Resistance<br>Qty: %{{y:,.0f}}<br>Time: %{{x|%H:%M}}<extra></extra>'
-                        ),
-                    ))
-            _depth_fig_ts.update_layout(
-                title=dict(text="Key Levels from Order Book Depth — Qty over Time", font=dict(size=16)),
-                template='plotly_dark',
-                height=320,
-                margin=dict(l=10, r=10, t=50, b=40),
-                xaxis=dict(tickformat='%H:%M', title='Time'),
-                yaxis=dict(title='Order Book Qty', tickformat=',.0f'),
-                plot_bgcolor='#1e1e1e',
-                paper_bgcolor='#1e1e1e',
-                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            _depth_levels = (
+                [('S', i+1, _support_colors[i], 'Support', 'bidQty_PE') for i in range(3)] +
+                [('R', i+1, _resist_colors[i],  'Resistance', 'askQty_CE') for i in range(3)]
             )
-            st.plotly_chart(_depth_fig_ts, use_container_width=True)
+            _depth_cols = st.columns(6)
+            for _col_idx, (_col, (_side, _n, _clr, _label, _)) in enumerate(zip(_depth_cols, _depth_levels)):
+                with _col:
+                    _qty_col   = f'{_side}{_n}_qty'
+                    _price_col = f'{_side}{_n}_price'
+                    if _qty_col not in _depth_hist_df.columns:
+                        st.info(f"{_side}{_n} N/A")
+                        continue
+                    _cur_qty = _depth_hist_df[_qty_col].iloc[-1]
+                    _cur_price = (
+                        _depth_hist_df[_price_col].iloc[-1]
+                        if _price_col in _depth_hist_df.columns else None
+                    )
+                    _price_str = f'₹{_cur_price:,.0f}' if _cur_price is not None else ''
+                    _rgb = tuple(int(_clr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+                    _fill = f'rgba({_rgb[0]},{_rgb[1]},{_rgb[2]},0.15)'
+                    _qty_vals = _depth_hist_df[_qty_col].dropna()
+                    _max_qty = _qty_vals.max() if len(_qty_vals) > 0 else 1
+                    _fig_d = go.Figure()
+                    _fig_d.add_trace(go.Scatter(
+                        x=_depth_hist_df['time'],
+                        y=_depth_hist_df[_qty_col],
+                        mode='lines+markers',
+                        name=_label,
+                        line=dict(color=_clr, width=2),
+                        marker=dict(size=3),
+                        fill='tozeroy',
+                        fillcolor=_fill,
+                        hovertemplate=f'{_side}{_n} {_label}<br>Qty: %{{y:,.0f}}<br>Time: %{{x|%H:%M}}<extra></extra>',
+                    ))
+                    _fig_d.update_layout(
+                        title=dict(
+                            text=f"{'🟢' if _side=='S' else '🔴'} {_side}{_n} {_label}<br>{_price_str}<br>Qty: {_cur_qty:,.0f}",
+                            font=dict(size=11)
+                        ),
+                        template='plotly_dark',
+                        height=300,
+                        showlegend=False,
+                        margin=dict(l=5, r=10, t=70, b=30),
+                        xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                        yaxis=dict(
+                            title='Bid Qty' if _side == 'S' else 'Ask Qty',
+                            tickformat=',.0f',
+                            range=[0, _max_qty * 1.2],
+                            title_font=dict(color=_clr, size=9),
+                            tickfont=dict(size=8),
+                        ),
+                        plot_bgcolor='#1e1e1e',
+                        paper_bgcolor='#1e1e1e',
+                    )
+                    st.plotly_chart(_fig_d, use_container_width=True)
+                    _caption = f"{'PE Bid' if _side=='S' else 'CE Ask'} {_cur_qty:,.0f}"
+                    if _cur_price is not None:
+                        _caption += f" @ {_price_str}"
+                    st.caption(_caption)
         else:
             depth_fig = plot_depth_levels(
                 option_data.get('df_summary'),
