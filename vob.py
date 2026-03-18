@@ -5583,6 +5583,12 @@ def main():
                 # Get current PCR value
                 current_pcr = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
 
+                # Dynamic Y range: data + reference thresholds always in view
+                _pcr_raw = history_df[col_name].dropna().tolist()
+                _pcr_all = _pcr_raw + [0.7, 1.2]
+                _pcr_ymin = max(0.0, min(_pcr_all) * 0.9)
+                _pcr_ymax = max(_pcr_all) * 1.1
+
                 fig.update_layout(
                     title=f"{title_prefix}<br>₹{strike_val}<br>PCR: {current_pcr:.2f}",
                     template='plotly_dark',
@@ -5590,7 +5596,7 @@ def main():
                     showlegend=False,
                     margin=dict(l=10, r=10, t=70, b=30),
                     xaxis=dict(tickformat='%H:%M', title=''),
-                    yaxis=dict(title='PCR'),
+                    yaxis=dict(title='PCR', range=[_pcr_ymin, _pcr_ymax]),
                     plot_bgcolor='#1e1e1e',
                     paper_bgcolor='#1e1e1e'
                 )
@@ -5771,6 +5777,16 @@ def main():
                                       annotation_text="Bear 0.7", annotation_position="right",
                                       annotation_font_size=8, annotation_font_color="#ff4444")
 
+                        # Dynamic Y range: include both OI PCR and ChgOI PCR values + thresholds
+                        _cmp_vals = []
+                        if strike_col in history_df.columns:
+                            _cmp_vals += history_df[strike_col].dropna().tolist()
+                        if chgoi_history_df is not None and strike_col in chgoi_history_df.columns:
+                            _cmp_vals += chgoi_history_df[strike_col].dropna().tolist()
+                        _cmp_vals += [0.7, 1.2]
+                        _cmp_ymin = max(0.0, min(_cmp_vals) * 0.9)
+                        _cmp_ymax = max(_cmp_vals) * 1.1
+
                         fig.update_layout(
                             title=dict(text=f"{position_labels[i]}<br>₹{strike}", font=dict(size=11)),
                             template='plotly_dark',
@@ -5780,7 +5796,7 @@ def main():
                                         xanchor='center', x=0.5, font=dict(size=8)),
                             margin=dict(l=5, r=10, t=70, b=30),
                             xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
-                            yaxis=dict(title='PCR'),
+                            yaxis=dict(title='PCR', range=[_cmp_ymin, _cmp_ymax]),
                             plot_bgcolor='#1e1e1e',
                             paper_bgcolor='#1e1e1e',
                         )
@@ -6005,12 +6021,17 @@ def main():
                                     annotation_text="Bear 0.7", annotation_position="right",
                                     annotation_font_size=8, annotation_font_color="#ff4444")
                     _vfig.add_hline(y=1.0, line_dash="dash", line_color="rgba(255,255,255,0.3)", line_width=1)
+                    # Dynamic Y range: data + thresholds always visible
+                    _vp_raw = _vp_hist_df[_vscol].dropna().tolist()
+                    _vp_all = _vp_raw + [0.7, 1.2]
+                    _vp_ymin = max(0.0, min(_vp_all) * 0.9)
+                    _vp_ymax = max(_vp_all) * 1.1
                     _vfig.update_layout(
                         title=dict(text=f"{_pos_labels[_vi]}<br>₹{_vstrike}<br>Vol PCR: {_vcur:.2f}", font=dict(size=11)),
                         template='plotly_dark', height=280, showlegend=False,
                         margin=dict(l=5, r=10, t=70, b=30),
                         xaxis=dict(tickformat='%H:%M', title=''),
-                        yaxis=dict(title='Vol PCR'),
+                        yaxis=dict(title='Vol PCR', range=[_vp_ymin, _vp_ymax]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     )
                     st.plotly_chart(_vfig, use_container_width=True)
@@ -6093,7 +6114,7 @@ def main():
 
         # ── Panel 3: Combined Trend / Strength / Move Type Signal ──
         st.markdown("---")
-        st.markdown("### 🧠 Combined Signal — Trend · Strength · Move Type")
+        st.markdown("### 🧠 Combined Signal — Trend · Strength · Move Type · Confidence")
         try:
             _cs_oi_hist   = st.session_state.pcr_history
             _cs_vol_hist  = st.session_state.vol_pcr_history
@@ -6106,125 +6127,218 @@ def main():
                 _cs_oi_df  = pd.DataFrame(_cs_oi_hist)
                 _cs_vol_df = pd.DataFrame(_cs_vol_hist)
 
-                # Average OI PCR + Vol PCR across ATM±2 strikes (latest row)
+                # ── Avg OI PCR + Vol PCR across ATM±2 ──
                 _cs_oi_vals  = [_cs_oi_df[str(s)].iloc[-1]  for s in _cs_strikes if str(s) in _cs_oi_df.columns]
                 _cs_vol_vals = [_cs_vol_df[str(s)].iloc[-1] for s in _cs_strikes if str(s) in _cs_vol_df.columns]
                 _avg_oi_pcr  = sum(_cs_oi_vals)  / len(_cs_oi_vals)  if _cs_oi_vals  else 1.0
                 _avg_vol_pcr = sum(_cs_vol_vals) / len(_cs_vol_vals) if _cs_vol_vals else 1.0
-
-                # OI PCR signal
                 _oi_sig  = "bull" if _avg_oi_pcr  > 1.2 else ("bear" if _avg_oi_pcr  < 0.7 else "neut")
                 _vol_sig = "bull" if _avg_vol_pcr > 1.2 else ("bear" if _avg_vol_pcr < 0.7 else "neut")
 
-                # Trend logic (OI = positioning, Vol = live action)
+                # ── Trap Detector ──
+                if _oi_sig == "bull" and _vol_sig == "bear":
+                    _trap = "🚨 BULL TRAP"
+                    _trap_clr = "#ff6600"
+                    _trap_sub = "OI bull but Vol bear — smart money exiting"
+                elif _oi_sig == "bear" and _vol_sig == "bull":
+                    _trap = "🚨 BEAR TRAP"
+                    _trap_clr = "#ffcc00"
+                    _trap_sub = "OI bear but Vol bull — absorption / reversal watch"
+                else:
+                    _trap = "✅ Clean Signal"
+                    _trap_clr = "#44cc88"
+                    _trap_sub = "OI PCR & Vol PCR aligned"
+
+                # ── Trend ──
                 if _oi_sig == "bull" and _vol_sig == "bull":
-                    _trend = "🟢 Strong Bullish"
+                    _trend = "🟢 Strong Bull"
                     _trend_clr = "#00ff88"
                 elif _oi_sig == "bear" and _vol_sig == "bear":
-                    _trend = "🔴 Strong Bearish"
+                    _trend = "🔴 Strong Bear"
                     _trend_clr = "#ff4444"
-                elif _oi_sig == "bull" and _vol_sig == "bear":
-                    _trend = "⚠️ Trap / Fake Bull"
-                    _trend_clr = "#ff9900"
-                elif _oi_sig == "bear" and _vol_sig == "bull":
-                    _trend = "🔄 Possible Reversal"
-                    _trend_clr = "#ffdd44"
                 elif _oi_sig == "bull":
-                    _trend = "🟢 Bullish (positioning)"
+                    _trend = "🟢 Bull (positioning)"
                     _trend_clr = "#00cc88"
                 elif _oi_sig == "bear":
-                    _trend = "🔴 Bearish (positioning)"
+                    _trend = "🔴 Bear (positioning)"
                     _trend_clr = "#dd4444"
                 else:
                     _trend = "⚪ Neutral"
                     _trend_clr = "#888888"
 
-                # Strength from GEX
+                # ── Strength from GEX ──
                 _cs_gex_df = pd.DataFrame(_cs_gex_hist) if _cs_gex_hist else None
                 _cs_gex_cols = [str(s) for s in _cs_strikes if _cs_gex_df is not None and str(s) in _cs_gex_df.columns]
-                if _cs_gex_cols and _cs_gex_df is not None:
-                    _total_gex = sum(_cs_gex_df[c].iloc[-1] for c in _cs_gex_cols)
-                else:
-                    _total_gex = 0
+                _total_gex = sum(_cs_gex_df[c].iloc[-1] for c in _cs_gex_cols) if _cs_gex_cols and _cs_gex_df is not None else 0
                 if _total_gex < -10:
-                    _strength = "⚡ Strong (Negative GEX — trending)"
+                    _strength = "⚡ Strong (Neg GEX)"
                     _strength_clr = "#ff9900"
+                    _gex_mode = "trending"
                 elif _total_gex > 10:
-                    _strength = "📍 Weak / Capped (Positive GEX — pinning)"
+                    _strength = "📍 Capped (Pos GEX)"
                     _strength_clr = "#aaaaaa"
+                    _gex_mode = "pinning"
                 else:
                     _strength = "➡️ Normal"
                     _strength_clr = "#cccccc"
+                    _gex_mode = "neutral"
 
-                # Move type from Straddle
-                if _cs_st_hist:
-                    _cs_st_df = pd.DataFrame(_cs_st_hist)
-                    _cs_st_vals = _cs_st_df['straddle'].dropna().tolist()
-                    if len(_cs_st_vals) >= 3:
-                        _cs_st_delta = _cs_st_vals[-1] - _cs_st_vals[-3]
-                        _cs_st_dir = "rising" if _cs_st_delta > 0.5 else ("falling" if _cs_st_delta < -0.5 else "flat")
-                    else:
-                        _cs_st_dir = "flat"
-                    _move_map = {'rising': "💥 Explosive", 'falling': "🐌 Slow / Grinding", 'flat': "⬛ Range / Sideways"}
-                    _move_type_s = _move_map[_cs_st_dir]
+                # ── Move Type: avg straddle delta across ALL 5 strikes ──
+                _cs_st_df = pd.DataFrame(_cs_st_hist) if _cs_st_hist else None
+                _st_deltas = []
+                _strike_dirs = {}    # per-strike direction for pattern detection
+                _strike_cur  = {}    # per-strike current straddle value
+                if _cs_st_df is not None:
+                    for _s in _cs_strikes:
+                        _sk = f'straddle_{_s}'
+                        if _sk in _cs_st_df.columns:
+                            _sv = _cs_st_df[_sk].dropna().tolist()
+                            _strike_cur[_s] = _sv[-1] if _sv else 0
+                            if len(_sv) >= 3:
+                                _d = _sv[-1] - _sv[-3]
+                                _st_deltas.append(_d)
+                                _strike_dirs[_s] = "rising" if _d > 0.5 else ("falling" if _d < -0.5 else "flat")
+                            else:
+                                _strike_dirs[_s] = "flat"
+
+                _avg_st_delta = sum(_st_deltas) / len(_st_deltas) if _st_deltas else 0
+                _cs_st_dir = "rising" if _avg_st_delta > 0.5 else ("falling" if _avg_st_delta < -0.5 else "flat")
+                _move_map = {'rising': "💥 Explosive", 'falling': "🐌 Grinding", 'flat': "⬛ Range"}
+                _move_type_s = _move_map[_cs_st_dir]
+                _move_clr = '#ff9944' if _cs_st_dir == 'rising' else ('#44aaff' if _cs_st_dir == 'falling' else '#888888')
+
+                # ── Straddle Pattern (case 1-4) ──
+                _n_rising  = sum(1 for d in _strike_dirs.values() if d == "rising")
+                _n_falling = sum(1 for d in _strike_dirs.values() if d == "falling")
+                _itm_s = _cs_strikes[:2]
+                _otm_s = _cs_strikes[3:]
+                _atm_s = _cs_strikes[2] if len(_cs_strikes) > 2 else None
+                _itm_rising = all(_strike_dirs.get(s, "flat") == "rising" for s in _itm_s)
+                _otm_flat   = all(_strike_dirs.get(s, "flat") in ("flat", "falling") for s in _otm_s)
+                _atm_rising = _strike_dirs.get(_atm_s, "flat") == "rising" if _atm_s else False
+                _atm_only   = _atm_rising and all(_strike_dirs.get(s, "flat") != "rising" for s in _cs_strikes if s != _atm_s)
+
+                if _n_rising >= 4:
+                    _pattern = "🔥 All Rising"
+                    _pattern_desc = "BIG MOVE COMING"
+                    _pattern_clr = "#ff4444"
+                elif _atm_only:
+                    _pattern = "⚠️ ATM Only Rising"
+                    _pattern_desc = "Fake / noise — wait"
+                    _pattern_clr = "#ff9900"
+                elif _itm_rising and _otm_flat:
+                    _pattern = "📐 ITM ↑ / OTM Flat"
+                    _pattern_desc = "Directional move starting"
+                    _pattern_clr = "#00ccff"
+                elif _n_falling >= 4:
+                    _pattern = "💤 All Falling"
+                    _pattern_desc = "Sideways / premium decay"
+                    _pattern_clr = "#44aaff"
                 else:
-                    _move_type_s = "⬛ Range / Sideways"
+                    _pattern = "🔀 Mixed"
+                    _pattern_desc = f"{_n_rising}↑ {_n_falling}↓"
+                    _pattern_clr = "#cccccc"
 
-                # Render signal card
-                _sig_c1, _sig_c2, _sig_c3, _sig_c4 = st.columns(4)
+                # ── Straddle Spread: OTM avg − ITM avg ──
+                _itm_cur = [_strike_cur.get(s, 0) for s in _itm_s if s in _strike_cur]
+                _otm_cur = [_strike_cur.get(s, 0) for s in _otm_s if s in _strike_cur]
+                _itm_avg = sum(_itm_cur) / len(_itm_cur) if _itm_cur else 0
+                _otm_avg = sum(_otm_cur) / len(_otm_cur) if _otm_cur else 0
+                _spread  = _otm_avg - _itm_avg
+                if _spread > 5:
+                    _spread_sig = "⬆️ Upside Expansion"
+                    _spread_clr = "#00ff88"
+                elif _spread < -5:
+                    _spread_sig = "⬇️ Downside Pressure"
+                    _spread_clr = "#ff4444"
+                else:
+                    _spread_sig = "↔️ Balanced"
+                    _spread_clr = "#888888"
+
+                # ── Direction Confidence Score ──
+                _conf = 0
+                # PCR alignment (max 3)
+                if _oi_sig == _vol_sig and _oi_sig != "neut":
+                    _conf += 3
+                elif _oi_sig != "neut" and _vol_sig != "neut":
+                    _conf += 1
+                # GEX alignment with trend (max 2)
+                if (("bull" in _oi_sig or "bull" in _vol_sig) and _gex_mode == "trending") or \
+                   (("bear" in _oi_sig or "bear" in _vol_sig) and _gex_mode == "trending"):
+                    _conf += 2
+                elif _gex_mode == "pinning":
+                    _conf += 0
+                else:
+                    _conf += 1
+                # Straddle confirmation (max 2)
+                if (_cs_st_dir == "rising" and "bull" in _oi_sig) or (_cs_st_dir == "falling" and "bear" in _oi_sig):
+                    _conf += 2
+                elif _cs_st_dir == "flat":
+                    _conf += 0
+                # Spread confirmation (max 1)
+                if (_spread > 5 and "bull" in _oi_sig) or (_spread < -5 and "bear" in _oi_sig):
+                    _conf += 1
+                # No trap bonus (max 1)
+                if _trap.startswith("✅"):
+                    _conf += 1
+                _conf_pct = min(int((_conf / 9) * 100), 100)
+                _conf_clr = "#00ff88" if _conf_pct >= 65 else ("#ff9900" if _conf_pct >= 35 else "#ff4444")
+
+                # ── Verdict ──
+                if "Trap" in _trap:
+                    _interp = "⚠️ CAUTION / TRAP"
+                    _interp_clr = "#ff6600"
+                elif "Bull" in _trend and "Explosive" in _move_type_s and _gex_mode == "trending":
+                    _interp = "🚀 BREAKOUT UP"
+                    _interp_clr = "#00ff88"
+                elif "Bear" in _trend and "Explosive" in _move_type_s and _gex_mode == "trending":
+                    _interp = "💥 BREAKDOWN"
+                    _interp_clr = "#ff4444"
+                elif "Bull" in _trend and "Grinding" in _move_type_s:
+                    _interp = "📈 SLOW GRIND UP"
+                    _interp_clr = "#88ff88"
+                elif "Bear" in _trend and "Grinding" in _move_type_s:
+                    _interp = "📉 SLOW GRIND DOWN"
+                    _interp_clr = "#ff8888"
+                elif _gex_mode == "pinning" or _cs_st_dir == "flat":
+                    _interp = "⬛ RANGE BOUND"
+                    _interp_clr = "#888888"
+                else:
+                    _interp = "➡️ WAIT / UNCLEAR"
+                    _interp_clr = "#aaaaaa"
+
+                # ── Row 1: 5 signal cards ──
+                _sig_c1, _sig_c2, _sig_c3, _sig_c4, _sig_c5 = st.columns(5)
+                def _card(clr, label, value, sub):
+                    return f"""<div style="background:#1e1e1e;border:1.5px solid {clr};border-radius:8px;padding:14px;text-align:center;min-height:110px">
+                        <div style="color:#888;font-size:10px;margin-bottom:4px;letter-spacing:1px">{label}</div>
+                        <div style="color:{clr};font-size:15px;font-weight:bold;line-height:1.3">{value}</div>
+                        <div style="color:#999;font-size:10px;margin-top:6px">{sub}</div>
+                    </div>"""
                 with _sig_c1:
-                    st.markdown(f"""
-                    <div style="background:#1e1e1e;border:1px solid {_trend_clr};border-radius:8px;padding:16px;text-align:center">
-                        <div style="color:#888;font-size:11px;margin-bottom:4px">TREND</div>
-                        <div style="color:{_trend_clr};font-size:18px;font-weight:bold">{_trend}</div>
-                        <div style="color:#aaa;font-size:11px;margin-top:6px">OI PCR {_avg_oi_pcr:.2f} · Vol PCR {_avg_vol_pcr:.2f}</div>
-                    </div>""", unsafe_allow_html=True)
+                    st.markdown(_card(_trap_clr, "🚨 TRAP DETECTOR", _trap, _trap_sub), unsafe_allow_html=True)
                 with _sig_c2:
-                    st.markdown(f"""
-                    <div style="background:#1e1e1e;border:1px solid {_strength_clr};border-radius:8px;padding:16px;text-align:center">
-                        <div style="color:#888;font-size:11px;margin-bottom:4px">STRENGTH</div>
-                        <div style="color:{_strength_clr};font-size:18px;font-weight:bold">{_strength}</div>
-                        <div style="color:#aaa;font-size:11px;margin-top:6px">Total GEX: {_total_gex:+.1f}L</div>
-                    </div>""", unsafe_allow_html=True)
+                    st.markdown(_card(_trend_clr, "📊 TREND", _trend, f"OI {_avg_oi_pcr:.2f} · Vol {_avg_vol_pcr:.2f}"), unsafe_allow_html=True)
                 with _sig_c3:
-                    st.markdown(f"""
-                    <div style="background:#1e1e1e;border:1px solid #888;border-radius:8px;padding:16px;text-align:center">
-                        <div style="color:#888;font-size:11px;margin-bottom:4px">MOVE TYPE</div>
-                        <div style="color:#ffffff;font-size:18px;font-weight:bold">{_move_type_s}</div>
-                        <div style="color:#aaa;font-size:11px;margin-top:6px">From ATM Straddle trend</div>
-                    </div>""", unsafe_allow_html=True)
+                    st.markdown(_card(_strength_clr, "⚙️ STRENGTH", _strength, f"GEX {_total_gex:+.1f}L"), unsafe_allow_html=True)
                 with _sig_c4:
-                    # Composite interpretation
-                    if "Bullish" in _trend and "Explosive" in _move_type_s and "Strong" in _strength:
-                        _interp = "🚀 BREAKOUT UP"
-                        _interp_clr = "#00ff88"
-                    elif "Bearish" in _trend and "Explosive" in _move_type_s and "Strong" in _strength:
-                        _interp = "💥 BREAKDOWN"
-                        _interp_clr = "#ff4444"
-                    elif "Trap" in _trend:
-                        _interp = "⚠️ CAUTION / TRAP"
-                        _interp_clr = "#ff9900"
-                    elif "Reversal" in _trend:
-                        _interp = "🔄 REVERSAL WATCH"
-                        _interp_clr = "#ffdd44"
-                    elif "Bullish" in _trend and "Grinding" in _move_type_s:
-                        _interp = "📈 SLOW GRIND UP"
-                        _interp_clr = "#88ff88"
-                    elif "Bearish" in _trend and "Grinding" in _move_type_s:
-                        _interp = "📉 SLOW GRIND DOWN"
-                        _interp_clr = "#ff8888"
-                    elif "Capped" in _strength or "Range" in _move_type_s:
-                        _interp = "⬛ RANGE BOUND"
-                        _interp_clr = "#888888"
-                    else:
-                        _interp = "➡️ WAIT / UNCLEAR"
-                        _interp_clr = "#aaaaaa"
-                    st.markdown(f"""
-                    <div style="background:#1e1e1e;border:2px solid {_interp_clr};border-radius:8px;padding:16px;text-align:center">
-                        <div style="color:#888;font-size:11px;margin-bottom:4px">VERDICT</div>
-                        <div style="color:{_interp_clr};font-size:20px;font-weight:bold">{_interp}</div>
-                        <div style="color:#aaa;font-size:10px;margin-top:6px">OI+Vol+GEX+Straddle</div>
-                    </div>""", unsafe_allow_html=True)
+                    st.markdown(_card(_move_clr, "🎯 MOVE TYPE", _move_type_s, f"5-strike avg Δ {_avg_st_delta:+.1f}"), unsafe_allow_html=True)
+                with _sig_c5:
+                    st.markdown(_card(_interp_clr, "🏆 VERDICT", _interp, "OI+Vol+GEX+Straddle"), unsafe_allow_html=True)
+
+                # ── Row 2: Straddle Pattern | Spread | Confidence ──
+                st.markdown("<div style='margin-top:10px'></div>", unsafe_allow_html=True)
+                _row2_c1, _row2_c2, _row2_c3 = st.columns(3)
+                with _row2_c1:
+                    st.markdown(_card(_pattern_clr, "🧩 STRADDLE PATTERN", _pattern, _pattern_desc), unsafe_allow_html=True)
+                with _row2_c2:
+                    st.markdown(_card(_spread_clr, "📐 STRADDLE SPREAD", f"₹{_spread:+.1f}",
+                                      f"{_spread_sig} | OTM {_otm_avg:.1f} vs ITM {_itm_avg:.1f}"), unsafe_allow_html=True)
+                with _row2_c3:
+                    _bar_filled = int(_conf_pct / 10)
+                    _bar = "█" * _bar_filled + "░" * (10 - _bar_filled)
+                    st.markdown(_card(_conf_clr, "🎯 CONFIDENCE", f"{_conf_pct}%", f"{_bar}"), unsafe_allow_html=True)
+
             else:
                 st.info("📊 Combined signal will appear once history builds for Volume PCR. Wait a few refreshes.")
         except Exception as _cs_exc:
@@ -6606,10 +6720,15 @@ def main():
                 fig_pcr_chgoi.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1,
                                         annotation_text="0.7 (Bearish)", annotation_position="right")
 
+                # Dynamic Y range: data + reference thresholds always in view
+                _ov_raw = pcr_chgoi_df['pcr'].dropna().tolist()
+                _ov_all = _ov_raw + [0.7, 1.0, 1.2]
+                _ov_ymin = max(0.0, min(_ov_all) * 0.9)
+                _ov_ymax = max(_ov_all) * 1.1
+
                 # Add green/red shading zones
-                y_max = max(pcr_chgoi_df['pcr'].max() * 1.2, 1.5)
-                fig_pcr_chgoi.add_hrect(y0=1.2, y1=y_max, fillcolor="rgba(0,255,136,0.06)", line_width=0)
-                fig_pcr_chgoi.add_hrect(y0=0, y1=0.7, fillcolor="rgba(255,68,68,0.06)", line_width=0)
+                fig_pcr_chgoi.add_hrect(y0=1.2, y1=_ov_ymax, fillcolor="rgba(0,255,136,0.06)", line_width=0)
+                fig_pcr_chgoi.add_hrect(y0=_ov_ymin, y1=0.7, fillcolor="rgba(255,68,68,0.06)", line_width=0)
 
                 fig_pcr_chgoi.update_layout(
                     title=f"PCR of Total Change in OI | Current: {curr_pcr:.3f} ({pcr_label})",
@@ -6617,7 +6736,7 @@ def main():
                     height=400,
                     showlegend=False,
                     xaxis=dict(tickformat='%H:%M', title='Time'),
-                    yaxis=dict(title='PCR (Total PE ΔOI / Total CE ΔOI)', rangemode='tozero'),
+                    yaxis=dict(title='PCR (Total PE ΔOI / Total CE ΔOI)', range=[_ov_ymin, _ov_ymax]),
                     plot_bgcolor='#1e1e1e',
                     paper_bgcolor='#1e1e1e',
                     margin=dict(l=50, r=50, t=60, b=50)
@@ -6670,6 +6789,12 @@ def main():
                 # Get current value
                 current_val = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
 
+                # Dynamic Y range: data + reference thresholds always in view
+                _chgoi_raw = history_df[col_name].dropna().tolist()
+                _chgoi_all = _chgoi_raw + [0.7, 1.2]
+                _chgoi_ymin = max(0.0, min(_chgoi_all) * 0.9)
+                _chgoi_ymax = max(_chgoi_all) * 1.1
+
                 fig.update_layout(
                     title=f"{title_prefix}<br>₹{strike_val}<br>PCR(ΔOI): {current_val:.2f}",
                     template='plotly_dark',
@@ -6677,7 +6802,7 @@ def main():
                     showlegend=False,
                     margin=dict(l=10, r=10, t=70, b=30),
                     xaxis=dict(tickformat='%H:%M', title=''),
-                    yaxis=dict(title='PCR (ΔOI)'),
+                    yaxis=dict(title='PCR (ΔOI)', range=[_chgoi_ymin, _chgoi_ymax]),
                     plot_bgcolor='#1e1e1e',
                     paper_bgcolor='#1e1e1e'
                 )
@@ -7164,12 +7289,17 @@ def main():
                     fig_pcr_ts.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
                     fig_pcr_ts.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
                     fig_pcr_ts.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+                    # Dynamic Y range: both series + thresholds always in view
+                    _comp_pcr_raw = comp_hist_df['avg_pcr'].dropna().tolist() + comp_hist_df['avg_chgoi'].dropna().tolist()
+                    _comp_pcr_all = _comp_pcr_raw + [0.7, 1.0, 1.2]
+                    _comp_ymin = max(0.0, min(_comp_pcr_all) * 0.9)
+                    _comp_ymax = max(_comp_pcr_all) * 1.1
                     fig_pcr_ts.update_layout(
                         title="Avg PCR (OI) vs Avg PCR (ΔOI)",
                         template='plotly_dark', height=320, showlegend=True,
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                         xaxis=dict(tickformat='%H:%M', title=''),
-                        yaxis=dict(title='PCR'),
+                        yaxis=dict(title='PCR', range=[_comp_ymin, _comp_ymax]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         margin=dict(l=40, r=10, t=60, b=30)
                     )
