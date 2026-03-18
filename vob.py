@@ -7842,14 +7842,14 @@ def main():
             _ivp_df = option_data.get('df_summary') if option_data else None
             _ivp_underlying = option_data.get('underlying') if option_data else None
 
-            if (_ivp_df is not None and _ivp_underlying and
-                    'Zone' in _ivp_df.columns and
-                    'impliedVolatility_CE' in _ivp_df.columns and
-                    'impliedVolatility_PE' in _ivp_df.columns and
-                    'bidQty_CE' in _ivp_df.columns and
-                    'bidQty_PE' in _ivp_df.columns and
-                    'askQty_CE' in _ivp_df.columns and
-                    'askQty_PE' in _ivp_df.columns):
+            # Ensure optional bid/ask columns exist (may be absent if Dhan didn't return them)
+            if _ivp_df is not None:
+                for _col in ['impliedVolatility_CE', 'impliedVolatility_PE',
+                             'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']:
+                    if _col not in _ivp_df.columns:
+                        _ivp_df[_col] = 0.0
+
+            if (_ivp_df is not None and _ivp_underlying and 'Zone' in _ivp_df.columns):
 
                 # --- ATM ± 2 slice ---
                 _ivp_atm_idx = _ivp_df[_ivp_df['Zone'] == 'ATM'].index
@@ -8092,10 +8092,14 @@ def main():
             _ae_df = option_data.get('df_summary') if option_data else None
             _ae_underlying = option_data.get('underlying') if option_data else None
 
-            if (_ae_df is not None and _ae_underlying and
-                    'Zone' in _ae_df.columns and
-                    'impliedVolatility_CE' in _ae_df.columns and
-                    'bidQty_CE' in _ae_df.columns):
+            # Ensure optional columns exist
+            if _ae_df is not None:
+                for _col in ['impliedVolatility_CE', 'impliedVolatility_PE',
+                             'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']:
+                    if _col not in _ae_df.columns:
+                        _ae_df[_col] = 0.0
+
+            if (_ae_df is not None and _ae_underlying and 'Zone' in _ae_df.columns):
 
                 # Re-compute signals (lightweight — uses same logic as above)
                 _ae_atm_idx = _ae_df[_ae_df['Zone'] == 'ATM'].index
@@ -8526,9 +8530,9 @@ def main():
                             paper_bgcolor='#111', plot_bgcolor='#111',
                             font=dict(color='#ccc'),
                             xaxis=dict(gridcolor='#333'),
-                            yaxis=dict(title='Net Delta', gridcolor='#333', titlefont=dict(color='#00C853')),
-                            yaxis2=dict(title='Net Gamma (L)', overlaying='y', side='right',
-                                        titlefont=dict(color='#FFD740'), showgrid=False),
+                            yaxis=dict(title=dict(text='Net Delta', font=dict(color='#00C853')), gridcolor='#333'),
+                            yaxis2=dict(title=dict(text='Net Gamma (L)', font=dict(color='#FFD740')),
+                                        overlaying='y', side='right', showgrid=False),
                             showlegend=True, legend=dict(orientation='h', y=-0.3)
                         )
                         st.plotly_chart(_fig_dg, use_container_width=True)
