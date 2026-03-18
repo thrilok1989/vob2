@@ -5770,9 +5770,7 @@ def main():
                                         xanchor='center', x=0.5, font=dict(size=8)),
                             margin=dict(l=5, r=10, t=70, b=30),
                             xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
-                            yaxis=dict(title='PCR', range=[0, 3],
-                                       title_font=dict(color='#00ccff', size=9),
-                                       tickfont=dict(size=8)),
+                            yaxis=dict(title='PCR'),
                             plot_bgcolor='#1e1e1e',
                             paper_bgcolor='#1e1e1e',
                         )
