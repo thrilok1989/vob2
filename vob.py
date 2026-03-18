@@ -415,33 +415,6 @@ class DhanAPI:
             st.error(f"Error fetching LTP: {str(e)}")
             return None
 
-    def place_order(self, security_id, trading_symbol, transaction_type="BUY",
-                    quantity=65, exchange_segment="NSE_FNO", product_type="INTRADAY"):
-        """Place a market order for an options contract"""
-        url = f"{self.base_url}/orders"
-        payload = {
-            "dhanClientId": self.client_id,
-            "transactionType": transaction_type,
-            "exchangeSegment": exchange_segment,
-            "productType": product_type,
-            "orderType": "MARKET",
-            "validity": "DAY",
-            "tradingSymbol": trading_symbol,
-            "securityId": str(security_id),
-            "quantity": quantity,
-            "price": 0,
-            "disclosedQuantity": 0,
-            "afterMarketOrder": False
-        }
-        try:
-            response = requests.post(url, headers=self.headers, json=payload)
-            if response.status_code in (200, 201):
-                return True, response.json()
-            else:
-                return False, f"HTTP {response.status_code}: {response.text}"
-        except Exception as e:
-            return False, str(e)
-
 @st.cache_data(ttl=300)  # Cache expiry list for 5 minutes
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
     return get_dhan_expiry_list(underlying_scrip, underlying_seg)
@@ -3691,7 +3664,7 @@ def create_csv_download(df_summary):
     return output.getvalue()
 
 
-def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
+def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None, live_spot_price=None):
     """Enhanced options chain analysis with expiry selection, HTF pivot data, and VOB data"""
     now = datetime.now(timezone("Asia/Kolkata"))
     
@@ -3715,7 +3688,8 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         return {'underlying': None, 'df_summary': None, 'expiry_dates': expiry_dates, 'expiry': None, 'sr_data': [], 'max_pain_strike': None, 'styled_df': None, 'df_display': None, 'display_cols': [], 'bias_cols': [], 'total_ce_change': 0, 'total_pe_change': 0}
     
     data = option_chain_data['data']
-    underlying = data['last_price']
+    # Use live spot price from LTP API if available, as option chain's last_price can be stale
+    underlying = live_spot_price if live_spot_price and live_spot_price > 0 else data['last_price']
 
     oc_data = data['oc']
     calls, puts = [], []
@@ -3779,9 +3753,9 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
 
     atm_strike = min(df['strikePrice'], key=lambda x: abs(x - underlying))
     
-    # Limit to ATM ± 5 strikes for Strike Price / LTP table display
-    atm_plus_minus_5 = df[abs(df['strikePrice'] - atm_strike) <= 250]  # Assuming 50 point strikes
-    df = atm_plus_minus_5.copy()
+    # Limit to ATM ± 2 strikes for faster UI (performance optimization)
+    atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]  # Assuming 50 point strikes
+    df = atm_plus_minus_2.copy()
     
     df['Zone'] = df['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
     df['Level'] = df.apply(determine_level, axis=1)
@@ -3925,8 +3899,7 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     merge_cols = ['strikePrice', 'openInterest_CE', 'openInterest_PE', 'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
                   'lastPrice_CE', 'lastPrice_PE', 'totalTradedVolume_CE', 'totalTradedVolume_PE',
                   'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE', 'Vega_CE', 'Vega_PE', 'Theta_CE', 'Theta_PE',
-                  'impliedVolatility_CE', 'impliedVolatility_PE', 'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE',
-                  'scrp_cd_CE', 'scrp_cd_PE']
+                  'impliedVolatility_CE', 'impliedVolatility_PE', 'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']
     merge_cols = [col for col in merge_cols if col in df.columns]
 
     df_summary = pd.merge(
@@ -4335,7 +4308,6 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     # Return all data for external display
     return {
         'underlying': underlying,
-        'atm_strike': atm_strike,
         'df_summary': df_summary,
         'expiry_dates': expiry_dates,
         'expiry': expiry,
@@ -4539,8 +4511,16 @@ def main():
     # Initialize session state for per-strike ChgOI PCR history (for comparison view)
     if 'pcr_chgoi_strike_history' not in st.session_state:
         st.session_state.pcr_chgoi_strike_history = []
+    if 'pcr_chgoi_strike_last_valid' not in st.session_state:
+        st.session_state.pcr_chgoi_strike_last_valid = None
     if 'pcr_chgoi_strike_current_strikes' not in st.session_state:
         st.session_state.pcr_chgoi_strike_current_strikes = []
+
+    # Initialize session state for Composite Direction Signal history
+    if 'composite_signal_history' not in st.session_state:
+        st.session_state.composite_signal_history = []
+    if 'composite_signal_last_valid' not in st.session_state:
+        st.session_state.composite_signal_last_valid = None
 
     # Initialize session state for Total GEX time-series history
     if 'total_gex_history' not in st.session_state:
@@ -5280,7 +5260,8 @@ def main():
         st.header("📊 Options Analysis")
 
         # Options chain analysis with expiry selection (pass pivot data and VOB data for HTF S/R table)
-        option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
+        # Pass live spot price from LTP API to avoid stale option chain last_price for ATM calculation
+        option_data = analyze_option_chain(selected_expiry, pivots, vob_data, live_spot_price=current_price)
 
         if option_data and option_data.get('underlying'):
             underlying_price = option_data['underlying']
@@ -5395,7 +5376,6 @@ def main():
         )
         if depth_fig is not None:
             st.plotly_chart(depth_fig, use_container_width=True)
-
         # Option Chain Bias Summary Table
         st.markdown("## Option Chain Bias Summary")
         if option_data.get('styled_df') is not None:
@@ -6182,6 +6162,655 @@ def main():
 
         except Exception as e:
             st.warning(f"PCR of ΔOI analysis unavailable: {str(e)}")
+
+        # ===== PCR OF CHANGE IN OI - TIME SERIES PER ATM ± 2 STRIKES =====
+        st.markdown("---")
+        st.markdown("## 📊 PCR of Change in OI - Time Series (ATM ± 2)")
+
+        # Helper function to create per-strike ChgOI PCR chart
+        def create_pcr_chgoi_strike_chart(history_df, col_name, color, title_prefix):
+            """Helper to create individual PCR of Change in OI chart per strike"""
+            if col_name and col_name in history_df.columns:
+                strike_val = col_name
+
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=history_df['time'],
+                    y=history_df[col_name],
+                    mode='lines+markers',
+                    name=f'₹{strike_val}',
+                    line=dict(color=color, width=2),
+                    marker=dict(size=4),
+                    fill='tozeroy',
+                    fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.1])}'
+                ))
+
+                # Reference lines
+                fig.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
+                fig.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
+                fig.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+
+                # Get current value
+                current_val = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
+
+                fig.update_layout(
+                    title=f"{title_prefix}<br>₹{strike_val}<br>PCR(ΔOI): {current_val:.2f}",
+                    template='plotly_dark',
+                    height=280,
+                    showlegend=False,
+                    margin=dict(l=10, r=10, t=70, b=30),
+                    xaxis=dict(tickformat='%H:%M', title=''),
+                    yaxis=dict(title='PCR (ΔOI)'),
+                    plot_bgcolor='#1e1e1e',
+                    paper_bgcolor='#1e1e1e'
+                )
+                return fig, current_val
+            return None, 0
+
+        # Try to get new data and add to history
+        pcr_chgoi_strike_available = False
+        pcr_chgoi_strike_df = None
+
+        df_summary_chgoi = option_data.get('df_summary') if option_data else None
+        if df_summary_chgoi is not None and 'Zone' in df_summary_chgoi.columns and 'changeinOpenInterest_CE' in df_summary_chgoi.columns and 'changeinOpenInterest_PE' in df_summary_chgoi.columns:
+            try:
+                # Find ATM index
+                atm_idx_chgoi = df_summary_chgoi[df_summary_chgoi['Zone'] == 'ATM'].index
+                if len(atm_idx_chgoi) > 0:
+                    atm_pos_chgoi = df_summary_chgoi.index.get_loc(atm_idx_chgoi[0])
+
+                    # Get ATM ± 2 strikes (5 strikes total)
+                    start_idx_chgoi = max(0, atm_pos_chgoi - 2)
+                    end_idx_chgoi = min(len(df_summary_chgoi), atm_pos_chgoi + 3)
+
+                    pcr_chgoi_strike_df = df_summary_chgoi.iloc[start_idx_chgoi:end_idx_chgoi][['Strike', 'Zone',
+                                                                   'changeinOpenInterest_CE', 'changeinOpenInterest_PE']].copy()
+
+                    # Calculate PCR of Change in OI per strike
+                    pcr_chgoi_strike_df['PCR_ChgOI'] = pcr_chgoi_strike_df.apply(
+                        lambda row: abs(row['changeinOpenInterest_PE'] / row['changeinOpenInterest_CE'])
+                        if row['changeinOpenInterest_CE'] != 0 else 0, axis=1
+                    )
+                    pcr_chgoi_strike_df['PCR_ChgOI'] = pcr_chgoi_strike_df['PCR_ChgOI'].round(3)
+                    pcr_chgoi_strike_df['PCR_ChgOI_Signal'] = np.where(
+                        pcr_chgoi_strike_df['PCR_ChgOI'] > 1.2, "Bullish",
+                        np.where(pcr_chgoi_strike_df['PCR_ChgOI'] < 0.7, "Bearish", "Neutral")
+                    )
+
+                    if not pcr_chgoi_strike_df.empty:
+                        pcr_chgoi_strike_available = True
+                        st.session_state.pcr_chgoi_strike_last_valid = pcr_chgoi_strike_df.copy()
+
+                        ist = pytz.timezone('Asia/Kolkata')
+                        current_time = datetime.now(ist)
+
+                        # Build history entry keyed by strike price
+                        chgoi_entry = {'time': current_time}
+                        for _, row in pcr_chgoi_strike_df.iterrows():
+                            strike_label = str(int(row['Strike']))
+                            chgoi_entry[strike_label] = row['PCR_ChgOI']
+
+                        # Store current strikes
+                        current_chgoi_strikes = pcr_chgoi_strike_df['Strike'].tolist()
+                        st.session_state.pcr_chgoi_strike_current_strikes = [int(s) for s in current_chgoi_strikes]
+
+                        # Deduplicate within 30 seconds
+                        should_add = True
+                        if st.session_state.pcr_chgoi_strike_history:
+                            last_entry = st.session_state.pcr_chgoi_strike_history[-1]
+                            time_diff = (current_time - last_entry['time']).total_seconds()
+                            if time_diff < 30:
+                                should_add = False
+
+                        if should_add:
+                            st.session_state.pcr_chgoi_strike_history.append(chgoi_entry)
+                            if len(st.session_state.pcr_chgoi_strike_history) > 200:
+                                st.session_state.pcr_chgoi_strike_history = st.session_state.pcr_chgoi_strike_history[-200:]
+
+            except Exception as e:
+                st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
+
+        # ALWAYS try to display graph if we have history
+        if len(st.session_state.pcr_chgoi_strike_history) > 0:
+            try:
+                chgoi_history_df = pd.DataFrame(st.session_state.pcr_chgoi_strike_history)
+
+                current_chgoi_strikes = getattr(st.session_state, 'pcr_chgoi_strike_current_strikes', [])
+
+                if not current_chgoi_strikes and st.session_state.pcr_chgoi_strike_last_valid is not None:
+                    current_chgoi_strikes = [int(s) for s in st.session_state.pcr_chgoi_strike_last_valid['Strike'].tolist()]
+
+                current_chgoi_strikes = sorted(current_chgoi_strikes)
+
+                # 5 columns for side-by-side display
+                chgoi_col1, chgoi_col2, chgoi_col3, chgoi_col4, chgoi_col5 = st.columns(5)
+
+                def display_pcr_chgoi_with_signal(container, fig, pcr_val):
+                    if fig:
+                        container.plotly_chart(fig, use_container_width=True)
+                        if pcr_val > 1.2:
+                            container.success("Bullish")
+                        elif pcr_val < 0.7:
+                            container.error("Bearish")
+                        else:
+                            container.warning("Neutral")
+
+                # Get zone info
+                chgoi_zone_info = {}
+                chgoi_zone_df = pcr_chgoi_strike_df if pcr_chgoi_strike_df is not None else st.session_state.pcr_chgoi_strike_last_valid
+                if chgoi_zone_df is not None:
+                    for _, row in chgoi_zone_df.iterrows():
+                        chgoi_zone_info[int(row['Strike'])] = row['Zone']
+
+                position_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+                position_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+                chgoi_columns = [chgoi_col1, chgoi_col2, chgoi_col3, chgoi_col4, chgoi_col5]
+
+                for i, col in enumerate(chgoi_columns):
+                    with col:
+                        if i < len(current_chgoi_strikes):
+                            strike = current_chgoi_strikes[i]
+                            strike_col = str(strike)
+                            zone = chgoi_zone_info.get(strike, position_labels[i].split()[-1])
+
+                            if strike_col in chgoi_history_df.columns:
+                                fig, pcr_val = create_pcr_chgoi_strike_chart(chgoi_history_df, strike_col, position_colors[i], f'{position_labels[i]}')
+                                display_pcr_chgoi_with_signal(st, fig, pcr_val)
+                            else:
+                                st.info(f"₹{strike} - Building history...")
+                        else:
+                            st.info(f"{position_labels[i]} N/A")
+
+                # Show current data table
+                st.markdown("### Current PCR of Change in OI Values")
+                display_chgoi_df = pcr_chgoi_strike_df if pcr_chgoi_strike_df is not None else st.session_state.pcr_chgoi_strike_last_valid
+                if display_chgoi_df is not None:
+                    chgoi_display = display_chgoi_df[['Strike', 'Zone', 'PCR_ChgOI', 'PCR_ChgOI_Signal']].copy()
+                    chgoi_display['CE ΔOI (L)'] = (display_chgoi_df['changeinOpenInterest_CE'] / 100000).round(2)
+                    chgoi_display['PE ΔOI (L)'] = (display_chgoi_df['changeinOpenInterest_PE'] / 100000).round(2)
+                    chgoi_display.rename(columns={'PCR_ChgOI': 'PCR (ΔOI)', 'PCR_ChgOI_Signal': 'Signal'}, inplace=True)
+                    st.dataframe(chgoi_display, use_container_width=True, hide_index=True)
+
+                # Status bar and clear button
+                chgoi_info1, chgoi_info2 = st.columns([3, 1])
+                with chgoi_info1:
+                    status = "🟢 Live" if pcr_chgoi_strike_available else "🟡 Using cached history"
+                    st.caption(f"{status} | 📈 {len(st.session_state.pcr_chgoi_strike_history)} data points | History preserved on refresh failures")
+                with chgoi_info2:
+                    if st.button("🗑️ Clear ΔOI Strike History"):
+                        st.session_state.pcr_chgoi_strike_history = []
+                        st.session_state.pcr_chgoi_strike_last_valid = None
+                        st.rerun()
+
+            except Exception as e:
+                st.warning(f"Error displaying PCR ΔOI strike charts: {str(e)}")
+        else:
+            st.info("📊 PCR of ΔOI per strike history will build up as the app refreshes. Please wait for data collection...")
+
+        # ===== COMPOSITE DIRECTIONAL SIGNAL: PCR + PCR(ΔOI) + GEX (ATM ± 2) =====
+        st.markdown("---")
+        st.markdown("## 🧭 Composite Direction Signal - PCR × ΔOI × GEX (ATM ± 2)")
+
+        try:
+            df_summary_comp = option_data.get('df_summary') if option_data else None
+            underlying_price_comp = option_data.get('underlying') if option_data else None
+            composite_data_available = False
+
+            if (df_summary_comp is not None and underlying_price_comp and
+                'Zone' in df_summary_comp.columns and 'PCR' in df_summary_comp.columns and
+                'changeinOpenInterest_CE' in df_summary_comp.columns and
+                'Gamma_CE' in df_summary_comp.columns):
+
+                # Find ATM ± 2 strikes
+                atm_idx_comp = df_summary_comp[df_summary_comp['Zone'] == 'ATM'].index
+                if len(atm_idx_comp) > 0:
+                    atm_pos_comp = df_summary_comp.index.get_loc(atm_idx_comp[0])
+                    start_comp = max(0, atm_pos_comp - 2)
+                    end_comp = min(len(df_summary_comp), atm_pos_comp + 3)
+                    comp_df = df_summary_comp.iloc[start_comp:end_comp].copy()
+
+                    # Calculate PCR of ΔOI per strike
+                    comp_df['PCR_ChgOI'] = comp_df.apply(
+                        lambda row: abs(row['changeinOpenInterest_PE'] / row['changeinOpenInterest_CE'])
+                        if row['changeinOpenInterest_CE'] != 0 else 0, axis=1
+                    )
+
+                    # Calculate per-strike GEX
+                    contract_multiplier = 25
+                    comp_df['Net_GEX'] = (
+                        -1 * comp_df.get('Gamma_CE', 0) * comp_df.get('openInterest_CE', 0) * contract_multiplier * underlying_price_comp / 100000
+                        + comp_df.get('Gamma_PE', 0) * comp_df.get('openInterest_PE', 0) * contract_multiplier * underlying_price_comp / 100000
+                    )
+
+                    # ---- Per-strike scoring ----
+                    strike_scores = []
+                    strike_details = []
+                    position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                    weights = [1.0, 1.5, 2.0, 1.5, 1.0]
+
+                    total_net_gex = comp_df['Net_GEX'].sum()
+
+                    # Per-strike history entries for individual tracking
+                    per_strike_scores = {}
+
+                    for i, (_, row) in enumerate(comp_df.iterrows()):
+                        pcr_val = row.get('PCR', 1.0)
+                        pcr_chgoi_val = row['PCR_ChgOI']
+                        net_gex_val = row['Net_GEX']
+
+                        pcr_score = 1 if pcr_val > 1.2 else (-1 if pcr_val < 0.7 else 0)
+                        chgoi_score = 1 if pcr_chgoi_val > 1.2 else (-1 if pcr_chgoi_val < 0.7 else 0)
+                        dir_score = pcr_score + chgoi_score
+
+                        w = weights[i] if i < len(weights) else 1.0
+                        strike_scores.append(dir_score * w)
+
+                        # Track per-strike score for history
+                        strike_label = str(int(row['Strike']))
+                        per_strike_scores[strike_label] = round(dir_score * w, 2)
+
+                        label = position_labels[i] if i < len(position_labels) else f"Strike {i}"
+                        pcr_sig = "Bull" if pcr_score > 0 else ("Bear" if pcr_score < 0 else "Neut")
+                        chgoi_sig = "Bull" if chgoi_score > 0 else ("Bear" if chgoi_score < 0 else "Neut")
+                        gex_sig = "Pin" if net_gex_val > 10 else ("Accel" if net_gex_val < -10 else "Neut")
+
+                        strike_details.append({
+                            'Position': label,
+                            'Strike': int(row['Strike']),
+                            'PCR (OI)': round(pcr_val, 2),
+                            'PCR Signal': pcr_sig,
+                            'PCR (ΔOI)': round(pcr_chgoi_val, 2),
+                            'ΔOI Signal': chgoi_sig,
+                            'Net GEX': round(net_gex_val, 2),
+                            'GEX Signal': gex_sig,
+                            'Score': round(dir_score * w, 1)
+                        })
+
+                    # ---- Aggregate verdict ----
+                    total_score = sum(strike_scores)
+                    max_possible = sum(w * 2 for w in weights)
+                    gex_trending = total_net_gex < -10
+                    gex_pinning = total_net_gex > 10
+                    score_pct = (total_score / max_possible) * 100 if max_possible > 0 else 0
+
+                    if abs(score_pct) < 15:
+                        if gex_pinning:
+                            verdict = "SIDEWAYS"
+                            verdict_icon = "↔️"
+                            verdict_color = "#FFD700"
+                            verdict_desc = "Mixed signals + Positive GEX = Range-bound / Choppy"
+                            verdict_numeric = 0
+                        else:
+                            verdict = "NEUTRAL"
+                            verdict_icon = "⚪"
+                            verdict_color = "#888888"
+                            verdict_desc = "No clear directional bias from ATM±2 strikes"
+                            verdict_numeric = 0
+                    elif score_pct > 0:
+                        if gex_trending:
+                            verdict = "STRONG UP"
+                            verdict_icon = "🟢🔥"
+                            verdict_color = "#00ff88"
+                            verdict_desc = "Bullish PCR + Fresh put writing + Negative GEX = Breakout UP"
+                            verdict_numeric = 3
+                        elif gex_pinning:
+                            verdict = "UP (CAPPED)"
+                            verdict_icon = "🟢📍"
+                            verdict_color = "#90EE90"
+                            verdict_desc = "Bullish bias but positive GEX may cap upside momentum"
+                            verdict_numeric = 1
+                        else:
+                            verdict = "UP"
+                            verdict_icon = "🟢"
+                            verdict_color = "#00ff88"
+                            verdict_desc = "Bullish PCR + Put writing activity across ATM±2 strikes"
+                            verdict_numeric = 2
+                    else:
+                        if gex_trending:
+                            verdict = "STRONG DOWN"
+                            verdict_icon = "🔴🔥"
+                            verdict_color = "#ff4444"
+                            verdict_desc = "Bearish PCR + Fresh call writing + Negative GEX = Breakdown"
+                            verdict_numeric = -3
+                        elif gex_pinning:
+                            verdict = "DOWN (SUPPORTED)"
+                            verdict_icon = "🔴📍"
+                            verdict_color = "#FFB6C1"
+                            verdict_desc = "Bearish bias but positive GEX may provide support"
+                            verdict_numeric = -1
+                        else:
+                            verdict = "DOWN"
+                            verdict_icon = "🔴"
+                            verdict_color = "#ff4444"
+                            verdict_desc = "Bearish PCR + Call writing activity across ATM±2 strikes"
+                            verdict_numeric = -2
+
+                    composite_data_available = True
+
+                    # ---- Store history ----
+                    ist = pytz.timezone('Asia/Kolkata')
+                    current_time = datetime.now(ist)
+
+                    avg_pcr = comp_df['PCR'].mean()
+                    avg_chgoi = comp_df['PCR_ChgOI'].mean()
+
+                    st.session_state.composite_signal_last_valid = {
+                        'verdict': verdict,
+                        'verdict_icon': verdict_icon,
+                        'verdict_color': verdict_color,
+                        'verdict_desc': verdict_desc,
+                        'total_score': total_score,
+                        'score_pct': score_pct,
+                        'total_net_gex': total_net_gex,
+                        'avg_pcr': avg_pcr,
+                        'avg_chgoi': avg_chgoi,
+                        'strike_details': strike_details,
+                        'per_strike_scores': per_strike_scores
+                    }
+
+                    # Add to history (deduplicate within 30 seconds)
+                    should_add = True
+                    if st.session_state.composite_signal_history:
+                        last_entry = st.session_state.composite_signal_history[-1]
+                        time_diff = (current_time - last_entry['time']).total_seconds()
+                        if time_diff < 30:
+                            should_add = False
+
+                    if should_add:
+                        history_entry = {
+                            'time': current_time,
+                            'score': round(total_score, 2),
+                            'score_pct': round(score_pct, 1),
+                            'verdict': verdict,
+                            'verdict_numeric': verdict_numeric,
+                            'avg_pcr': round(avg_pcr, 3),
+                            'avg_chgoi': round(avg_chgoi, 3),
+                            'total_gex': round(total_net_gex, 2),
+                        }
+                        # Add per-strike scores to history
+                        for k, v in per_strike_scores.items():
+                            history_entry[f'score_{k}'] = v
+                        st.session_state.composite_signal_history.append(history_entry)
+                        if len(st.session_state.composite_signal_history) > 200:
+                            st.session_state.composite_signal_history = st.session_state.composite_signal_history[-200:]
+
+            # ---- Display section (always show if history exists) ----
+            # Use last valid data for verdict card if current fetch failed
+            last_valid = st.session_state.composite_signal_last_valid
+            if last_valid:
+                verdict = last_valid['verdict']
+                verdict_icon = last_valid['verdict_icon']
+                verdict_color = last_valid['verdict_color']
+                verdict_desc = last_valid['verdict_desc']
+                total_score = last_valid['total_score']
+                score_pct = last_valid['score_pct']
+                total_net_gex = last_valid['total_net_gex']
+                avg_pcr = last_valid['avg_pcr']
+                avg_chgoi = last_valid['avg_chgoi']
+                strike_details = last_valid.get('strike_details', [])
+                gex_trending = total_net_gex < -10
+                gex_pinning = total_net_gex > 10
+                max_possible = 14.0  # sum(w*2 for w in [1,1.5,2,1.5,1])
+
+                # Main verdict card
+                st.markdown(f"""
+                <div style="background: linear-gradient(135deg, {verdict_color}15, {verdict_color}30);
+                            padding: 25px; border-radius: 15px; border: 3px solid {verdict_color};
+                            text-align: center; margin-bottom: 20px;">
+                    <h1 style="color: {verdict_color}; margin: 0; font-size: 48px;">{verdict_icon} {verdict}</h1>
+                    <p style="color: #cccccc; margin: 10px 0 0 0; font-size: 16px;">{verdict_desc}</p>
+                    <p style="color: {verdict_color}; margin: 5px 0 0 0; font-size: 14px;">
+                        Composite Score: {total_score:+.1f} / {max_possible:.0f} ({score_pct:+.0f}%) |
+                        Net GEX: {total_net_gex:.1f}L ({'Trending' if gex_trending else 'Pinning' if gex_pinning else 'Neutral'})
+                    </p>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Three metric cards
+                met1, met2, met3 = st.columns(3)
+                with met1:
+                    pcr_c = "#00ff88" if avg_pcr > 1.2 else "#ff4444" if avg_pcr < 0.7 else "#FFD700"
+                    st.markdown(f"""
+                    <div style="background-color: {pcr_c}20; padding: 12px; border-radius: 10px; border: 2px solid {pcr_c}; text-align: center;">
+                        <h4 style="color: {pcr_c}; margin: 0;">Avg PCR (OI)</h4>
+                        <h2 style="color: {pcr_c}; margin: 5px 0;">{avg_pcr:.2f}</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{'Bullish' if avg_pcr > 1.2 else 'Bearish' if avg_pcr < 0.7 else 'Neutral'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with met2:
+                    chg_c = "#00ff88" if avg_chgoi > 1.2 else "#ff4444" if avg_chgoi < 0.7 else "#FFD700"
+                    st.markdown(f"""
+                    <div style="background-color: {chg_c}20; padding: 12px; border-radius: 10px; border: 2px solid {chg_c}; text-align: center;">
+                        <h4 style="color: {chg_c}; margin: 0;">Avg PCR (ΔOI)</h4>
+                        <h2 style="color: {chg_c}; margin: 5px 0;">{avg_chgoi:.2f}</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{'Bullish' if avg_chgoi > 1.2 else 'Bearish' if avg_chgoi < 0.7 else 'Neutral'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+                with met3:
+                    gex_c = "#00ff88" if total_net_gex > 10 else "#ff4444" if total_net_gex < -10 else "#FFD700"
+                    st.markdown(f"""
+                    <div style="background-color: {gex_c}20; padding: 12px; border-radius: 10px; border: 2px solid {gex_c}; text-align: center;">
+                        <h4 style="color: {gex_c}; margin: 0;">Total GEX (ATM±2)</h4>
+                        <h2 style="color: {gex_c}; margin: 5px 0;">{total_net_gex:.1f}L</h2>
+                        <p style="color: white; margin: 0; font-size: 12px;">{'Pin/Chop' if total_net_gex > 10 else 'Trend/Accel' if total_net_gex < -10 else 'Neutral'}</p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+            # ---- Time-Series Charts ----
+            if len(st.session_state.composite_signal_history) > 0:
+                comp_hist_df = pd.DataFrame(st.session_state.composite_signal_history)
+
+                # === Chart 1: Composite Score over time ===
+                st.markdown("### 📈 Composite Score & Verdict - Time Series")
+
+                fig_score = go.Figure()
+
+                # Color markers by verdict
+                marker_colors = []
+                for _, hrow in comp_hist_df.iterrows():
+                    vn = hrow.get('verdict_numeric', 0)
+                    if vn >= 2:
+                        marker_colors.append('#00ff88')   # Strong/Normal UP = green
+                    elif vn == 1:
+                        marker_colors.append('#90EE90')   # UP CAPPED = light green
+                    elif vn <= -2:
+                        marker_colors.append('#ff4444')   # Strong/Normal DOWN = red
+                    elif vn == -1:
+                        marker_colors.append('#FFB6C1')   # DOWN SUPPORTED = light red
+                    else:
+                        marker_colors.append('#FFD700')   # NEUTRAL/SIDEWAYS = yellow
+
+                fig_score.add_trace(go.Scatter(
+                    x=comp_hist_df['time'],
+                    y=comp_hist_df['score_pct'],
+                    mode='lines+markers',
+                    name='Score %',
+                    line=dict(color='#00aaff', width=3),
+                    marker=dict(size=8, color=marker_colors),
+                    fill='tozeroy',
+                    fillcolor='rgba(0, 170, 255, 0.08)'
+                ))
+
+                # Reference zones
+                fig_score.add_hline(y=0, line_dash="dash", line_color="white", line_width=1.5,
+                                    annotation_text="Neutral (0%)", annotation_position="right")
+                fig_score.add_hline(y=15, line_dash="dot", line_color="#00ff88", line_width=1,
+                                    annotation_text="Bullish Zone", annotation_position="right")
+                fig_score.add_hline(y=-15, line_dash="dot", line_color="#ff4444", line_width=1,
+                                    annotation_text="Bearish Zone", annotation_position="right")
+
+                # Shaded zones
+                y_max_s = max(abs(comp_hist_df['score_pct'].max()), abs(comp_hist_df['score_pct'].min()), 30) * 1.2
+                fig_score.add_hrect(y0=15, y1=y_max_s, fillcolor="rgba(0,255,136,0.06)", line_width=0)
+                fig_score.add_hrect(y0=-y_max_s, y1=-15, fillcolor="rgba(255,68,68,0.06)", line_width=0)
+
+                # Add verdict text annotations at each point
+                for idx, hrow in comp_hist_df.iterrows():
+                    if idx % max(1, len(comp_hist_df) // 10) == 0:  # Show every ~10th label to avoid clutter
+                        fig_score.add_annotation(
+                            x=hrow['time'], y=hrow['score_pct'],
+                            text=hrow['verdict'], showarrow=False,
+                            yshift=15, font=dict(size=8, color='white'),
+                            bgcolor='rgba(0,0,0,0.5)', borderpad=2
+                        )
+
+                fig_score.update_layout(
+                    title=f"Composite Direction Score | Current: {score_pct:+.0f}% ({verdict})",
+                    template='plotly_dark',
+                    height=400,
+                    showlegend=False,
+                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                    yaxis=dict(title='Score %', zeroline=True, zerolinecolor='white', zerolinewidth=1),
+                    plot_bgcolor='#1e1e1e',
+                    paper_bgcolor='#1e1e1e',
+                    margin=dict(l=50, r=50, t=60, b=50)
+                )
+                st.plotly_chart(fig_score, use_container_width=True)
+
+                # === Chart 2: Three indicators over time (Avg PCR, Avg ΔOI PCR, GEX) ===
+                st.markdown("### 📊 Component Indicators - Time Series")
+                ind_col1, ind_col2 = st.columns(2)
+
+                with ind_col1:
+                    # PCR OI + PCR ΔOI over time
+                    fig_pcr_ts = go.Figure()
+                    fig_pcr_ts.add_trace(go.Scatter(
+                        x=comp_hist_df['time'], y=comp_hist_df['avg_pcr'],
+                        mode='lines+markers', name='Avg PCR (OI)',
+                        line=dict(color='#00aaff', width=2), marker=dict(size=4)
+                    ))
+                    fig_pcr_ts.add_trace(go.Scatter(
+                        x=comp_hist_df['time'], y=comp_hist_df['avg_chgoi'],
+                        mode='lines+markers', name='Avg PCR (ΔOI)',
+                        line=dict(color='#ff44ff', width=2), marker=dict(size=4)
+                    ))
+                    fig_pcr_ts.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
+                    fig_pcr_ts.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
+                    fig_pcr_ts.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+                    fig_pcr_ts.update_layout(
+                        title="Avg PCR (OI) vs Avg PCR (ΔOI)",
+                        template='plotly_dark', height=320, showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        xaxis=dict(tickformat='%H:%M', title=''),
+                        yaxis=dict(title='PCR'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        margin=dict(l=40, r=10, t=60, b=30)
+                    )
+                    st.plotly_chart(fig_pcr_ts, use_container_width=True)
+
+                with ind_col2:
+                    # GEX over time
+                    fig_gex_ts = go.Figure()
+                    gex_colors = ['#00ff88' if g > 10 else '#ff4444' if g < -10 else '#FFD700'
+                                  for g in comp_hist_df['total_gex']]
+                    fig_gex_ts.add_trace(go.Scatter(
+                        x=comp_hist_df['time'], y=comp_hist_df['total_gex'],
+                        mode='lines+markers', name='Total GEX',
+                        line=dict(color='#FFD700', width=2),
+                        marker=dict(size=5, color=gex_colors),
+                        fill='tozeroy', fillcolor='rgba(255,215,0,0.08)'
+                    ))
+                    fig_gex_ts.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                    fig_gex_ts.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1,
+                                          annotation_text="Pin Zone", annotation_position="right")
+                    fig_gex_ts.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1,
+                                          annotation_text="Accel Zone", annotation_position="right")
+                    fig_gex_ts.update_layout(
+                        title="Total GEX (ATM±2) Over Time",
+                        template='plotly_dark', height=320, showlegend=False,
+                        xaxis=dict(tickformat='%H:%M', title=''),
+                        yaxis=dict(title='GEX (Lakhs)', zeroline=True, zerolinecolor='white'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        margin=dict(l=40, r=10, t=60, b=30)
+                    )
+                    st.plotly_chart(fig_gex_ts, use_container_width=True)
+
+                # === Chart 3: Per-strike score over time ===
+                # Find score columns in history
+                score_cols = [c for c in comp_hist_df.columns if c.startswith('score_')]
+                if score_cols:
+                    st.markdown("### 🎯 Per-Strike Score - Time Series")
+                    fig_strike_ts = go.Figure()
+                    strike_colors_map = {'0': '#ff44ff', '1': '#cc44cc', '2': '#ffaa00', '3': '#00aaff', '4': '#0088dd'}
+                    for idx_s, sc in enumerate(sorted(score_cols)):
+                        strike_num = sc.replace('score_', '')
+                        color = strike_colors_map.get(str(idx_s), '#ffffff')
+                        # Determine label from position
+                        pos_lbl = position_labels[idx_s] if idx_s < len(position_labels) else strike_num
+                        fig_strike_ts.add_trace(go.Scatter(
+                            x=comp_hist_df['time'], y=comp_hist_df[sc],
+                            mode='lines+markers', name=f'{pos_lbl} (₹{strike_num})',
+                            line=dict(color=color, width=2), marker=dict(size=3)
+                        ))
+                    fig_strike_ts.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                    fig_strike_ts.update_layout(
+                        title="Per-Strike Weighted Score Over Time",
+                        template='plotly_dark', height=350, showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+                        xaxis=dict(tickformat='%H:%M', title='Time'),
+                        yaxis=dict(title='Weighted Score', zeroline=True, zerolinecolor='white'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        margin=dict(l=50, r=20, t=60, b=40)
+                    )
+                    st.plotly_chart(fig_strike_ts, use_container_width=True)
+
+                # Per-strike breakdown table
+                if strike_details:
+                    st.markdown("### Per-Strike Breakdown")
+                    detail_df = pd.DataFrame(strike_details)
+                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+
+                # Status bar and clear button
+                comp_info1, comp_info2 = st.columns([3, 1])
+                with comp_info1:
+                    status = "🟢 Live" if composite_data_available else "🟡 Using cached data"
+                    st.caption(f"{status} | 📈 {len(st.session_state.composite_signal_history)} data points | Updates every ~30s")
+                with comp_info2:
+                    if st.button("🗑️ Clear Composite History"):
+                        st.session_state.composite_signal_history = []
+                        st.session_state.composite_signal_last_valid = None
+                        st.rerun()
+
+                # Signal interpretation guide
+                with st.expander("📖 How This Works"):
+                    st.markdown("""
+                    **Three indicators are combined for each ATM±2 strike:**
+
+                    | Indicator | Bullish (+1) | Bearish (-1) | Neutral (0) |
+                    |-----------|-------------|-------------|-------------|
+                    | **PCR (OI)** | > 1.2 (Heavy puts = support) | < 0.7 (Heavy calls = resistance) | 0.7 - 1.2 |
+                    | **PCR (ΔOI)** | > 1.2 (Fresh put writing) | < 0.7 (Fresh call writing) | 0.7 - 1.2 |
+                    | **GEX** | Determines trend vs chop | Determines trend vs chop | - |
+
+                    **Weighting:** ATM = 2x, ±1 strikes = 1.5x, ±2 strikes = 1x
+
+                    **GEX Role:** GEX doesn't determine direction — it determines **conviction**:
+                    - **Negative GEX** (< -10L): Dealers short gamma → moves amplified → **STRONG** trend signal
+                    - **Positive GEX** (> 10L): Dealers long gamma → moves dampened → **SIDEWAYS/CAPPED**
+                    - **Neutral GEX**: Normal market conditions
+
+                    **Verdict Logic:**
+                    - 🟢🔥 **STRONG UP**: Bullish PCR+ΔOI + Negative GEX = Breakout rally
+                    - 🟢📍 **UP (CAPPED)**: Bullish PCR+ΔOI + Positive GEX = Upside but range-bound
+                    - 🟢 **UP**: Bullish PCR+ΔOI + Neutral GEX
+                    - 🔴🔥 **STRONG DOWN**: Bearish PCR+ΔOI + Negative GEX = Breakdown selloff
+                    - 🔴📍 **DOWN (SUPPORTED)**: Bearish PCR+ΔOI + Positive GEX = Downside but supported
+                    - 🔴 **DOWN**: Bearish PCR+ΔOI + Neutral GEX
+                    - ↔️ **SIDEWAYS**: Mixed signals + Positive GEX = Choppy range
+                    - ⚪ **NEUTRAL**: No clear signal
+
+                    **Time-Series Charts:**
+                    - **Composite Score**: Shows overall direction score (%) over time — green zone (>15%) = bullish, red zone (<-15%) = bearish
+                    - **Avg PCR vs Avg ΔOI PCR**: Tracks positioning vs fresh activity — divergence signals shift in progress
+                    - **Total GEX**: Shows if market is in Pin mode (>10) or Acceleration mode (<-10)
+                    - **Per-Strike Score**: Shows which individual strikes are driving the signal — useful for spotting strike-level shifts
+                    """)
+
+            elif not last_valid:
+                st.info("📊 Composite signal history will build up as the app refreshes. Please wait for data collection...")
+
+        except Exception as e:
+            st.warning(f"Composite direction signal unavailable: {str(e)}")
 
         # ===== TOTAL GEX TIME-SERIES GRAPH =====
         st.markdown("---")
