@@ -4542,6 +4542,16 @@ def main():
     if 'straddle_history' not in st.session_state:
         st.session_state.straddle_history = []
 
+    # Initialize session state for IV Skew & Pressure history
+    if 'iv_skew_history' not in st.session_state:
+        st.session_state.iv_skew_history = []
+    if 'iv_skew_last_valid' not in st.session_state:
+        st.session_state.iv_skew_last_valid = None
+    if 'pressure_history' not in st.session_state:
+        st.session_state.pressure_history = []
+    if 'pressure_last_valid' not in st.session_state:
+        st.session_state.pressure_last_valid = None
+
     # Initialize Supabase
     try:
         if not supabase_url or not supabase_key:
@@ -7817,6 +7827,479 @@ def main():
 
         except Exception as e:
             st.warning(f"Gamma sequence unavailable: {str(e)}")
+
+        # ===== IV SKEW & OPTIONS PRESSURE SIGNALS =====
+        st.markdown("---")
+        st.markdown("## 📡 IV Skew & Options Pressure Signals (ATM ± 2)")
+
+        try:
+            _ivp_df = option_data.get('df_summary') if option_data else None
+            _ivp_underlying = option_data.get('underlying') if option_data else None
+
+            if (_ivp_df is not None and _ivp_underlying and
+                    'Zone' in _ivp_df.columns and
+                    'impliedVolatility_CE' in _ivp_df.columns and
+                    'impliedVolatility_PE' in _ivp_df.columns and
+                    'bidQty_CE' in _ivp_df.columns and
+                    'bidQty_PE' in _ivp_df.columns and
+                    'askQty_CE' in _ivp_df.columns and
+                    'askQty_PE' in _ivp_df.columns):
+
+                # --- ATM ± 2 slice ---
+                _ivp_atm_idx = _ivp_df[_ivp_df['Zone'] == 'ATM'].index
+                if len(_ivp_atm_idx) > 0:
+                    _ivp_atm_pos = _ivp_df.index.get_loc(_ivp_atm_idx[0])
+                    _ivp_start = max(0, _ivp_atm_pos - 2)
+                    _ivp_end = min(len(_ivp_df), _ivp_atm_pos + 3)
+                    _ivp_slice = _ivp_df.iloc[_ivp_start:_ivp_end].copy()
+
+                    # --- IV SKEW ---
+                    _iv_ce_vals = _ivp_slice['impliedVolatility_CE'].fillna(0).tolist()
+                    _iv_pe_vals = _ivp_slice['impliedVolatility_PE'].fillna(0).tolist()
+                    _avg_iv_ce = sum(_iv_ce_vals) / len(_iv_ce_vals) if _iv_ce_vals else 0
+                    _avg_iv_pe = sum(_iv_pe_vals) / len(_iv_pe_vals) if _iv_pe_vals else 0
+                    _iv_skew = _avg_iv_pe / (_avg_iv_ce + 1e-6)
+
+                    if _iv_skew < 0.90:
+                        _iv_signal = "🟢 Bullish Expectation"
+                        _iv_signal_color = "#00C853"
+                    elif _iv_skew > 1.10:
+                        _iv_signal = "🔴 Bearish Expectation"
+                        _iv_signal_color = "#FF5252"
+                    else:
+                        _iv_signal = "🟡 Neutral"
+                        _iv_signal_color = "#FFD740"
+
+                    # IV Skew momentum (vs last saved)
+                    _prev_iv_skew = st.session_state.iv_skew_history[-1]['iv_skew'] if st.session_state.iv_skew_history else _iv_skew
+                    _iv_skew_change = _iv_skew - _prev_iv_skew
+                    if _iv_skew_change < -0.02:
+                        _iv_momentum = "⬆️ Bullish Building"
+                    elif _iv_skew_change > 0.02:
+                        _iv_momentum = "⬇️ Bearish Building"
+                    else:
+                        _iv_momentum = "➡️ Stable"
+
+                    # --- CALL & PUT PRESSURE ---
+                    _call_pres = {}
+                    _put_pres = {}
+                    for _, _row in _ivp_slice.iterrows():
+                        _s = _row['Strike']
+                        _bc = float(_row.get('bidQty_CE', 0) or 0)
+                        _ac = float(_row.get('askQty_CE', 0) or 0)
+                        _bp = float(_row.get('bidQty_PE', 0) or 0)
+                        _ap = float(_row.get('askQty_PE', 0) or 0)
+                        _call_pres[_s] = (_bc - _ac) / (_bc + _ac + 1e-6)
+                        _put_pres[_s]  = (_bp - _ap) / (_bp + _ap + 1e-6)
+
+                    _avg_call_pres = sum(_call_pres.values()) / len(_call_pres) if _call_pres else 0
+                    _avg_put_pres  = sum(_put_pres.values())  / len(_put_pres)  if _put_pres  else 0
+                    _net_pressure  = _avg_call_pres - _avg_put_pres
+
+                    if _net_pressure > 0.15:
+                        _net_signal = "🟢 Bullish Pressure"
+                        _net_color = "#00C853"
+                    elif _net_pressure < -0.15:
+                        _net_signal = "🔴 Bearish Pressure"
+                        _net_color = "#FF5252"
+                    else:
+                        _net_signal = "🟡 Neutral"
+                        _net_color = "#FFD740"
+
+                    if _avg_call_pres > 0.2 and _avg_put_pres < -0.1:
+                        _pressure_signal = "🚀 Strong Bullish"
+                    elif _avg_put_pres > 0.2 and _avg_call_pres < -0.1:
+                        _pressure_signal = "🔥 Strong Bearish"
+                    elif _avg_call_pres > 0.2 and _avg_put_pres > 0.2:
+                        _pressure_signal = "⚠️ High Volatility"
+                    else:
+                        _pressure_signal = "⏳ Sideways"
+
+                    # --- COMBINED FINAL SIGNAL ---
+                    if _iv_skew < 0.90 and _net_pressure > 0.15:
+                        _final_signal = "🚀 STRONG BUY (Confirmed Breakout)"
+                        _final_color = "#00C853"
+                    elif _iv_skew > 1.10 and _net_pressure < -0.15:
+                        _final_signal = "🔥 STRONG SELL (Confirmed Breakdown)"
+                        _final_color = "#FF5252"
+                    elif _iv_skew < 0.90 and _net_pressure < 0:
+                        _final_signal = "⚠️ Bull Trap"
+                        _final_color = "#FF9800"
+                    elif _iv_skew > 1.10 and _net_pressure > 0:
+                        _final_signal = "⚠️ Bear Trap"
+                        _final_color = "#FF9800"
+                    else:
+                        _final_signal = "⏳ No Clear Edge"
+                        _final_color = "#888888"
+
+                    # --- PRESSURE SPIKE (Entry Timing) ---
+                    _prev_net_pres = st.session_state.pressure_history[-1]['net_pressure'] if st.session_state.pressure_history else _net_pressure
+                    _pressure_change = _net_pressure - _prev_net_pres
+                    _spike_alert = "⚡ Sudden Aggression — Entry Signal!" if abs(_pressure_change) > 0.15 else ""
+
+                    # --- Save to history ---
+                    _ivp_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+
+                    _should_append_iv = (
+                        not st.session_state.iv_skew_history or
+                        (_ivp_now - st.session_state.iv_skew_history[-1]['time']).total_seconds() >= 30
+                    )
+                    if _should_append_iv:
+                        st.session_state.iv_skew_history.append({
+                            'time': _ivp_now,
+                            'iv_skew': round(_iv_skew, 4),
+                            'avg_iv_ce': round(_avg_iv_ce, 2),
+                            'avg_iv_pe': round(_avg_iv_pe, 2),
+                        })
+                        if len(st.session_state.iv_skew_history) > 200:
+                            st.session_state.iv_skew_history = st.session_state.iv_skew_history[-200:]
+
+                        st.session_state.pressure_history.append({
+                            'time': _ivp_now,
+                            'call_pressure': round(_avg_call_pres, 4),
+                            'put_pressure': round(_avg_put_pres, 4),
+                            'net_pressure': round(_net_pressure, 4),
+                        })
+                        if len(st.session_state.pressure_history) > 200:
+                            st.session_state.pressure_history = st.session_state.pressure_history[-200:]
+
+                    # ======== UI OUTPUT ========
+                    _ivp_c1, _ivp_c2, _ivp_c3 = st.columns(3)
+                    with _ivp_c1:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid {_iv_signal_color};">
+                        <div style="color:#aaa;font-size:12px;">IV SKEW (PE/CE avg)</div>
+                        <div style="font-size:22px;font-weight:bold;color:{_iv_signal_color};">{_iv_skew:.3f}</div>
+                        <div style="font-size:13px;margin-top:4px;">{_iv_signal}</div>
+                        <div style="font-size:12px;color:#aaa;margin-top:2px;">Momentum: {_iv_momentum}</div>
+                        <div style="font-size:11px;color:#888;margin-top:4px;">
+                            CE avg IV: {_avg_iv_ce:.1f}% &nbsp;|&nbsp; PE avg IV: {_avg_iv_pe:.1f}%
+                        </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with _ivp_c2:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid {_net_color};">
+                        <div style="color:#aaa;font-size:12px;">PRESSURE (ATM ± 2)</div>
+                        <div style="font-size:13px;margin-top:4px;">
+                            Call: <b style="color:#00C853;">{_avg_call_pres:+.3f}</b> &nbsp;
+                            Put: <b style="color:#FF5252;">{_avg_put_pres:+.3f}</b>
+                        </div>
+                        <div style="font-size:18px;font-weight:bold;color:{_net_color};margin-top:6px;">
+                            Net: {_net_pressure:+.3f}
+                        </div>
+                        <div style="font-size:13px;margin-top:4px;">{_net_signal}</div>
+                        <div style="font-size:12px;color:#aaa;margin-top:2px;">{_pressure_signal}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with _ivp_c3:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:2px solid {_final_color};">
+                        <div style="color:#aaa;font-size:12px;">COMBINED SIGNAL</div>
+                        <div style="font-size:16px;font-weight:bold;color:{_final_color};margin-top:6px;">{_final_signal}</div>
+                        {"<div style='font-size:13px;color:#FFD740;margin-top:6px;'>" + _spike_alert + "</div>" if _spike_alert else ""}
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+
+                    # ---- IV Time-Series Chart ----
+                    if len(st.session_state.iv_skew_history) >= 2:
+                        _iv_hist_df = pd.DataFrame(st.session_state.iv_skew_history)
+                        _fig_iv = go.Figure()
+                        _fig_iv.add_trace(go.Scatter(
+                            x=_iv_hist_df['time'], y=_iv_hist_df['iv_skew'],
+                            mode='lines+markers', name='IV Skew (PE/CE)',
+                            line=dict(color='#FFD740', width=2),
+                            marker=dict(size=4)
+                        ))
+                        _fig_iv.add_hline(y=0.90, line_dash='dash', line_color='#00C853',
+                                          annotation_text='Bullish (0.90)', annotation_position='bottom right')
+                        _fig_iv.add_hline(y=1.10, line_dash='dash', line_color='#FF5252',
+                                          annotation_text='Bearish (1.10)', annotation_position='top right')
+                        _fig_iv.update_layout(
+                            title='IV Skew Over Time (ATM ± 2)',
+                            height=250, margin=dict(l=40, r=20, t=40, b=30),
+                            paper_bgcolor='#111', plot_bgcolor='#111',
+                            font=dict(color='#ccc'),
+                            xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333'),
+                            showlegend=True, legend=dict(orientation='h', y=-0.3)
+                        )
+                        st.plotly_chart(_fig_iv, use_container_width=True)
+
+                    # ---- Pressure Time-Series Chart ----
+                    if len(st.session_state.pressure_history) >= 2:
+                        _pr_hist_df = pd.DataFrame(st.session_state.pressure_history)
+                        _fig_pr = go.Figure()
+                        _fig_pr.add_trace(go.Scatter(
+                            x=_pr_hist_df['time'], y=_pr_hist_df['call_pressure'],
+                            mode='lines', name='Call Pressure',
+                            line=dict(color='#00C853', width=2)
+                        ))
+                        _fig_pr.add_trace(go.Scatter(
+                            x=_pr_hist_df['time'], y=_pr_hist_df['put_pressure'],
+                            mode='lines', name='Put Pressure',
+                            line=dict(color='#FF5252', width=2)
+                        ))
+                        _fig_pr.add_trace(go.Scatter(
+                            x=_pr_hist_df['time'], y=_pr_hist_df['net_pressure'],
+                            mode='lines+markers', name='Net Pressure',
+                            line=dict(color='#FFD740', width=2, dash='dot'),
+                            marker=dict(size=4)
+                        ))
+                        _fig_pr.add_hline(y=0.15, line_dash='dash', line_color='#00C853',
+                                          annotation_text='+0.15 Bull', annotation_position='bottom right')
+                        _fig_pr.add_hline(y=-0.15, line_dash='dash', line_color='#FF5252',
+                                          annotation_text='-0.15 Bear', annotation_position='top right')
+                        _fig_pr.add_hline(y=0, line_color='#555', line_width=1)
+                        _fig_pr.update_layout(
+                            title='Call / Put / Net Pressure Over Time (ATM ± 2)',
+                            height=250, margin=dict(l=40, r=20, t=40, b=30),
+                            paper_bgcolor='#111', plot_bgcolor='#111',
+                            font=dict(color='#ccc'),
+                            xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333'),
+                            showlegend=True, legend=dict(orientation='h', y=-0.3)
+                        )
+                        st.plotly_chart(_fig_pr, use_container_width=True)
+
+                    _ivp_col_l, _ivp_col_r = st.columns([3, 1])
+                    with _ivp_col_l:
+                        st.caption(f"📡 IV pts: {len(st.session_state.iv_skew_history)} · Pressure pts: {len(st.session_state.pressure_history)}")
+                    with _ivp_col_r:
+                        if st.button("🗑️ Clear IV/Pressure History"):
+                            st.session_state.iv_skew_history = []
+                            st.session_state.pressure_history = []
+                            st.rerun()
+                else:
+                    st.info("ATM strike not identified — IV Skew & Pressure unavailable.")
+            else:
+                st.info("Option chain data required for IV Skew & Pressure signals.")
+
+        except Exception as _ivp_e:
+            st.warning(f"IV Skew & Pressure unavailable: {str(_ivp_e)}")
+
+        # ===== AUTO ENTRY ENGINE =====
+        st.markdown("---")
+        st.markdown("## 🎯 Auto Entry Engine — CE / PE Strike + SL + Target")
+
+        try:
+            _ae_df = option_data.get('df_summary') if option_data else None
+            _ae_underlying = option_data.get('underlying') if option_data else None
+
+            if (_ae_df is not None and _ae_underlying and
+                    'Zone' in _ae_df.columns and
+                    'impliedVolatility_CE' in _ae_df.columns and
+                    'bidQty_CE' in _ae_df.columns):
+
+                # Re-compute signals (lightweight — uses same logic as above)
+                _ae_atm_idx = _ae_df[_ae_df['Zone'] == 'ATM'].index
+                if len(_ae_atm_idx) > 0:
+                    _ae_atm_pos = _ae_df.index.get_loc(_ae_atm_idx[0])
+                    _ae_start = max(0, _ae_atm_pos - 2)
+                    _ae_end = min(len(_ae_df), _ae_atm_pos + 3)
+                    _ae_slice = _ae_df.iloc[_ae_start:_ae_end].copy()
+
+                    # IV Skew
+                    _ae_iv_ce = _ae_slice['impliedVolatility_CE'].fillna(0).mean()
+                    _ae_iv_pe = _ae_slice['impliedVolatility_PE'].fillna(0).mean() if 'impliedVolatility_PE' in _ae_slice.columns else 0
+                    _ae_iv_skew = _ae_iv_pe / (_ae_iv_ce + 1e-6)
+
+                    # Net Pressure
+                    _ae_cp_list, _ae_pp_list = [], []
+                    for _, _aer in _ae_slice.iterrows():
+                        _bc = float(_aer.get('bidQty_CE', 0) or 0)
+                        _ac = float(_aer.get('askQty_CE', 0) or 0)
+                        _bp = float(_aer.get('bidQty_PE', 0) or 0)
+                        _ap = float(_aer.get('askQty_PE', 0) or 0)
+                        _ae_cp_list.append((_bc - _ac) / (_bc + _ac + 1e-6))
+                        _ae_pp_list.append((_bp - _ap) / (_bp + _ap + 1e-6))
+                    _ae_avg_cp = sum(_ae_cp_list) / len(_ae_cp_list) if _ae_cp_list else 0
+                    _ae_avg_pp = sum(_ae_pp_list) / len(_ae_pp_list) if _ae_pp_list else 0
+                    _ae_net_pres = _ae_avg_cp - _ae_avg_pp
+
+                    # Pressure spike (vs history)
+                    _ae_prev_np = st.session_state.pressure_history[-2]['net_pressure'] if len(st.session_state.pressure_history) >= 2 else _ae_net_pres
+                    _ae_pres_change = _ae_net_pres - _ae_prev_np
+
+                    # PCR OI (ATM)
+                    _ae_atm_row = _ae_df[_ae_df['Zone'] == 'ATM']
+                    _ae_pcr = float(_ae_atm_row['PCR'].values[0]) if (len(_ae_atm_row) > 0 and 'PCR' in _ae_atm_row.columns) else 1.0
+
+                    # Total Net GEX (from existing gex_data if available)
+                    _ae_net_gex = 0.0
+                    try:
+                        if gex_data and 'net_gex' in gex_data:
+                            _ae_net_gex = float(gex_data['net_gex'])
+                        elif gex_data and 'gex_df' in gex_data:
+                            _ae_gdf = gex_data['gex_df']
+                            if 'Net_GEX' in _ae_gdf.columns:
+                                _ae_net_gex = float(_ae_gdf['Net_GEX'].sum())
+                    except Exception:
+                        pass
+
+                    # ATM strike value
+                    _ae_atm_strike = float(_ae_atm_row['Strike'].values[0]) if len(_ae_atm_row) > 0 else round(_ae_underlying / 50) * 50
+
+                    # Determine strike step (50 or 100 points)
+                    _ae_strikes_sorted = sorted(_ae_slice['Strike'].unique())
+                    _ae_step = int(_ae_strikes_sorted[1] - _ae_strikes_sorted[0]) if len(_ae_strikes_sorted) >= 2 else 50
+
+                    # ---- ENTRY LOGIC ----
+                    _ae_signal = "NO TRADE"
+                    _ae_strike = _ae_atm_strike
+                    _ae_sl = None
+                    _ae_target = None
+                    _ae_trade_type = "Low Edge"
+                    _ae_option_type = ""
+
+                    # Safety filter: avoid trades when market is pinned
+                    if _ae_net_gex > 10:
+                        _ae_signal = "NO TRADE"
+                        _ae_trade_type = "Market Capped (GEX > 10L)"
+                    elif _ae_iv_skew < 0.90 and _ae_net_pres > 0.15 and _ae_net_gex < 0:
+                        _ae_signal = "BUY CE"
+                        _ae_option_type = "CE"
+                        if _ae_net_pres > 0.30:
+                            _ae_strike = _ae_atm_strike + _ae_step
+                            _ae_trade_type = "Breakout"
+                        elif _ae_net_pres > 0.50:
+                            _ae_strike = _ae_atm_strike + 2 * _ae_step
+                            _ae_trade_type = "Strong Breakout"
+                        else:
+                            _ae_strike = _ae_atm_strike
+                            _ae_trade_type = "Scalp"
+                        _ae_sl = _ae_underlying - 20
+                        _ae_target = _ae_underlying + 40
+
+                    elif _ae_iv_skew > 1.10 and _ae_net_pres < -0.15 and _ae_net_gex < 0:
+                        _ae_signal = "BUY PE"
+                        _ae_option_type = "PE"
+                        if _ae_net_pres < -0.30:
+                            _ae_strike = _ae_atm_strike - _ae_step
+                            _ae_trade_type = "Breakdown"
+                        elif _ae_net_pres < -0.50:
+                            _ae_strike = _ae_atm_strike - 2 * _ae_step
+                            _ae_trade_type = "Strong Breakdown"
+                        else:
+                            _ae_strike = _ae_atm_strike
+                            _ae_trade_type = "Scalp"
+                        _ae_sl = _ae_underlying + 20
+                        _ae_target = _ae_underlying - 40
+
+                    elif _ae_iv_skew < 0.90 and _ae_net_pres < 0:
+                        _ae_signal = "BUY PE"
+                        _ae_option_type = "PE"
+                        _ae_strike = _ae_atm_strike
+                        _ae_trade_type = "Bull Trap Reversal"
+                        _ae_sl = _ae_underlying + 15
+                        _ae_target = _ae_underlying - 30
+
+                    elif _ae_iv_skew > 1.10 and _ae_net_pres > 0:
+                        _ae_signal = "BUY CE"
+                        _ae_option_type = "CE"
+                        _ae_strike = _ae_atm_strike
+                        _ae_trade_type = "Bear Trap Reversal"
+                        _ae_sl = _ae_underlying - 15
+                        _ae_target = _ae_underlying + 30
+
+                    _ae_timing = "ENTER NOW ⚡" if abs(_ae_pres_change) > 0.15 else "WAIT ⏳"
+
+                    # Signal color
+                    if "BUY CE" in _ae_signal:
+                        _ae_sig_color = "#00C853"
+                    elif "BUY PE" in _ae_signal:
+                        _ae_sig_color = "#FF5252"
+                    else:
+                        _ae_sig_color = "#888888"
+
+                    # ---- UI ----
+                    _ae_c1, _ae_c2, _ae_c3, _ae_c4 = st.columns(4)
+                    with _ae_c1:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:2px solid {_ae_sig_color};">
+                        <div style="color:#aaa;font-size:11px;">SIGNAL</div>
+                        <div style="font-size:20px;font-weight:bold;color:{_ae_sig_color};">{_ae_signal}</div>
+                        <div style="font-size:12px;color:#aaa;margin-top:4px;">{_ae_trade_type}</div>
+                        <div style="font-size:13px;margin-top:4px;color:#FFD740;">{_ae_timing}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with _ae_c2:
+                        _ae_strike_label = f"₹{int(_ae_strike)}" if _ae_signal != "NO TRADE" else "—"
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid #444;">
+                        <div style="color:#aaa;font-size:11px;">STRIKE</div>
+                        <div style="font-size:22px;font-weight:bold;color:#fff;">{_ae_strike_label}</div>
+                        <div style="font-size:12px;color:#aaa;margin-top:4px;">{_ae_option_type or '—'}</div>
+                        <div style="font-size:11px;color:#777;margin-top:2px;">ATM: ₹{int(_ae_atm_strike)}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with _ae_c3:
+                        _ae_sl_label = f"₹{_ae_sl:.0f}" if _ae_sl else "—"
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid #FF5252;">
+                        <div style="color:#aaa;font-size:11px;">STOP LOSS (Spot)</div>
+                        <div style="font-size:20px;font-weight:bold;color:#FF5252;">{_ae_sl_label}</div>
+                        <div style="font-size:11px;color:#777;margin-top:4px;">Spot: ₹{_ae_underlying:.0f}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+                    with _ae_c4:
+                        _ae_tgt_label = f"₹{_ae_target:.0f}" if _ae_target else "—"
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid #00C853;">
+                        <div style="color:#aaa;font-size:11px;">TARGET (Spot)</div>
+                        <div style="font-size:20px;font-weight:bold;color:#00C853;">{_ae_tgt_label}</div>
+                        <div style="font-size:11px;color:#777;margin-top:4px;">
+                            {"R:R = 1:2" if _ae_sl and _ae_target else ""}
+                        </div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    # ---- Inputs summary row ----
+                    st.markdown("<br>", unsafe_allow_html=True)
+                    _ae_meta_cols = st.columns(5)
+                    _ae_meta_labels = [
+                        ("IV Skew", f"{_ae_iv_skew:.3f}"),
+                        ("Net Pressure", f"{_ae_net_pres:+.3f}"),
+                        ("PCR (OI)", f"{_ae_pcr:.2f}"),
+                        ("Net GEX", f"{_ae_net_gex:+.1f}L"),
+                        ("Pressure Δ", f"{_ae_pres_change:+.3f}"),
+                    ]
+                    for _col, (_lbl, _val) in zip(_ae_meta_cols, _ae_meta_labels):
+                        with _col:
+                            st.metric(_lbl, _val)
+
+                    with st.expander("📖 Auto Entry Engine — How It Works"):
+                        st.markdown("""
+                        | Condition | Signal |
+                        |-----------|--------|
+                        | IV Skew < 0.90 AND Net Pressure > 0.15 AND GEX < 0 | **BUY CE** (Breakout/Scalp) |
+                        | IV Skew > 1.10 AND Net Pressure < -0.15 AND GEX < 0 | **BUY PE** (Breakdown/Scalp) |
+                        | IV Skew < 0.90 AND Net Pressure < 0 | **BUY PE** (Bull Trap Reversal) |
+                        | IV Skew > 1.10 AND Net Pressure > 0 | **BUY CE** (Bear Trap Reversal) |
+                        | GEX > 10L | **NO TRADE** (Market Capped) |
+
+                        **Strike Selection:**
+                        - Net Pressure > 0.50 → ATM+2 (Strong Breakout)
+                        - Net Pressure > 0.30 → ATM+1 (Breakout)
+                        - Otherwise → ATM (Scalp)
+
+                        **SL/Target based on spot points:**
+                        - CE trade: SL = Spot − 20, Target = Spot + 40
+                        - PE trade: SL = Spot + 20, Target = Spot − 40
+                        - Trap reversals: Tighter (±15 SL / ∓30 Target)
+
+                        **Entry Timing:** Pressure spike > 0.15 in last interval → ENTER NOW ⚡
+
+                        > ⚠️ These are directional signals for educational use.
+                        > Always apply your own risk management and position sizing.
+                        """)
+                else:
+                    st.info("ATM strike not identified — Auto Entry Engine unavailable.")
+            else:
+                st.info("Option chain data required for Auto Entry Engine.")
+
+        except Exception as _ae_e:
+            st.warning(f"Auto Entry Engine unavailable: {str(_ae_e)}")
 
         # Expandable section for detailed Greeks and raw values
         with st.expander("📊 Detailed Greeks & Raw Values"):
