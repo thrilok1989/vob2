@@ -4528,6 +4528,10 @@ def main():
     if 'total_gex_last_valid' not in st.session_state:
         st.session_state.total_gex_last_valid = None
 
+    # Initialize session state for Order Book Depth key levels history
+    if 'depth_history' not in st.session_state:
+        st.session_state.depth_history = []
+
     # Initialize Supabase
     try:
         if not supabase_url or not supabase_key:
@@ -5368,14 +5372,109 @@ def main():
                     else:
                         st.error(f"PE BUY failed for {ts_pe}: {res}")
 
-        # ===== KEY LEVELS FROM ORDER BOOK DEPTH CHART =====
+        # ===== KEY LEVELS FROM ORDER BOOK DEPTH CHART (time-series) =====
         st.markdown("---")
-        depth_fig = plot_depth_levels(
-            option_data.get('df_summary'),
-            option_data.get('underlying')
-        )
-        if depth_fig is not None:
-            st.plotly_chart(depth_fig, use_container_width=True)
+        _depth_df_summary = option_data.get('df_summary')
+        if _depth_df_summary is not None:
+            _has_bid = 'bidQty_PE' in _depth_df_summary.columns and not _depth_df_summary['bidQty_PE'].isna().all()
+            _has_ask = 'askQty_CE' in _depth_df_summary.columns and not _depth_df_summary['askQty_CE'].isna().all()
+            if _has_bid or _has_ask:
+                _ist = pytz.timezone('Asia/Kolkata')
+                _depth_now = datetime.now(_ist)
+                _depth_entry = {'time': _depth_now}
+                if _has_bid:
+                    _top3_sup = _depth_df_summary.nlargest(3, 'bidQty_PE')[['Strike', 'bidQty_PE']].copy()
+                    _top3_sup = _top3_sup.sort_values('Strike', ascending=False).reset_index(drop=True)
+                    for _i, _r in _top3_sup.iterrows():
+                        _depth_entry[f'S{_i+1}_qty'] = _r['bidQty_PE']
+                        _depth_entry[f'S{_i+1}_price'] = _r['Strike']
+                if _has_ask:
+                    _top3_res = _depth_df_summary.nlargest(3, 'askQty_CE')[['Strike', 'askQty_CE']].copy()
+                    _top3_res = _top3_res.sort_values('Strike').reset_index(drop=True)
+                    for _i, _r in _top3_res.iterrows():
+                        _depth_entry[f'R{_i+1}_qty'] = _r['askQty_CE']
+                        _depth_entry[f'R{_i+1}_price'] = _r['Strike']
+                # Avoid duplicates within 30 seconds
+                _should_add_depth = True
+                if st.session_state.depth_history:
+                    _last_depth = st.session_state.depth_history[-1]
+                    if (_depth_now - _last_depth['time']).total_seconds() < 30:
+                        _should_add_depth = False
+                if _should_add_depth:
+                    st.session_state.depth_history.append(_depth_entry)
+                    if len(st.session_state.depth_history) > 200:
+                        st.session_state.depth_history = st.session_state.depth_history[-200:]
+
+        if st.session_state.depth_history:
+            _depth_hist_df = pd.DataFrame(st.session_state.depth_history)
+            _depth_fig_ts = go.Figure()
+            _support_colors = ['#00cc66', '#00aa55', '#008844']
+            _resist_colors  = ['#ff4444', '#dd3333', '#bb2222']
+            for _i, (_sc, _rc) in enumerate(zip(_support_colors, _resist_colors)):
+                _scol = f'S{_i+1}_qty'
+                _rcol = f'R{_i+1}_qty'
+                if _scol in _depth_hist_df.columns:
+                    # Build hover text with price info
+                    _s_price_col = f'S{_i+1}_price'
+                    _s_hover = (
+                        _depth_hist_df[_s_price_col].apply(lambda p: f'₹{p:,.0f}')
+                        if _s_price_col in _depth_hist_df.columns
+                        else None
+                    )
+                    _depth_fig_ts.add_trace(go.Scatter(
+                        x=_depth_hist_df['time'],
+                        y=_depth_hist_df[_scol],
+                        mode='lines+markers',
+                        name=f'S{_i+1} (Support)',
+                        line=dict(color=_sc, width=2),
+                        marker=dict(size=4),
+                        customdata=_s_hover if _s_hover is not None else None,
+                        hovertemplate=(
+                            f'S{_i+1} Support<br>Qty: %{{y:,.0f}}<br>Strike: %{{customdata}}<br>Time: %{{x|%H:%M}}<extra></extra>'
+                            if _s_hover is not None else
+                            f'S{_i+1} Support<br>Qty: %{{y:,.0f}}<br>Time: %{{x|%H:%M}}<extra></extra>'
+                        ),
+                    ))
+                if _rcol in _depth_hist_df.columns:
+                    _r_price_col = f'R{_i+1}_price'
+                    _r_hover = (
+                        _depth_hist_df[_r_price_col].apply(lambda p: f'₹{p:,.0f}')
+                        if _r_price_col in _depth_hist_df.columns
+                        else None
+                    )
+                    _depth_fig_ts.add_trace(go.Scatter(
+                        x=_depth_hist_df['time'],
+                        y=_depth_hist_df[_rcol],
+                        mode='lines+markers',
+                        name=f'R{_i+1} (Resistance)',
+                        line=dict(color=_rc, width=2, dash='dot'),
+                        marker=dict(size=4),
+                        customdata=_r_hover if _r_hover is not None else None,
+                        hovertemplate=(
+                            f'R{_i+1} Resistance<br>Qty: %{{y:,.0f}}<br>Strike: %{{customdata}}<br>Time: %{{x|%H:%M}}<extra></extra>'
+                            if _r_hover is not None else
+                            f'R{_i+1} Resistance<br>Qty: %{{y:,.0f}}<br>Time: %{{x|%H:%M}}<extra></extra>'
+                        ),
+                    ))
+            _depth_fig_ts.update_layout(
+                title=dict(text="Key Levels from Order Book Depth — Qty over Time", font=dict(size=16)),
+                template='plotly_dark',
+                height=320,
+                margin=dict(l=10, r=10, t=50, b=40),
+                xaxis=dict(tickformat='%H:%M', title='Time'),
+                yaxis=dict(title='Order Book Qty', tickformat=',.0f'),
+                plot_bgcolor='#1e1e1e',
+                paper_bgcolor='#1e1e1e',
+                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+            )
+            st.plotly_chart(_depth_fig_ts, use_container_width=True)
+        else:
+            depth_fig = plot_depth_levels(
+                option_data.get('df_summary'),
+                option_data.get('underlying')
+            )
+            if depth_fig is not None:
+                st.plotly_chart(depth_fig, use_container_width=True)
         # Option Chain Bias Summary Table
         st.markdown("## Option Chain Bias Summary")
         if option_data.get('styled_df') is not None:
