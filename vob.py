@@ -5583,6 +5583,12 @@ def main():
                 # Get current PCR value
                 current_pcr = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
 
+                # Dynamic Y range: data + reference thresholds always in view
+                _pcr_raw = history_df[col_name].dropna().tolist()
+                _pcr_all = _pcr_raw + [0.7, 1.2]
+                _pcr_ymin = max(0.0, min(_pcr_all) * 0.9)
+                _pcr_ymax = max(_pcr_all) * 1.1
+
                 fig.update_layout(
                     title=f"{title_prefix}<br>₹{strike_val}<br>PCR: {current_pcr:.2f}",
                     template='plotly_dark',
@@ -5590,7 +5596,7 @@ def main():
                     showlegend=False,
                     margin=dict(l=10, r=10, t=70, b=30),
                     xaxis=dict(tickformat='%H:%M', title=''),
-                    yaxis=dict(title='PCR'),
+                    yaxis=dict(title='PCR', range=[_pcr_ymin, _pcr_ymax]),
                     plot_bgcolor='#1e1e1e',
                     paper_bgcolor='#1e1e1e'
                 )
@@ -5771,6 +5777,16 @@ def main():
                                       annotation_text="Bear 0.7", annotation_position="right",
                                       annotation_font_size=8, annotation_font_color="#ff4444")
 
+                        # Dynamic Y range: include both OI PCR and ChgOI PCR values + thresholds
+                        _cmp_vals = []
+                        if strike_col in history_df.columns:
+                            _cmp_vals += history_df[strike_col].dropna().tolist()
+                        if chgoi_history_df is not None and strike_col in chgoi_history_df.columns:
+                            _cmp_vals += chgoi_history_df[strike_col].dropna().tolist()
+                        _cmp_vals += [0.7, 1.2]
+                        _cmp_ymin = max(0.0, min(_cmp_vals) * 0.9)
+                        _cmp_ymax = max(_cmp_vals) * 1.1
+
                         fig.update_layout(
                             title=dict(text=f"{position_labels[i]}<br>₹{strike}", font=dict(size=11)),
                             template='plotly_dark',
@@ -5780,7 +5796,7 @@ def main():
                                         xanchor='center', x=0.5, font=dict(size=8)),
                             margin=dict(l=5, r=10, t=70, b=30),
                             xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
-                            yaxis=dict(title='PCR'),
+                            yaxis=dict(title='PCR', range=[_cmp_ymin, _cmp_ymax]),
                             plot_bgcolor='#1e1e1e',
                             paper_bgcolor='#1e1e1e',
                         )
@@ -6005,12 +6021,17 @@ def main():
                                     annotation_text="Bear 0.7", annotation_position="right",
                                     annotation_font_size=8, annotation_font_color="#ff4444")
                     _vfig.add_hline(y=1.0, line_dash="dash", line_color="rgba(255,255,255,0.3)", line_width=1)
+                    # Dynamic Y range: data + thresholds always visible
+                    _vp_raw = _vp_hist_df[_vscol].dropna().tolist()
+                    _vp_all = _vp_raw + [0.7, 1.2]
+                    _vp_ymin = max(0.0, min(_vp_all) * 0.9)
+                    _vp_ymax = max(_vp_all) * 1.1
                     _vfig.update_layout(
                         title=dict(text=f"{_pos_labels[_vi]}<br>₹{_vstrike}<br>Vol PCR: {_vcur:.2f}", font=dict(size=11)),
                         template='plotly_dark', height=280, showlegend=False,
                         margin=dict(l=5, r=10, t=70, b=30),
                         xaxis=dict(tickformat='%H:%M', title=''),
-                        yaxis=dict(title='Vol PCR'),
+                        yaxis=dict(title='Vol PCR', range=[_vp_ymin, _vp_ymax]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     )
                     st.plotly_chart(_vfig, use_container_width=True)
@@ -6699,10 +6720,15 @@ def main():
                 fig_pcr_chgoi.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1,
                                         annotation_text="0.7 (Bearish)", annotation_position="right")
 
+                # Dynamic Y range: data + reference thresholds always in view
+                _ov_raw = pcr_chgoi_df['pcr'].dropna().tolist()
+                _ov_all = _ov_raw + [0.7, 1.0, 1.2]
+                _ov_ymin = max(0.0, min(_ov_all) * 0.9)
+                _ov_ymax = max(_ov_all) * 1.1
+
                 # Add green/red shading zones
-                y_max = max(pcr_chgoi_df['pcr'].max() * 1.2, 1.5)
-                fig_pcr_chgoi.add_hrect(y0=1.2, y1=y_max, fillcolor="rgba(0,255,136,0.06)", line_width=0)
-                fig_pcr_chgoi.add_hrect(y0=0, y1=0.7, fillcolor="rgba(255,68,68,0.06)", line_width=0)
+                fig_pcr_chgoi.add_hrect(y0=1.2, y1=_ov_ymax, fillcolor="rgba(0,255,136,0.06)", line_width=0)
+                fig_pcr_chgoi.add_hrect(y0=_ov_ymin, y1=0.7, fillcolor="rgba(255,68,68,0.06)", line_width=0)
 
                 fig_pcr_chgoi.update_layout(
                     title=f"PCR of Total Change in OI | Current: {curr_pcr:.3f} ({pcr_label})",
@@ -6710,7 +6736,7 @@ def main():
                     height=400,
                     showlegend=False,
                     xaxis=dict(tickformat='%H:%M', title='Time'),
-                    yaxis=dict(title='PCR (Total PE ΔOI / Total CE ΔOI)', rangemode='tozero'),
+                    yaxis=dict(title='PCR (Total PE ΔOI / Total CE ΔOI)', range=[_ov_ymin, _ov_ymax]),
                     plot_bgcolor='#1e1e1e',
                     paper_bgcolor='#1e1e1e',
                     margin=dict(l=50, r=50, t=60, b=50)
@@ -6763,6 +6789,12 @@ def main():
                 # Get current value
                 current_val = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
 
+                # Dynamic Y range: data + reference thresholds always in view
+                _chgoi_raw = history_df[col_name].dropna().tolist()
+                _chgoi_all = _chgoi_raw + [0.7, 1.2]
+                _chgoi_ymin = max(0.0, min(_chgoi_all) * 0.9)
+                _chgoi_ymax = max(_chgoi_all) * 1.1
+
                 fig.update_layout(
                     title=f"{title_prefix}<br>₹{strike_val}<br>PCR(ΔOI): {current_val:.2f}",
                     template='plotly_dark',
@@ -6770,7 +6802,7 @@ def main():
                     showlegend=False,
                     margin=dict(l=10, r=10, t=70, b=30),
                     xaxis=dict(tickformat='%H:%M', title=''),
-                    yaxis=dict(title='PCR (ΔOI)'),
+                    yaxis=dict(title='PCR (ΔOI)', range=[_chgoi_ymin, _chgoi_ymax]),
                     plot_bgcolor='#1e1e1e',
                     paper_bgcolor='#1e1e1e'
                 )
@@ -7257,12 +7289,17 @@ def main():
                     fig_pcr_ts.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
                     fig_pcr_ts.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
                     fig_pcr_ts.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+                    # Dynamic Y range: both series + thresholds always in view
+                    _comp_pcr_raw = comp_hist_df['avg_pcr'].dropna().tolist() + comp_hist_df['avg_chgoi'].dropna().tolist()
+                    _comp_pcr_all = _comp_pcr_raw + [0.7, 1.0, 1.2]
+                    _comp_ymin = max(0.0, min(_comp_pcr_all) * 0.9)
+                    _comp_ymax = max(_comp_pcr_all) * 1.1
                     fig_pcr_ts.update_layout(
                         title="Avg PCR (OI) vs Avg PCR (ΔOI)",
                         template='plotly_dark', height=320, showlegend=True,
                         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
                         xaxis=dict(tickformat='%H:%M', title=''),
-                        yaxis=dict(title='PCR'),
+                        yaxis=dict(title='PCR', range=[_comp_ymin, _comp_ymax]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         margin=dict(l=40, r=10, t=60, b=30)
                     )
