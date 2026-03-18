@@ -106,6 +106,9 @@ except Exception:
 NIFTY_UNDERLYING_SCRIP = 13
 NIFTY_UNDERLYING_SEG = "IDX_I"
 
+SENSEX_SCRIP_ID = "51"        # BSE Sensex security ID in Dhan API
+SENSEX_EXCHANGE_SEG = "IDX_I"  # All indices (NSE + BSE) share IDX_I segment in Dhan API
+
 # Cached functions for performance
 @st.cache_data(ttl=300)  # Cache for 5 minutes
 def cached_pivot_calculation(df_json, pivot_settings):
@@ -3467,6 +3470,78 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
     
     return fig
 
+def plot_depth_levels(df_summary, underlying_price=None):
+    """Diverging horizontal bar chart: top-3 PE bid qty (support) vs top-3 CE ask qty (resistance)."""
+    has_bid = 'bidQty_PE' in df_summary.columns and not df_summary['bidQty_PE'].isna().all()
+    has_ask = 'askQty_CE' in df_summary.columns and not df_summary['askQty_CE'].isna().all()
+    if not has_bid and not has_ask:
+        return None
+
+    rows = []
+    if has_bid:
+        top3_sup = df_summary.nlargest(3, 'bidQty_PE')[['Strike', 'bidQty_PE']].copy()
+        top3_sup = top3_sup.sort_values('Strike', ascending=False).reset_index(drop=True)
+        for i, r in top3_sup.iterrows():
+            rows.append({'price': r['Strike'], 'qty': r['bidQty_PE'], 'label': f'S{i+1}', 'side': 'support'})
+
+    if has_ask:
+        top3_res = df_summary.nlargest(3, 'askQty_CE')[['Strike', 'askQty_CE']].copy()
+        top3_res = top3_res.sort_values('Strike').reset_index(drop=True)
+        for i, r in top3_res.iterrows():
+            rows.append({'price': r['Strike'], 'qty': r['askQty_CE'], 'label': f'R{i+1}', 'side': 'resistance'})
+
+    if not rows:
+        return None
+
+    rows.sort(key=lambda x: x['price'])
+
+    fig = go.Figure()
+    for row in rows:
+        is_sup = row['side'] == 'support'
+        x_val = -row['qty'] if is_sup else row['qty']
+        color = '#00cc66' if is_sup else '#ff4444'
+        y_label = f"{row['label']}: ₹{row['price']:,.0f}"
+        fig.add_trace(go.Bar(
+            x=[x_val],
+            y=[y_label],
+            orientation='h',
+            marker_color=color,
+            showlegend=False,
+            text=[f"{row['qty']:,.0f}"],
+            textposition='outside',
+            hovertemplate=f"{row['label']} ₹{row['price']:,.0f}<br>Qty: {row['qty']:,.0f}<extra></extra>",
+        ))
+
+    max_qty = max(r['qty'] for r in rows)
+    fig.update_layout(
+        title=dict(text="Key Levels from Order Book Depth", font=dict(size=16)),
+        template='plotly_dark',
+        height=320,
+        barmode='overlay',
+        xaxis=dict(
+            title='← Support (PE Bid) &nbsp;&nbsp;|&nbsp;&nbsp; Resistance (CE Ask) →',
+            range=[-max_qty * 1.35, max_qty * 1.35],
+            zeroline=True,
+            zerolinecolor='#FFD700',
+            zerolinewidth=2,
+            tickformat=',.0f',
+            tickvals=[-max_qty, -max_qty // 2, 0, max_qty // 2, max_qty],
+            ticktext=[f"{max_qty:,.0f}", f"{max_qty//2:,.0f}", "0",
+                      f"{max_qty//2:,.0f}", f"{max_qty:,.0f}"],
+        ),
+        yaxis=dict(autorange=True, tickfont=dict(size=12)),
+        margin=dict(l=10, r=80, t=50, b=50),
+        plot_bgcolor='#1e1e1e',
+        paper_bgcolor='#1e1e1e',
+        annotations=[dict(
+            x=0.02, y=1.08, xref='paper', yref='paper',
+            text="🟢 Support Levels (Largest bid quantities) &nbsp;&nbsp; 🔴 Resistance Levels (Largest ask quantities)",
+            showarrow=False, font=dict(color='white', size=11)
+        )],
+    )
+    return fig
+
+
 def display_metrics(ltp_data, df, db, symbol="NIFTY50"):
     """Display price metrics and save analytics"""
     if ltp_data and 'data' in ltp_data and not df.empty:
@@ -3640,7 +3715,8 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None, l
         'top_ask_quantity': 'askQty',
         'top_bid_quantity': 'bidQty',
         'volume': 'totalTradedVolume',
-        'iv': 'impliedVolatility'
+        'iv': 'impliedVolatility',
+        'security_id': 'scrp_cd'  # Dhan v2 API returns security_id for each option contract
     }
     for old_col, new_col in column_mapping.items():
         if f"{old_col}_CE" in df.columns:
@@ -4309,6 +4385,79 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
             max_loss = analytics_df['price_change_pct'].min()
             st.metric("Max Daily Loss", f"{max_loss:.2f}%")
 
+def fetch_index_metrics(api, security_id, exchange_segment, interval="1", days_back=1):
+    """Fetch intraday OHLCV + LTP for an index and return a metrics dict."""
+    try:
+        data = api.get_intraday_data(
+            security_id=security_id,
+            exchange_segment=exchange_segment,
+            instrument="INDEX",
+            interval=interval,
+            days_back=days_back
+        )
+        df = process_candle_data(data, interval) if data else pd.DataFrame()
+        ltp_resp = api.get_ltp_data(security_id, exchange_segment)
+        current = None
+        if ltp_resp and 'data' in ltp_resp:
+            for _exc, _d in ltp_resp['data'].items():
+                for _sid, _pd in _d.items():
+                    current = _pd.get('last_price')
+                    break
+        if current is None and not df.empty:
+            current = float(df['close'].iloc[-1])
+        if df.empty or current is None:
+            return None
+        prev_close = float(df['close'].iloc[-2]) if len(df) > 1 else float(df['close'].iloc[0])
+        change = current - prev_close
+        change_pct = (change / prev_close) * 100 if prev_close else 0
+        return {
+            'current': current,
+            'change': change,
+            'change_pct': change_pct,
+            'day_high': float(df['high'].max()),
+            'day_low': float(df['low'].min()),
+            'day_open': float(df['open'].iloc[0]),
+            'volume': int(df['volume'].sum()),
+        }
+    except Exception:
+        return None
+
+
+def show_market_overview(api, interval="1", days_back=1):
+    """Render NIFTY 50 and SENSEX metrics in a tabbed table at the top of the page."""
+    st.markdown("### Market Overview")
+
+    tab_nifty, tab_sensex = st.tabs(["📈 NIFTY 50", "📊 SENSEX"])
+
+    def _render_metrics(m, label):
+        if m is None:
+            st.warning(f"Could not fetch {label} data.")
+            return
+        sign = "+" if m['change'] >= 0 else ""
+        arrow = "▲" if m['change'] >= 0 else "▼"
+        chg_color = "#00cc66" if m['change'] >= 0 else "#ff4444"
+        cols = st.columns(5)
+        cols[0].metric("Current Price", f"₹{m['current']:,.2f}")
+        cols[1].metric(
+            "Change",
+            f"{sign}{m['change']:,.2f}",
+            delta=f"{sign}{m['change_pct']:.2f}%"
+        )
+        cols[2].metric("Day High", f"₹{m['day_high']:,.2f}")
+        cols[3].metric("Day Low",  f"₹{m['day_low']:,.2f}")
+        cols[4].metric("Day Open", f"₹{m['day_open']:,.2f}")
+
+    with tab_nifty:
+        nifty_m = fetch_index_metrics(api, "13", "IDX_I", interval, days_back)
+        _render_metrics(nifty_m, "NIFTY 50")
+
+    with tab_sensex:
+        sensex_m = fetch_index_metrics(api, SENSEX_SCRIP_ID, SENSEX_EXCHANGE_SEG, interval, days_back)
+        _render_metrics(sensex_m, "SENSEX")
+
+    st.markdown("---")
+
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -4359,7 +4508,7 @@ def main():
     if 'pcr_chgoi_last_valid' not in st.session_state:
         st.session_state.pcr_chgoi_last_valid = None
 
-    # Initialize session state for PCR of Change in OI per ATM±2 strike history
+    # Initialize session state for per-strike ChgOI PCR history (for comparison view)
     if 'pcr_chgoi_strike_history' not in st.session_state:
         st.session_state.pcr_chgoi_strike_history = []
     if 'pcr_chgoi_strike_last_valid' not in st.session_state:
@@ -4586,7 +4735,10 @@ def main():
     
     # Initialize API
     api = DhanAPI(access_token, client_id)
-    
+
+    # ===== MARKET OVERVIEW (NIFTY + SENSEX) =====
+    show_market_overview(api, interval=timeframes.get(selected_timeframe, "1"), days_back=days_back)
+
     # Main layout - Trading chart and Options analysis side by side
     col1, col2 = st.columns([2, 1])
 
@@ -5132,6 +5284,98 @@ def main():
         with oi_col2:
             st.metric("PUT ΔOI", f"{option_data['total_pe_change']:+.1f}L", delta_color="normal")
 
+        # ===== STRIKE PRICE vs LTP TABLE (ATM ± 5) =====
+        st.markdown("---")
+        st.markdown("## Strike Price vs LTP (ATM ± 5)")
+
+        df_summary_ltp = option_data.get('df_summary')
+        atm_strike_ltp = option_data.get('atm_strike')
+
+        if (df_summary_ltp is not None
+                and 'lastPrice_CE' in df_summary_ltp.columns
+                and 'lastPrice_PE' in df_summary_ltp.columns):
+
+            NIFTY_LOT_SIZE = 65
+            _expiry = option_data.get('expiry', '')
+
+            # Collect scrp_cd columns if available (for order placement)
+            ltp_extra = [c for c in ('scrp_cd_CE', 'scrp_cd_PE') if c in df_summary_ltp.columns]
+            ltp_tbl = df_summary_ltp[['Strike', 'lastPrice_CE', 'lastPrice_PE', 'Zone'] + ltp_extra].copy()
+            ltp_tbl = ltp_tbl.sort_values('Strike', ascending=False).reset_index(drop=True)
+
+            has_scrp = 'scrp_cd_CE' in ltp_tbl.columns and 'scrp_cd_PE' in ltp_tbl.columns
+            if not has_scrp:
+                st.info("Security IDs (scrp_cd) not available in option chain data — Buy buttons disabled.")
+
+            # Build expiry suffix for trading symbol e.g. "25FEB27"
+            try:
+                from datetime import datetime as _dt
+                _exp_sfx = _dt.strptime(_expiry, "%Y-%m-%d").strftime('%y%b%d').upper()
+            except Exception:
+                _exp_sfx = ''
+
+            # Header row
+            hdr = st.columns([2, 1.5, 1, 2, 1, 2, 1.5])
+            for col_h, label, color in zip(
+                hdr,
+                ["CE LTP", "CE Val (x65)", "BUY CE", "STRIKE", "BUY PE", "PE LTP", "PE Val (x65)"],
+                ["#00cc66", "#00cc66", "#aaa", "#FFD700", "#aaa", "#ff6b6b", "#ff6b6b"]
+            ):
+                col_h.markdown(f"<b style='color:{color}'>{label}</b>", unsafe_allow_html=True)
+
+            st.markdown("<hr style='margin:4px 0; border-color:#333'>", unsafe_allow_html=True)
+
+            for _, row in ltp_tbl.iterrows():
+                strike = int(row['Strike'])
+                ce_ltp = float(row['lastPrice_CE'])
+                pe_ltp = float(row['lastPrice_PE'])
+                ce_val = ce_ltp * NIFTY_LOT_SIZE
+                pe_val = pe_ltp * NIFTY_LOT_SIZE
+                is_atm = row['Zone'] == 'ATM'
+                scrp_ce = str(row['scrp_cd_CE']) if has_scrp else ''
+                scrp_pe = str(row['scrp_cd_PE']) if has_scrp else ''
+                ts_ce = f"NIFTY{_exp_sfx}{strike}CE" if _exp_sfx else f"NIFTY{strike}CE"
+                ts_pe = f"NIFTY{_exp_sfx}{strike}PE" if _exp_sfx else f"NIFTY{strike}PE"
+
+                ce_color = "#00ff88" if is_atm else "#00cc66"
+                pe_color = "#ff8888" if is_atm else "#ff6b6b"
+                fw = "bold" if is_atm else "normal"
+                strike_style = "color:#FFD700; font-weight:bold; font-size:1.1em" if is_atm else "color:#c0c0c0"
+
+                r = st.columns([2, 1.5, 1, 2, 1, 2, 1.5])
+                r[0].markdown(f"<span style='color:{ce_color}; font-weight:{fw}'>{ce_ltp:.2f}</span>", unsafe_allow_html=True)
+                r[1].markdown(f"<span style='color:{ce_color}'>₹{ce_val:,.0f}</span>", unsafe_allow_html=True)
+                buy_ce = r[2].button("BUY", key=f"buy_ce_{strike}", type="primary",
+                                     disabled=not (has_scrp and scrp_ce))
+                r[3].markdown(f"<div style='text-align:center'><span style='{strike_style}'>{strike}</span></div>",
+                               unsafe_allow_html=True)
+                buy_pe = r[4].button("BUY", key=f"buy_pe_{strike}", type="primary",
+                                     disabled=not (has_scrp and scrp_pe))
+                r[5].markdown(f"<span style='color:{pe_color}; font-weight:{fw}'>{pe_ltp:.2f}</span>", unsafe_allow_html=True)
+                r[6].markdown(f"<span style='color:{pe_color}'>₹{pe_val:,.0f}</span>", unsafe_allow_html=True)
+
+                if buy_ce:
+                    ok, res = api.place_order(scrp_ce, ts_ce)
+                    if ok:
+                        st.success(f"CE BUY order placed for {ts_ce} | Order ID: {res.get('orderId', res)}")
+                    else:
+                        st.error(f"CE BUY failed for {ts_ce}: {res}")
+
+                if buy_pe:
+                    ok, res = api.place_order(scrp_pe, ts_pe)
+                    if ok:
+                        st.success(f"PE BUY order placed for {ts_pe} | Order ID: {res.get('orderId', res)}")
+                    else:
+                        st.error(f"PE BUY failed for {ts_pe}: {res}")
+
+        # ===== KEY LEVELS FROM ORDER BOOK DEPTH CHART =====
+        st.markdown("---")
+        depth_fig = plot_depth_levels(
+            option_data.get('df_summary'),
+            option_data.get('underlying')
+        )
+        if depth_fig is not None:
+            st.plotly_chart(depth_fig, use_container_width=True)
         # Option Chain Bias Summary Table
         st.markdown("## Option Chain Bias Summary")
         if option_data.get('styled_df') is not None:
@@ -5171,9 +5415,37 @@ def main():
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
 
-        # ===== PCR TIME-SERIES GRAPHS FOR ATM ± 2 STRIKES (SIDE BY SIDE) =====
+        # ===== PRE-COMPUTE GEX + TRACK HISTORY (before comparison view) =====
+        _gex_pre_summary = option_data.get('df_summary')
+        _gex_pre_underlying = option_data.get('underlying')
+        gex_data_pre = None
+        if _gex_pre_summary is not None and _gex_pre_underlying:
+            try:
+                gex_data_pre = calculate_dealer_gex(_gex_pre_summary, _gex_pre_underlying)
+                if gex_data_pre:
+                    st.session_state.gex_last_valid_data = gex_data_pre
+                    _gex_df_pre = gex_data_pre['gex_df']
+                    _gex_ist = pytz.timezone('Asia/Kolkata')
+                    _gex_now = datetime.now(_gex_ist)
+                    _gex_entry = {'time': _gex_now, 'total_gex': gex_data_pre['total_gex']}
+                    for _, _gr in _gex_df_pre.iterrows():
+                        _gex_entry[str(int(_gr['Strike']))] = _gr['Net_GEX']
+                    st.session_state.gex_current_strikes = sorted(
+                        [int(_gr['Strike']) for _, _gr in _gex_df_pre.iterrows()])
+                    _should_gex = True
+                    if st.session_state.gex_history:
+                        if (_gex_now - st.session_state.gex_history[-1]['time']).total_seconds() < 30:
+                            _should_gex = False
+                    if _should_gex:
+                        st.session_state.gex_history.append(_gex_entry)
+                        if len(st.session_state.gex_history) > 200:
+                            st.session_state.gex_history = st.session_state.gex_history[-200:]
+            except Exception:
+                pass
+
+        # ===== ATM ±2 STRIKE COMPARISON: PCR / ChgOI PCR / GEX =====
         st.markdown("---")
-        st.markdown("## 📊 PCR Analysis - Time Series (ATM ± 2)")
+        st.markdown("## 📊 ATM ±2 Strike Comparison — PCR · ChgOI PCR · GEX")
 
         # Helper function to create PCR chart (defined outside try block for reuse)
         def create_pcr_chart(history_df, col_name, color, title_prefix):
@@ -5215,6 +5487,45 @@ def main():
                 return fig, current_pcr
             return None, 0
 
+        # Helper function for GEX charts (defined here so it's available in comparison view)
+        def create_gex_chart(history_df, col_name, color, title_prefix):
+            """Create individual GEX time-series chart per strike."""
+            if col_name and col_name in history_df.columns:
+                strike_val = col_name
+                gex_values = history_df[col_name].dropna()
+                max_abs = max(abs(gex_values.max()), abs(gex_values.min()), 15) if len(gex_values) > 0 else 20
+                y_range = [-max_abs * 1.1, max_abs * 1.1]
+                fig = go.Figure()
+                fig.add_trace(go.Scatter(
+                    x=history_df['time'],
+                    y=history_df[col_name],
+                    mode='lines+markers',
+                    name=f'₹{strike_val}',
+                    line=dict(color=color, width=2),
+                    marker=dict(size=4),
+                    fill='tozeroy',
+                    fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.15])}'
+                ))
+                fig.add_hline(y=0, line_dash="solid", line_color="white", line_width=2)
+                fig.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1,
+                              annotation_text="+10", annotation_position="right")
+                fig.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1,
+                              annotation_text="-10", annotation_position="right")
+                current_gex = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
+                fig.update_layout(
+                    title=f"{title_prefix}<br>₹{strike_val}<br>GEX: {current_gex:+.1f}L",
+                    template='plotly_dark', height=280, showlegend=False,
+                    margin=dict(l=10, r=10, t=70, b=30),
+                    xaxis=dict(tickformat='%H:%M', title=''),
+                    yaxis=dict(title='GEX (L)', range=y_range, zeroline=True,
+                               zerolinecolor='white', zerolinewidth=2,
+                               tickmode='array',
+                               tickvals=[-20, -10, 0, 10, 20] if max_abs <= 25 else None),
+                    plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
+                )
+                return fig, current_gex
+            return None, 0
+
         # Try to get new data and add to history
         pcr_data_available = False
         pcr_df = None
@@ -5231,8 +5542,12 @@ def main():
                     start_idx = max(0, atm_pos - 2)
                     end_idx = min(len(df_summary), atm_pos + 3)
 
-                    pcr_df = df_summary.iloc[start_idx:end_idx][['Strike', 'Zone', 'PCR', 'PCR_Signal',
-                                                                   'openInterest_CE', 'openInterest_PE']].copy()
+                    chgoi_avail = [c for c in ['changeinOpenInterest_CE', 'changeinOpenInterest_PE']
+                                   if c in df_summary.columns]
+                    pcr_df = df_summary.iloc[start_idx:end_idx][
+                        ['Strike', 'Zone', 'PCR', 'PCR_Signal',
+                         'openInterest_CE', 'openInterest_PE'] + chgoi_avail
+                    ].copy()
 
                     if not pcr_df.empty:
                         pcr_data_available = True
@@ -5246,13 +5561,20 @@ def main():
                         # Add current PCR data to history - store by STRIKE PRICE ONLY (not zone)
                         # This preserves history even when strikes change zone (OTM->ATM->ITM)
                         pcr_entry = {'time': current_time}
+                        chgoi_entry = {'time': current_time}
                         for _, row in pcr_df.iterrows():
                             strike_label = str(int(row['Strike']))  # Store by strike only
                             pcr_entry[strike_label] = row['PCR']
+                            # Per-strike ChgOI PCR
+                            if 'changeinOpenInterest_CE' in row and 'changeinOpenInterest_PE' in row:
+                                ce_chg = row['changeinOpenInterest_CE']
+                                pe_chg = row['changeinOpenInterest_PE']
+                                chgoi_entry[strike_label] = round(abs(pe_chg / ce_chg), 3) if ce_chg != 0 else 0.0
 
                         # Store current ATM ±2 strike positions for display
                         current_strikes = pcr_df['Strike'].tolist()
                         st.session_state.pcr_current_strikes = [int(s) for s in current_strikes]
+                        st.session_state.pcr_chgoi_strike_current_strikes = [int(s) for s in current_strikes]
 
                         # Check if we should add new entry (avoid duplicates within 30 seconds)
                         should_add = True
@@ -5264,9 +5586,13 @@ def main():
 
                         if should_add:
                             st.session_state.pcr_history.append(pcr_entry)
-                            # Keep only last 200 entries (longer history)
                             if len(st.session_state.pcr_history) > 200:
                                 st.session_state.pcr_history = st.session_state.pcr_history[-200:]
+                            # Also store per-strike ChgOI PCR if data was available
+                            if len(chgoi_entry) > 1:
+                                st.session_state.pcr_chgoi_strike_history.append(chgoi_entry)
+                                if len(st.session_state.pcr_chgoi_strike_history) > 200:
+                                    st.session_state.pcr_chgoi_strike_history = st.session_state.pcr_chgoi_strike_history[-200:]
 
             except Exception as e:
                 st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
@@ -5286,48 +5612,131 @@ def main():
                 # Sort strikes (ascending: ITM-2, ITM-1, ATM, OTM+1, OTM+2)
                 current_strikes = sorted(current_strikes)
 
-                # Create 5 columns for side-by-side display (ITM-2, ITM-1, ATM, OTM+1, OTM+2)
-                pcr_col1, pcr_col2, pcr_col3, pcr_col4, pcr_col5 = st.columns(5)
-
-                # Helper to display chart with signal
-                def display_pcr_with_signal(container, fig, pcr_val):
-                    if fig:
-                        container.plotly_chart(fig, use_container_width=True)
-                        if pcr_val > 1.2:
-                            container.success("Bullish")
-                        elif pcr_val < 0.7:
-                            container.error("Bearish")
-                        else:
-                            container.warning("Neutral")
-
-                # Get current zone info from pcr_df or last valid data
-                zone_info = {}
-                zone_df = pcr_df if pcr_df is not None else st.session_state.pcr_last_valid_data
-                if zone_df is not None:
-                    for _, row in zone_df.iterrows():
-                        zone_info[int(row['Strike'])] = row['Zone']
-
-                # Display 5 strikes: position 0=ITM-2, 1=ITM-1, 2=ATM, 3=OTM+1, 4=OTM+2
                 position_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
                 position_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
-                columns = [pcr_col1, pcr_col2, pcr_col3, pcr_col4, pcr_col5]
 
-                for i, col in enumerate(columns):
+                # ── COMBINED: PCR OI + ChgOI PCR + GEX per strike ──
+                chgoi_hist = st.session_state.pcr_chgoi_strike_history
+                chgoi_history_df = pd.DataFrame(chgoi_hist) if chgoi_hist else None
+
+                has_gex_hist = len(st.session_state.gex_history) > 0
+                gex_hist_df = pd.DataFrame(st.session_state.gex_history) if has_gex_hist else None
+                gex_current_strikes = sorted(getattr(st.session_state, 'gex_current_strikes', current_strikes))
+
+                cur_gex_vals = {}
+                if gex_data_pre and 'gex_df' in gex_data_pre:
+                    for _, gr in gex_data_pre['gex_df'].iterrows():
+                        cur_gex_vals[int(gr['Strike'])] = gr['Net_GEX']
+
+                combined_cols = st.columns(5)
+                for i, col in enumerate(combined_cols):
                     with col:
-                        if i < len(current_strikes):
-                            strike = current_strikes[i]
-                            strike_col = str(strike)
-                            zone = zone_info.get(strike, position_labels[i].split()[-1])
-
-                            if strike_col in history_df.columns:
-                                fig, pcr_val = create_pcr_chart(history_df, strike_col, position_colors[i], f'{position_labels[i]}')
-                                display_pcr_with_signal(st, fig, pcr_val)
-                            else:
-                                st.info(f"₹{strike} - Building history...")
-                        else:
+                        if i >= len(current_strikes):
                             st.info(f"{position_labels[i]} N/A")
+                            continue
 
-                # Show current PCR data table (use last valid if current not available)
+                        strike = current_strikes[i]
+                        strike_col = str(strike)
+                        clr = position_colors[i]
+
+                        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+                        # ── PCR OI (left Y, solid blue) ──
+                        if strike_col in history_df.columns:
+                            fig.add_trace(go.Scatter(
+                                x=history_df['time'],
+                                y=history_df[strike_col],
+                                mode='lines+markers',
+                                name='PCR OI',
+                                line=dict(color='#00ccff', width=2),
+                                marker=dict(size=3),
+                            ), secondary_y=False)
+
+                        # ── ChgOI PCR (left Y, dashed orange) ──
+                        if chgoi_history_df is not None and strike_col in chgoi_history_df.columns:
+                            fig.add_trace(go.Scatter(
+                                x=chgoi_history_df['time'],
+                                y=chgoi_history_df[strike_col],
+                                mode='lines+markers',
+                                name='PCR ChgOI',
+                                line=dict(color='#ffaa00', width=2, dash='dash'),
+                                marker=dict(size=3),
+                            ), secondary_y=False)
+
+                        # ── GEX (right Y, strike color, filled area) ──
+                        cur_gex = cur_gex_vals.get(strike, 0)
+                        _rgb = tuple(int(clr.lstrip('#')[j:j+2], 16) for j in (0, 2, 4))
+                        _fill = f'rgba({_rgb[0]},{_rgb[1]},{_rgb[2]},0.15)'
+                        if has_gex_hist and gex_hist_df is not None and strike_col in gex_hist_df.columns:
+                            gex_series = gex_hist_df[strike_col]
+                            cur_gex = gex_series.iloc[-1]
+                            fig.add_trace(go.Scatter(
+                                x=gex_hist_df['time'],
+                                y=gex_series,
+                                mode='lines',
+                                name='GEX (L)',
+                                line=dict(color=clr, width=1.5),
+                                fill='tozeroy',
+                                fillcolor=_fill,
+                            ), secondary_y=True)
+                        elif strike in cur_gex_vals:
+                            fig.add_trace(go.Scatter(
+                                x=[datetime.now(pytz.timezone('Asia/Kolkata'))],
+                                y=[cur_gex],
+                                mode='markers+text',
+                                name='GEX (L)',
+                                marker=dict(size=14, color=clr, symbol='diamond'),
+                                text=[f'{cur_gex:+.1f}L'],
+                                textposition='top center',
+                                textfont=dict(size=10, color='white'),
+                            ), secondary_y=True)
+
+                        # PCR reference lines (left Y)
+                        fig.add_hline(y=1.2, line_dash="dot", line_color="#00ff8888", line_width=1,
+                                      annotation_text="Bull 1.2", annotation_position="right",
+                                      annotation_font_size=8, annotation_font_color="#00ff88")
+                        fig.add_hline(y=0.7, line_dash="dot", line_color="#ff444488", line_width=1,
+                                      annotation_text="Bear 0.7", annotation_position="right",
+                                      annotation_font_size=8, annotation_font_color="#ff4444")
+                        # GEX reference lines (right Y)
+                        fig.add_hline(y=0, line_dash="solid", line_color="#ffffff40", line_width=1,
+                                      secondary_y=True)
+                        fig.add_hline(y=10, line_dash="dot", line_color="#00ff8866", line_width=1,
+                                      secondary_y=True)
+                        fig.add_hline(y=-10, line_dash="dot", line_color="#ff444466", line_width=1,
+                                      secondary_y=True)
+
+                        fig.update_layout(
+                            title=dict(text=f"{position_labels[i]}<br>₹{strike}", font=dict(size=11)),
+                            template='plotly_dark',
+                            height=330,
+                            showlegend=True,
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                                        xanchor='center', x=0.5, font=dict(size=8)),
+                            margin=dict(l=5, r=40, t=70, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                        )
+                        fig.update_yaxes(title_text='PCR', secondary_y=False,
+                                         title_font=dict(color='#00ccff', size=9),
+                                         tickfont=dict(color='#00ccff', size=8),
+                                         range=[0, 3])
+                        fig.update_yaxes(title_text='GEX(L)', secondary_y=True,
+                                         zeroline=True, zerolinecolor='white', zerolinewidth=1,
+                                         title_font=dict(color=clr, size=9),
+                                         tickfont=dict(color=clr, size=8))
+
+                        st.plotly_chart(fig, use_container_width=True)
+
+                        # Signal summary below chart
+                        cur_pcr = history_df[strike_col].iloc[-1] if (
+                            strike_col in history_df.columns and len(history_df) > 0) else 1.0
+                        pcr_sig = "🟢 Bull" if cur_pcr > 1.2 else ("🔴 Bear" if cur_pcr < 0.7 else "🟡 Ntrl")
+                        gex_sig = "📍 Pin" if cur_gex > 10 else ("⚡ Accel" if cur_gex < -10 else "➡️ Ntrl")
+                        st.caption(f"PCR {cur_pcr:.2f} {pcr_sig} | GEX {cur_gex:+.1f}L {gex_sig}")
+
+                # ── Summary table + status ──
                 st.markdown("### Current PCR Values")
                 display_df = pcr_df if pcr_df is not None else st.session_state.pcr_last_valid_data
                 if display_df is not None:
@@ -5336,40 +5745,37 @@ def main():
                     pcr_display['PE OI (L)'] = (display_df['openInterest_PE'] / 100000).round(2)
                     st.dataframe(pcr_display, use_container_width=True, hide_index=True)
 
-                # Show status and clear button
                 col_info1, col_info2 = st.columns([3, 1])
                 with col_info1:
                     status = "🟢 Live" if pcr_data_available else "🟡 Using cached history"
-                    st.caption(f"{status} | 📈 {len(st.session_state.pcr_history)} data points | History preserved on refresh failures")
+                    st.caption(f"{status} | 📈 {len(st.session_state.pcr_history)} PCR pts · "
+                               f"{len(chgoi_hist)} ChgOI pts · "
+                               f"{len(st.session_state.gex_history)} GEX pts")
                 with col_info2:
                     if st.button("🗑️ Clear History"):
                         st.session_state.pcr_history = []
                         st.session_state.pcr_last_valid_data = None
+                        st.session_state.pcr_chgoi_strike_history = []
+                        st.session_state.gex_history = []
                         st.rerun()
 
             except Exception as e:
-                st.warning(f"Error displaying PCR charts: {str(e)}")
+                st.warning(f"Error displaying comparison charts: {str(e)}")
         else:
-            st.info("📊 PCR history will build up as the app refreshes. Please wait for data collection...")
+            st.info("📊 History will build up as the app refreshes. Please wait for data collection…")
 
         # ===== GEX (GAMMA EXPOSURE) ANALYSIS SECTION =====
         st.markdown("---")
         st.markdown("## 📊 Gamma Exposure (GEX) Analysis - Dealer Hedging Flow")
 
-        gex_data = None
+        gex_data = gex_data_pre  # already computed above; avoids duplicate API/calculation
         try:
-            df_summary = option_data.get('df_summary')
             underlying_price = option_data.get('underlying')
 
-            if df_summary is not None and underlying_price:
-                # Calculate GEX
-                gex_data = calculate_dealer_gex(df_summary, underlying_price)
-
-                if gex_data:
+            if gex_data:
+                # nesting preserved from original structure
+                if True:
                     gex_df = gex_data['gex_df']
-
-                    # Save last valid GEX data
-                    st.session_state.gex_last_valid_data = gex_data
 
                     # ===== GEX Summary Cards =====
                     gex_col1, gex_col2, gex_col3, gex_col4 = st.columns(4)
@@ -5572,197 +5978,8 @@ def main():
                         - **Gamma Flip**: Level where dealers switch from long to short gamma
                         """)
 
-                    # ===== GEX TIME-SERIES PER STRIKE (Like PCR - 5 columns) =====
-                    st.markdown("### 📈 GEX Time Series (ATM ± 2 Strikes)")
-
-                    # Store GEX per strike in history (like PCR)
-                    ist = pytz.timezone('Asia/Kolkata')
-                    current_time = datetime.now(ist)
-
-                    # Build GEX entry with per-strike values
-                    gex_entry = {'time': current_time, 'total_gex': gex_data['total_gex']}
-                    for _, row in gex_df.iterrows():
-                        strike_label = str(int(row['Strike']))
-                        gex_entry[strike_label] = row['Net_GEX']
-
-                    # Store current strikes for display
-                    current_gex_strikes = [int(row['Strike']) for _, row in gex_df.iterrows()]
-                    st.session_state.gex_current_strikes = sorted(current_gex_strikes)
-
-                    # Check if we should add new entry (avoid duplicates within 30 seconds)
-                    should_add_gex = True
-                    if st.session_state.gex_history:
-                        last_gex_entry = st.session_state.gex_history[-1]
-                        time_diff = (current_time - last_gex_entry['time']).total_seconds()
-                        if time_diff < 30:
-                            should_add_gex = False
-
-                    if should_add_gex:
-                        st.session_state.gex_history.append(gex_entry)
-                        # Keep only last 200 entries
-                        if len(st.session_state.gex_history) > 200:
-                            st.session_state.gex_history = st.session_state.gex_history[-200:]
-
-                    # Helper function to create individual GEX chart (like PCR)
-                    def create_gex_chart(history_df, col_name, color, title_prefix):
-                        """Helper to create individual GEX chart per strike"""
-                        if col_name and col_name in history_df.columns:
-                            strike_val = col_name
-
-                            # Get data for this strike
-                            gex_values = history_df[col_name].dropna()
-
-                            # Calculate symmetric y-axis range (0 in middle)
-                            max_abs = 20  # Default
-                            if len(gex_values) > 0:
-                                max_abs = max(abs(gex_values.max()), abs(gex_values.min()), 15)  # Min range of ±15
-                            y_range = [-max_abs * 1.1, max_abs * 1.1]  # Add 10% padding
-
-                            fig = go.Figure()
-
-                            # Split into positive and negative for different colors
-                            fig.add_trace(go.Scatter(
-                                x=history_df['time'],
-                                y=history_df[col_name],
-                                mode='lines+markers',
-                                name=f'₹{strike_val}',
-                                line=dict(color=color, width=2),
-                                marker=dict(size=4),
-                                fill='tozeroy',
-                                fillcolor=f'rgba{tuple(list(int(color.lstrip("#")[i:i+2], 16) for i in (0, 2, 4)) + [0.15])}'
-                            ))
-
-                            # Reference line at zero (critical - in the MIDDLE)
-                            fig.add_hline(y=0, line_dash="solid", line_color="white", line_width=2)
-                            # Positive threshold (pinning zone) - ABOVE zero
-                            fig.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1,
-                                         annotation_text="+10", annotation_position="right")
-                            # Negative threshold (acceleration zone) - BELOW zero
-                            fig.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1,
-                                         annotation_text="-10", annotation_position="right")
-
-                            # Get current GEX value
-                            current_gex = history_df[col_name].iloc[-1] if len(history_df) > 0 else 0
-
-                            fig.update_layout(
-                                title=f"{title_prefix}<br>₹{strike_val}<br>GEX: {current_gex:+.1f}L",
-                                template='plotly_dark',
-                                height=300,
-                                showlegend=False,
-                                margin=dict(l=10, r=10, t=70, b=30),
-                                xaxis=dict(tickformat='%H:%M', title=''),
-                                yaxis=dict(
-                                    title='GEX (L)',
-                                    range=y_range,  # Symmetric range with 0 in middle
-                                    zeroline=True,
-                                    zerolinecolor='white',
-                                    zerolinewidth=2,
-                                    tickmode='array',
-                                    tickvals=[-20, -10, 0, 10, 20] if max_abs <= 25 else None
-                                ),
-                                plot_bgcolor='#1e1e1e',
-                                paper_bgcolor='#1e1e1e'
-                            )
-                            return fig, current_gex
-                        return None, 0
-
-                    # Display GEX charts - show immediately even with 1 data point
+                    # ===== GEX PER-STRIKE TABLE (time-series charts shown in comparison view above) =====
                     try:
-                        # Get current strikes from gex_df
-                        current_strikes = sorted([int(row['Strike']) for _, row in gex_df.iterrows()])
-                        st.session_state.gex_current_strikes = current_strikes
-
-                        # Get current GEX values for immediate display
-                        current_gex_values = {}
-                        for _, row in gex_df.iterrows():
-                            strike = int(row['Strike'])
-                            current_gex_values[strike] = row['Net_GEX']
-
-                        # Create 5 columns for side-by-side display
-                        gex_col1, gex_col2, gex_col3, gex_col4, gex_col5 = st.columns(5)
-
-                        # Helper to display chart with signal
-                        def display_gex_with_signal(container, fig, gex_val):
-                            if fig:
-                                container.plotly_chart(fig, use_container_width=True)
-                                if gex_val > 10:
-                                    container.success("📍 Pin Zone")
-                                elif gex_val < -10:
-                                    container.error("⚡ Accel Zone")
-                                else:
-                                    container.warning("➡️ Neutral")
-
-                        # Display 5 strikes: ITM-2, ITM-1, ATM, OTM+1, OTM+2
-                        position_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
-                        position_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
-                        columns = [gex_col1, gex_col2, gex_col3, gex_col4, gex_col5]
-
-                        # Check if we have history
-                        has_history = len(st.session_state.gex_history) > 0
-                        gex_history_df = pd.DataFrame(st.session_state.gex_history) if has_history else None
-
-                        for i, col in enumerate(columns):
-                            with col:
-                                if i < len(current_strikes):
-                                    strike = current_strikes[i]
-                                    strike_col = str(strike)
-                                    current_gex = current_gex_values.get(strike, 0)
-
-                                    # Check if we have history for this strike
-                                    if has_history and gex_history_df is not None and strike_col in gex_history_df.columns:
-                                        fig, gex_val = create_gex_chart(gex_history_df, strike_col, position_colors[i], f'{position_labels[i]}')
-                                        display_gex_with_signal(st, fig, gex_val)
-                                    else:
-                                        # Show current value as single point chart (immediate display)
-                                        fig = go.Figure()
-
-                                        # Add single point at current time
-                                        now = datetime.now(pytz.timezone('Asia/Kolkata'))
-                                        fig.add_trace(go.Scatter(
-                                            x=[now],
-                                            y=[current_gex],
-                                            mode='markers+text',
-                                            marker=dict(size=20, color=position_colors[i], symbol='diamond'),
-                                            text=[f'{current_gex:+.1f}L'],
-                                            textposition='top center',
-                                            textfont=dict(size=12, color='white'),
-                                            name=f'₹{strike}'
-                                        ))
-
-                                        # Reference lines - symmetric around zero
-                                        max_abs = max(abs(current_gex), 15)
-                                        y_range = [-max_abs * 1.3, max_abs * 1.3]
-
-                                        fig.add_hline(y=0, line_dash="solid", line_color="white", line_width=2)
-                                        fig.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1,
-                                                     annotation_text="+10", annotation_position="right")
-                                        fig.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1,
-                                                     annotation_text="-10", annotation_position="right")
-
-                                        fig.update_layout(
-                                            title=f"{position_labels[i]}<br>₹{strike}<br>GEX: {current_gex:+.1f}L",
-                                            template='plotly_dark',
-                                            height=300,
-                                            showlegend=False,
-                                            margin=dict(l=10, r=10, t=70, b=30),
-                                            xaxis=dict(tickformat='%H:%M', title='', showticklabels=True),
-                                            yaxis=dict(
-                                                title='GEX (L)',
-                                                range=y_range,
-                                                zeroline=True,
-                                                zerolinecolor='white',
-                                                zerolinewidth=2,
-                                                tickmode='array',
-                                                tickvals=[-20, -10, 0, 10, 20] if max_abs <= 25 else None
-                                            ),
-                                            plot_bgcolor='#1e1e1e',
-                                            paper_bgcolor='#1e1e1e'
-                                        )
-
-                                        display_gex_with_signal(st, fig, current_gex)
-                                else:
-                                    st.info(f"{position_labels[i]} N/A")
-
                         # Show current GEX data table
                         st.markdown("### Current GEX Values")
                         gex_display = gex_df[['Strike', 'Zone', 'Call_GEX', 'Put_GEX', 'Net_GEX']].copy()
@@ -5787,16 +6004,8 @@ def main():
                         styled_gex_table = gex_display.style.applymap(style_gex_val, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
                         st.dataframe(styled_gex_table, use_container_width=True, hide_index=True)
 
-                        # Show status and clear button
-                        gex_info1, gex_info2 = st.columns([3, 1])
-                        with gex_info1:
-                            history_status = f"📈 {len(st.session_state.gex_history)} data points" if has_history else "⏳ Building history..."
-                            st.caption(f"🟢 Live | {history_status} | GEX > 10 = Pin Zone | GEX < -10 = Acceleration Zone")
-                        with gex_info2:
-                            if st.button("🗑️ Clear GEX History"):
-                                st.session_state.gex_history = []
-                                st.session_state.gex_last_valid_data = None
-                                st.rerun()
+                        st.caption("GEX > 10 = Pin Zone | GEX < -10 = Acceleration Zone | "
+                                   "Time-series charts shown in comparison view above")
 
                     except Exception as e:
                         st.warning(f"Error displaying GEX charts: {str(e)}")
