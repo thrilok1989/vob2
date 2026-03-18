@@ -5491,6 +5491,104 @@ def main():
         if option_data.get('styled_df') is not None:
             st.dataframe(option_data['styled_df'], use_container_width=True)
 
+        # ── ATM ±3 Strike Data Tabulation ──
+        st.markdown("### 📋 ATM ±3 Strike Data — PCR · Straddle · OI · Vol · GEX · Bias")
+        try:
+            _bs_src = option_data.get('df_summary') if option_data else None
+            if _bs_src is not None:
+                _bs_atm_idx = _bs_src[_bs_src['Zone'] == 'ATM'].index
+                if len(_bs_atm_idx) > 0:
+                    _bs_atm_pos = _bs_src.index.get_loc(_bs_atm_idx[0])
+                    _bs_start   = max(0, _bs_atm_pos - 3)
+                    _bs_end     = min(len(_bs_src), _bs_atm_pos + 4)
+                    _bs         = _bs_src.iloc[_bs_start:_bs_end].copy().reset_index(drop=True)
+
+                    _bs_atm_strike = _bs[_bs['Zone'] == 'ATM']['Strike'].values[0]
+                    _bs_stk_list   = _bs['Strike'].tolist()
+                    _bs_atm_i      = _bs_stk_list.index(_bs_atm_strike)
+                    def _bs_zone(i):
+                        d = i - _bs_atm_i
+                        return '🟡 ATM' if d == 0 else (f'🟣 ITM{d}' if d < 0 else f'🔵 OTM+{d}')
+
+                    _bt = pd.DataFrame()
+                    _bt['Strike']   = _bs['Strike']
+                    _bt['Zone']     = [_bs_zone(i) for i in range(len(_bs))]
+
+                    # CE / PE LTP + Straddle
+                    if 'lastPrice_CE' in _bs.columns:
+                        _bt['CE LTP']   = _bs['lastPrice_CE'].round(2)
+                        _bt['PE LTP']   = _bs['lastPrice_PE'].round(2)
+                        _bt['Straddle'] = (_bs['lastPrice_CE'] + _bs['lastPrice_PE']).round(2)
+
+                    # PCR (OI) + signal
+                    if 'PCR' in _bs.columns:
+                        _bt['PCR OI']   = _bs['PCR']
+                        _bt['OI Sig']   = _bs['PCR'].apply(
+                            lambda v: '🟢 Bull' if v > 1.2 else ('🔴 Bear' if v < 0.7 else '🟡 Ntrl'))
+
+                    # PCR (ΔOI) + signal
+                    if 'changeinOpenInterest_CE' in _bs.columns:
+                        _bce = _bs['changeinOpenInterest_CE'].replace(0, np.nan)
+                        _bt['PCR ΔOI']  = (_bs['changeinOpenInterest_PE'] / _bce).round(3)
+                        _bt['ΔOI Sig']  = _bt['PCR ΔOI'].apply(
+                            lambda v: '🟢 Bull' if (pd.notna(v) and v > 1.2) else (
+                                      '🔴 Bear' if (pd.notna(v) and v < 0.7) else '🟡 Ntrl'))
+
+                    # Vol PCR
+                    if 'totalTradedVolume_CE' in _bs.columns:
+                        _bvol = _bs['totalTradedVolume_CE'].replace(0, np.nan)
+                        _bt['Vol PCR']  = (_bs['totalTradedVolume_PE'] / _bvol).round(3)
+
+                    # OI (Lakhs)
+                    if 'openInterest_CE' in _bs.columns:
+                        _bt['CE OI(L)'] = (_bs['openInterest_CE'] / 100000).round(2)
+                        _bt['PE OI(L)'] = (_bs['openInterest_PE'] / 100000).round(2)
+
+                    # ΔOI
+                    if 'changeinOpenInterest_CE' in _bs.columns:
+                        _bt['CE ΔOI']   = _bs['changeinOpenInterest_CE'].fillna(0).astype(int)
+                        _bt['PE ΔOI']   = _bs['changeinOpenInterest_PE'].fillna(0).astype(int)
+
+                    # IV
+                    if 'impliedVolatility_CE' in _bs.columns:
+                        _bt['IV CE']    = _bs['impliedVolatility_CE'].round(2)
+                        _bt['IV PE']    = _bs['impliedVolatility_PE'].round(2)
+
+                    # GEX Net (Lakhs)
+                    if 'GammaExp_Net' in _bs.columns:
+                        _bt['GEX(L)']   = (_bs['GammaExp_Net'] / 100000).round(2)
+
+                    # BiasScore + Verdict
+                    if 'BiasScore' in _bs.columns:
+                        _bt['Bias%']    = _bs['BiasScore'].round(1)
+                    if 'Verdict' in _bs.columns:
+                        _bt['Verdict']  = _bs['Verdict']
+
+                    # Row styling
+                    def _bt_style(row):
+                        if row['Zone'] == '🟡 ATM':
+                            return ['background-color: rgba(255,200,0,0.18)'] * len(row)
+                        pcr = row.get('PCR OI', 1.0)
+                        if pd.notna(pcr) and pcr > 1.2:
+                            return ['background-color: rgba(0,255,136,0.07)'] * len(row)
+                        if pd.notna(pcr) and pcr < 0.7:
+                            return ['background-color: rgba(255,68,68,0.07)'] * len(row)
+                        return [''] * len(row)
+
+                    st.dataframe(
+                        _bt.style.apply(_bt_style, axis=1),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(f"📍 ATM ₹{_bs_atm_strike} · ATM±3 ({len(_bt)} strikes) · "
+                               f"🟡 ATM highlighted · 🟢 PCR>1.2 Bull · 🔴 PCR<0.7 Bear")
+                else:
+                    st.info("ATM strike not found.")
+            else:
+                st.info("Option data not available.")
+        except Exception as _bs_exc:
+            st.warning(f"ATM ±5 table error: {str(_bs_exc)[:120]}")
+
         # ===== HTF SUPPORT & RESISTANCE TABLES (SPLIT) =====
         st.markdown("---")
         st.markdown("## 📈 HTF Support & Resistance Levels")
@@ -5915,6 +6013,105 @@ def main():
                 st.warning(f"Error displaying comparison charts: {str(e)}")
         else:
             st.info("📊 History will build up as the app refreshes. Please wait for data collection…")
+
+        # ===== ATM ±3 STRIKE DATA TABLE =====
+        st.markdown("---")
+        st.markdown("## 📋 ATM ±3 Strike Data — Full Tabulation (7 Strikes)")
+        try:
+            _t5_src = option_data.get('df_summary') if option_data else None
+            if _t5_src is not None:
+                _t5_atm_idx = _t5_src[_t5_src['Zone'] == 'ATM'].index
+                if len(_t5_atm_idx) > 0:
+                    _t5_atm_pos = _t5_src.index.get_loc(_t5_atm_idx[0])
+                    _t5_start   = max(0, _t5_atm_pos - 3)
+                    _t5_end     = min(len(_t5_src), _t5_atm_pos + 4)
+                    _t5         = _t5_src.iloc[_t5_start:_t5_end].copy().reset_index(drop=True)
+
+                    # Zone labels: ITM-5 … ATM … OTM+5
+                    _t5_atm_strike  = _t5[_t5['Zone'] == 'ATM']['Strike'].values[0]
+                    _t5_stk_list    = _t5['Strike'].tolist()
+                    _t5_atm_i       = _t5_stk_list.index(_t5_atm_strike)
+                    def _t5_zone(i):
+                        d = i - _t5_atm_i
+                        return '🟡 ATM' if d == 0 else (f'🟣 ITM{d}' if d < 0 else f'🔵 OTM+{d}')
+                    _t5_tbl = pd.DataFrame()
+                    _t5_tbl['Strike']   = _t5['Strike']
+                    _t5_tbl['Zone']     = [_t5_zone(i) for i in range(len(_t5))]
+
+                    # LTP + Straddle
+                    if 'lastPrice_CE' in _t5.columns:
+                        _t5_tbl['CE LTP']   = _t5['lastPrice_CE'].round(2)
+                        _t5_tbl['PE LTP']   = _t5['lastPrice_PE'].round(2)
+                        _t5_tbl['Straddle'] = (_t5['lastPrice_CE'] + _t5['lastPrice_PE']).round(2)
+
+                    # PCR (OI)
+                    if 'PCR' in _t5.columns:
+                        _t5_tbl['PCR OI']   = _t5['PCR']
+                        _t5_tbl['OI Sig']   = _t5['PCR'].apply(
+                            lambda v: '🟢 Bull' if v > 1.2 else ('🔴 Bear' if v < 0.7 else '🟡 Ntrl'))
+
+                    # PCR (ChgOI)
+                    if 'changeinOpenInterest_CE' in _t5.columns:
+                        _ce_chg = _t5['changeinOpenInterest_CE'].replace(0, np.nan)
+                        _t5_tbl['PCR ΔOI']  = (_t5['changeinOpenInterest_PE'] / _ce_chg).round(3)
+                        _t5_tbl['ΔOI Sig']  = _t5_tbl['PCR ΔOI'].apply(
+                            lambda v: '🟢 Bull' if (pd.notna(v) and v > 1.2) else (
+                                      '🔴 Bear' if (pd.notna(v) and v < 0.7) else '🟡 Ntrl'))
+
+                    # Vol PCR
+                    if 'totalTradedVolume_CE' in _t5.columns:
+                        _ce_vol = _t5['totalTradedVolume_CE'].replace(0, np.nan)
+                        _t5_tbl['Vol PCR']  = (_t5['totalTradedVolume_PE'] / _ce_vol).round(3)
+
+                    # OI in Lakhs
+                    if 'openInterest_CE' in _t5.columns:
+                        _t5_tbl['CE OI(L)'] = (_t5['openInterest_CE'] / 100000).round(2)
+                        _t5_tbl['PE OI(L)'] = (_t5['openInterest_PE'] / 100000).round(2)
+
+                    # Change in OI
+                    if 'changeinOpenInterest_CE' in _t5.columns:
+                        _t5_tbl['CE ΔOI']   = _t5['changeinOpenInterest_CE'].fillna(0).astype(int)
+                        _t5_tbl['PE ΔOI']   = _t5['changeinOpenInterest_PE'].fillna(0).astype(int)
+
+                    # IV
+                    if 'impliedVolatility_CE' in _t5.columns:
+                        _t5_tbl['IV CE']    = _t5['impliedVolatility_CE'].round(2)
+                        _t5_tbl['IV PE']    = _t5['impliedVolatility_PE'].round(2)
+
+                    # GEX Net (Lakhs)
+                    if 'GammaExp_Net' in _t5.columns:
+                        _t5_tbl['GEX(L)']   = (_t5['GammaExp_Net'] / 100000).round(2)
+
+                    # Bias + Verdict
+                    if 'BiasScore' in _t5.columns:
+                        _t5_tbl['Bias%']    = _t5['BiasScore'].round(1)
+                    if 'Verdict' in _t5.columns:
+                        _t5_tbl['Verdict']  = _t5['Verdict']
+
+                    # Row styling: ATM = amber, Bull rows = faint green, Bear = faint red
+                    def _t5_style(row):
+                        if row['Zone'] == '🟡 ATM':
+                            return ['background-color: rgba(255,200,0,0.18)'] * len(row)
+                        pcr = row.get('PCR OI', 1.0)
+                        if pd.notna(pcr) and pcr > 1.2:
+                            return ['background-color: rgba(0,255,136,0.07)'] * len(row)
+                        if pd.notna(pcr) and pcr < 0.7:
+                            return ['background-color: rgba(255,68,68,0.07)'] * len(row)
+                        return [''] * len(row)
+
+                    st.dataframe(
+                        _t5_tbl.style.apply(_t5_style, axis=1),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(f"📍 ATM ₹{_t5_atm_strike} · ATM±3 ({len(_t5_tbl)} strikes) · "
+                               f"{'🟢 Live' if option_data else '🟡 Cached'}")
+                else:
+                    st.info("ATM strike not identified in current data.")
+            else:
+                st.info("Option data not available yet — wait for first refresh.")
+        except Exception as _t5_exc:
+            st.warning(f"ATM ±5 table error: {str(_t5_exc)[:120]}")
 
         # ===== VOLUME PCR + STRADDLE + COMBINED SIGNAL (ATM ± 2) =====
         st.markdown("---")
