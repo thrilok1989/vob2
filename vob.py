@@ -302,7 +302,7 @@ class SupabaseDB:
                 return prefs
             else:
                 return {
-                    'timeframe': '1',
+                    'timeframe': '5',
                     'auto_refresh': True,
                     'days_back': 1,
                     'pivot_proximity': 5,
@@ -314,7 +314,7 @@ class SupabaseDB:
         except Exception as e:
             st.error(f"Error retrieving preferences: {str(e)}")
             return {
-                'timeframe': '1',
+                'timeframe': '5',
                 'auto_refresh': True,
                 'days_back': 1,
                 'pivot_proximity': 5,
@@ -2958,7 +2958,82 @@ def process_candle_data(data, interval):
     
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None):
+def _detect_chart_candle_types(df):
+    """Detect basic candle patterns for each row in df. Returns list of dicts with time, pattern, direction, price."""
+    if df.empty or len(df) < 2:
+        return []
+    patterns = []
+    avg_body = (df['close'] - df['open']).abs().mean()
+    avg_range = (df['high'] - df['low']).mean()
+    if avg_body == 0 or avg_range == 0:
+        return []
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        prev = df.iloc[i - 1]
+        o, h, l, c = row['open'], row['high'], row['low'], row['close']
+        po, ph, pl, pc = prev['open'], prev['high'], prev['low'], prev['close']
+        body = abs(c - o)
+        candle_range = h - l if h != l else 0.001
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        is_bull = c > o
+        is_bear = c < o
+        ts = row['datetime']
+        price = c
+
+        detected = None
+        direction = None
+
+        # Doji
+        if body < avg_range * 0.08:
+            detected = 'Doji'
+            direction = 'NEUTRAL'
+        # Hammer (bullish reversal)
+        elif lower_wick > body * 2 and upper_wick < body * 0.5 and is_bull:
+            detected = 'Hammer'
+            direction = 'BUY'
+        # Inverted Hammer / Shooting Star
+        elif upper_wick > body * 2 and lower_wick < body * 0.5 and is_bear:
+            detected = 'Shooting Star'
+            direction = 'SELL'
+        # Bullish Engulfing
+        elif (pc < po and is_bull and c > po and o < pc and body > avg_body * 1.2):
+            detected = 'Bull Engulfing'
+            direction = 'BUY'
+        # Bearish Engulfing
+        elif (pc > po and is_bear and c < po and o > pc and body > avg_body * 1.2):
+            detected = 'Bear Engulfing'
+            direction = 'SELL'
+        # Strong Bullish (Marubozu-like)
+        elif is_bull and body > avg_body * 1.8 and upper_wick < body * 0.15 and lower_wick < body * 0.15:
+            detected = 'Marubozu ↑'
+            direction = 'BUY'
+        # Strong Bearish (Marubozu-like)
+        elif is_bear and body > avg_body * 1.8 and upper_wick < body * 0.15 and lower_wick < body * 0.15:
+            detected = 'Marubozu ↓'
+            direction = 'SELL'
+        # Long Upper Wick Rejection (bearish)
+        elif upper_wick > candle_range * 0.60 and upper_wick > body * 1.5:
+            detected = 'Upper Wick Rej'
+            direction = 'SELL'
+        # Long Lower Wick Rejection (bullish)
+        elif lower_wick > candle_range * 0.60 and lower_wick > body * 1.5:
+            detected = 'Lower Wick Rej'
+            direction = 'BUY'
+
+        if detected:
+            patterns.append({
+                'time': ts,
+                'pattern': detected,
+                'direction': direction,
+                'price': price,
+                'high': h,
+                'low': l,
+            })
+    return patterns
+
+
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None, candle_patterns=None):
     """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, RSI Suppression Zones, and Ultimate RSI"""
     if df.empty:
         return go.Figure()
@@ -3481,6 +3556,62 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
                                  type='date', row=3, col=1)
         except Exception:
             pass  # Ultimate RSI drawing failed, skip it
+
+    # ── Candle Pattern Markers ────────────────────────────────────────────
+    if candle_patterns:
+        try:
+            _buy_x, _buy_y, _buy_txt = [], [], []
+            _sell_x, _sell_y, _sell_txt = [], [], []
+            _neutral_x, _neutral_y, _neutral_txt = [], [], []
+            _offset = (df['high'].max() - df['low'].min()) * 0.005
+
+            for _cp in candle_patterns:
+                _t = _cp['time']
+                _lbl = _cp['pattern']
+                if _cp['direction'] == 'BUY':
+                    _buy_x.append(_t)
+                    _buy_y.append(_cp['low'] - _offset)
+                    _buy_txt.append(_lbl)
+                elif _cp['direction'] == 'SELL':
+                    _sell_x.append(_t)
+                    _sell_y.append(_cp['high'] + _offset)
+                    _sell_txt.append(_lbl)
+                else:
+                    _neutral_x.append(_t)
+                    _neutral_y.append(_cp['high'] + _offset)
+                    _neutral_txt.append(_lbl)
+
+            if _buy_x:
+                fig.add_trace(go.Scatter(
+                    x=_buy_x, y=_buy_y, mode='markers+text',
+                    marker=dict(symbol='triangle-up', size=12, color='#00ff88'),
+                    text=_buy_txt, textposition='bottom center',
+                    textfont=dict(color='#00ff88', size=9),
+                    name='Bullish Pattern', hovertemplate='%{text}<br>%{x}<extra></extra>',
+                    showlegend=True
+                ), row=1, col=1)
+
+            if _sell_x:
+                fig.add_trace(go.Scatter(
+                    x=_sell_x, y=_sell_y, mode='markers+text',
+                    marker=dict(symbol='triangle-down', size=12, color='#ff4444'),
+                    text=_sell_txt, textposition='top center',
+                    textfont=dict(color='#ff4444', size=9),
+                    name='Bearish Pattern', hovertemplate='%{text}<br>%{x}<extra></extra>',
+                    showlegend=True
+                ), row=1, col=1)
+
+            if _neutral_x:
+                fig.add_trace(go.Scatter(
+                    x=_neutral_x, y=_neutral_y, mode='markers+text',
+                    marker=dict(symbol='diamond', size=9, color='#FFD700'),
+                    text=_neutral_txt, textposition='top center',
+                    textfont=dict(color='#FFD700', size=9),
+                    name='Neutral Pattern', hovertemplate='%{text}<br>%{x}<extra></extra>',
+                    showlegend=True
+                ), row=1, col=1)
+        except Exception:
+            pass  # Candle pattern markers failed, skip
 
     fig.update_layout(
         title=title,
@@ -5741,7 +5872,7 @@ def main():
         "15 min": "15"
     }
     
-    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "1 min")
+    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "5 min")
     selected_timeframe = st.sidebar.selectbox(
         "Select Timeframe",
         list(timeframes.keys()),
@@ -5988,9 +6119,24 @@ def main():
 
         # Create and display chart
         if not df.empty:
+            # ── Filter to today's date only ───────────────────────────────
+            _ist_tz = pytz.timezone('Asia/Kolkata')
+            _today_date = datetime.now(_ist_tz).date()
+            _df_today = df.copy()
+            if hasattr(_df_today['datetime'].iloc[0], 'date'):
+                _df_today = _df_today[_df_today['datetime'].apply(
+                    lambda x: x.date() if hasattr(x, 'date') else x
+                ) == _today_date]
+            if _df_today.empty:
+                _df_today = df  # fallback to all data if today has none yet
+            _df_today = _df_today.reset_index(drop=True)
+
+            # ── Detect candle patterns for chart markers ──────────────────
+            _chart_candle_markers = _detect_chart_candle_types(_df_today)
+
             fig = create_candlestick_chart(
-                df,
-                f"Nifty 50 - {selected_timeframe} Chart {'with Pivot Levels' if show_pivots else ''}",
+                _df_today,
+                f"Nifty 50 - {selected_timeframe} Chart (Today) {'with Pivot Levels' if show_pivots else ''}",
                 interval,
                 show_pivots=show_pivots,
                 pivot_settings=pivot_settings,
@@ -5998,7 +6144,8 @@ def main():
                 poc_data=poc_data_for_chart,
                 swing_data=swing_data_for_chart,
                 rsi_sz_data=rsi_sz_data_for_chart,
-                ultimate_rsi_data=ultimate_rsi_data_for_chart
+                ultimate_rsi_data=ultimate_rsi_data_for_chart,
+                candle_patterns=_chart_candle_markers
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -6030,6 +6177,25 @@ def main():
                 *R = Resistance (Price ceiling), S = Support (Price floor)*
                 *VOB zones show volume-backed order flow areas with % distribution*
                 """)
+
+            # ── Candle Types Table (Today) ────────────────────────────────
+            if _chart_candle_markers:
+                st.markdown("### 🕯️ Candle Patterns Detected Today")
+                _ctype_rows = []
+                for _cp in reversed(_chart_candle_markers):
+                    _ts = _cp['time']
+                    _time_str = _ts.strftime('%H:%M') if hasattr(_ts, 'strftime') else str(_ts)
+                    _dir = _cp['direction']
+                    _dir_lbl = '🟢 BUY' if _dir == 'BUY' else ('🔴 SELL' if _dir == 'SELL' else '🟡 NEUTRAL')
+                    _ctype_rows.append({
+                        'Time': _time_str,
+                        'Pattern': _cp['pattern'],
+                        'Signal': _dir_lbl,
+                        'Price (₹)': f"{_cp['price']:.1f}",
+                        'High (₹)': f"{_cp['high']:.1f}",
+                        'Low (₹)': f"{_cp['low']:.1f}",
+                    })
+                st.dataframe(pd.DataFrame(_ctype_rows), use_container_width=True, hide_index=True)
 
             # Reversal Detector Analysis
             st.markdown("---")
