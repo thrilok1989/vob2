@@ -27,7 +27,12 @@ st.set_page_config(
 )
 
 # Auto-refresh every 80 seconds - MOVE THIS RIGHT AFTER PAGE CONFIG
-st_autorefresh(interval=30000, key="datarefresh")
+# ── Auto-refresh only during market hours (08:30–16:00 IST, Mon–Fri) ────────
+_ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+_mkt_open  = _ist_now.replace(hour=8,  minute=30, second=0, microsecond=0)
+_mkt_close = _ist_now.replace(hour=16, minute=0,  second=0, microsecond=0)
+if _ist_now.weekday() < 5 and _mkt_open <= _ist_now <= _mkt_close:
+    st_autorefresh(interval=30000, key="datarefresh")
 
 # Custom CSS for TradingView-like appearance + ATM highlighting
 st.markdown("""
@@ -50,6 +55,22 @@ st.markdown("""
     }
     .price-down {
         color: #ff4444;
+    }
+    /* ── Prevent page dimming / dark overlay on auto-refresh ── */
+    [data-testid="stApp"] {
+        opacity: 1 !important;
+        transition: none !important;
+    }
+    /* Hide the thin loading bar at the top */
+    [data-testid="stDecoration"] {
+        display: none !important;
+    }
+    /* Keep all content fully visible during reload */
+    .main .block-container {
+        opacity: 1 !important;
+    }
+    div[data-stale="true"] {
+        opacity: 1 !important;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -6161,7 +6182,7 @@ def main():
         if not df.empty:
             display_metrics(ltp_data, df, db)
 
-        # Calculate Volume Order Blocks (VOB) early for chart display
+        # Calculate Volume Order Blocks (VOB) from full df (HTF context)
         vob_blocks_for_chart = None
         if not df.empty and len(df) > 30:
             try:
@@ -6169,42 +6190,6 @@ def main():
                 _, vob_blocks_for_chart = vob_detector.get_sr_levels(df)
             except Exception:
                 vob_blocks_for_chart = None
-
-        # Calculate Triple POC for chart display
-        poc_data_for_chart = None
-        if not df.empty and len(df) > 100:
-            try:
-                poc_calculator = TriplePOC(period1=10, period2=25, period3=70)
-                poc_data_for_chart = poc_calculator.calculate_all_pocs(df)
-            except Exception:
-                poc_data_for_chart = None
-
-        # Calculate Future Swing for chart display
-        swing_data_for_chart = None
-        if not df.empty and len(df) > 50:
-            try:
-                swing_calculator = FutureSwing(swing_length=30, history_samples=5, calc_type='Average')
-                swing_data_for_chart = swing_calculator.analyze(df)
-            except Exception:
-                swing_data_for_chart = None
-
-        # Calculate RSI Volatility Suppression Zones for chart display
-        rsi_sz_data_for_chart = None
-        if not df.empty and len(df) > 30:
-            try:
-                rsi_sz_calculator = RSIVolatilitySuppression(rsi_length=14, vol_length=5)
-                rsi_sz_data_for_chart = rsi_sz_calculator.analyze(df)
-            except Exception:
-                rsi_sz_data_for_chart = None
-
-        # Calculate Ultimate RSI for chart display
-        ultimate_rsi_data_for_chart = None
-        if not df.empty and len(df) > 20:
-            try:
-                ursi_calculator = UltimateRSI(length=7, smo_type='RMA', signal_length=14, signal_type='EMA', ob_value=70, os_value=40)
-                ultimate_rsi_data_for_chart = ursi_calculator.calculate(df)
-            except Exception:
-                ultimate_rsi_data_for_chart = None
 
         # Create and display chart
         if not df.empty:
@@ -6221,13 +6206,49 @@ def main():
 
             # ── Filter df to the target date ──────────────────────────────
             _df_today = df.copy()
-            if hasattr(_df_today['datetime'].iloc[0], 'date'):
-                _df_today = _df_today[_df_today['datetime'].apply(
+            try:
+                _df_today = df[pd.to_datetime(df['datetime']).dt.tz_convert('Asia/Kolkata').dt.date == _target_date].copy()
+            except Exception:
+                _df_today = df[df['datetime'].apply(
                     lambda x: x.date() if hasattr(x, 'date') else x
-                ) == _target_date]
+                ) == _target_date].copy()
             if _df_today.empty:
-                _df_today = df  # fallback
+                _df_today = df.copy()  # fallback
             _df_today = _df_today.reset_index(drop=True)
+
+            # ── Compute time-series indicators on the display df ──────────
+            # Must run AFTER filtering so indices align with _df_today
+            poc_data_for_chart = None
+            if len(_df_today) > 30:
+                try:
+                    poc_calculator = TriplePOC(period1=10, period2=25, period3=70)
+                    poc_data_for_chart = poc_calculator.calculate_all_pocs(_df_today)
+                except Exception:
+                    poc_data_for_chart = None
+
+            swing_data_for_chart = None
+            if len(_df_today) > 30:
+                try:
+                    swing_calculator = FutureSwing(swing_length=30, history_samples=5, calc_type='Average')
+                    swing_data_for_chart = swing_calculator.analyze(_df_today)
+                except Exception:
+                    swing_data_for_chart = None
+
+            rsi_sz_data_for_chart = None
+            if len(_df_today) > 20:
+                try:
+                    rsi_sz_calculator = RSIVolatilitySuppression(rsi_length=14, vol_length=5)
+                    rsi_sz_data_for_chart = rsi_sz_calculator.analyze(_df_today)
+                except Exception:
+                    rsi_sz_data_for_chart = None
+
+            ultimate_rsi_data_for_chart = None
+            if len(_df_today) > 14:
+                try:
+                    ursi_calculator = UltimateRSI(length=7, smo_type='RMA', signal_length=14, signal_type='EMA', ob_value=70, os_value=40)
+                    ultimate_rsi_data_for_chart = ursi_calculator.calculate(_df_today)
+                except Exception:
+                    ultimate_rsi_data_for_chart = None
 
             # ── Detect candle patterns for chart markers ──────────────────
             _chart_candle_markers = _detect_chart_candle_types(_df_today)
