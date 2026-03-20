@@ -456,7 +456,36 @@ class DhanAPI:
         except Exception as e:
             st.error(f"Error fetching data: {str(e)}")
             return None
-    
+
+    def get_intraday_data_range(self, security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval="1", from_date=None, to_date=None):
+        """Get intraday historical data for an explicit date range (used for backtesting)."""
+        url = f"{self.base_url}/charts/intraday"
+        ist = pytz.timezone('Asia/Kolkata')
+        if to_date is None:
+            to_date = datetime.now(ist)
+        if from_date is None:
+            from_date = to_date - timedelta(days=1)
+        _fmt = lambda d: d.strftime("%Y-%m-%d %H:%M:%S") if hasattr(d, 'strftime') else str(d)
+        payload = {
+            "securityId": security_id,
+            "exchangeSegment": exchange_segment,
+            "instrument": instrument,
+            "interval": interval,
+            "oi": False,
+            "fromDate": _fmt(from_date),
+            "toDate": _fmt(to_date),
+        }
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                st.error(f"API Error: {response.status_code} - {response.text}")
+                return None
+        except Exception as e:
+            st.error(f"Error fetching data: {str(e)}")
+            return None
+
     def get_ltp_data(self, security_id="13", exchange_segment="IDX_I"):
         """Get Last Traded Price"""
         url = f"{self.base_url}/marketfeed/ltp"
@@ -5965,9 +5994,41 @@ def main():
     
     # Days back for data
     days_back = st.sidebar.slider("Days of Historical Data", 1, 5, user_prefs['days_back'])
-    
+
     # Data source preference
     use_cache = st.sidebar.checkbox("Use Cached Data", value=True, help="Use database cache for faster loading")
+
+    # ── Backtesting Section ────────────────────────────────────────────────
+    st.sidebar.header("🔍 Backtesting")
+    backtest_mode = st.sidebar.checkbox(
+        "Enable Backtest Mode", value=False,
+        help="Select any past trading day (up to 50 days back) to replay the chart with HTF S/R, VOB, and candle patterns"
+    )
+    backtest_date = None
+    if backtest_mode:
+        _min_bt = (datetime.now() - timedelta(days=50)).date()
+        _max_bt = (datetime.now() - timedelta(days=1)).date()
+        backtest_date = st.sidebar.date_input(
+            "Select Backtest Date",
+            value=_max_bt,
+            min_value=_min_bt,
+            max_value=_max_bt,
+            help="Pick any past trading day up to 50 days back"
+        )
+        if backtest_date.weekday() >= 5:
+            st.sidebar.warning(f"⚠️ {backtest_date.strftime('%A %d %b %Y')} is a weekend — markets are closed. Please pick a weekday.")
+            backtest_date = None
+        else:
+            st.sidebar.success(f"📅 Backtesting: {backtest_date.strftime('%d %b %Y (%A)')}")
+            st.sidebar.info(
+                "Chart will show:\n"
+                "• 5-min candles for selected date\n"
+                "• 🟢 HTF Support Levels\n"
+                "• 🔴 HTF Resistance Levels\n"
+                "• 🟩 VOB Bullish zones\n"
+                "• 🟪 VOB Bearish zones\n"
+                "• 🕯️ Candle Patterns"
+            )
     
     # Database management
     st.sidebar.header("🗑️ Database Management")
@@ -6027,24 +6088,47 @@ def main():
 
     with col1:
         st.header("📈 Trading Chart")
-        
+
+        # ── Backtest banner ────────────────────────────────────────────────
+        if backtest_mode and backtest_date:
+            st.info(
+                f"🔍 **Backtest Mode** — Viewing **{backtest_date.strftime('%d %b %Y (%A)')}**  \n"
+                "HTF Support/Resistance & VOB are computed from the 30 days of data preceding the selected date."
+            )
+
         # Data fetching strategy
         df = pd.DataFrame()
         current_price = None
-        
-        if use_cache:
+
+        if backtest_mode and backtest_date:
+            # ── Backtesting: fetch 30 days of context before selected date ──
+            _bt_ist = pytz.timezone('Asia/Kolkata')
+            _bt_to = datetime.combine(backtest_date + timedelta(days=1), datetime.min.time()).replace(tzinfo=_bt_ist)
+            _bt_from = datetime.combine(backtest_date - timedelta(days=30), datetime.min.time()).replace(tzinfo=_bt_ist)
+            with st.spinner(f"Fetching historical data for {backtest_date.strftime('%d %b %Y')}..."):
+                _bt_raw = api.get_intraday_data_range(
+                    security_id="13",
+                    exchange_segment="IDX_I",
+                    instrument="INDEX",
+                    interval=interval,
+                    from_date=_bt_from,
+                    to_date=_bt_to,
+                )
+                if _bt_raw:
+                    df = process_candle_data(_bt_raw, interval)
+        elif use_cache:
             df = db.get_candle_data("NIFTY50", "IDX_I", interval, hours_back=days_back*24)
-            
+
             if df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_convert(pytz.UTC)).total_seconds() > 300:
                 with st.spinner("Fetching latest data from API..."):
                     data = api.get_intraday_data(
                         security_id="13",
-                        exchange_segment="IDX_I", 
+                        exchange_segment="IDX_I",
                         instrument="INDEX",
                         interval=interval,
                         days_back=days_back
                     )
-                    
+
                     if data:
                         df = process_candle_data(data, interval)
                         db.save_candle_data("NIFTY50", "IDX_I", interval, df)
@@ -6124,16 +6208,25 @@ def main():
 
         # Create and display chart
         if not df.empty:
-            # ── Filter to today's date only ───────────────────────────────
+            # ── Determine the target date (today or backtest date) ────────
             _ist_tz = pytz.timezone('Asia/Kolkata')
-            _today_date = datetime.now(_ist_tz).date()
+            if backtest_mode and backtest_date:
+                _target_date = backtest_date
+                _date_label = backtest_date.strftime('%d %b %Y')
+                _chart_label = f"Backtesting: {_date_label}"
+            else:
+                _target_date = datetime.now(_ist_tz).date()
+                _date_label = 'Today'
+                _chart_label = 'Today'
+
+            # ── Filter df to the target date ──────────────────────────────
             _df_today = df.copy()
             if hasattr(_df_today['datetime'].iloc[0], 'date'):
                 _df_today = _df_today[_df_today['datetime'].apply(
                     lambda x: x.date() if hasattr(x, 'date') else x
-                ) == _today_date]
+                ) == _target_date]
             if _df_today.empty:
-                _df_today = df  # fallback to all data if today has none yet
+                _df_today = df  # fallback
             _df_today = _df_today.reset_index(drop=True)
 
             # ── Detect candle patterns for chart markers ──────────────────
@@ -6141,7 +6234,7 @@ def main():
 
             fig = create_candlestick_chart(
                 _df_today,
-                f"Nifty 50 - {selected_timeframe} Chart (Today) {'with Pivot Levels' if show_pivots else ''}",
+                f"Nifty 50 - {selected_timeframe} Chart ({_chart_label}) {'with Pivot Levels' if show_pivots else ''}",
                 interval,
                 show_pivots=show_pivots,
                 pivot_settings=pivot_settings,
@@ -6183,9 +6276,9 @@ def main():
                 *VOB zones show volume-backed order flow areas with % distribution*
                 """)
 
-            # ── Candle Types Table (Today) ────────────────────────────────
+            # ── Candle Types Table ────────────────────────────────────────
             if _chart_candle_markers:
-                st.markdown("### 🕯️ Candle Patterns Detected Today")
+                st.markdown(f"### 🕯️ Candle Patterns Detected — {_date_label}")
                 _ctype_rows = []
                 for _cp in reversed(_chart_candle_markers):
                     _ts = _cp['time']
@@ -6201,6 +6294,58 @@ def main():
                         'Low (₹)': f"{_cp['low']:.1f}",
                     })
                 st.dataframe(pd.DataFrame(_ctype_rows), use_container_width=True, hide_index=True)
+
+            # ── HTF Support & Resistance + VOB Summary ────────────────────
+            st.markdown("---")
+            _sr_label = f"HTF Support & Resistance Levels — {_date_label}" if (backtest_mode and backtest_date) else "HTF Support & Resistance Levels"
+            st.markdown(f"## 📊 {_sr_label}")
+
+            _htf_pivots_raw = []
+            if show_pivots and len(df) > 50:
+                try:
+                    _htf_df_json = df.to_json()
+                    _htf_pivots_raw = cached_pivot_calculation(_htf_df_json, pivot_settings or {})
+                except Exception:
+                    _htf_pivots_raw = []
+
+            _htf_supports = sorted([p['value'] for p in _htf_pivots_raw if p['type'] == 'low'], reverse=True)
+            _htf_resistances = sorted([p['value'] for p in _htf_pivots_raw if p['type'] == 'high'])
+
+            _vob_supports = []
+            _vob_resistances = []
+            if len(df) > 30:
+                try:
+                    _vob_det = VolumeOrderBlocks(sensitivity=5)
+                    _vob_sr, _ = _vob_det.get_sr_levels(df)
+                    _vob_supports = sorted([v for v in _vob_sr.get('support', [])], reverse=True)
+                    _vob_resistances = sorted([v for v in _vob_sr.get('resistance', [])])
+                except Exception:
+                    pass
+
+            _col_sup, _col_res = st.columns(2)
+            with _col_sup:
+                st.markdown("### 🟢 Support Levels")
+                _sup_rows = []
+                for _v in _htf_supports[:10]:
+                    _sup_rows.append({'Type': 'HTF Pivot', 'Level (₹)': f"{_v:.1f}"})
+                for _v in _vob_supports[:5]:
+                    _sup_rows.append({'Type': 'VOB↑', 'Level (₹)': f"{_v:.1f}"})
+                if _sup_rows:
+                    st.dataframe(pd.DataFrame(_sup_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.info("No support levels detected")
+
+            with _col_res:
+                st.markdown("### 🔴 Resistance Levels")
+                _res_rows = []
+                for _v in _htf_resistances[:10]:
+                    _res_rows.append({'Type': 'HTF Pivot', 'Level (₹)': f"{_v:.1f}"})
+                for _v in _vob_resistances[:5]:
+                    _res_rows.append({'Type': 'VOB↓', 'Level (₹)': f"{_v:.1f}"})
+                if _res_rows:
+                    st.dataframe(pd.DataFrame(_res_rows), use_container_width=True, hide_index=True)
+                else:
+                    st.info("No resistance levels detected")
 
             # Reversal Detector Analysis
             st.markdown("---")
