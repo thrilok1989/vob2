@@ -6898,10 +6898,12 @@ def main():
                         _sent_alert_msg = None
                         if _prev_sent < 70 <= _sentiment_score:
                             _sent_alert_msg = (f"🚀 <b>BULLISH FLOW INCREASING</b>\n"
+                                               f"Spot: ₹{_pro_spot:.0f}\n"
                                                f"Sentiment Score: {_sentiment_score}/100\n"
                                                f"Breakout probability high")
                         elif _prev_sent > 30 >= _sentiment_score:
                             _sent_alert_msg = (f"🔥 <b>BEARISH FLOW INCREASING</b>\n"
+                                               f"Spot: ₹{_pro_spot:.0f}\n"
                                                f"Sentiment Score: {_sentiment_score}/100\n"
                                                f"Breakdown probability high")
                         if _sent_alert_msg:
@@ -7685,6 +7687,7 @@ def main():
                         if _itm_ok:
                             send_telegram_message_sync(
                                 f"<b>🗺️ INSTITUTIONAL TRADE SETUP</b>\n"
+                                f"Spot: ₹{_itm_spot:.0f}\n"
                                 f"Direction: {_itm_dir_lbl}\n"
                                 f"Entry: {_itm_entry:.0f} | Target: {_itm_target:.0f} | SL: {_itm_sl:.0f}\n"
                                 f"Support: {_true_support:.0f} | Resistance: {_true_resist:.0f}\n"
@@ -8150,7 +8153,7 @@ def main():
                         _tg_fig.update_yaxes(title_text='PCR', tickfont=dict(size=8))
                         _img_bytes = _tg_fig.to_image(format="png", scale=2)
                         # Build caption with current PCR values
-                        _caption_parts = [f"<b>ATM ±2 PCR · ChgOI PCR</b>  {_now.strftime('%H:%M')}"]
+                        _caption_parts = [f"<b>ATM ±2 PCR · ChgOI PCR</b>  {_now.strftime('%H:%M')}  Spot: ₹{underlying_price:.0f}"]
                         for _i, _strike in enumerate(current_strikes):
                             _sc = str(_strike)
                             _pcr_v = history_df[_sc].iloc[-1] if _sc in history_df.columns and len(history_df) > 0 else None
@@ -10854,6 +10857,7 @@ def main():
                 if _spike['spike_score'] >= 75 and st.session_state.last_spike_alert != _alert_minute:
                     _spike_msg = (
                         f"🚀 <b>INSTITUTIONAL SPIKE DETECTED</b>\n\n"
+                        f"Spot: ₹{_mae_underlying:.0f}\n"
                         f"Spike Score: <b>{_spike['spike_score']}</b>\n"
                         f"Signal: {_spike['signal']}\n"
                         f"Direction: {_spike['direction']}\n"
@@ -10869,6 +10873,7 @@ def main():
                 if _gamma['pattern'] in ('Gamma Ramp Up', 'Gamma Ramp Down') and st.session_state.last_gamma_alert != _alert_minute:
                     _gamma_msg = (
                         f"📊 <b>GAMMA SEQUENCE SIGNAL</b>\n\n"
+                        f"Spot: ₹{_mae_underlying:.0f}\n"
                         f"Pattern: <b>{_gamma['pattern']}</b>\n"
                         f"Direction: {_gamma['direction']}\n"
                         f"Dealer Signal: {_gamma['dealer_signal']}\n"
@@ -10884,6 +10889,7 @@ def main():
                 if _expiry_spike['active'] and _expiry_spike['expiry_spike_score'] >= 80 and st.session_state.last_expiry_spike_alert != _alert_minute:
                     _expiry_msg = (
                         f"⚡ <b>EXPIRY MOVE DETECTED</b>\n\n"
+                        f"Spot: ₹{_mae_underlying:.0f}\n"
                         f"Market Type: {_expiry_intel.get('market_type', 'N/A')}\n"
                         f"Expiry Spike Score: <b>{_expiry_spike['expiry_spike_score']}</b>\n"
                         f"Signal: {_expiry_spike['signal']}\n"
