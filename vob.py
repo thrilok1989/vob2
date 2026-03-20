@@ -4563,6 +4563,11 @@ def main():
         st.session_state.pro_trader_history = []
     if 'pro_smart_signal_last' not in st.session_state:
         st.session_state.pro_smart_signal_last = None
+    # Initialize session state for Unified Sentiment Engine
+    if 'sentiment_history' not in st.session_state:
+        st.session_state.sentiment_history = []
+    if 'itm_last_alert' not in st.session_state:
+        st.session_state.itm_last_alert = (None, None)
 
     # Initialize Supabase
     try:
@@ -5852,9 +5857,9 @@ def main():
         else:
             st.info("🕐 Composite Score builds up after first refresh — data will appear here on the next cycle.")
 
-        # ===== PRO TRADER DASHBOARD =====
+        # ===== UNIFIED OPTIONS FLOW SENTIMENT ENGINE =====
         st.markdown("---")
-        st.markdown("## 🚀 Pro Trader Dashboard — Options Flow")
+        st.markdown("## 🧭 Unified Options Flow Sentiment Engine")
         try:
             _pro_df    = option_data.get('df_summary') if option_data else None
             _pro_spot  = option_data.get('underlying') if option_data else None
@@ -5969,6 +5974,285 @@ def main():
                         if len(st.session_state.pro_trader_history) > 200:
                             st.session_state.pro_trader_history = st.session_state.pro_trader_history[-200:]
 
+                    # ── 7a. Composite Direction Signal (PCR × ΔOI × GEX) ────────
+                    _comp_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                    _comp_weights = [1.0, 1.5, 2.0, 1.5, 1.0]
+                    _comp_strike_scores, _comp_strike_details, _comp_per_strike_scores = [], [], {}
+                    _comp_data_available = False
+                    _verdict = _verdict_icon = _verdict_color = _verdict_desc = None
+                    _comp_total_score = _comp_score_pct = 0.0
+                    _comp_total_gex = _comp_avg_pcr = _comp_avg_chgoi = 0.0
+                    _comp_gex_trending = _comp_gex_pinning = False
+                    _comp_max_possible = 14.0
+                    _verdict_numeric = 0
+                    _slice_has_comp = ('PCR' in _pro_slice.columns and
+                                       'changeinOpenInterest_CE' in _pro_slice.columns and
+                                       'Gamma_CE' in _pro_slice.columns)
+                    if _slice_has_comp:
+                        _sc = _pro_slice.copy()
+                        _sc['_PCR_ChgOI'] = _sc.apply(
+                            lambda r: abs(float(r['changeinOpenInterest_PE']) /
+                                          float(r['changeinOpenInterest_CE']))
+                            if float(r['changeinOpenInterest_CE']) != 0 else 0.0, axis=1)
+                        _sc['_Net_GEX'] = (
+                            -1 * _sc['Gamma_CE'].fillna(0) * _sc['openInterest_CE'].fillna(0) *
+                            _pro_lot * _pro_spot / 100000 +
+                            _sc['Gamma_PE'].fillna(0) * _sc['openInterest_PE'].fillna(0) *
+                            _pro_lot * _pro_spot / 100000)
+                        _comp_total_gex  = _sc['_Net_GEX'].sum()
+                        _comp_avg_pcr    = float(_sc['PCR'].mean()) if 'PCR' in _sc.columns else 1.0
+                        _comp_avg_chgoi  = float(_sc['_PCR_ChgOI'].mean())
+                        _comp_gex_trending = _comp_total_gex < -10
+                        _comp_gex_pinning  = _comp_total_gex > 10
+                        for _ci, (_, _cr) in enumerate(_sc.iterrows()):
+                            _pv = float(_cr.get('PCR', 1.0) or 1.0)
+                            _cv = float(_cr['_PCR_ChgOI'])
+                            _gv = float(_cr['_Net_GEX'])
+                            _ps = 1 if _pv > 1.2 else (-1 if _pv < 0.7 else 0)
+                            _cs = 1 if _cv > 1.2 else (-1 if _cv < 0.7 else 0)
+                            _ds = _ps + _cs
+                            _cw = _comp_weights[_ci] if _ci < len(_comp_weights) else 1.0
+                            _comp_strike_scores.append(_ds * _cw)
+                            _slbl2 = str(int(_cr['Strike']))
+                            _comp_per_strike_scores[_slbl2] = round(_ds * _cw, 2)
+                            _clbl = _comp_position_labels[_ci] if _ci < len(_comp_position_labels) else f"S{_ci}"
+                            _comp_strike_details.append({
+                                'Position': _clbl, 'Strike': int(_cr['Strike']),
+                                'PCR (OI)': round(_pv, 2),
+                                'PCR Signal': 'Bull' if _ps > 0 else ('Bear' if _ps < 0 else 'Neut'),
+                                'PCR (ΔOI)': round(_cv, 2),
+                                'ΔOI Signal': 'Bull' if _cs > 0 else ('Bear' if _cs < 0 else 'Neut'),
+                                'Net GEX': round(_gv, 2),
+                                'GEX Signal': 'Pin' if _gv > 10 else ('Accel' if _gv < -10 else 'Neut'),
+                                'Score': round(_ds * _cw, 1)
+                            })
+                        _comp_total_score = sum(_comp_strike_scores)
+                        _comp_score_pct   = (_comp_total_score / _comp_max_possible) * 100
+                        if abs(_comp_score_pct) < 15:
+                            if _comp_gex_pinning:
+                                _verdict, _verdict_icon, _verdict_color = "SIDEWAYS", "↔️", "#FFD700"
+                                _verdict_desc = "Mixed signals + Positive GEX = Range-bound / Choppy"
+                                _verdict_numeric = 0
+                            else:
+                                _verdict, _verdict_icon, _verdict_color = "NEUTRAL", "⚪", "#888888"
+                                _verdict_desc = "No clear directional bias from ATM±2 strikes"
+                                _verdict_numeric = 0
+                        elif _comp_score_pct > 0:
+                            if _comp_gex_trending:
+                                _verdict, _verdict_icon, _verdict_color = "STRONG UP", "🟢🔥", "#00ff88"
+                                _verdict_desc = "Bullish PCR + Fresh put writing + Negative GEX = Breakout UP"
+                                _verdict_numeric = 3
+                            elif _comp_gex_pinning:
+                                _verdict, _verdict_icon, _verdict_color = "UP (CAPPED)", "🟢📍", "#90EE90"
+                                _verdict_desc = "Bullish bias but positive GEX may cap upside momentum"
+                                _verdict_numeric = 1
+                            else:
+                                _verdict, _verdict_icon, _verdict_color = "UP", "🟢", "#00ff88"
+                                _verdict_desc = "Bullish PCR + Put writing activity across ATM±2 strikes"
+                                _verdict_numeric = 2
+                        else:
+                            if _comp_gex_trending:
+                                _verdict, _verdict_icon, _verdict_color = "STRONG DOWN", "🔴🔥", "#ff4444"
+                                _verdict_desc = "Bearish PCR + Fresh call writing + Negative GEX = Breakdown"
+                                _verdict_numeric = -3
+                            elif _comp_gex_pinning:
+                                _verdict, _verdict_icon, _verdict_color = "DOWN (SUPPORTED)", "🔴📍", "#FFB6C1"
+                                _verdict_desc = "Bearish PCR + Positive GEX may provide support"
+                                _verdict_numeric = -1
+                            else:
+                                _verdict, _verdict_icon, _verdict_color = "DOWN", "🔴", "#ff4444"
+                                _verdict_desc = "Bearish PCR + Call writing activity across ATM±2 strikes"
+                                _verdict_numeric = -2
+                        _comp_data_available = True
+                        st.session_state.composite_signal_last_valid = {
+                            'verdict': _verdict, 'verdict_icon': _verdict_icon,
+                            'verdict_color': _verdict_color, 'verdict_desc': _verdict_desc,
+                            'total_score': _comp_total_score, 'score_pct': _comp_score_pct,
+                            'total_net_gex': _comp_total_gex, 'avg_pcr': _comp_avg_pcr,
+                            'avg_chgoi': _comp_avg_chgoi, 'strike_details': _comp_strike_details,
+                            'per_strike_scores': _comp_per_strike_scores
+                        }
+                        _comp_should_add = (
+                            not st.session_state.composite_signal_history or
+                            (_pro_now - st.session_state.composite_signal_history[-1]['time']).total_seconds() >= 30
+                        )
+                        if _comp_should_add:
+                            _comp_hist_entry = {
+                                'time': _pro_now, 'score': round(_comp_total_score, 2),
+                                'score_pct': round(_comp_score_pct, 1), 'verdict': _verdict,
+                                'verdict_numeric': _verdict_numeric,
+                                'avg_pcr': round(_comp_avg_pcr, 3),
+                                'avg_chgoi': round(_comp_avg_chgoi, 3),
+                                'total_gex': round(_comp_total_gex, 2),
+                            }
+                            for _ck, _cv2 in _comp_per_strike_scores.items():
+                                _comp_hist_entry[f'score_{_ck}'] = _cv2
+                            st.session_state.composite_signal_history.append(_comp_hist_entry)
+                            if len(st.session_state.composite_signal_history) > 200:
+                                st.session_state.composite_signal_history = st.session_state.composite_signal_history[-200:]
+                    # Fall back to cached composite verdict
+                    if not _comp_data_available:
+                        _lv = st.session_state.composite_signal_last_valid
+                        if _lv:
+                            _verdict, _verdict_icon = _lv['verdict'], _lv['verdict_icon']
+                            _verdict_color = _lv['verdict_color']
+                            _verdict_desc  = _lv['verdict_desc']
+                            _comp_total_score = _lv['total_score']
+                            _comp_score_pct   = _lv['score_pct']
+                            _comp_total_gex   = _lv['total_net_gex']
+                            _comp_avg_pcr     = _lv['avg_pcr']
+                            _comp_avg_chgoi   = _lv['avg_chgoi']
+                            _comp_strike_details = _lv.get('strike_details', [])
+                            _comp_gex_trending   = _comp_total_gex < -10
+                            _comp_gex_pinning    = _comp_total_gex > 10
+
+                    # ── 7b. Weighted PCR per strike (ATM±2) ─────────────────────
+                    _wts_map = {'ATM-2': 1.0, 'ATM-1': 1.5, 'ATM': 2.0, 'ATM+1': 1.5, 'ATM+2': 1.0}
+                    _wpcr_oi = _wpcr_chgoi = _wpcr_vol = _wtotal = 0.0
+                    for _, _wr in _pro_slice.iterrows():
+                        _wlbl = _pro_lbl(float(_wr['Strike']))
+                        _ww = _wts_map.get(_wlbl, 1.0)
+                        _wtotal += _ww
+                        _wce_oi = float(_wr.get('openInterest_CE', 0) or 0)
+                        _wpe_oi = float(_wr.get('openInterest_PE', 0) or 0)
+                        _wce_ch = abs(float(_wr.get('changeinOpenInterest_CE', 0) or 0))
+                        _wpe_ch = abs(float(_wr.get('changeinOpenInterest_PE', 0) or 0))
+                        _wce_vl = float(_wr.get('totalTradedVolume_CE', 0) or 0)
+                        _wpe_vl = float(_wr.get('totalTradedVolume_PE', 0) or 0)
+                        _wpcr_oi    += (_wpe_oi / (_wce_oi + 1e-6)) * _ww
+                        _wpcr_chgoi += (_wpe_ch / (_wce_ch + 1e-6)) * _ww
+                        _wpcr_vol   += (_wpe_vl / (_wce_vl + 1e-6)) * _ww
+                    if _wtotal > 0:
+                        _wpcr_oi /= _wtotal
+                        _wpcr_chgoi /= _wtotal
+                        _wpcr_vol /= _wtotal
+
+                    # ── 7c. Unified Sentiment Score (0–100) ─────────────────────
+                    _pro_h_tmp = st.session_state.pro_trader_history
+                    _pro_h_df_tmp = pd.DataFrame(_pro_h_tmp) if len(_pro_h_tmp) >= 2 else None
+                    # PCR OI score (±20)
+                    _ss_pcr = (20 if _wpcr_oi > 1.2 else
+                               -20 if _wpcr_oi < 0.7 else
+                               int((_wpcr_oi - 0.95) / 0.25 * 20))
+                    # ΔOI trend score (±20)
+                    _ss_chgoi = 0
+                    if _pro_h_df_tmp is not None and 'pcr_chgoi' in _pro_h_df_tmp.columns and len(_pro_h_df_tmp) >= 3:
+                        _chgoi_tr = _pro_h_df_tmp['pcr_chgoi'].iloc[-1] - _pro_h_df_tmp['pcr_chgoi'].iloc[-3]
+                        _ss_chgoi = (20 if _chgoi_tr > 0.05 else
+                                     -20 if _chgoi_tr < -0.05 else int(_chgoi_tr * 200))
+                    elif _wpcr_chgoi > 1.2:
+                        _ss_chgoi = 20
+                    elif _wpcr_chgoi < 0.7:
+                        _ss_chgoi = -20
+                    # GEX conviction score (±20) — amplifies PCR direction
+                    _gex_mag = abs(_pro_net_gex)
+                    _ss_gex_raw = (20 if _gex_mag > 50 else 14 if _gex_mag > 20 else
+                                   10 if _gex_mag > 10 else 5 if _gex_mag > 5 else 0)
+                    _ss_gex_dir = 1 if _ss_pcr >= 0 else -1
+                    if _pro_net_gex < -10:
+                        _ss_gex = _ss_gex_raw * _ss_gex_dir
+                    elif _pro_net_gex < 0:
+                        _ss_gex = int(_ss_gex_raw * 0.5) * _ss_gex_dir
+                    elif _pro_net_gex > 10:
+                        _ss_gex = -5
+                    else:
+                        _ss_gex = 0
+                    # Straddle momentum score (±20)
+                    _ss_straddle = 0
+                    if _pro_h_df_tmp is not None and 'straddle_atm' in _pro_h_df_tmp.columns and len(_pro_h_df_tmp) >= 3:
+                        _st_roc2 = (_pro_h_df_tmp['straddle_atm'].iloc[-1] -
+                                    _pro_h_df_tmp['straddle_atm'].iloc[-3]) / (
+                            abs(_pro_h_df_tmp['straddle_atm'].iloc[-3]) + 1e-6) * 100
+                        _ss_straddle = (20 if _st_roc2 > 2 else 10 if _st_roc2 > 0.5 else
+                                        -10 if _st_roc2 < -2 else 0)
+                    # Pressure imbalance score (±20)
+                    _pres_diff = _pro_call_pres - _pro_put_pres
+                    _ss_pressure = (20 if _pres_diff > 0.10 else
+                                    -20 if _pres_diff < -0.10 else int(_pres_diff * 100))
+                    # Combine: raw range −20 to +20, map to 0–100
+                    _sentiment_raw = (0.25 * _ss_pcr + 0.20 * _ss_chgoi + 0.20 * _ss_gex +
+                                      0.20 * _ss_straddle + 0.15 * _ss_pressure)
+                    _sentiment_score = int(max(0, min(100, (_sentiment_raw + 20) * 2.5)))
+
+                    if _sentiment_score >= 80:
+                        _sent_verdict = "STRONG BULLISH TREND"; _sent_icon = "🚀"; _sent_color = "#00ff88"
+                    elif _sentiment_score >= 60:
+                        _sent_verdict = "BULLISH BIAS"; _sent_icon = "🟢"; _sent_color = "#00C853"
+                    elif _sentiment_score >= 40:
+                        _sent_verdict = "SIDEWAYS MARKET"; _sent_icon = "↔️"; _sent_color = "#FFD700"
+                    elif _sentiment_score >= 20:
+                        _sent_verdict = "BEARISH BIAS"; _sent_icon = "🔴"; _sent_color = "#FF5252"
+                    else:
+                        _sent_verdict = "STRONG BEARISH TREND"; _sent_icon = "🔥"; _sent_color = "#FF1744"
+
+                    _market_bias = ("BULLISH" if _sentiment_score > 65 else
+                                    "BEARISH" if _sentiment_score < 35 else "SIDEWAYS")
+
+                    # ── 7d. Final Institutional Signal ──────────────────────────
+                    if _verdict == "STRONG UP" and _sentiment_score > 70:
+                        _final_signal = "🔥 INSTITUTIONAL BULLISH FLOW"
+                        _final_color  = "#00ff88"
+                        _final_desc   = "Options flow + PCR × GEX aligned — Smart money buying"
+                    elif _verdict == "STRONG DOWN" and _sentiment_score < 30:
+                        _final_signal = "⚡ INSTITUTIONAL BEARISH FLOW"
+                        _final_color  = "#FF5252"
+                        _final_desc   = "Options flow + PCR × GEX aligned — Smart money selling"
+                    elif _verdict in ("STRONG UP", "UP") and _sentiment_score < 40:
+                        _final_signal = "⚠️ FLOW DIVERGENCE — BULL TRAP POSSIBLE"
+                        _final_color  = "#FF9800"
+                        _final_desc   = "Composite bullish but sentiment weak — caution"
+                    elif _verdict in ("STRONG DOWN", "DOWN") and _sentiment_score > 60:
+                        _final_signal = "⚠️ FLOW DIVERGENCE — BEAR TRAP POSSIBLE"
+                        _final_color  = "#FF9800"
+                        _final_desc   = "Composite bearish but sentiment strong — caution"
+                    elif _sentiment_score >= 60:
+                        _final_signal = f"{_sent_icon} {_sent_verdict}"
+                        _final_color  = _sent_color
+                        _final_desc   = f"Sentiment Score: {_sentiment_score}/100"
+                    elif _sentiment_score <= 40:
+                        _final_signal = f"{_sent_icon} {_sent_verdict}"
+                        _final_color  = _sent_color
+                        _final_desc   = f"Sentiment Score: {_sentiment_score}/100"
+                    elif _verdict:
+                        _final_signal = f"{_verdict_icon} {_verdict}"
+                        _final_color  = _verdict_color
+                        _final_desc   = _verdict_desc or ""
+                    else:
+                        _final_signal = "⚪ NEUTRAL"
+                        _final_color  = "#888888"
+                        _final_desc   = "Insufficient data for signal"
+
+                    # ── Store sentiment history ──────────────────────────────────
+                    _sent_should_add = (
+                        not st.session_state.sentiment_history or
+                        (_pro_now - st.session_state.sentiment_history[-1]['time']).total_seconds() >= 28
+                    )
+                    if _sent_should_add:
+                        st.session_state.sentiment_history.append({
+                            'time': _pro_now,
+                            'sentiment_score': _sentiment_score,
+                            'comp_score_pct': round(_comp_score_pct, 1),
+                            'total_gex': round(_comp_total_gex, 2),
+                            'verdict': _final_signal,
+                        })
+                        if len(st.session_state.sentiment_history) > 200:
+                            st.session_state.sentiment_history = st.session_state.sentiment_history[-200:]
+
+                    # ── Telegram alerts at 70/30 threshold crossings ─────────────
+                    if enable_signals and len(st.session_state.sentiment_history) >= 2:
+                        _prev_sent = st.session_state.sentiment_history[-2]['sentiment_score']
+                        _sent_alert_msg = None
+                        if _prev_sent < 70 <= _sentiment_score:
+                            _sent_alert_msg = (f"🚀 <b>BULLISH FLOW INCREASING</b>\n"
+                                               f"Sentiment Score: {_sentiment_score}/100\n"
+                                               f"Breakout probability high")
+                        elif _prev_sent > 30 >= _sentiment_score:
+                            _sent_alert_msg = (f"🔥 <b>BEARISH FLOW INCREASING</b>\n"
+                                               f"Sentiment Score: {_sentiment_score}/100\n"
+                                               f"Breakdown probability high")
+                        if _sent_alert_msg:
+                            send_telegram_message_sync(_sent_alert_msg)
+
                     # ── 7. Breakout Probability Score (0–100) ──────────────────
                     _pro_h    = st.session_state.pro_trader_history
                     _pro_h_df = pd.DataFrame(_pro_h) if len(_pro_h) >= 2 else None
@@ -6065,50 +6349,113 @@ def main():
                             pass  # Supabase table may not exist yet; fail silently
 
                     # ══════════════════════════════════════════════════════════
-                    # TOP PANEL
+                    # UNIFIED SENTIMENT TOP PANEL
                     # ══════════════════════════════════════════════════════════
-                    _tp1, _tp2, _tp3, _tp4 = st.columns(4)
                     _prev_atm_st = (_pro_h_df['straddle_atm'].iloc[-2]
                                     if _pro_h_df is not None and len(_pro_h_df) >= 2
                                     else _pro_atm_straddle)
                     _st_chg = _pro_atm_straddle - _prev_atm_st
                     _st_clr = "#FF5252" if _st_chg > 5 else ("#00C853" if _st_chg < -5 else "#FFD740")
-                    with _tp1:
+
+                    # Row 1: Large FinalSignal verdict (left) + 4 metric cards (right)
+                    _uf1, _uf2 = st.columns([3, 2])
+                    with _uf1:
+                        _vc_txt = _verdict_color if _verdict_color else "#888888"
                         st.markdown(f"""
-                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid #444;">
-                        <div style="color:#aaa;font-size:11px;">SPOT PRICE</div>
-                        <div style="font-size:24px;font-weight:bold;color:#FFD740;">{_pro_spot:,.1f}</div>
-                        <div style="font-size:11px;color:#888;">ATM: ₹{int(_pro_atm_val)}</div>
+                        <div style="background:linear-gradient(135deg,{_final_color}10,{_final_color}25);
+                                    padding:20px;border-radius:12px;border:3px solid {_final_color};
+                                    text-align:center;min-height:130px;">
+                            <div style="color:#888;font-size:10px;letter-spacing:2px;">
+                                UNIFIED OPTIONS FLOW SENTIMENT</div>
+                            <div style="color:{_final_color};font-size:30px;font-weight:bold;margin:6px 0;
+                                        line-height:1.2;">{_final_signal}</div>
+                            <div style="color:#ccc;font-size:12px;">{_final_desc}</div>
+                            <div style="color:{_sent_color};font-size:11px;margin-top:6px;">
+                                Sentiment <b>{_sentiment_score}/100</b> — {_sent_verdict} &nbsp;|&nbsp;
+                                Direction <b>{_verdict_icon if _verdict_icon else "⚪"} {_verdict if _verdict else "NEUTRAL"}</b>
+                                ({_comp_score_pct:+.0f}%)
+                            </div>
                         </div>""", unsafe_allow_html=True)
-                    with _tp2:
+                    with _uf2:
+                        _um1, _um2 = st.columns(2)
+                        with _um1:
+                            st.markdown(f"""
+                            <div style="background:#1e1e1e;padding:10px;border-radius:8px;border:1px solid #444;margin-bottom:5px;">
+                            <div style="color:#aaa;font-size:10px;">SPOT / ATM</div>
+                            <div style="font-size:18px;font-weight:bold;color:#FFD740;">{_pro_spot:,.0f}</div>
+                            <div style="font-size:10px;color:#888;">ATM: ₹{int(_pro_atm_val)}</div>
+                            </div>""", unsafe_allow_html=True)
+                            st.markdown(f"""
+                            <div style="background:#1e1e1e;padding:10px;border-radius:8px;border:2px solid {_pro_mode_color};">
+                            <div style="color:#aaa;font-size:10px;">MARKET MODE</div>
+                            <div style="font-size:14px;font-weight:bold;color:{_pro_mode_color};">{_pro_market_mode}</div>
+                            <div style="font-size:10px;color:#888;">GEX {_pro_net_gex:+.1f}L</div>
+                            </div>""", unsafe_allow_html=True)
+                        with _um2:
+                            st.markdown(f"""
+                            <div style="background:#1e1e1e;padding:10px;border-radius:8px;border:2px solid {_bs_color};margin-bottom:5px;">
+                            <div style="color:#aaa;font-size:10px;">BREAKOUT SCORE</div>
+                            <div style="font-size:18px;font-weight:bold;color:{_bs_color};">{_pro_score}/100</div>
+                            <div style="font-size:10px;color:{_bs_color};">{_bs_label}</div>
+                            </div>""", unsafe_allow_html=True)
+                            st.markdown(f"""
+                            <div style="background:#1e1e1e;padding:10px;border-radius:8px;border:1px solid {_st_clr};">
+                            <div style="color:#aaa;font-size:10px;">ATM STRADDLE</div>
+                            <div style="font-size:18px;font-weight:bold;color:{_st_clr};">₹{_pro_atm_straddle:.0f}</div>
+                            <div style="font-size:10px;color:#888;">Chg {_st_chg:+.1f}</div>
+                            </div>""", unsafe_allow_html=True)
+
+                    # Row 2: 4 composite metric cards
+                    _cm1, _cm2, _cm3, _cm4 = st.columns(4)
+                    with _cm1:
+                        _pclr = "#00ff88" if _comp_avg_pcr > 1.2 else "#ff4444" if _comp_avg_pcr < 0.7 else "#FFD700"
                         st.markdown(f"""
-                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:2px solid {_bs_color};">
-                        <div style="color:#aaa;font-size:11px;">BREAKOUT SCORE</div>
-                        <div style="font-size:24px;font-weight:bold;color:{_bs_color};">{_pro_score}/100</div>
-                        <div style="font-size:11px;color:{_bs_color};">{_bs_label}</div>
+                        <div style="background:{_pclr}12;padding:9px;border-radius:7px;border:1px solid {_pclr};
+                                    text-align:center;margin-top:5px;">
+                        <div style="color:{_pclr};font-size:10px;font-weight:bold;">AVG PCR (OI)</div>
+                        <div style="color:{_pclr};font-size:18px;font-weight:bold;">{_comp_avg_pcr:.2f}</div>
+                        <div style="color:#ccc;font-size:10px;">{'Bull' if _comp_avg_pcr > 1.2 else 'Bear' if _comp_avg_pcr < 0.7 else 'Neut'}</div>
                         </div>""", unsafe_allow_html=True)
-                    with _tp3:
+                    with _cm2:
+                        _cclr = "#00ff88" if _comp_avg_chgoi > 1.2 else "#ff4444" if _comp_avg_chgoi < 0.7 else "#FFD700"
                         st.markdown(f"""
-                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:2px solid {_pro_mode_color};">
-                        <div style="color:#aaa;font-size:11px;">MARKET MODE</div>
-                        <div style="font-size:20px;font-weight:bold;color:{_pro_mode_color};">{_pro_market_mode}</div>
-                        <div style="font-size:11px;color:#888;">Net GEX: {_pro_net_gex:+.1f}L</div>
+                        <div style="background:{_cclr}12;padding:9px;border-radius:7px;border:1px solid {_cclr};
+                                    text-align:center;margin-top:5px;">
+                        <div style="color:{_cclr};font-size:10px;font-weight:bold;">AVG PCR (ΔOI)</div>
+                        <div style="color:{_cclr};font-size:18px;font-weight:bold;">{_comp_avg_chgoi:.2f}</div>
+                        <div style="color:#ccc;font-size:10px;">{'Bull' if _comp_avg_chgoi > 1.2 else 'Bear' if _comp_avg_chgoi < 0.7 else 'Neut'}</div>
                         </div>""", unsafe_allow_html=True)
-                    with _tp4:
+                    with _cm3:
+                        _gclr = "#00ff88" if _comp_total_gex > 10 else "#ff4444" if _comp_total_gex < -10 else "#FFD700"
                         st.markdown(f"""
-                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid {_st_clr};">
-                        <div style="color:#aaa;font-size:11px;">ATM STRADDLE</div>
-                        <div style="font-size:24px;font-weight:bold;color:{_st_clr};">₹{_pro_atm_straddle:.0f}</div>
-                        <div style="font-size:11px;color:#888;">Chg: {_st_chg:+.1f} · PCR: {_pro_pcr_oi:.2f}</div>
+                        <div style="background:{_gclr}12;padding:9px;border-radius:7px;border:1px solid {_gclr};
+                                    text-align:center;margin-top:5px;">
+                        <div style="color:{_gclr};font-size:10px;font-weight:bold;">TOTAL GEX</div>
+                        <div style="color:{_gclr};font-size:18px;font-weight:bold;">{_comp_total_gex:.1f}L</div>
+                        <div style="color:#ccc;font-size:10px;">{'Pin' if _comp_total_gex > 10 else 'Accel' if _comp_total_gex < -10 else 'Neut'}</div>
+                        </div>""", unsafe_allow_html=True)
+                    with _cm4:
+                        st.markdown(f"""
+                        <div style="background:{_sent_color}12;padding:9px;border-radius:7px;border:1px solid {_sent_color};
+                                    text-align:center;margin-top:5px;">
+                        <div style="color:{_sent_color};font-size:10px;font-weight:bold;">SENTIMENT</div>
+                        <div style="color:{_sent_color};font-size:18px;font-weight:bold;">{_sentiment_score}/100</div>
+                        <div style="color:#ccc;font-size:10px;">{_market_bias}</div>
                         </div>""", unsafe_allow_html=True)
 
-                    # Smart signal alert banner
-                    if _pro_alert:
+                    # Smart signal + divergence alert banner
+                    _alert_txt = _pro_alert or ""
+                    _alert_clr = _pro_alert_color
+                    if not _pro_alert and "DIVERGENCE" in _final_signal:
+                        _alert_txt = _final_signal
+                        _alert_clr = _final_color
+                    if _alert_txt:
                         st.markdown(f"""
-                        <div style="background:{_pro_alert_color}22;border:2px solid {_pro_alert_color};
+                        <div style="background:{_alert_clr}22;border:2px solid {_alert_clr};
                              border-radius:8px;padding:10px;margin:8px 0;text-align:center;">
-                        <span style="font-size:16px;font-weight:bold;color:{_pro_alert_color};">{_pro_alert}</span>
-                        <span style="font-size:13px;color:#ccc;margin-left:16px;">Score: {_pro_score}/100</span>
+                        <span style="font-size:15px;font-weight:bold;color:{_alert_clr};">{_alert_txt}</span>
+                        <span style="font-size:12px;color:#ccc;margin-left:12px;">
+                            Score: {_pro_score}/100 · Sentiment: {_sentiment_score}/100</span>
                         </div>""", unsafe_allow_html=True)
 
                     st.markdown("<br>", unsafe_allow_html=True)
@@ -6393,15 +6740,80 @@ def main():
                             st.caption(f"Straddle {_s1}/20 · IV {_s2}/20 · Gamma {_s3}/20 · "
                                        f"Volume {_s4}/20 · Pressure {_s5}/20")
 
+                    # ── Sentiment Over Time Chart ───────────────────────────────
+                    if st.session_state.sentiment_history:
+                        _sent_h_df = pd.DataFrame(st.session_state.sentiment_history)
+                        _fig_sent = go.Figure()
+                        _sent_mkr = []
+                        for _, _shr in _sent_h_df.iterrows():
+                            _sv = _shr.get('sentiment_score', 50)
+                            _sent_mkr.append(
+                                '#00ff88' if _sv >= 70 else '#FFD700' if _sv >= 40 else '#FF5252')
+                        _fig_sent.add_trace(go.Scatter(
+                            x=_sent_h_df['time'], y=_sent_h_df['sentiment_score'],
+                            mode='lines+markers', name='Sentiment Score',
+                            line=dict(color='#00aaff', width=2.5),
+                            marker=dict(size=6, color=_sent_mkr),
+                            fill='tozeroy', fillcolor='rgba(0,170,255,0.07)'))
+                        if 'comp_score_pct' in _sent_h_df.columns:
+                            _fig_sent.add_trace(go.Scatter(
+                                x=_sent_h_df['time'],
+                                y=_sent_h_df['comp_score_pct'].apply(lambda x: (x + 100) / 2),
+                                mode='lines', name='Direction Score (scaled 0-100)',
+                                line=dict(color='#ff44ff', width=1.5, dash='dash')))
+                        if 'total_gex' in _sent_h_df.columns:
+                            _fig_sent.add_trace(go.Scatter(
+                                x=_sent_h_df['time'],
+                                y=_sent_h_df['total_gex'].apply(
+                                    lambda x: max(0, min(100, (x + 100) / 2))),
+                                mode='lines', name='GEX (scaled)',
+                                line=dict(color='#FFD740', width=1.5, dash='dot')))
+                        _fig_sent.add_hline(y=70, line_dash='dot',
+                            line_color='rgba(0,255,136,0.5)', line_width=1,
+                            annotation_text='Bullish 70', annotation_position='right',
+                            annotation_font_size=8)
+                        _fig_sent.add_hline(y=30, line_dash='dot',
+                            line_color='rgba(255,68,68,0.5)', line_width=1,
+                            annotation_text='Bearish 30', annotation_position='right',
+                            annotation_font_size=8)
+                        _fig_sent.add_hrect(y0=70, y1=105,
+                            fillcolor='rgba(0,255,136,0.05)', line_width=0)
+                        _fig_sent.add_hrect(y0=0, y1=30,
+                            fillcolor='rgba(255,68,68,0.05)', line_width=0)
+                        _fig_sent.update_layout(
+                            title=f'Options Flow Sentiment — Current: {_sentiment_score}/100 ({_sent_verdict})',
+                            height=320, template='plotly_dark',
+                            xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                            yaxis=dict(title='Score (0–100)', range=[0, 105], gridcolor='#333'),
+                            legend=dict(orientation='h', y=-0.3, font=dict(size=9)),
+                            margin=dict(l=40, r=65, t=45, b=30),
+                            paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'))
+                        st.plotly_chart(_fig_sent, use_container_width=True)
+
+                    # ── Per-Strike Breakdown ─────────────────────────────────────
+                    if _comp_strike_details:
+                        with st.expander("📋 Per-Strike Direction Breakdown"):
+                            st.dataframe(pd.DataFrame(_comp_strike_details),
+                                         use_container_width=True, hide_index=True)
+
                     # Controls
-                    _pro_cl, _pro_cr = st.columns([4, 1])
+                    _pro_cl, _pro_cm, _pro_cr = st.columns([3, 1, 1])
                     with _pro_cl:
-                        st.caption(f"📊 Pro pts: {len(st.session_state.pro_trader_history)} · "
-                                   f"Refreshes every 30s")
-                    with _pro_cr:
-                        if st.button("🗑️ Clear Pro History"):
+                        _comp_status = "🟢 Live" if _comp_data_available else "🟡 Cached"
+                        st.caption(f"📊 Pro: {len(st.session_state.pro_trader_history)} pts · "
+                                   f"Sentiment: {len(st.session_state.sentiment_history)} pts · "
+                                   f"Composite: {len(st.session_state.composite_signal_history)} pts · "
+                                   f"{_comp_status} · Refreshes every 30s")
+                    with _pro_cm:
+                        if st.button("🗑️ Clear Pro"):
                             st.session_state.pro_trader_history = []
                             st.session_state.pro_smart_signal_last = None
+                            st.session_state.sentiment_history = []
+                            st.rerun()
+                    with _pro_cr:
+                        if st.button("🗑️ Clear Composite"):
+                            st.session_state.composite_signal_history = []
+                            st.session_state.composite_signal_last_valid = None
                             st.rerun()
                 else:
                     st.info("ATM strike not identified — Pro Dashboard unavailable.")
@@ -6409,6 +6821,347 @@ def main():
                 st.info("Option chain data required for Pro Trader Dashboard.")
         except Exception as _pro_e:
             st.warning(f"Pro Dashboard error: {str(_pro_e)}")
+
+        # ===== INSTITUTIONAL TRADE MAP ENGINE =====
+        st.markdown("---")
+        st.markdown("## 🗺️ Institutional Trade Map")
+        try:
+            _itm_df   = option_data.get('df_summary') if option_data else None
+            _itm_spot = option_data.get('underlying') if option_data else None
+            _itm_lot  = 25
+
+            # Latest sentiment score from session state
+            _itm_sent_score = 50
+            _itm_market_bias = "SIDEWAYS"
+            if st.session_state.sentiment_history:
+                _itm_sent_score = st.session_state.sentiment_history[-1]['sentiment_score']
+                _itm_market_bias = ("BULLISH" if _itm_sent_score > 65 else
+                                    "BEARISH" if _itm_sent_score < 35 else "SIDEWAYS")
+            _itm_final_signal = (st.session_state.sentiment_history[-1].get('verdict', '⚪ NEUTRAL')
+                                 if st.session_state.sentiment_history else '⚪ NEUTRAL')
+
+            if _itm_df is not None and _itm_spot and 'Zone' in _itm_df.columns:
+                _itm_atm_idx = _itm_df[_itm_df['Zone'] == 'ATM'].index
+                if len(_itm_atm_idx) > 0:
+                    _itm_atm_pos = _itm_df.index.get_loc(_itm_atm_idx[0])
+                    # ATM±5 for OI walls
+                    _itm_s5 = max(0, _itm_atm_pos - 5)
+                    _itm_e5 = min(len(_itm_df), _itm_atm_pos + 6)
+                    _itm_slice5 = _itm_df.iloc[_itm_s5:_itm_e5].copy()
+                    _itm_atm_val = float(_itm_df[_itm_df['Zone'] == 'ATM']['Strike'].values[0])
+                    _itm_stk_list = sorted(_itm_slice5['Strike'].unique())
+                    _itm_step = int(_itm_stk_list[1] - _itm_stk_list[0]) if len(_itm_stk_list) >= 2 else 50
+                    for _c in ['openInterest_CE', 'openInterest_PE', 'Gamma_CE', 'Gamma_PE',
+                               'changeinOpenInterest_CE', 'changeinOpenInterest_PE']:
+                        if _c not in _itm_slice5.columns:
+                            _itm_slice5[_c] = 0.0
+
+                    # ── Put OI Wall & Call OI Wall ──────────────────────────────
+                    _pe_oi_s = _itm_slice5.set_index('Strike')['openInterest_PE'].fillna(0)
+                    _ce_oi_s = _itm_slice5.set_index('Strike')['openInterest_CE'].fillna(0)
+                    _put_oi_wall = float(_pe_oi_s.idxmax()) if len(_pe_oi_s) > 0 else _itm_atm_val - _itm_step * 2
+                    _call_oi_wall = float(_ce_oi_s.idxmax()) if len(_ce_oi_s) > 0 else _itm_atm_val + _itm_step * 2
+
+                    # ── Gamma Support / Resistance / Flip ──────────────────────
+                    _itm_slice5['_gex'] = (
+                        _itm_slice5['Gamma_PE'].fillna(0) * _itm_slice5['openInterest_PE'].fillna(0) *
+                        _itm_lot * _itm_spot / 100000 -
+                        _itm_slice5['Gamma_CE'].fillna(0) * _itm_slice5['openInterest_CE'].fillna(0) *
+                        _itm_lot * _itm_spot / 100000)
+                    _below_atm = _itm_slice5[_itm_slice5['Strike'] < _itm_atm_val]
+                    _above_atm = _itm_slice5[_itm_slice5['Strike'] > _itm_atm_val]
+                    _gamma_support = (float(_below_atm.loc[_below_atm['_gex'].idxmax(), 'Strike'])
+                                      if len(_below_atm) > 0 else _itm_atm_val - _itm_step)
+                    _gamma_resist  = (float(_above_atm.loc[_above_atm['_gex'].idxmin(), 'Strike'])
+                                      if len(_above_atm) > 0 else _itm_atm_val + _itm_step)
+                    # Gamma flip: first sign change in GEX
+                    _gamma_flip = _itm_atm_val
+                    _gex_arr = _itm_slice5['_gex'].values
+                    for _gi in range(len(_gex_arr) - 1):
+                        if (_gex_arr[_gi] * _gex_arr[_gi + 1]) < 0:
+                            _gamma_flip = (_itm_slice5['Strike'].iloc[_gi] +
+                                           _itm_slice5['Strike'].iloc[_gi + 1]) / 2
+                            break
+
+                    # ── VOB Support & Resistance ────────────────────────────────
+                    _vob_support = _itm_atm_val - _itm_step * 3
+                    _vob_resist  = _itm_atm_val + _itm_step * 3
+                    if 'sr_levels' in vob_data:
+                        _vs = [l.get('mid', l.get('lower', 0)) for l in vob_data['sr_levels']
+                               if ('Support' in l.get('Type', '') or '🟢' in l.get('Type', ''))
+                               and l.get('mid', l.get('lower', 0)) > 0
+                               and l.get('mid', l.get('lower', 0)) < _itm_spot]
+                        _vr = [l.get('mid', l.get('upper', 0)) for l in vob_data['sr_levels']
+                               if ('Resistance' in l.get('Type', '') or '🔴' in l.get('Type', ''))
+                               and l.get('mid', l.get('upper', 0)) > _itm_spot]
+                        if _vs: _vob_support = max(_vs)
+                        if _vr: _vob_resist  = min(_vr)
+
+                    # ── Triple POC ──────────────────────────────────────────────
+                    _poc_val = _itm_spot
+                    if poc_data_for_chart:
+                        _pvs = []
+                        for _pk in ['poc1', 'poc2', 'poc3']:
+                            _pd2 = poc_data_for_chart.get(_pk, {})
+                            _pv2 = _pd2.get('poc', 0) if isinstance(_pd2, dict) else 0
+                            if isinstance(_pv2, (int, float)) and _pv2 > 0:
+                                _pvs.append(float(_pv2))
+                        if _pvs: _poc_val = sum(_pvs) / len(_pvs)
+
+                    # ── HTF Pivot Support & Resistance ──────────────────────────
+                    _piv_support = _itm_atm_val - _itm_step * 4
+                    _piv_resist  = _itm_atm_val + _itm_step * 4
+                    if pivots:
+                        _pl = [p['value'] for p in pivots
+                               if p.get('type') == 'low' and p['value'] < _itm_spot]
+                        _ph = [p['value'] for p in pivots
+                               if p.get('type') == 'high' and p['value'] > _itm_spot]
+                        if _pl: _piv_support = max(_pl)
+                        if _ph: _piv_resist  = min(_ph)
+
+                    # ── STEP 2: True Support ────────────────────────────────────
+                    _true_support = (0.30 * _put_oi_wall + 0.25 * _gamma_support +
+                                     0.20 * _vob_support + 0.15 * _poc_val + 0.10 * _piv_support)
+                    _true_support = round(_true_support / _itm_step) * _itm_step
+
+                    # ── STEP 3: True Resistance ─────────────────────────────────
+                    _true_resist = (0.30 * _call_oi_wall + 0.25 * _gamma_resist +
+                                    0.20 * _vob_resist + 0.15 * _poc_val + 0.10 * _piv_resist)
+                    _true_resist = round(_true_resist / _itm_step) * _itm_step
+
+                    # ── STEP 4: Entry Zones ─────────────────────────────────────
+                    _entry_support = round(
+                        (_gamma_support + _put_oi_wall + _vob_support) / 3 / _itm_step) * _itm_step
+                    _entry_resist  = round(
+                        (_gamma_resist + _call_oi_wall + _vob_resist) / 3 / _itm_step) * _itm_step
+
+                    # ── STEP 5: Exit Targets ────────────────────────────────────
+                    _above_spot = [l for l in [_call_oi_wall, _gamma_resist, _piv_resist, _poc_val]
+                                   if l > _itm_spot]
+                    _below_spot = [l for l in [_put_oi_wall, _gamma_support, _piv_support, _poc_val]
+                                   if l < _itm_spot]
+                    _exit_resist  = (round(min(_above_spot) / _itm_step) * _itm_step
+                                     if _above_spot else _true_resist)
+                    _exit_support = (round(max(_below_spot) / _itm_step) * _itm_step
+                                     if _below_spot else _true_support)
+
+                    # ── STEP 6: Breakout Level ──────────────────────────────────
+                    _breakout_lvl = round(
+                        (_itm_atm_val + _itm_step + _gamma_flip + _call_oi_wall) / 3 / _itm_step) * _itm_step
+
+                    # ── STEP 7: Breakdown Level ─────────────────────────────────
+                    _breakdown_lvl = round(
+                        (_itm_atm_val - _itm_step + _gamma_flip + _put_oi_wall) / 3 / _itm_step) * _itm_step
+
+                    # ── STEP 8: Stop Loss Engine ────────────────────────────────
+                    _sl_call_cands = [l for l in [_gamma_support, _put_oi_wall, _piv_support]
+                                      if l < _entry_support]
+                    _sl_call = (round(max(_sl_call_cands) / _itm_step) * _itm_step
+                                if _sl_call_cands else _entry_support - _itm_step * 2)
+                    _sl_put_cands = [l for l in [_gamma_resist, _call_oi_wall, _piv_resist]
+                                     if l > _entry_resist]
+                    _sl_put = (round(min(_sl_put_cands) / _itm_step) * _itm_step
+                               if _sl_put_cands else _entry_resist + _itm_step * 2)
+
+                    # ── STEP 9: Active Trade Setup ──────────────────────────────
+                    if _itm_market_bias == "BULLISH":
+                        _itm_entry   = _entry_support
+                        _itm_target  = _exit_resist
+                        _itm_sl      = _sl_call
+                        _itm_dir_clr = "#00ff88"
+                        _itm_dir_lbl = "🚀 BULLISH"
+                    elif _itm_market_bias == "BEARISH":
+                        _itm_entry   = _entry_resist
+                        _itm_target  = _exit_support
+                        _itm_sl      = _sl_put
+                        _itm_dir_clr = "#FF5252"
+                        _itm_dir_lbl = "🔥 BEARISH"
+                    else:
+                        _itm_entry   = _itm_atm_val
+                        _itm_target  = _itm_atm_val
+                        _itm_sl      = _itm_atm_val
+                        _itm_dir_clr = "#FFD700"
+                        _itm_dir_lbl = "↔️ SIDEWAYS"
+
+                    # ── STEP 10: Confidence Score ───────────────────────────────
+                    _conf_pts = 0
+                    _itm_net_gex = 0.0
+                    _itm_net_delta = 0.0
+                    _itm_call_pres = _itm_put_pres = 0.5
+                    _itm_wpcr_oi = 1.0
+                    # Pull from session state if available
+                    if st.session_state.pro_trader_history:
+                        _last_pro = st.session_state.pro_trader_history[-1]
+                        _itm_net_gex   = _last_pro.get('net_gex', 0)
+                        _itm_net_delta = _last_pro.get('net_delta', 0)
+                        _itm_call_pres = _last_pro.get('call_pressure', 0.5)
+                        _itm_put_pres  = _last_pro.get('put_pressure', 0.5)
+                        _itm_wpcr_oi   = _last_pro.get('pcr_oi', 1.0)
+                    # PCR aligned
+                    if ((_itm_market_bias == "BULLISH" and _itm_wpcr_oi > 1.1) or
+                            (_itm_market_bias == "BEARISH" and _itm_wpcr_oi < 0.9)):
+                        _conf_pts += 1
+                    # GEX trending (negative = conviction)
+                    if _itm_net_gex < -5:
+                        _conf_pts += 1
+                    # Delta aligned
+                    if ((_itm_market_bias == "BULLISH" and _itm_net_delta > 0) or
+                            (_itm_market_bias == "BEARISH" and _itm_net_delta < 0)):
+                        _conf_pts += 1
+                    # Pressure aligned
+                    if ((_itm_market_bias == "BULLISH" and _itm_call_pres > _itm_put_pres) or
+                            (_itm_market_bias == "BEARISH" and _itm_put_pres > _itm_call_pres)):
+                        _conf_pts += 1
+                    # Sentiment extreme
+                    if _itm_sent_score > 65 or _itm_sent_score < 35:
+                        _conf_pts += 1
+                    _confidence = ("HIGH" if _conf_pts >= 4 else
+                                   "MEDIUM" if _conf_pts >= 2 else "LOW")
+                    _conf_clr   = ("#00ff88" if _confidence == "HIGH" else
+                                   "#FFD700"  if _confidence == "MEDIUM" else "#FF5252")
+
+                    # ── STEP 11: Telegram Alert ─────────────────────────────────
+                    if _confidence == "HIGH" and _itm_market_bias != "SIDEWAYS" and enable_signals:
+                        _itm_key = f"{_itm_market_bias}_{int(_itm_entry)}_{int(_itm_target)}"
+                        _last_itm = st.session_state.itm_last_alert
+                        _itm_now2 = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        _itm_ok   = (_last_itm[0] != _itm_key or
+                                     (_last_itm[1] is not None and
+                                      (_itm_now2 - _last_itm[1]).total_seconds() > 600))
+                        if _itm_ok:
+                            send_telegram_message_sync(
+                                f"<b>🗺️ INSTITUTIONAL TRADE SETUP</b>\n"
+                                f"Direction: {_itm_dir_lbl}\n"
+                                f"Entry: {_itm_entry:.0f} | Target: {_itm_target:.0f} | SL: {_itm_sl:.0f}\n"
+                                f"Support: {_true_support:.0f} | Resistance: {_true_resist:.0f}\n"
+                                f"Breakout: {_breakout_lvl:.0f} | Breakdown: {_breakdown_lvl:.0f}\n"
+                                f"Confidence: {_confidence} | Sentiment: {_itm_sent_score}/100\n"
+                                f"Flow: {_itm_final_signal}"
+                            )
+                            st.session_state.itm_last_alert = (_itm_key, _itm_now2)
+
+                    # ── STEP 9 Display: Trade Map Panel ────────────────────────
+                    st.markdown(f"""
+                    <div style="background:linear-gradient(135deg,{_itm_dir_clr}08,{_itm_dir_clr}18);
+                                padding:18px;border-radius:12px;border:2px solid {_itm_dir_clr};
+                                margin-bottom:14px;">
+                        <div style="color:#888;font-size:10px;letter-spacing:2px;">
+                            INSTITUTIONAL TRADE MAP — ATM±5 LIQUIDITY ANALYSIS</div>
+                        <div style="color:{_itm_dir_clr};font-size:28px;font-weight:bold;margin:6px 0;">
+                            {_itm_dir_lbl} &nbsp;·&nbsp; Confidence: <span style="border:1px solid {_conf_clr};
+                            color:{_conf_clr};padding:2px 10px;border-radius:5px;font-size:16px;">{_confidence}</span>
+                        </div>
+                        <div style="color:#aaa;font-size:12px;">
+                            Spot: <b style="color:#FFD740">{_itm_spot:,.0f}</b> &nbsp;|&nbsp;
+                            ATM: <b style="color:#FFD740">₹{int(_itm_atm_val)}</b> &nbsp;|&nbsp;
+                            Sentiment: <b style="color:{_conf_clr}">{_itm_sent_score}/100</b> &nbsp;|&nbsp;
+                            {_itm_final_signal}
+                        </div>
+                    </div>""", unsafe_allow_html=True)
+
+                    # Level grid (3 cols × 3 rows)
+                    _lg1, _lg2, _lg3 = st.columns(3)
+                    def _itm_card(label, value, color, note=""):
+                        return (f'<div style="background:{color}12;padding:11px;border-radius:8px;'
+                                f'border:1px solid {color};text-align:center;margin:3px 0;">'
+                                f'<div style="color:{color};font-size:10px;font-weight:bold;">{label}</div>'
+                                f'<div style="color:{color};font-size:20px;font-weight:bold;">{value:.0f}</div>'
+                                f'<div style="color:#aaa;font-size:10px;">{note}</div></div>')
+
+                    with _lg1:
+                        st.markdown(_itm_card("PUT OI WALL",     _put_oi_wall,   "#00ff88", "Max PE OI"),
+                                    unsafe_allow_html=True)
+                        st.markdown(_itm_card("TRUE SUPPORT",    _true_support,  "#00C853", "Weighted avg"),
+                                    unsafe_allow_html=True)
+                        st.markdown(_itm_card("ENTRY SUPPORT",   _entry_support, "#00aaff", "GEX+OI+VOB"),
+                                    unsafe_allow_html=True)
+                    with _lg2:
+                        st.markdown(_itm_card("TARGET",          _itm_target,    _itm_dir_clr, "Exit zone"),
+                                    unsafe_allow_html=True)
+                        st.markdown(_itm_card("ENTRY",           _itm_entry,     _itm_dir_clr, "Trade entry"),
+                                    unsafe_allow_html=True)
+                        st.markdown(_itm_card("STOP LOSS",       _itm_sl,        "#FF5252", "Max risk"),
+                                    unsafe_allow_html=True)
+                    with _lg3:
+                        st.markdown(_itm_card("CALL OI WALL",    _call_oi_wall,  "#FF5252", "Max CE OI"),
+                                    unsafe_allow_html=True)
+                        st.markdown(_itm_card("TRUE RESISTANCE", _true_resist,   "#FF1744", "Weighted avg"),
+                                    unsafe_allow_html=True)
+                        st.markdown(_itm_card("ENTRY RESIST",    _entry_resist,  "#ff8844", "GEX+OI+VOB"),
+                                    unsafe_allow_html=True)
+
+                    # Breakout / Breakdown / Gamma levels
+                    _bb1, _bb2, _bb3, _bb4 = st.columns(4)
+                    with _bb1:
+                        st.markdown(_itm_card("BREAKOUT ABOVE", _breakout_lvl,  "#00ff88", "ATM+1+GEX+Call OI"),
+                                    unsafe_allow_html=True)
+                    with _bb2:
+                        st.markdown(_itm_card("BREAKDOWN BELOW", _breakdown_lvl, "#FF5252", "ATM-1+GEX+Put OI"),
+                                    unsafe_allow_html=True)
+                    with _bb3:
+                        st.markdown(_itm_card("GAMMA FLIP",     _gamma_flip,    "#FFD700", "GEX zero crossing"),
+                                    unsafe_allow_html=True)
+                    with _bb4:
+                        st.markdown(_itm_card("POC (avg)",      _poc_val,       "#00BCD4", "Triple POC avg"),
+                                    unsafe_allow_html=True)
+
+                    # ── STEP 12: Institutional Levels Chart ────────────────────
+                    if st.session_state.sentiment_history:
+                        _itm_chart_times = [h['time'] for h in st.session_state.sentiment_history]
+                        _fig_itm = go.Figure()
+                        for _lv2, _ln, _lc, _ld in [
+                            (_true_support,  "Support",        "#00C853", "dash"),
+                            (_true_resist,   "Resistance",     "#FF1744", "dash"),
+                            (_itm_entry,     "Entry Zone",     _itm_dir_clr, "dot"),
+                            (_itm_target,    "Target",         "#00BCD4", "dot"),
+                            (_breakout_lvl,  "Breakout Level", "#00ff88", "dashdot"),
+                            (_breakdown_lvl, "Breakdown Level","#FF5252", "dashdot"),
+                            (_itm_sl,        "Stop Loss",      "#ff8800", "longdash"),
+                        ]:
+                            _fig_itm.add_hline(
+                                y=_lv2, line_dash=_ld, line_color=_lc, line_width=1.5,
+                                annotation_text=f"{_ln}: {_lv2:.0f}",
+                                annotation_position="right",
+                                annotation_font_size=9,
+                                annotation_font_color=_lc)
+                        _fig_itm.add_trace(go.Scatter(
+                            x=_itm_chart_times,
+                            y=[_itm_spot] * len(_itm_chart_times),
+                            mode='lines', name='Spot Price',
+                            line=dict(color='#FFD740', width=2)))
+                        _fig_itm.update_layout(
+                            title=f"Institutional Trade Map — Spot: {_itm_spot:,.0f}",
+                            height=350, template='plotly_dark',
+                            xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                            yaxis=dict(title='Price', gridcolor='#333'),
+                            legend=dict(orientation='h', y=-0.3, font=dict(size=9)),
+                            margin=dict(l=40, r=120, t=45, b=30),
+                            paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'))
+                        st.plotly_chart(_fig_itm, use_container_width=True)
+
+                    # Source breakdown
+                    with st.expander("📖 Level Sources"):
+                        _src_data = [
+                            ["Put OI Wall",     f"₹{_put_oi_wall:.0f}",   "Max PE open interest strike (ATM±5)"],
+                            ["Call OI Wall",    f"₹{_call_oi_wall:.0f}",  "Max CE open interest strike (ATM±5)"],
+                            ["Gamma Support",   f"₹{_gamma_support:.0f}", "Highest positive GEX below ATM"],
+                            ["Gamma Resistance",f"₹{_gamma_resist:.0f}",  "Lowest negative GEX above ATM"],
+                            ["Gamma Flip",      f"₹{_gamma_flip:.0f}",    "GEX sign change level"],
+                            ["VOB Support",     f"₹{_vob_support:.0f}",   "Volume Order Block nearest below spot"],
+                            ["VOB Resistance",  f"₹{_vob_resist:.0f}",    "Volume Order Block nearest above spot"],
+                            ["POC (avg)",       f"₹{_poc_val:.0f}",       "Average of Short/Mid/Long POC"],
+                            ["Pivot Support",   f"₹{_piv_support:.0f}",   "Nearest HTF pivot low below spot"],
+                            ["Pivot Resistance",f"₹{_piv_resist:.0f}",    "Nearest HTF pivot high above spot"],
+                        ]
+                        st.dataframe(pd.DataFrame(_src_data,
+                            columns=['Level', 'Value', 'Source']),
+                            use_container_width=True, hide_index=True)
+                else:
+                    st.info("ATM strike not identified in option chain.")
+            else:
+                st.info("Option chain data required for Institutional Trade Map.")
+        except Exception as _itm_e:
+            st.warning(f"Institutional Trade Map error: {str(_itm_e)}")
 
         # ===== ATM ±2 STRIKE COMPARISON: PCR / ChgOI PCR / GEX =====
         st.markdown("---")
@@ -7835,472 +8588,207 @@ def main():
         else:
             st.info("📊 PCR of ΔOI per strike history will build up as the app refreshes. Please wait for data collection...")
 
-        # ===== COMPOSITE DIRECTIONAL SIGNAL: PCR + PCR(ΔOI) + GEX (ATM ± 2) =====
+        # ===== COMPOSITE DIRECTION SIGNAL — now merged into Unified Sentiment Engine above =====
+        # Computation runs inside Unified Options Flow Sentiment Engine; session state is shared.
+        # Displaying the verdict & per-strike charts here for historical time-series view.
         st.markdown("---")
-        st.markdown("## 🧭 Composite Direction Signal - PCR × ΔOI × GEX (ATM ± 2)")
+        st.markdown("## 🧭 Composite Direction Signal — Time Series (ATM ± 2)")
 
         try:
-            df_summary_comp = option_data.get('df_summary') if option_data else None
-            underlying_price_comp = option_data.get('underlying') if option_data else None
-            composite_data_available = False
-
-            if (df_summary_comp is not None and underlying_price_comp and
-                'Zone' in df_summary_comp.columns and 'PCR' in df_summary_comp.columns and
-                'changeinOpenInterest_CE' in df_summary_comp.columns and
-                'Gamma_CE' in df_summary_comp.columns):
-
-                # Find ATM ± 2 strikes
-                atm_idx_comp = df_summary_comp[df_summary_comp['Zone'] == 'ATM'].index
-                if len(atm_idx_comp) > 0:
-                    atm_pos_comp = df_summary_comp.index.get_loc(atm_idx_comp[0])
-                    start_comp = max(0, atm_pos_comp - 2)
-                    end_comp = min(len(df_summary_comp), atm_pos_comp + 3)
-                    comp_df = df_summary_comp.iloc[start_comp:end_comp].copy()
-
-                    # Calculate PCR of ΔOI per strike
-                    comp_df['PCR_ChgOI'] = comp_df.apply(
-                        lambda row: abs(row['changeinOpenInterest_PE'] / row['changeinOpenInterest_CE'])
-                        if row['changeinOpenInterest_CE'] != 0 else 0, axis=1
-                    )
-
-                    # Calculate per-strike GEX
-                    contract_multiplier = 25
-                    comp_df['Net_GEX'] = (
-                        -1 * comp_df.get('Gamma_CE', 0) * comp_df.get('openInterest_CE', 0) * contract_multiplier * underlying_price_comp / 100000
-                        + comp_df.get('Gamma_PE', 0) * comp_df.get('openInterest_PE', 0) * contract_multiplier * underlying_price_comp / 100000
-                    )
-
-                    # ---- Per-strike scoring ----
-                    strike_scores = []
-                    strike_details = []
-                    position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
-                    weights = [1.0, 1.5, 2.0, 1.5, 1.0]
-
-                    total_net_gex = comp_df['Net_GEX'].sum()
-
-                    # Per-strike history entries for individual tracking
-                    per_strike_scores = {}
-
-                    for i, (_, row) in enumerate(comp_df.iterrows()):
-                        pcr_val = row.get('PCR', 1.0)
-                        pcr_chgoi_val = row['PCR_ChgOI']
-                        net_gex_val = row['Net_GEX']
-
-                        pcr_score = 1 if pcr_val > 1.2 else (-1 if pcr_val < 0.7 else 0)
-                        chgoi_score = 1 if pcr_chgoi_val > 1.2 else (-1 if pcr_chgoi_val < 0.7 else 0)
-                        dir_score = pcr_score + chgoi_score
-
-                        w = weights[i] if i < len(weights) else 1.0
-                        strike_scores.append(dir_score * w)
-
-                        # Track per-strike score for history
-                        strike_label = str(int(row['Strike']))
-                        per_strike_scores[strike_label] = round(dir_score * w, 2)
-
-                        label = position_labels[i] if i < len(position_labels) else f"Strike {i}"
-                        pcr_sig = "Bull" if pcr_score > 0 else ("Bear" if pcr_score < 0 else "Neut")
-                        chgoi_sig = "Bull" if chgoi_score > 0 else ("Bear" if chgoi_score < 0 else "Neut")
-                        gex_sig = "Pin" if net_gex_val > 10 else ("Accel" if net_gex_val < -10 else "Neut")
-
-                        strike_details.append({
-                            'Position': label,
-                            'Strike': int(row['Strike']),
-                            'PCR (OI)': round(pcr_val, 2),
-                            'PCR Signal': pcr_sig,
-                            'PCR (ΔOI)': round(pcr_chgoi_val, 2),
-                            'ΔOI Signal': chgoi_sig,
-                            'Net GEX': round(net_gex_val, 2),
-                            'GEX Signal': gex_sig,
-                            'Score': round(dir_score * w, 1)
-                        })
-
-                    # ---- Aggregate verdict ----
-                    total_score = sum(strike_scores)
-                    max_possible = sum(w * 2 for w in weights)
-                    gex_trending = total_net_gex < -10
-                    gex_pinning = total_net_gex > 10
-                    score_pct = (total_score / max_possible) * 100 if max_possible > 0 else 0
-
-                    if abs(score_pct) < 15:
-                        if gex_pinning:
-                            verdict = "SIDEWAYS"
-                            verdict_icon = "↔️"
-                            verdict_color = "#FFD700"
-                            verdict_desc = "Mixed signals + Positive GEX = Range-bound / Choppy"
-                            verdict_numeric = 0
-                        else:
-                            verdict = "NEUTRAL"
-                            verdict_icon = "⚪"
-                            verdict_color = "#888888"
-                            verdict_desc = "No clear directional bias from ATM±2 strikes"
-                            verdict_numeric = 0
-                    elif score_pct > 0:
-                        if gex_trending:
-                            verdict = "STRONG UP"
-                            verdict_icon = "🟢🔥"
-                            verdict_color = "#00ff88"
-                            verdict_desc = "Bullish PCR + Fresh put writing + Negative GEX = Breakout UP"
-                            verdict_numeric = 3
-                        elif gex_pinning:
-                            verdict = "UP (CAPPED)"
-                            verdict_icon = "🟢📍"
-                            verdict_color = "#90EE90"
-                            verdict_desc = "Bullish bias but positive GEX may cap upside momentum"
-                            verdict_numeric = 1
-                        else:
-                            verdict = "UP"
-                            verdict_icon = "🟢"
-                            verdict_color = "#00ff88"
-                            verdict_desc = "Bullish PCR + Put writing activity across ATM±2 strikes"
-                            verdict_numeric = 2
-                    else:
-                        if gex_trending:
-                            verdict = "STRONG DOWN"
-                            verdict_icon = "🔴🔥"
-                            verdict_color = "#ff4444"
-                            verdict_desc = "Bearish PCR + Fresh call writing + Negative GEX = Breakdown"
-                            verdict_numeric = -3
-                        elif gex_pinning:
-                            verdict = "DOWN (SUPPORTED)"
-                            verdict_icon = "🔴📍"
-                            verdict_color = "#FFB6C1"
-                            verdict_desc = "Bearish bias but positive GEX may provide support"
-                            verdict_numeric = -1
-                        else:
-                            verdict = "DOWN"
-                            verdict_icon = "🔴"
-                            verdict_color = "#ff4444"
-                            verdict_desc = "Bearish PCR + Call writing activity across ATM±2 strikes"
-                            verdict_numeric = -2
-
-                    composite_data_available = True
-
-                    # ---- Store history ----
-                    ist = pytz.timezone('Asia/Kolkata')
-                    current_time = datetime.now(ist)
-
-                    avg_pcr = comp_df['PCR'].mean()
-                    avg_chgoi = comp_df['PCR_ChgOI'].mean()
-
-                    st.session_state.composite_signal_last_valid = {
-                        'verdict': verdict,
-                        'verdict_icon': verdict_icon,
-                        'verdict_color': verdict_color,
-                        'verdict_desc': verdict_desc,
-                        'total_score': total_score,
-                        'score_pct': score_pct,
-                        'total_net_gex': total_net_gex,
-                        'avg_pcr': avg_pcr,
-                        'avg_chgoi': avg_chgoi,
-                        'strike_details': strike_details,
-                        'per_strike_scores': per_strike_scores
-                    }
-
-                    # Add to history (deduplicate within 30 seconds)
-                    should_add = True
-                    if st.session_state.composite_signal_history:
-                        last_entry = st.session_state.composite_signal_history[-1]
-                        time_diff = (current_time - last_entry['time']).total_seconds()
-                        if time_diff < 30:
-                            should_add = False
-
-                    if should_add:
-                        history_entry = {
-                            'time': current_time,
-                            'score': round(total_score, 2),
-                            'score_pct': round(score_pct, 1),
-                            'verdict': verdict,
-                            'verdict_numeric': verdict_numeric,
-                            'avg_pcr': round(avg_pcr, 3),
-                            'avg_chgoi': round(avg_chgoi, 3),
-                            'total_gex': round(total_net_gex, 2),
-                        }
-                        # Add per-strike scores to history
-                        for k, v in per_strike_scores.items():
-                            history_entry[f'score_{k}'] = v
-                        st.session_state.composite_signal_history.append(history_entry)
-                        if len(st.session_state.composite_signal_history) > 200:
-                            st.session_state.composite_signal_history = st.session_state.composite_signal_history[-200:]
-
-            # ---- Display section (always show if history exists) ----
-            # Use last valid data for verdict card if current fetch failed
+            # Computation runs inside Unified Options Flow Sentiment Engine (above).
+            # This section shows the composite time-series history from session state.
             last_valid = st.session_state.composite_signal_last_valid
             if last_valid:
-                verdict = last_valid['verdict']
-                verdict_icon = last_valid['verdict_icon']
-                verdict_color = last_valid['verdict_color']
-                verdict_desc = last_valid['verdict_desc']
-                total_score = last_valid['total_score']
-                score_pct = last_valid['score_pct']
-                total_net_gex = last_valid['total_net_gex']
-                avg_pcr = last_valid['avg_pcr']
-                avg_chgoi = last_valid['avg_chgoi']
+                _cv2_verdict = last_valid['verdict']
+                _cv2_icon    = last_valid['verdict_icon']
+                _cv2_color   = last_valid['verdict_color']
+                _cv2_desc    = last_valid['verdict_desc']
+                _cv2_score   = last_valid['score_pct']
+                _cv2_gex     = last_valid['total_net_gex']
+                _cv2_pcr     = last_valid['avg_pcr']
+                _cv2_chgoi   = last_valid['avg_chgoi']
+                _cv2_max     = 14.0
+                _cv2_gtrend  = _cv2_gex < -10
+                _cv2_gpin    = _cv2_gex > 10
                 strike_details = last_valid.get('strike_details', [])
-                gex_trending = total_net_gex < -10
-                gex_pinning = total_net_gex > 10
-                max_possible = 14.0  # sum(w*2 for w in [1,1.5,2,1.5,1])
 
-                # Main verdict card
+                # Verdict card
                 st.markdown(f"""
-                <div style="background: linear-gradient(135deg, {verdict_color}15, {verdict_color}30);
-                            padding: 25px; border-radius: 15px; border: 3px solid {verdict_color};
-                            text-align: center; margin-bottom: 20px;">
-                    <h1 style="color: {verdict_color}; margin: 0; font-size: 48px;">{verdict_icon} {verdict}</h1>
-                    <p style="color: #cccccc; margin: 10px 0 0 0; font-size: 16px;">{verdict_desc}</p>
-                    <p style="color: {verdict_color}; margin: 5px 0 0 0; font-size: 14px;">
-                        Composite Score: {total_score:+.1f} / {max_possible:.0f} ({score_pct:+.0f}%) |
-                        Net GEX: {total_net_gex:.1f}L ({'Trending' if gex_trending else 'Pinning' if gex_pinning else 'Neutral'})
+                <div style="background:linear-gradient(135deg,{_cv2_color}15,{_cv2_color}30);
+                            padding:20px;border-radius:12px;border:3px solid {_cv2_color};
+                            text-align:center;margin-bottom:14px;">
+                    <h1 style="color:{_cv2_color};margin:0;font-size:42px;">{_cv2_icon} {_cv2_verdict}</h1>
+                    <p style="color:#ccc;margin:8px 0 0 0;font-size:15px;">{_cv2_desc}</p>
+                    <p style="color:{_cv2_color};margin:5px 0 0 0;font-size:13px;">
+                        Score: {_cv2_score:+.0f}% | GEX: {_cv2_gex:.1f}L
+                        ({'Trending' if _cv2_gtrend else 'Pinning' if _cv2_gpin else 'Neutral'})
                     </p>
-                </div>
-                """, unsafe_allow_html=True)
+                </div>""", unsafe_allow_html=True)
 
-                # Three metric cards
-                met1, met2, met3 = st.columns(3)
-                with met1:
-                    pcr_c = "#00ff88" if avg_pcr > 1.2 else "#ff4444" if avg_pcr < 0.7 else "#FFD700"
-                    st.markdown(f"""
-                    <div style="background-color: {pcr_c}20; padding: 12px; border-radius: 10px; border: 2px solid {pcr_c}; text-align: center;">
-                        <h4 style="color: {pcr_c}; margin: 0;">Avg PCR (OI)</h4>
-                        <h2 style="color: {pcr_c}; margin: 5px 0;">{avg_pcr:.2f}</h2>
-                        <p style="color: white; margin: 0; font-size: 12px;">{'Bullish' if avg_pcr > 1.2 else 'Bearish' if avg_pcr < 0.7 else 'Neutral'}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with met2:
-                    chg_c = "#00ff88" if avg_chgoi > 1.2 else "#ff4444" if avg_chgoi < 0.7 else "#FFD700"
-                    st.markdown(f"""
-                    <div style="background-color: {chg_c}20; padding: 12px; border-radius: 10px; border: 2px solid {chg_c}; text-align: center;">
-                        <h4 style="color: {chg_c}; margin: 0;">Avg PCR (ΔOI)</h4>
-                        <h2 style="color: {chg_c}; margin: 5px 0;">{avg_chgoi:.2f}</h2>
-                        <p style="color: white; margin: 0; font-size: 12px;">{'Bullish' if avg_chgoi > 1.2 else 'Bearish' if avg_chgoi < 0.7 else 'Neutral'}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
-                with met3:
-                    gex_c = "#00ff88" if total_net_gex > 10 else "#ff4444" if total_net_gex < -10 else "#FFD700"
-                    st.markdown(f"""
-                    <div style="background-color: {gex_c}20; padding: 12px; border-radius: 10px; border: 2px solid {gex_c}; text-align: center;">
-                        <h4 style="color: {gex_c}; margin: 0;">Total GEX (ATM±2)</h4>
-                        <h2 style="color: {gex_c}; margin: 5px 0;">{total_net_gex:.1f}L</h2>
-                        <p style="color: white; margin: 0; font-size: 12px;">{'Pin/Chop' if total_net_gex > 10 else 'Trend/Accel' if total_net_gex < -10 else 'Neutral'}</p>
-                    </div>
-                    """, unsafe_allow_html=True)
+                # 3 metric cards
+                _cm1x, _cm2x, _cm3x = st.columns(3)
+                with _cm1x:
+                    _pc2 = "#00ff88" if _cv2_pcr > 1.2 else "#ff4444" if _cv2_pcr < 0.7 else "#FFD700"
+                    st.markdown(f'''<div style="background:{_pc2}20;padding:12px;border-radius:8px;
+                        border:2px solid {_pc2};text-align:center;">
+                        <h4 style="color:{_pc2};margin:0;">Avg PCR (OI)</h4>
+                        <h2 style="color:{_pc2};margin:5px 0;">{_cv2_pcr:.2f}</h2>
+                        <p style="color:white;margin:0;font-size:12px;">
+                            {'Bullish' if _cv2_pcr > 1.2 else 'Bearish' if _cv2_pcr < 0.7 else 'Neutral'}
+                        </p></div>''', unsafe_allow_html=True)
+                with _cm2x:
+                    _cc2 = "#00ff88" if _cv2_chgoi > 1.2 else "#ff4444" if _cv2_chgoi < 0.7 else "#FFD700"
+                    st.markdown(f'''<div style="background:{_cc2}20;padding:12px;border-radius:8px;
+                        border:2px solid {_cc2};text-align:center;">
+                        <h4 style="color:{_cc2};margin:0;">Avg PCR (ΔOI)</h4>
+                        <h2 style="color:{_cc2};margin:5px 0;">{_cv2_chgoi:.2f}</h2>
+                        <p style="color:white;margin:0;font-size:12px;">
+                            {'Bullish' if _cv2_chgoi > 1.2 else 'Bearish' if _cv2_chgoi < 0.7 else 'Neutral'}
+                        </p></div>''', unsafe_allow_html=True)
+                with _cm3x:
+                    _gc2 = "#00ff88" if _cv2_gex > 10 else "#ff4444" if _cv2_gex < -10 else "#FFD700"
+                    st.markdown(f'''<div style="background:{_gc2}20;padding:12px;border-radius:8px;
+                        border:2px solid {_gc2};text-align:center;">
+                        <h4 style="color:{_gc2};margin:0;">Total GEX (ATM±2)</h4>
+                        <h2 style="color:{_gc2};margin:5px 0;">{_cv2_gex:.1f}L</h2>
+                        <p style="color:white;margin:0;font-size:12px;">
+                            {'Pin/Chop' if _cv2_gex > 10 else 'Trend/Accel' if _cv2_gex < -10 else 'Neutral'}
+                        </p></div>''', unsafe_allow_html=True)
 
-            # ---- Time-Series Charts ----
+            # Time-series charts from shared session state
             if len(st.session_state.composite_signal_history) > 0:
                 comp_hist_df = pd.DataFrame(st.session_state.composite_signal_history)
 
-                # === Chart 1: Composite Score over time ===
-                st.markdown("### 📈 Composite Score & Verdict - Time Series")
-
+                # Chart 1: Composite Score over time
                 fig_score = go.Figure()
-
-                # Color markers by verdict
-                marker_colors = []
-                for _, hrow in comp_hist_df.iterrows():
-                    vn = hrow.get('verdict_numeric', 0)
-                    if vn >= 2:
-                        marker_colors.append('#00ff88')   # Strong/Normal UP = green
-                    elif vn == 1:
-                        marker_colors.append('#90EE90')   # UP CAPPED = light green
-                    elif vn <= -2:
-                        marker_colors.append('#ff4444')   # Strong/Normal DOWN = red
-                    elif vn == -1:
-                        marker_colors.append('#FFB6C1')   # DOWN SUPPORTED = light red
-                    else:
-                        marker_colors.append('#FFD700')   # NEUTRAL/SIDEWAYS = yellow
-
+                _mkr_colors2 = []
+                for _, _hrow2 in comp_hist_df.iterrows():
+                    _vn2 = _hrow2.get('verdict_numeric', 0)
+                    _mkr_colors2.append(
+                        '#00ff88' if _vn2 >= 2 else '#90EE90' if _vn2 == 1 else
+                        '#ff4444' if _vn2 <= -2 else '#FFB6C1' if _vn2 == -1 else '#FFD700')
                 fig_score.add_trace(go.Scatter(
-                    x=comp_hist_df['time'],
-                    y=comp_hist_df['score_pct'],
-                    mode='lines+markers',
-                    name='Score %',
+                    x=comp_hist_df['time'], y=comp_hist_df['score_pct'],
+                    mode='lines+markers', name='Score %',
                     line=dict(color='#00aaff', width=3),
-                    marker=dict(size=8, color=marker_colors),
-                    fill='tozeroy',
-                    fillcolor='rgba(0, 170, 255, 0.08)'
-                ))
-
-                # Reference zones
-                fig_score.add_hline(y=0, line_dash="dash", line_color="white", line_width=1.5,
-                                    annotation_text="Neutral (0%)", annotation_position="right")
-                fig_score.add_hline(y=15, line_dash="dot", line_color="#00ff88", line_width=1,
-                                    annotation_text="Bullish Zone", annotation_position="right")
-                fig_score.add_hline(y=-15, line_dash="dot", line_color="#ff4444", line_width=1,
-                                    annotation_text="Bearish Zone", annotation_position="right")
-
-                # Shaded zones
-                y_max_s = max(abs(comp_hist_df['score_pct'].max()), abs(comp_hist_df['score_pct'].min()), 30) * 1.2
-                fig_score.add_hrect(y0=15, y1=y_max_s, fillcolor="rgba(0,255,136,0.06)", line_width=0)
-                fig_score.add_hrect(y0=-y_max_s, y1=-15, fillcolor="rgba(255,68,68,0.06)", line_width=0)
-
-                # Add verdict text annotations at each point
-                for idx, hrow in comp_hist_df.iterrows():
-                    if idx % max(1, len(comp_hist_df) // 10) == 0:  # Show every ~10th label to avoid clutter
-                        fig_score.add_annotation(
-                            x=hrow['time'], y=hrow['score_pct'],
-                            text=hrow['verdict'], showarrow=False,
-                            yshift=15, font=dict(size=8, color='white'),
-                            bgcolor='rgba(0,0,0,0.5)', borderpad=2
-                        )
-
+                    marker=dict(size=8, color=_mkr_colors2),
+                    fill='tozeroy', fillcolor='rgba(0,170,255,0.08)'))
+                fig_score.add_hline(y=0, line_dash='dash', line_color='white', line_width=1.5,
+                    annotation_text='Neutral (0%)', annotation_position='right')
+                fig_score.add_hline(y=15, line_dash='dot', line_color='#00ff88', line_width=1,
+                    annotation_text='Bullish Zone', annotation_position='right')
+                fig_score.add_hline(y=-15, line_dash='dot', line_color='#ff4444', line_width=1,
+                    annotation_text='Bearish Zone', annotation_position='right')
+                _ymax2 = max(abs(comp_hist_df['score_pct'].max()), abs(comp_hist_df['score_pct'].min()), 30) * 1.2
+                fig_score.add_hrect(y0=15, y1=_ymax2, fillcolor='rgba(0,255,136,0.06)', line_width=0)
+                fig_score.add_hrect(y0=-_ymax2, y1=-15, fillcolor='rgba(255,68,68,0.06)', line_width=0)
+                _cv2_s_now = last_valid['score_pct'] if last_valid else 0
+                _cv2_v_now = last_valid['verdict']    if last_valid else 'NEUTRAL'
                 fig_score.update_layout(
-                    title=f"Composite Direction Score | Current: {score_pct:+.0f}% ({verdict})",
-                    template='plotly_dark',
-                    height=400,
-                    showlegend=False,
+                    title=f"Composite Direction Score | Current: {_cv2_s_now:+.0f}% ({_cv2_v_now})",
+                    template='plotly_dark', height=380, showlegend=False,
                     xaxis=dict(tickformat='%H:%M', title='Time'),
-                    yaxis=dict(title='Score %', zeroline=True, zerolinecolor='white', zerolinewidth=1),
-                    plot_bgcolor='#1e1e1e',
-                    paper_bgcolor='#1e1e1e',
-                    margin=dict(l=50, r=50, t=60, b=50)
-                )
+                    yaxis=dict(title='Score %', zeroline=True, zerolinecolor='white'),
+                    plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                    margin=dict(l=50, r=50, t=60, b=50))
                 st.plotly_chart(fig_score, use_container_width=True)
 
-                # === Chart 2: Three indicators over time (Avg PCR, Avg ΔOI PCR, GEX) ===
-                st.markdown("### 📊 Component Indicators - Time Series")
+                # Charts: PCR components + GEX (2 col)
                 ind_col1, ind_col2 = st.columns(2)
-
                 with ind_col1:
-                    # PCR OI + PCR ΔOI over time
                     fig_pcr_ts = go.Figure()
                     fig_pcr_ts.add_trace(go.Scatter(
                         x=comp_hist_df['time'], y=comp_hist_df['avg_pcr'],
                         mode='lines+markers', name='Avg PCR (OI)',
-                        line=dict(color='#00aaff', width=2), marker=dict(size=4)
-                    ))
+                        line=dict(color='#00aaff', width=2), marker=dict(size=4)))
                     fig_pcr_ts.add_trace(go.Scatter(
                         x=comp_hist_df['time'], y=comp_hist_df['avg_chgoi'],
                         mode='lines+markers', name='Avg PCR (ΔOI)',
-                        line=dict(color='#ff44ff', width=2), marker=dict(size=4)
-                    ))
-                    fig_pcr_ts.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
-                    fig_pcr_ts.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
-                    fig_pcr_ts.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
-                    # Dynamic Y range: both series + thresholds always in view
-                    _comp_pcr_raw = comp_hist_df['avg_pcr'].dropna().tolist() + comp_hist_df['avg_chgoi'].dropna().tolist()
-                    _comp_pcr_all = _comp_pcr_raw + [0.7, 1.0, 1.2]
-                    _comp_ymin = max(0.0, min(_comp_pcr_all) * 0.9)
-                    _comp_ymax = max(_comp_pcr_all) * 1.1
+                        line=dict(color='#ff44ff', width=2), marker=dict(size=4)))
+                    fig_pcr_ts.add_hline(y=1.2, line_dash='dot', line_color='#00ff88', line_width=1)
+                    fig_pcr_ts.add_hline(y=1.0, line_dash='dash', line_color='white', line_width=1)
+                    fig_pcr_ts.add_hline(y=0.7, line_dash='dot', line_color='#ff4444', line_width=1)
+                    _all_pcr = (comp_hist_df['avg_pcr'].dropna().tolist() +
+                                comp_hist_df['avg_chgoi'].dropna().tolist() + [0.7, 1.0, 1.2])
                     fig_pcr_ts.update_layout(
-                        title="Avg PCR (OI) vs Avg PCR (ΔOI)",
-                        template='plotly_dark', height=320, showlegend=True,
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        xaxis=dict(tickformat='%H:%M', title=''),
-                        yaxis=dict(title='PCR', range=[_comp_ymin, _comp_ymax]),
+                        title='Avg PCR (OI) vs Avg PCR (ΔOI)',
+                        template='plotly_dark', height=300, showlegend=True,
+                        legend=dict(orientation="h", y=-0.3, font=dict(size=9)),
+                        xaxis=dict(tickformat='%H:%M'),
+                        yaxis=dict(title='PCR',
+                                   range=[max(0, min(_all_pcr)*0.9), max(_all_pcr)*1.1]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
-                        margin=dict(l=40, r=10, t=60, b=30)
-                    )
+                        margin=dict(l=40, r=10, t=50, b=30))
                     st.plotly_chart(fig_pcr_ts, use_container_width=True)
-
                 with ind_col2:
-                    # GEX over time
                     fig_gex_ts = go.Figure()
-                    gex_colors = ['#00ff88' if g > 10 else '#ff4444' if g < -10 else '#FFD700'
-                                  for g in comp_hist_df['total_gex']]
+                    _gex_c2 = ['#00ff88' if g > 10 else '#ff4444' if g < -10 else '#FFD700'
+                               for g in comp_hist_df['total_gex']]
                     fig_gex_ts.add_trace(go.Scatter(
                         x=comp_hist_df['time'], y=comp_hist_df['total_gex'],
                         mode='lines+markers', name='Total GEX',
                         line=dict(color='#FFD700', width=2),
-                        marker=dict(size=5, color=gex_colors),
-                        fill='tozeroy', fillcolor='rgba(255,215,0,0.08)'
-                    ))
-                    fig_gex_ts.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
-                    fig_gex_ts.add_hline(y=10, line_dash="dot", line_color="#00ff88", line_width=1,
-                                          annotation_text="Pin Zone", annotation_position="right")
-                    fig_gex_ts.add_hline(y=-10, line_dash="dot", line_color="#ff4444", line_width=1,
-                                          annotation_text="Accel Zone", annotation_position="right")
+                        marker=dict(size=5, color=_gex_c2),
+                        fill='tozeroy', fillcolor='rgba(255,215,0,0.08)'))
+                    fig_gex_ts.add_hline(y=0, line_dash='dash', line_color='white', line_width=1)
+                    fig_gex_ts.add_hline(y=10, line_dash='dot', line_color='#00ff88', line_width=1,
+                        annotation_text='Pin Zone', annotation_position='right')
+                    fig_gex_ts.add_hline(y=-10, line_dash='dot', line_color='#ff4444', line_width=1,
+                        annotation_text='Accel Zone', annotation_position='right')
                     fig_gex_ts.update_layout(
-                        title="Total GEX (ATM±2) Over Time",
-                        template='plotly_dark', height=320, showlegend=False,
-                        xaxis=dict(tickformat='%H:%M', title=''),
+                        title='Total GEX (ATM±2) Over Time',
+                        template='plotly_dark', height=300, showlegend=False,
+                        xaxis=dict(tickformat='%H:%M'),
                         yaxis=dict(title='GEX (Lakhs)', zeroline=True, zerolinecolor='white'),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
-                        margin=dict(l=40, r=10, t=60, b=30)
-                    )
+                        margin=dict(l=40, r=50, t=50, b=30))
                     st.plotly_chart(fig_gex_ts, use_container_width=True)
 
-                # === Chart 3: Per-strike score over time ===
-                # Find score columns in history
+                # Per-strike score time series
                 score_cols = [c for c in comp_hist_df.columns if c.startswith('score_')]
                 if score_cols:
-                    st.markdown("### 🎯 Per-Strike Score - Time Series")
                     fig_strike_ts = go.Figure()
-                    strike_colors_map = {'0': '#ff44ff', '1': '#cc44cc', '2': '#ffaa00', '3': '#00aaff', '4': '#0088dd'}
-                    for idx_s, sc in enumerate(sorted(score_cols)):
-                        strike_num = sc.replace('score_', '')
-                        color = strike_colors_map.get(str(idx_s), '#ffffff')
-                        # Determine label from position
-                        pos_lbl = position_labels[idx_s] if idx_s < len(position_labels) else strike_num
+                    _cs_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+                    _plbls = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                    for _idx_s, _sc2 in enumerate(sorted(score_cols)):
+                        _sn = _sc2.replace('score_', '')
+                        _slbl3 = _plbls[_idx_s] if _idx_s < len(_plbls) else _sn
                         fig_strike_ts.add_trace(go.Scatter(
-                            x=comp_hist_df['time'], y=comp_hist_df[sc],
-                            mode='lines+markers', name=f'{pos_lbl} (₹{strike_num})',
-                            line=dict(color=color, width=2), marker=dict(size=3)
-                        ))
-                    fig_strike_ts.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                            x=comp_hist_df['time'], y=comp_hist_df[_sc2],
+                            mode='lines+markers',
+                            name=f'{_slbl3} (₹{_sn})',
+                            line=dict(color=_cs_colors[_idx_s % len(_cs_colors)], width=2),
+                            marker=dict(size=3)))
+                    fig_strike_ts.add_hline(y=0, line_dash='dash', line_color='white', line_width=1)
                     fig_strike_ts.update_layout(
-                        title="Per-Strike Weighted Score Over Time",
-                        template='plotly_dark', height=350, showlegend=True,
-                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
-                        xaxis=dict(tickformat='%H:%M', title='Time'),
+                        title='Per-Strike Weighted Score Over Time',
+                        template='plotly_dark', height=320, showlegend=True,
+                        legend=dict(orientation='h', y=-0.3, font=dict(size=9)),
+                        xaxis=dict(tickformat='%H:%M'),
                         yaxis=dict(title='Weighted Score', zeroline=True, zerolinecolor='white'),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
-                        margin=dict(l=50, r=20, t=60, b=40)
-                    )
+                        margin=dict(l=50, r=20, t=50, b=40))
                     st.plotly_chart(fig_strike_ts, use_container_width=True)
 
                 # Per-strike breakdown table
-                if strike_details:
+                if last_valid and last_valid.get('strike_details'):
                     st.markdown("### Per-Strike Breakdown")
-                    detail_df = pd.DataFrame(strike_details)
-                    st.dataframe(detail_df, use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(last_valid['strike_details']),
+                                 use_container_width=True, hide_index=True)
 
-                # Status bar and clear button
+                # Status / clear
                 comp_info1, comp_info2 = st.columns([3, 1])
                 with comp_info1:
-                    status = "🟢 Live" if composite_data_available else "🟡 Using cached data"
-                    st.caption(f"{status} | 📈 {len(st.session_state.composite_signal_history)} data points | Updates every ~30s")
+                    st.caption(f"📈 {len(st.session_state.composite_signal_history)} pts · "
+                               f"Computed inside Unified Sentiment Engine · Updates every ~30s")
                 with comp_info2:
-                    if st.button("🗑️ Clear Composite History"):
+                    if st.button("🗑️ Clear Composite History", key="clr_comp_ts"):
                         st.session_state.composite_signal_history = []
                         st.session_state.composite_signal_last_valid = None
                         st.rerun()
 
-                # Signal interpretation guide
-                with st.expander("📖 How This Works"):
-                    st.markdown("""
-                    **Three indicators are combined for each ATM±2 strike:**
-
-                    | Indicator | Bullish (+1) | Bearish (-1) | Neutral (0) |
-                    |-----------|-------------|-------------|-------------|
-                    | **PCR (OI)** | > 1.2 (Heavy puts = support) | < 0.7 (Heavy calls = resistance) | 0.7 - 1.2 |
-                    | **PCR (ΔOI)** | > 1.2 (Fresh put writing) | < 0.7 (Fresh call writing) | 0.7 - 1.2 |
-                    | **GEX** | Determines trend vs chop | Determines trend vs chop | - |
-
-                    **Weighting:** ATM = 2x, ±1 strikes = 1.5x, ±2 strikes = 1x
-
-                    **GEX Role:** GEX doesn't determine direction — it determines **conviction**:
-                    - **Negative GEX** (< -10L): Dealers short gamma → moves amplified → **STRONG** trend signal
-                    - **Positive GEX** (> 10L): Dealers long gamma → moves dampened → **SIDEWAYS/CAPPED**
-                    - **Neutral GEX**: Normal market conditions
-
-                    **Verdict Logic:**
-                    - 🟢🔥 **STRONG UP**: Bullish PCR+ΔOI + Negative GEX = Breakout rally
-                    - 🟢📍 **UP (CAPPED)**: Bullish PCR+ΔOI + Positive GEX = Upside but range-bound
-                    - 🟢 **UP**: Bullish PCR+ΔOI + Neutral GEX
-                    - 🔴🔥 **STRONG DOWN**: Bearish PCR+ΔOI + Negative GEX = Breakdown selloff
-                    - 🔴📍 **DOWN (SUPPORTED)**: Bearish PCR+ΔOI + Positive GEX = Downside but supported
-                    - 🔴 **DOWN**: Bearish PCR+ΔOI + Neutral GEX
-                    - ↔️ **SIDEWAYS**: Mixed signals + Positive GEX = Choppy range
-                    - ⚪ **NEUTRAL**: No clear signal
-
-                    **Time-Series Charts:**
-                    - **Composite Score**: Shows overall direction score (%) over time — green zone (>15%) = bullish, red zone (<-15%) = bearish
-                    - **Avg PCR vs Avg ΔOI PCR**: Tracks positioning vs fresh activity — divergence signals shift in progress
-                    - **Total GEX**: Shows if market is in Pin mode (>10) or Acceleration mode (<-10)
-                    - **Per-Strike Score**: Shows which individual strikes are driving the signal — useful for spotting strike-level shifts
-                    """)
-
-            elif not last_valid:
-                st.info("📊 Composite signal history will build up as the app refreshes. Please wait for data collection...")
+            elif not st.session_state.composite_signal_last_valid:
+                st.info("📊 Composite signal history will build up as the app refreshes.")
 
         except Exception as e:
             st.warning(f"Composite direction signal unavailable: {str(e)}")
