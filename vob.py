@@ -5925,6 +5925,26 @@ def main():
                         _cmp_ymin = max(0.0, min(_cmp_vals) * 0.9)
                         _cmp_ymax = max(_cmp_vals) * 1.1
 
+                        # ── Current value markers (present value shown in graph) ──
+                        if strike_col in history_df.columns and len(history_df) > 0:
+                            _pcr_cur = history_df[strike_col].iloc[-1]
+                            fig.add_trace(go.Scatter(
+                                x=[history_df['time'].iloc[-1]], y=[_pcr_cur],
+                                mode='markers+text', text=[f'{_pcr_cur:.2f}'],
+                                textposition='top right', textfont=dict(size=9, color='#00ccff'),
+                                marker=dict(size=9, color='#00ccff', symbol='circle'),
+                                showlegend=False, hoverinfo='skip',
+                            ))
+                        if chgoi_history_df is not None and strike_col in chgoi_history_df.columns and len(chgoi_history_df) > 0:
+                            _chgoi_cur = chgoi_history_df[strike_col].iloc[-1]
+                            fig.add_trace(go.Scatter(
+                                x=[chgoi_history_df['time'].iloc[-1]], y=[_chgoi_cur],
+                                mode='markers+text', text=[f'{_chgoi_cur:.2f}'],
+                                textposition='bottom right', textfont=dict(size=9, color='#ffaa00'),
+                                marker=dict(size=9, color='#ffaa00', symbol='diamond'),
+                                showlegend=False, hoverinfo='skip',
+                            ))
+
                         fig.update_layout(
                             title=dict(text=f"{position_labels[i]}<br>₹{strike}", font=dict(size=11)),
                             template='plotly_dark',
@@ -6009,6 +6029,15 @@ def main():
                         fig_gex.add_hline(y=-10, line_dash="dot", line_color="rgba(255,68,68,0.4)", line_width=1,
                                           annotation_text="-10", annotation_position="right",
                                           annotation_font_size=8, annotation_font_color="#ff4444")
+                        # Current value marker (present value shown in graph)
+                        if has_gex_hist and gex_hist_df is not None and strike_col in gex_hist_df.columns and len(gex_hist_df) > 0:
+                            fig_gex.add_trace(go.Scatter(
+                                x=[gex_hist_df['time'].iloc[-1]], y=[cur_gex],
+                                mode='markers+text', text=[f'{cur_gex:+.1f}L'],
+                                textposition='top right', textfont=dict(size=9, color=clr),
+                                marker=dict(size=9, color=clr, symbol='circle'),
+                                showlegend=False, hoverinfo='skip',
+                            ))
                         fig_gex.update_layout(
                             title=dict(text=f"{position_labels[i]}<br>₹{strike}<br>GEX: {cur_gex:+.1f}L",
                                        font=dict(size=11)),
@@ -7859,6 +7888,25 @@ def main():
                     _ivp_end = min(len(_ivp_df), _ivp_atm_pos + 3)
                     _ivp_slice = _ivp_df.iloc[_ivp_start:_ivp_end].copy()
 
+                    # --- Strike label function for IV section ---
+                    _ivp_strikes_sorted = sorted(_ivp_slice['Strike'].unique())
+                    _ivp_step = int(_ivp_strikes_sorted[1] - _ivp_strikes_sorted[0]) if len(_ivp_strikes_sorted) >= 2 else 50
+                    _ivp_atm_val = float(_ivp_df[_ivp_df['Zone'] == 'ATM']['Strike'].values[0])
+                    def _ivp_label(s):
+                        diff = int(round((s - _ivp_atm_val) / _ivp_step))
+                        if diff == 0:  return "ATM"
+                        if diff > 0:   return f"ATM+{diff}"
+                        return f"ATM{diff}"
+
+                    # --- Per-strike IV (CE and PE) ---
+                    _ivp_per_iv_ce = {}
+                    _ivp_per_iv_pe = {}
+                    for _, _ivr in _ivp_slice.iterrows():
+                        _ivs = _ivr['Strike']
+                        _ivlbl = _ivp_label(_ivs)
+                        _ivp_per_iv_ce[_ivlbl] = float(_ivr.get('impliedVolatility_CE', 0) or 0)
+                        _ivp_per_iv_pe[_ivlbl] = float(_ivr.get('impliedVolatility_PE', 0) or 0)
+
                     # --- IV SKEW ---
                     _iv_ce_vals = _ivp_slice['impliedVolatility_CE'].fillna(0).tolist()
                     _iv_pe_vals = _ivp_slice['impliedVolatility_PE'].fillna(0).tolist()
@@ -7889,14 +7937,19 @@ def main():
                     # --- CALL & PUT PRESSURE ---
                     _call_pres = {}
                     _put_pres = {}
+                    _ivp_per_net_pres = {}  # per-strike net pressure
                     for _, _row in _ivp_slice.iterrows():
                         _s = _row['Strike']
+                        _slbl = _ivp_label(_s)
                         _bc = float(_row.get('bidQty_CE', 0) or 0)
                         _ac = float(_row.get('askQty_CE', 0) or 0)
                         _bp = float(_row.get('bidQty_PE', 0) or 0)
                         _ap = float(_row.get('askQty_PE', 0) or 0)
-                        _call_pres[_s] = (_bc - _ac) / (_bc + _ac + 1e-6)
-                        _put_pres[_s]  = (_bp - _ap) / (_bp + _ap + 1e-6)
+                        _cp = (_bc - _ac) / (_bc + _ac + 1e-6)
+                        _pp = (_bp - _ap) / (_bp + _ap + 1e-6)
+                        _call_pres[_s] = _cp
+                        _put_pres[_s]  = _pp
+                        _ivp_per_net_pres[_slbl] = round(_cp - _pp, 4)
 
                     _avg_call_pres = sum(_call_pres.values()) / len(_call_pres) if _call_pres else 0
                     _avg_put_pres  = sum(_put_pres.values())  / len(_put_pres)  if _put_pres  else 0
@@ -7956,6 +8009,9 @@ def main():
                             'iv_skew': round(_iv_skew, 4),
                             'avg_iv_ce': round(_avg_iv_ce, 2),
                             'avg_iv_pe': round(_avg_iv_pe, 2),
+                            **{f"iv_ce_{k}": round(v, 2) for k, v in _ivp_per_iv_ce.items()},
+                            **{f"iv_pe_{k}": round(v, 2) for k, v in _ivp_per_iv_pe.items()},
+                            **{f"pres_{k}": v for k, v in _ivp_per_net_pres.items()},
                         })
                         if len(st.session_state.iv_skew_history) > 200:
                             st.session_state.iv_skew_history = st.session_state.iv_skew_history[-200:]
@@ -8023,8 +8079,17 @@ def main():
                                           annotation_text='Bullish (0.90)', annotation_position='bottom right')
                         _fig_iv.add_hline(y=1.10, line_dash='dash', line_color='#FF5252',
                                           annotation_text='Bearish (1.10)', annotation_position='top right')
+                        # Current value marker (present value shown in graph)
+                        _iv_cur = _iv_hist_df['iv_skew'].iloc[-1]
+                        _fig_iv.add_trace(go.Scatter(
+                            x=[_iv_hist_df['time'].iloc[-1]], y=[_iv_cur],
+                            mode='markers+text', text=[f'{_iv_cur:.3f}'],
+                            textposition='top right', textfont=dict(size=10, color='#FFD740'),
+                            marker=dict(size=10, color='#FFD740', symbol='circle'),
+                            showlegend=False, hoverinfo='skip',
+                        ))
                         _fig_iv.update_layout(
-                            title='IV Skew Over Time (ATM ± 2)',
+                            title=f'IV Skew Over Time (ATM ± 2) — Now: {_iv_cur:.3f}',
                             height=250, margin=dict(l=40, r=20, t=40, b=30),
                             paper_bgcolor='#111', plot_bgcolor='#111',
                             font=dict(color='#ccc'),
@@ -8058,8 +8123,19 @@ def main():
                         _fig_pr.add_hline(y=-0.15, line_dash='dash', line_color='#FF5252',
                                           annotation_text='-0.15 Bear', annotation_position='top right')
                         _fig_pr.add_hline(y=0, line_color='#555', line_width=1)
+                        # Current value markers (present values shown in graph)
+                        _pr_cur_call = _pr_hist_df['call_pressure'].iloc[-1]
+                        _pr_cur_put  = _pr_hist_df['put_pressure'].iloc[-1]
+                        _pr_cur_net  = _pr_hist_df['net_pressure'].iloc[-1]
+                        _fig_pr.add_trace(go.Scatter(
+                            x=[_pr_hist_df['time'].iloc[-1]], y=[_pr_cur_net],
+                            mode='markers+text', text=[f'Net:{_pr_cur_net:+.3f}'],
+                            textposition='top right', textfont=dict(size=9, color='#FFD740'),
+                            marker=dict(size=9, color='#FFD740', symbol='circle'),
+                            showlegend=False, hoverinfo='skip',
+                        ))
                         _fig_pr.update_layout(
-                            title='Call / Put / Net Pressure Over Time (ATM ± 2)',
+                            title=f'Call / Put / Net Pressure Over Time (ATM ± 2) — Net: {_pr_cur_net:+.3f}',
                             height=250, margin=dict(l=40, r=20, t=40, b=30),
                             paper_bgcolor='#111', plot_bgcolor='#111',
                             font=dict(color='#ccc'),
@@ -8067,6 +8143,84 @@ def main():
                             showlegend=True, legend=dict(orientation='h', y=-0.3)
                         )
                         st.plotly_chart(_fig_pr, use_container_width=True)
+
+                    # ---- ATM ±2 Strike Comparison — CE IV · PE IV (5-column per-strike) ----
+                    if len(st.session_state.iv_skew_history) >= 2:
+                        _ivh_df = pd.DataFrame(st.session_state.iv_skew_history)
+                        st.markdown("### 📊 ATM ±2 Strike Comparison — CE IV · PE IV")
+                        _ivp_pos_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+                        _ivp_pos_keys   = ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']
+                        _ivp_pos_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+                        _ivp_5cols = st.columns(5)
+                        for _ivc_i, _ivc_col in enumerate(_ivp_5cols):
+                            with _ivc_col:
+                                _ivlk = _ivp_pos_keys[_ivc_i]
+                                _ck = f"iv_ce_{_ivlk}"
+                                _pk = f"iv_pe_{_ivlk}"
+                                _prk = f"pres_{_ivlk}"
+                                _ivc_clr = _ivp_pos_colors[_ivc_i]
+                                if _ck not in _ivh_df.columns and _pk not in _ivh_df.columns:
+                                    st.info(f"{_ivp_pos_labels[_ivc_i]} N/A")
+                                    continue
+                                _fig_ivs = go.Figure()
+                                # CE IV (solid cyan)
+                                if _ck in _ivh_df.columns:
+                                    _fig_ivs.add_trace(go.Scatter(
+                                        x=_ivh_df['time'], y=_ivh_df[_ck],
+                                        mode='lines+markers', name='CE IV%',
+                                        line=dict(color='#00ccff', width=2),
+                                        marker=dict(size=3),
+                                    ))
+                                # PE IV (dashed orange)
+                                if _pk in _ivh_df.columns:
+                                    _fig_ivs.add_trace(go.Scatter(
+                                        x=_ivh_df['time'], y=_ivh_df[_pk],
+                                        mode='lines+markers', name='PE IV%',
+                                        line=dict(color='#ffaa00', width=2, dash='dash'),
+                                        marker=dict(size=3),
+                                    ))
+                                # Current value markers
+                                _iv_ce_cur = _ivh_df[_ck].iloc[-1] if _ck in _ivh_df.columns else None
+                                _iv_pe_cur = _ivh_df[_pk].iloc[-1] if _pk in _ivh_df.columns else None
+                                if _iv_ce_cur is not None:
+                                    _fig_ivs.add_trace(go.Scatter(
+                                        x=[_ivh_df['time'].iloc[-1]], y=[_iv_ce_cur],
+                                        mode='markers+text', text=[f'{_iv_ce_cur:.1f}%'],
+                                        textposition='top right', textfont=dict(size=8, color='#00ccff'),
+                                        marker=dict(size=8, color='#00ccff', symbol='circle'),
+                                        showlegend=False, hoverinfo='skip',
+                                    ))
+                                if _iv_pe_cur is not None:
+                                    _fig_ivs.add_trace(go.Scatter(
+                                        x=[_ivh_df['time'].iloc[-1]], y=[_iv_pe_cur],
+                                        mode='markers+text', text=[f'{_iv_pe_cur:.1f}%'],
+                                        textposition='bottom right', textfont=dict(size=8, color='#ffaa00'),
+                                        marker=dict(size=8, color='#ffaa00', symbol='diamond'),
+                                        showlegend=False, hoverinfo='skip',
+                                    ))
+                                # Determine IV skew signal for this strike
+                                _ivs_skew = (_iv_pe_cur / (_iv_ce_cur + 1e-6)) if (_iv_ce_cur and _iv_pe_cur) else 1.0
+                                _ivs_title = f"{_ivp_pos_labels[_ivc_i]}<br>{_ivlk}"
+                                if _iv_ce_cur is not None:
+                                    _ivs_title += f"<br>CE:{_iv_ce_cur:.1f}% PE:{_iv_pe_cur:.1f}%" if _iv_pe_cur else f"<br>CE:{_iv_ce_cur:.1f}%"
+                                _fig_ivs.update_layout(
+                                    title=dict(text=_ivs_title, font=dict(size=10)),
+                                    template='plotly_dark', height=300,
+                                    showlegend=True,
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                                                xanchor='center', x=0.5, font=dict(size=8)),
+                                    margin=dict(l=5, r=10, t=80, b=30),
+                                    xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                                    yaxis=dict(title='IV%', tickfont=dict(size=8)),
+                                    plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                                )
+                                st.plotly_chart(_fig_ivs, use_container_width=True)
+                                # Net pressure caption
+                                _pres_cur = _ivh_df[_prk].iloc[-1] if (_prk in _ivh_df.columns and len(_ivh_df) > 0) else None
+                                _pres_sig = "🟢Bull" if (_pres_cur and _pres_cur > 0.15) else ("🔴Bear" if (_pres_cur and _pres_cur < -0.15) else "🟡Ntrl")
+                                _pres_str = f'{_pres_cur:+.3f}' if _pres_cur is not None else '—'
+                                _iv_skew_str = f'{_ivs_skew:.3f}' if _iv_ce_cur else '—'
+                                st.caption(f"IV Skew:{_iv_skew_str} · Pres:{_pres_str} {_pres_sig}")
 
                     _ivp_col_l, _ivp_col_r = st.columns([3, 1])
                     with _ivp_col_l:
@@ -8524,8 +8678,25 @@ def main():
                         _fig_dg.add_hline(y=-0.15, line_dash='dash', line_color='#FF5252',
                                           annotation_text='Bear Δ -0.15', annotation_position='top right',
                                           yref='y1')
+                        # Current value markers (present values shown in graph)
+                        _cur_nd = _dgh['net_delta'].iloc[-1]
+                        _cur_ng = _dgh['net_gamma'].iloc[-1]
+                        _fig_dg.add_trace(go.Scatter(
+                            x=[_dgh['time'].iloc[-1]], y=[_cur_nd],
+                            mode='markers+text', text=[f'{_cur_nd:+.4f}'],
+                            textposition='top right', textfont=dict(size=9, color='#00C853'),
+                            marker=dict(size=9, color='#00C853', symbol='circle'),
+                            showlegend=False, hoverinfo='skip', yaxis='y1'
+                        ))
+                        _fig_dg.add_trace(go.Scatter(
+                            x=[_dgh['time'].iloc[-1]], y=[_cur_ng],
+                            mode='markers+text', text=[f'{_cur_ng:+.2f}L'],
+                            textposition='bottom right', textfont=dict(size=9, color='#FFD740'),
+                            marker=dict(size=9, color='#FFD740', symbol='diamond'),
+                            showlegend=False, hoverinfo='skip', yaxis='y2'
+                        ))
                         _fig_dg.update_layout(
-                            title='Net Delta & Net Gamma Over Time (ATM ± 2)',
+                            title=f'Net Delta & Net Gamma Over Time (ATM ± 2) — Δ:{_cur_nd:+.4f} Γ:{_cur_ng:+.2f}L',
                             height=280, margin=dict(l=40, r=60, t=40, b=30),
                             paper_bgcolor='#111', plot_bgcolor='#111',
                             font=dict(color='#ccc'),
@@ -8537,59 +8708,85 @@ def main():
                         )
                         st.plotly_chart(_fig_dg, use_container_width=True)
 
-                        # ---- Per-Strike Delta Time-Series ----
-                        _dg_strike_labels = [k for k in _dg_delta_per.keys()]
-                        _dg_has_ps = all(f"delta_{k}" in _dgh.columns for k in _dg_strike_labels)
-                        if _dg_has_ps:
-                            _fig_ps = go.Figure()
-                            _ps_colors = ['#FF5252', '#FF9800', '#FFD740', '#69F0AE', '#00BCD4']
-                            for _i, _lk in enumerate(sorted(_dg_strike_labels, key=lambda x: (
-                                -2 if x=='ATM-2' else -1 if x=='ATM-1' else 0 if x=='ATM' else 1 if x=='ATM+1' else 2
-                            ))):
-                                _col_key = f"delta_{_lk}"
-                                if _col_key in _dgh.columns:
-                                    _fig_ps.add_trace(go.Scatter(
-                                        x=_dgh['time'], y=_dgh[_col_key],
-                                        mode='lines', name=_lk,
-                                        line=dict(color=_ps_colors[_i % len(_ps_colors)], width=1.5)
+                        # ---- ATM ±2 Strike Comparison — Delta · Gamma (5-column per-strike) ----
+                        st.markdown("### 📊 ATM ±2 Strike Comparison — Delta · Gamma")
+                        _dg_pos_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+                        _dg_pos_keys   = ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']
+                        _dg_pos_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+                        _dg_ps_cols = st.columns(5)
+                        for _dg_ci, _dg_col in enumerate(_dg_ps_cols):
+                            with _dg_col:
+                                _lk = _dg_pos_keys[_dg_ci]
+                                _dk = f"delta_{_lk}"
+                                _gk = f"gamma_{_lk}"
+                                _clr = _dg_pos_colors[_dg_ci]
+                                if _dk not in _dgh.columns and _gk not in _dgh.columns:
+                                    st.info(f"{_dg_pos_labels[_dg_ci]} N/A")
+                                    continue
+                                _fig_dg_ps = go.Figure()
+                                # Delta (solid, left y-axis)
+                                if _dk in _dgh.columns:
+                                    _fig_dg_ps.add_trace(go.Scatter(
+                                        x=_dgh['time'], y=_dgh[_dk],
+                                        mode='lines+markers', name='Delta',
+                                        line=dict(color='#00C853', width=2),
+                                        marker=dict(size=3), yaxis='y1'
                                     ))
-                            _fig_ps.add_hline(y=0, line_color='#555', line_width=1)
-                            _fig_ps.update_layout(
-                                title='Net Delta Per Strike Over Time',
-                                height=250, margin=dict(l=40, r=20, t=40, b=30),
-                                paper_bgcolor='#111', plot_bgcolor='#111',
-                                font=dict(color='#ccc'),
-                                xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333'),
-                                showlegend=True, legend=dict(orientation='h', y=-0.3)
-                            )
-                            st.plotly_chart(_fig_ps, use_container_width=True)
-
-                        # ---- Per-Strike Gamma Time-Series ----
-                        _dg_has_gs = all(f"gamma_{k}" in _dgh.columns for k in _dg_strike_labels)
-                        if _dg_has_gs:
-                            _fig_gps = go.Figure()
-                            for _i, _lk in enumerate(sorted(_dg_strike_labels, key=lambda x: (
-                                -2 if x=='ATM-2' else -1 if x=='ATM-1' else 0 if x=='ATM' else 1 if x=='ATM+1' else 2
-                            ))):
-                                _col_key = f"gamma_{_lk}"
-                                if _col_key in _dgh.columns:
-                                    _is_hot = _lk == _hot_lbl
-                                    _fig_gps.add_trace(go.Scatter(
-                                        x=_dgh['time'], y=_dgh[_col_key],
-                                        mode='lines', name=f"{_lk}{'🔥' if _is_hot else ''}",
-                                        line=dict(color=_ps_colors[_i % len(_ps_colors)],
-                                                  width=2.5 if _is_hot else 1.5)
+                                # Gamma (dashed, right y-axis)
+                                if _gk in _dgh.columns:
+                                    _fig_dg_ps.add_trace(go.Scatter(
+                                        x=_dgh['time'], y=_dgh[_gk],
+                                        mode='lines+markers', name='Gamma (L)',
+                                        line=dict(color='#FFD740', width=2, dash='dash'),
+                                        marker=dict(size=3), yaxis='y2'
                                     ))
-                            _fig_gps.add_hline(y=0, line_color='#555', line_width=1)
-                            _fig_gps.update_layout(
-                                title='Gamma Per Strike Over Time (Lakhs) — Hot Strike Highlighted',
-                                height=250, margin=dict(l=40, r=20, t=40, b=30),
-                                paper_bgcolor='#111', plot_bgcolor='#111',
-                                font=dict(color='#ccc'),
-                                xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333'),
-                                showlegend=True, legend=dict(orientation='h', y=-0.3)
-                            )
-                            st.plotly_chart(_fig_gps, use_container_width=True)
+                                _fig_dg_ps.add_hline(y=0, line_color='rgba(255,255,255,0.3)', line_width=1, yref='y1')
+                                # Current value markers
+                                _ps_cur_d = _dgh[_dk].iloc[-1] if _dk in _dgh.columns and len(_dgh) > 0 else None
+                                _ps_cur_g = _dgh[_gk].iloc[-1] if _gk in _dgh.columns and len(_dgh) > 0 else None
+                                if _ps_cur_d is not None:
+                                    _fig_dg_ps.add_trace(go.Scatter(
+                                        x=[_dgh['time'].iloc[-1]], y=[_ps_cur_d],
+                                        mode='markers+text', text=[f'{_ps_cur_d:+.4f}'],
+                                        textposition='top right', textfont=dict(size=8, color='#00C853'),
+                                        marker=dict(size=8, color='#00C853', symbol='circle'),
+                                        showlegend=False, hoverinfo='skip', yaxis='y1'
+                                    ))
+                                if _ps_cur_g is not None:
+                                    _fig_dg_ps.add_trace(go.Scatter(
+                                        x=[_dgh['time'].iloc[-1]], y=[_ps_cur_g],
+                                        mode='markers+text', text=[f'{_ps_cur_g:+.2f}L'],
+                                        textposition='bottom right', textfont=dict(size=8, color='#FFD740'),
+                                        marker=dict(size=8, color='#FFD740', symbol='diamond'),
+                                        showlegend=False, hoverinfo='skip', yaxis='y2'
+                                    ))
+                                _hot_border = '2px solid #ff4444' if _lk == _hot_lbl else '1px solid #333'
+                                _title_txt = f"{_dg_pos_labels[_dg_ci]}<br>{_lk}"
+                                if _ps_cur_d is not None:
+                                    _title_txt += f"<br>Δ:{_ps_cur_d:+.4f}"
+                                if _ps_cur_g is not None:
+                                    _title_txt += f" Γ:{_ps_cur_g:+.2f}L"
+                                _fig_dg_ps.update_layout(
+                                    title=dict(text=_title_txt, font=dict(size=10)),
+                                    template='plotly_dark', height=300,
+                                    showlegend=True,
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                                                xanchor='center', x=0.5, font=dict(size=8)),
+                                    margin=dict(l=5, r=35, t=80, b=30),
+                                    xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                                    yaxis=dict(title='Delta', title_font=dict(color='#00C853', size=9),
+                                               tickfont=dict(size=8), gridcolor='#333'),
+                                    yaxis2=dict(title='Gamma (L)', title_font=dict(color='#FFD740', size=9),
+                                                overlaying='y', side='right', showgrid=False,
+                                                tickfont=dict(size=8)),
+                                    plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                                )
+                                st.plotly_chart(_fig_dg_ps, use_container_width=True)
+                                _sig_d = "🟢" if _ps_cur_d and _ps_cur_d > 0.05 else ("🔴" if _ps_cur_d and _ps_cur_d < -0.05 else "🟡")
+                                _sig_g = "📍Pin" if _ps_cur_g and _ps_cur_g > 5 else ("⚡Acc" if _ps_cur_g and _ps_cur_g < -5 else "➡️Ntrl")
+                                _ps_d_str = f'{_ps_cur_d:+.4f}' if _ps_cur_d is not None else '—'
+                                _ps_g_str = f'{_ps_cur_g:+.2f}L' if _ps_cur_g is not None else '—'
+                                st.caption(f"{_sig_d} Δ:{_ps_d_str} · {_sig_g} Γ:{_ps_g_str}")
 
                     _dg_col_l, _dg_col_r = st.columns([3, 1])
                     with _dg_col_l:
