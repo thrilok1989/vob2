@@ -371,6 +371,51 @@ class SupabaseDB:
             st.error(f"Error retrieving analytics: {str(e)}")
             return pd.DataFrame()
 
+    def save_spike_history(self, record):
+        """Save options spike snapshot; keep last 300 records"""
+        try:
+            self.client.table('spike_history').insert(record).execute()
+            # Trim to 300 records
+            try:
+                all_rows = self.client.table('spike_history').select('id').order('id', desc=False).execute()
+                if all_rows.data and len(all_rows.data) > 300:
+                    oldest_ids = [r['id'] for r in all_rows.data[:len(all_rows.data) - 300]]
+                    self.client.table('spike_history').delete().in_('id', oldest_ids).execute()
+            except Exception:
+                pass
+        except Exception as e:
+            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
+                pass  # Silently ignore spike save errors
+
+    def save_expiry_spike_history(self, record):
+        """Save expiry spike snapshot; keep last 300 records"""
+        try:
+            self.client.table('expiry_spike_history').insert(record).execute()
+            try:
+                all_rows = self.client.table('expiry_spike_history').select('id').order('id', desc=False).execute()
+                if all_rows.data and len(all_rows.data) > 300:
+                    oldest_ids = [r['id'] for r in all_rows.data[:len(all_rows.data) - 300]]
+                    self.client.table('expiry_spike_history').delete().in_('id', oldest_ids).execute()
+            except Exception:
+                pass
+        except Exception as e:
+            pass
+
+    def save_gamma_sequence_history(self, record):
+        """Save gamma sequence snapshot; keep last 300 records"""
+        try:
+            self.client.table('gamma_sequence_history').insert(record).execute()
+            try:
+                all_rows = self.client.table('gamma_sequence_history').select('id').order('id', desc=False).execute()
+                if all_rows.data and len(all_rows.data) > 300:
+                    oldest_ids = [r['id'] for r in all_rows.data[:len(all_rows.data) - 300]]
+                    self.client.table('gamma_sequence_history').delete().in_('id', oldest_ids).execute()
+            except Exception:
+                pass
+        except Exception as e:
+            pass
+
+
 class DhanAPI:
     def __init__(self, access_token, client_id):
         self.access_token = access_token.strip() if access_token else ""
@@ -3680,6 +3725,581 @@ def create_csv_download(df_summary):
     return output.getvalue()
 
 
+# ============================================================
+# MARKET ACCELERATION ENGINES
+# ============================================================
+
+def _safe(val, default=0.0):
+    """Return float or default when val is None/NaN."""
+    try:
+        v = float(val)
+        return default if (v != v) else v  # NaN check
+    except Exception:
+        return default
+
+
+def calculate_options_spike_score(df_summary, atm_strike, spike_snapshots):
+    """
+    Options Spike Detector.
+    Returns dict with spike_score (0-100), direction, signal_label, conditions_met, individual scores.
+    spike_snapshots: list of past df_summary snapshots (last 10).
+    """
+    result = {
+        'spike_score': 0, 'direction': 'Neutral', 'signal': 'Normal Flow',
+        'conditions_met': 0, 'vol_score': 0, 'oi_score': 0,
+        'straddle_score': 0, 'iv_score': 0, 'pressure_score': 0,
+        'volume_spike': False, 'oi_spike': False, 'straddle_spike': False,
+        'iv_spike': False, 'pressure_spike': False, 'delta_spike': False,
+    }
+    try:
+        atm_row = df_summary[df_summary['Strike'] == atm_strike]
+        if atm_row.empty:
+            return result
+        atm = atm_row.iloc[0]
+
+        cur_vol_ce = _safe(atm.get('totalTradedVolume_CE', 0))
+        cur_vol_pe = _safe(atm.get('totalTradedVolume_PE', 0))
+        cur_vol = cur_vol_ce + cur_vol_pe
+
+        cur_chgoi_ce = _safe(atm.get('changeinOpenInterest_CE', 0))
+        cur_chgoi_pe = _safe(atm.get('changeinOpenInterest_PE', 0))
+        cur_chgoi = abs(cur_chgoi_ce) + abs(cur_chgoi_pe)
+
+        cur_atm_straddle = _safe(atm.get('lastPrice_CE', 0)) + _safe(atm.get('lastPrice_PE', 0))
+        cur_iv_ce = _safe(atm.get('impliedVolatility_CE', 15))
+        cur_iv_pe = _safe(atm.get('impliedVolatility_PE', 15))
+        cur_iv = (cur_iv_ce + cur_iv_pe) / 2.0
+
+        cur_bid_ce = _safe(atm.get('bidQty_CE', 0))
+        cur_ask_ce = _safe(atm.get('askQty_CE', 0))
+        cur_bid_pe = _safe(atm.get('bidQty_PE', 0))
+        cur_ask_pe = _safe(atm.get('askQty_PE', 0))
+        denom = cur_bid_ce + cur_ask_ce + cur_bid_pe + cur_ask_pe
+        cur_pressure = (cur_bid_pe - cur_ask_ce) / denom if denom > 0 else 0.0
+
+        cur_delta_ce = _safe(atm.get('Delta_CE', 0.5))
+        cur_delta_pe = _safe(atm.get('Delta_PE', -0.5))
+
+        # Historical averages from last 10 snapshots
+        avg_vol = cur_vol; avg_chgoi = cur_chgoi
+        avg_straddle = cur_atm_straddle; avg_iv = cur_iv; avg_pressure = cur_pressure
+        if spike_snapshots:
+            vols, chgois, straddles, ivs, pressures = [], [], [], [], []
+            for snap in spike_snapshots[-10:]:
+                atm_snap = snap[snap['Strike'] == atm_strike] if 'Strike' in snap.columns else pd.DataFrame()
+                if atm_snap.empty:
+                    continue
+                s = atm_snap.iloc[0]
+                vols.append(_safe(s.get('totalTradedVolume_CE', 0)) + _safe(s.get('totalTradedVolume_PE', 0)))
+                chgois.append(abs(_safe(s.get('changeinOpenInterest_CE', 0))) + abs(_safe(s.get('changeinOpenInterest_PE', 0))))
+                straddles.append(_safe(s.get('lastPrice_CE', 0)) + _safe(s.get('lastPrice_PE', 0)))
+                iv_avg = (_safe(s.get('impliedVolatility_CE', 15)) + _safe(s.get('impliedVolatility_PE', 15))) / 2.0
+                ivs.append(iv_avg)
+                bd = (_safe(s.get('bidQty_CE', 0)) + _safe(s.get('askQty_CE', 0)) +
+                      _safe(s.get('bidQty_PE', 0)) + _safe(s.get('askQty_PE', 0)))
+                pressures.append((_safe(s.get('bidQty_PE', 0)) - _safe(s.get('askQty_CE', 0))) / bd if bd > 0 else 0)
+            if vols:
+                avg_vol = sum(vols) / len(vols)
+            if chgois:
+                avg_chgoi = sum(chgois) / len(chgois)
+            if straddles and straddles[-1] > 0:
+                avg_straddle = straddles[-1]
+                prev_straddle = straddles[0] if straddles[0] > 0 else straddles[-1]
+            if ivs and ivs[-1] > 0:
+                avg_iv = ivs[-1]; prev_iv = ivs[0] if ivs[0] > 0 else ivs[-1]
+            if pressures:
+                avg_pressure = sum(pressures) / len(pressures)
+
+        # Condition checks
+        conditions = 0
+        # 1. Volume > 2x avg
+        vol_ratio = cur_vol / avg_vol if avg_vol > 0 else 1.0
+        vol_spike = vol_ratio >= 2.0
+        result['volume_spike'] = vol_spike
+        if vol_spike:
+            conditions += 1
+
+        # 2. OI Change > 1.5x avg
+        oi_ratio = cur_chgoi / avg_chgoi if avg_chgoi > 0 else 1.0
+        oi_spike = oi_ratio >= 1.5
+        result['oi_spike'] = oi_spike
+        if oi_spike:
+            conditions += 1
+
+        # 3. Straddle increase > 1%
+        straddle_change_pct = 0.0
+        if spike_snapshots and len(spike_snapshots) >= 2:
+            snap_prev = spike_snapshots[-2]
+            prev_row = snap_prev[snap_prev['Strike'] == atm_strike] if 'Strike' in snap_prev.columns else pd.DataFrame()
+            if not prev_row.empty:
+                prev_str = _safe(prev_row.iloc[0].get('lastPrice_CE', 0)) + _safe(prev_row.iloc[0].get('lastPrice_PE', 0))
+                straddle_change_pct = (cur_atm_straddle - prev_str) / prev_str * 100 if prev_str > 0 else 0
+        straddle_spike = straddle_change_pct > 1.0
+        result['straddle_spike'] = straddle_spike
+        if straddle_spike:
+            conditions += 1
+
+        # 4. IV increase > 0.5%
+        iv_change = 0.0
+        if spike_snapshots and len(spike_snapshots) >= 2:
+            snap_prev = spike_snapshots[-2]
+            prev_row = snap_prev[snap_prev['Strike'] == atm_strike] if 'Strike' in snap_prev.columns else pd.DataFrame()
+            if not prev_row.empty:
+                prev_iv = (_safe(prev_row.iloc[0].get('impliedVolatility_CE', 15)) +
+                           _safe(prev_row.iloc[0].get('impliedVolatility_PE', 15))) / 2.0
+                iv_change = cur_iv - prev_iv
+        iv_spike = iv_change > 0.5
+        result['iv_spike'] = iv_spike
+        if iv_spike:
+            conditions += 1
+
+        # 5. Pressure jump > 0.12
+        pressure_jump = abs(cur_pressure - avg_pressure) > 0.12
+        result['pressure_spike'] = pressure_jump
+        if pressure_jump:
+            conditions += 1
+
+        # 6. Delta shift (net delta moved significantly)
+        delta_shift = abs(cur_delta_ce + cur_delta_pe) > 0.08
+        result['delta_spike'] = delta_shift
+        if delta_shift:
+            conditions += 1
+
+        result['conditions_met'] = conditions
+
+        # Component scores (0-20 each, sum max 100)
+        vol_score    = min(20, int((min(vol_ratio, 4) / 4) * 20))
+        oi_score     = min(20, int((min(oi_ratio, 3) / 3) * 20))
+        straddle_score = min(20, int(min(abs(straddle_change_pct) / 3, 1) * 20))
+        iv_score     = min(20, int(min(abs(iv_change) / 2, 1) * 20))
+        pressure_score = min(20, int(min(abs(cur_pressure - avg_pressure) / 0.3, 1) * 20))
+
+        spike_score = vol_score + oi_score + straddle_score + iv_score + pressure_score
+        spike_score = max(0, min(100, spike_score))
+
+        # Gate by conditions met (< 3 conditions = cap score at 30)
+        if conditions < 3:
+            spike_score = min(spike_score, 30)
+
+        # Direction detection
+        ce_pressure_rising = cur_bid_ce > cur_ask_ce
+        pe_pressure_rising = cur_bid_pe > cur_ask_pe
+        delta_rising = cur_delta_ce + cur_delta_pe > 0
+        ce_vol_dominant = cur_vol_ce > cur_vol_pe
+
+        if ce_pressure_rising and delta_rising and ce_vol_dominant:
+            direction = 'Bullish'
+        elif pe_pressure_rising and not delta_rising and not ce_vol_dominant:
+            direction = 'Bearish'
+        else:
+            direction = 'Neutral'
+
+        # Signal label
+        if spike_score >= 80:
+            signal = 'Institutional Spike'
+        elif spike_score >= 60:
+            signal = 'Smart Money Activity'
+        elif spike_score >= 30:
+            signal = 'Activity Increasing'
+        else:
+            signal = 'Normal Flow'
+
+        result.update({
+            'spike_score': spike_score, 'direction': direction, 'signal': signal,
+            'vol_score': vol_score, 'oi_score': oi_score, 'straddle_score': straddle_score,
+            'iv_score': iv_score, 'pressure_score': pressure_score,
+            'vol_ratio': round(vol_ratio, 2), 'oi_ratio': round(oi_ratio, 2),
+            'straddle_change_pct': round(straddle_change_pct, 2), 'iv_change': round(iv_change, 2),
+            'pressure': round(cur_pressure, 3),
+        })
+    except Exception as e:
+        pass
+    return result
+
+
+def calculate_expiry_spike_score(df_summary, atm_strike, expiry_date_str, expiry_history):
+    """
+    Expiry Spike Detector — activates when DTE ≤ 2.
+    Returns dict with expiry_spike_score, market_type, signals, short_cover, long_unwind.
+    expiry_history: list of past df_summary snapshots.
+    """
+    result = {
+        'active': False, 'dte': 999, 'expiry_spike_score': 0,
+        'signal': 'Normal Expiry Movement', 'straddle_move': 0.0,
+        'gamma_shift': 0.0, 'oi_shift': 0.0, 'iv_change': 0.0, 'pressure_shift': 0.0,
+        'short_cover': False, 'long_unwind': False,
+    }
+    try:
+        # Calculate DTE
+        expiry_dt = datetime.strptime(expiry_date_str, "%Y-%m-%d")
+        now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        dte = (expiry_dt.date() - now.date()).days
+        result['dte'] = dte
+
+        if dte > 2:
+            return result
+        result['active'] = True
+
+        atm_row = df_summary[df_summary['Strike'] == atm_strike]
+        if atm_row.empty:
+            return result
+        atm = atm_row.iloc[0]
+
+        cur_straddle = _safe(atm.get('lastPrice_CE', 0)) + _safe(atm.get('lastPrice_PE', 0))
+        cur_gamma_ce = _safe(atm.get('Gamma_CE', 0))
+        cur_gamma_pe = _safe(atm.get('Gamma_PE', 0))
+        cur_oi_ce = _safe(atm.get('openInterest_CE', 0))
+        cur_oi_pe = _safe(atm.get('openInterest_PE', 0))
+        cur_chgoi_ce = _safe(atm.get('changeinOpenInterest_CE', 0))
+        cur_chgoi_pe = _safe(atm.get('changeinOpenInterest_PE', 0))
+        cur_iv_ce = _safe(atm.get('impliedVolatility_CE', 15))
+        cur_iv_pe = _safe(atm.get('impliedVolatility_PE', 15))
+        cur_bid_pe = _safe(atm.get('bidQty_PE', 0))
+        cur_ask_ce = _safe(atm.get('askQty_CE', 0))
+
+        straddle_move = 0.0; gamma_shift = 0.0; oi_shift = 0.0
+        iv_change = 0.0; pressure_shift = 0.0
+
+        if expiry_history and len(expiry_history) >= 2:
+            prev_snap = expiry_history[-2]
+            prev_atm = prev_snap[prev_snap['Strike'] == atm_strike] if 'Strike' in prev_snap.columns else pd.DataFrame()
+            if not prev_atm.empty:
+                p = prev_atm.iloc[0]
+                prev_straddle = _safe(p.get('lastPrice_CE', 0)) + _safe(p.get('lastPrice_PE', 0))
+                straddle_move = (cur_straddle - prev_straddle) / prev_straddle * 100 if prev_straddle > 0 else 0
+
+                prev_gamma = _safe(p.get('Gamma_CE', 0)) + _safe(p.get('Gamma_PE', 0))
+                cur_gamma = cur_gamma_ce + cur_gamma_pe
+                gamma_shift = abs(cur_gamma - prev_gamma) * 100
+
+                prev_oi = _safe(p.get('openInterest_CE', 0)) + _safe(p.get('openInterest_PE', 0))
+                cur_oi = cur_oi_ce + cur_oi_pe
+                oi_shift = abs(cur_oi - prev_oi) / max(prev_oi, 1) * 100
+
+                prev_iv = (_safe(p.get('impliedVolatility_CE', 15)) + _safe(p.get('impliedVolatility_PE', 15))) / 2
+                cur_iv = (cur_iv_ce + cur_iv_pe) / 2
+                iv_change = abs(cur_iv - prev_iv)
+
+                prev_bid_pe = _safe(p.get('bidQty_PE', 0))
+                prev_ask_ce = _safe(p.get('askQty_CE', 0))
+                pressure_shift = abs((cur_bid_pe - cur_ask_ce) - (prev_bid_pe - prev_ask_ce)) / max(cur_straddle, 1)
+
+        # Expiry spike score formula
+        expiry_spike_score = (
+            0.30 * min(abs(straddle_move) * 10, 100) +
+            0.25 * min(gamma_shift * 5, 100) +
+            0.20 * min(oi_shift * 2, 100) +
+            0.15 * min(iv_change * 10, 100) +
+            0.10 * min(pressure_shift * 20, 100)
+        )
+        expiry_spike_score = max(0, min(100, expiry_spike_score))
+
+        if expiry_spike_score >= 85:
+            signal = 'Expiry Explosion'
+        elif expiry_spike_score >= 70:
+            signal = 'Expiry Breakout Setup'
+        elif expiry_spike_score >= 40:
+            signal = 'Expiry Build-Up'
+        else:
+            signal = 'Normal Expiry Movement'
+
+        # Short covering: CE OI decreasing, price rising, IV falling
+        short_cover = (cur_chgoi_ce < 0 and iv_change < 0)
+        # Long unwinding: PE OI decreasing
+        long_unwind = (cur_chgoi_pe < 0)
+
+        result.update({
+            'expiry_spike_score': round(expiry_spike_score, 1),
+            'signal': signal, 'straddle_move': round(straddle_move, 2),
+            'gamma_shift': round(gamma_shift, 4), 'oi_shift': round(oi_shift, 2),
+            'iv_change': round(iv_change, 2), 'pressure_shift': round(pressure_shift, 4),
+            'short_cover': short_cover, 'long_unwind': long_unwind,
+        })
+    except Exception:
+        pass
+    return result
+
+
+def calculate_gamma_sequence(df_summary, atm_strike, gamma_seq_history):
+    """
+    Gamma Sequence Analyzer + Gamma Trap Detector.
+    Returns dict with pattern, acceleration, trap, dealer_signal.
+    gamma_seq_history: list of per-snapshot dicts [{ATM-2: gamma, ATM-1: gamma, ATM: gamma, ...}].
+    """
+    result = {
+        'pattern': 'Unknown', 'direction': 'Neutral',
+        'acceleration': False, 'dealer_signal': 'Normal',
+        'bull_trap': False, 'bear_trap': False, 'trap_signal': '',
+        'gamma_values': {}, 'gamma_ramp': 'None',
+    }
+    try:
+        strikes = sorted(df_summary['Strike'].unique())
+        atm_idx = None
+        for i, s in enumerate(strikes):
+            if s == atm_strike:
+                atm_idx = i
+                break
+        if atm_idx is None:
+            return result
+
+        pos_keys = ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']
+        pos_offsets = [-2, -1, 0, 1, 2]
+        gamma_vals = {}
+        for pk, offset in zip(pos_keys, pos_offsets):
+            idx = atm_idx + offset
+            if 0 <= idx < len(strikes):
+                row = df_summary[df_summary['Strike'] == strikes[idx]]
+                if not row.empty:
+                    gce = _safe(row.iloc[0].get('Gamma_CE', 0))
+                    gpe = _safe(row.iloc[0].get('Gamma_PE', 0))
+                    gamma_vals[pk] = gce + gpe
+            else:
+                gamma_vals[pk] = 0.0
+
+        result['gamma_values'] = gamma_vals
+
+        # Gamma Ramp Up: gamma increases from lower to higher strikes
+        g_vals = [gamma_vals.get(k, 0) for k in pos_keys]
+        ramp_up_count = sum(1 for i in range(len(g_vals) - 1) if g_vals[i+1] > g_vals[i])
+        ramp_dn_count = sum(1 for i in range(len(g_vals) - 1) if g_vals[i+1] < g_vals[i])
+
+        if ramp_up_count >= 3:
+            pattern = 'Gamma Ramp Up'
+            direction = 'Bullish'
+        elif ramp_dn_count >= 3:
+            pattern = 'Gamma Ramp Down'
+            direction = 'Bearish'
+        else:
+            pattern = 'Gamma Flat'
+            direction = 'Neutral'
+
+        result['pattern'] = pattern
+        result['direction'] = direction
+        result['gamma_ramp'] = pattern
+
+        # Gamma Acceleration: gamma ATM increased quickly over last 2 updates
+        acceleration = False
+        if gamma_seq_history and len(gamma_seq_history) >= 2:
+            prev_gamma_atm = _safe(gamma_seq_history[-2].get('ATM', 0))
+            cur_gamma_atm = gamma_vals.get('ATM', 0)
+            if prev_gamma_atm > 0 and cur_gamma_atm > prev_gamma_atm * 1.15:
+                acceleration = True
+        result['acceleration'] = acceleration
+        result['dealer_signal'] = 'Dealer Hedge Acceleration' if acceleration else 'Normal Hedging'
+
+        # Gamma Trap Detector
+        atm_row = df_summary[df_summary['Strike'] == atm_strike]
+        bull_trap = False; bear_trap = False; trap_signal = ''
+        if not atm_row.empty:
+            a = atm_row.iloc[0]
+            net_gamma = _safe(a.get('GammaExp_Net', 0))
+            chgoi_ce = _safe(a.get('changeinOpenInterest_CE', 0))
+            chgoi_pe = _safe(a.get('changeinOpenInterest_PE', 0))
+            # Bull trap: gamma positive, CE OI increasing but price not rising (no upward ramp)
+            if net_gamma > 0 and chgoi_ce > 0 and direction != 'Bullish':
+                bull_trap = True
+                trap_signal = 'CALL TRAP'
+            # Bear trap: gamma negative, PE OI increasing but price not falling
+            if net_gamma < 0 and chgoi_pe > 0 and direction != 'Bearish':
+                bear_trap = True
+                trap_signal = 'PUT TRAP' if not bull_trap else trap_signal
+
+        result['bull_trap'] = bull_trap
+        result['bear_trap'] = bear_trap
+        result['trap_signal'] = trap_signal
+
+    except Exception:
+        pass
+    return result
+
+
+def calculate_expiry_day_intelligence(df_summary, atm_strike, underlying, expiry_date_str, expiry_history):
+    """
+    Expiry Day Intelligence Engine — full expiry analysis.
+    Returns comprehensive dict; active only when DTE ≤ 1.
+    """
+    result = {
+        'active': False, 'dte': 999, 'market_type': 'N/A',
+        'atm_straddle': 0.0, 'straddle_roc': 0.0,
+        'max_pain': None, 'max_pain_signal': 'N/A',
+        'gamma_flip': None, 'highest_gamma_strike': None,
+        'breakout_level': None, 'breakdown_level': None,
+        'entry_support': None, 'entry_resistance': None,
+        'expiry_score': 0.0, 'expiry_signal': 'Normal Expiry',
+        'oi_shift_signal': '', 'expiry_trap': '',
+    }
+    try:
+        expiry_dt = datetime.strptime(expiry_date_str, "%Y-%m-%d")
+        now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        dte = (expiry_dt.date() - now.date()).days
+        result['dte'] = dte
+
+        if dte > 1:
+            return result
+        result['active'] = True
+
+        atm_row = df_summary[df_summary['Strike'] == atm_strike]
+        if atm_row.empty:
+            return result
+        atm = atm_row.iloc[0]
+
+        cur_straddle = _safe(atm.get('lastPrice_CE', 0)) + _safe(atm.get('lastPrice_PE', 0))
+        result['atm_straddle'] = round(cur_straddle, 2)
+
+        # Straddle Rate of Change
+        straddle_roc = 0.0
+        if expiry_history and len(expiry_history) >= 2:
+            prev_snap = expiry_history[-2]
+            prev_atm = prev_snap[prev_snap['Strike'] == atm_strike] if 'Strike' in prev_snap.columns else pd.DataFrame()
+            if not prev_atm.empty:
+                prev_str = _safe(prev_atm.iloc[0].get('lastPrice_CE', 0)) + _safe(prev_atm.iloc[0].get('lastPrice_PE', 0))
+                straddle_roc = (cur_straddle - prev_str) / prev_str * 100 if prev_str > 0 else 0
+        result['straddle_roc'] = round(straddle_roc, 2)
+
+        # Market type classification
+        cur_iv = (_safe(atm.get('impliedVolatility_CE', 15)) + _safe(atm.get('impliedVolatility_PE', 15))) / 2
+        price_dist = abs(underlying - atm_strike)
+        if price_dist <= 25 and abs(straddle_roc) < 0.5:
+            market_type = 'PINNING EXPIRY'
+        elif abs(straddle_roc) > 1.0 or price_dist > 100:
+            market_type = 'TRENDING EXPIRY'
+        else:
+            market_type = 'STRIKE ROTATION'
+        result['market_type'] = market_type
+
+        # Max Pain (strike with min total pain to writers)
+        max_pain_strike = None
+        min_pain = float('inf')
+        if 'openInterest_CE' in df_summary.columns and 'openInterest_PE' in df_summary.columns:
+            for _, row in df_summary.iterrows():
+                s = row['Strike']
+                pain = 0
+                for _, r2 in df_summary.iterrows():
+                    s2 = r2['Strike']
+                    if s < s2:
+                        pain += _safe(r2.get('openInterest_CE', 0)) * (s2 - s)
+                    if s > s2:
+                        pain += _safe(r2.get('openInterest_PE', 0)) * (s - s2)
+                if pain < min_pain:
+                    min_pain = pain
+                    max_pain_strike = s
+        result['max_pain'] = max_pain_strike
+        if max_pain_strike:
+            if underlying > max_pain_strike:
+                result['max_pain_signal'] = 'Magnet Move (Price above Max Pain, expect pull-down)'
+            elif underlying < max_pain_strike:
+                result['max_pain_signal'] = 'Magnet Move (Price below Max Pain, expect pull-up)'
+            else:
+                result['max_pain_signal'] = 'At Max Pain'
+
+        # Highest Gamma Strike and Gamma Flip
+        if 'GammaExp_Net' in df_summary.columns:
+            idx_max_g = df_summary['GammaExp_Net'].abs().idxmax()
+            result['highest_gamma_strike'] = df_summary.loc[idx_max_g, 'Strike']
+            # Gamma flip = strike where GammaExp_Net changes sign
+            sorted_df = df_summary.sort_values('Strike')
+            prev_sign = None
+            for _, row in sorted_df.iterrows():
+                sign = 1 if _safe(row.get('GammaExp_Net', 0)) >= 0 else -1
+                if prev_sign is not None and sign != prev_sign:
+                    result['gamma_flip'] = row['Strike']
+                    break
+                prev_sign = sign
+
+        # OI shift signals
+        chgoi_ce = _safe(atm.get('changeinOpenInterest_CE', 0))
+        chgoi_pe = _safe(atm.get('changeinOpenInterest_PE', 0))
+        if chgoi_ce < 0 and straddle_roc > 0:
+            oi_shift_signal = 'SHORT COVERING'
+        elif chgoi_pe < 0:
+            oi_shift_signal = 'LONG UNWINDING'
+        elif chgoi_ce > 0:
+            oi_shift_signal = 'Fresh Call Writing (Resistance forming)'
+        elif chgoi_pe > 0:
+            oi_shift_signal = 'Fresh Put Writing (Support forming)'
+        else:
+            oi_shift_signal = 'Neutral'
+        result['oi_shift_signal'] = oi_shift_signal
+
+        # Entry levels
+        max_pe_oi_strike = df_summary.loc[df_summary['openInterest_PE'].idxmax(), 'Strike'] if 'openInterest_PE' in df_summary.columns else underlying
+        max_ce_oi_strike = df_summary.loc[df_summary['openInterest_CE'].idxmax(), 'Strike'] if 'openInterest_CE' in df_summary.columns else underlying
+        gamma_support = result['gamma_flip'] or atm_strike
+        gamma_resist = result['highest_gamma_strike'] or atm_strike
+
+        entry_support = round((max_pe_oi_strike + gamma_support) / 2, 0)
+        entry_resistance = round((max_ce_oi_strike + gamma_resist) / 2, 0)
+        result['entry_support'] = entry_support
+        result['entry_resistance'] = entry_resistance
+
+        # Breakout / Breakdown levels
+        atm_p1 = df_summary[df_summary['Strike'] > atm_strike]['Strike'].min() if not df_summary[df_summary['Strike'] > atm_strike].empty else atm_strike + 50
+        atm_m1 = df_summary[df_summary['Strike'] < atm_strike]['Strike'].max() if not df_summary[df_summary['Strike'] < atm_strike].empty else atm_strike - 50
+        breakout = round((atm_p1 + (gamma_resist if gamma_resist else atm_strike + 50)) / 2, 0)
+        breakdown = round((atm_m1 + (gamma_support if gamma_support else atm_strike - 50)) / 2, 0)
+        result['breakout_level'] = breakout
+        result['breakdown_level'] = breakdown
+
+        # Expiry trap detection
+        if chgoi_ce > 0 and straddle_roc < 0:
+            expiry_trap = 'CALL WRITER TRAP'
+        elif chgoi_pe > 0 and straddle_roc < 0:
+            expiry_trap = 'PUT WRITER TRAP'
+        else:
+            expiry_trap = ''
+        result['expiry_trap'] = expiry_trap
+
+        # Expiry confidence score
+        score = (
+            min(abs(straddle_roc) * 20, 40) +
+            min(abs(chgoi_ce + chgoi_pe) / 100000, 20) +
+            (10 if result['gamma_flip'] else 0) +
+            min(cur_iv / 3, 20) +
+            (10 if abs(cur_iv - 15) > 5 else 0)
+        )
+        expiry_score = max(0, min(100, score))
+        result['expiry_score'] = round(expiry_score, 1)
+
+        if expiry_score >= 85:
+            result['expiry_signal'] = 'EXPIRY MOVE STARTED'
+        elif expiry_score >= 70:
+            result['expiry_signal'] = 'Breakout Setup'
+        elif expiry_score >= 40:
+            result['expiry_signal'] = 'Build-up'
+        else:
+            result['expiry_signal'] = 'Normal Expiry'
+
+    except Exception:
+        pass
+    return result
+
+
+def get_combined_acceleration_signal(sentiment_verdict, spike_result, gamma_result):
+    """Combine Sentiment Engine + Spike Engine + Gamma Sequence into final signal."""
+    spike_score = spike_result.get('spike_score', 0)
+    gamma_pattern = gamma_result.get('pattern', 'Unknown')
+    spike_direction = spike_result.get('direction', 'Neutral')
+    gamma_direction = gamma_result.get('direction', 'Neutral')
+
+    sentiment_bull = 'bullish' in str(sentiment_verdict).lower()
+    sentiment_bear = 'bearish' in str(sentiment_verdict).lower()
+
+    if sentiment_bull and spike_score >= 70 and gamma_pattern == 'Gamma Ramp Up':
+        return 'HIGH PROBABILITY BREAKOUT', '#00ff88', 'INSTITUTIONAL BUYING DETECTED'
+    elif sentiment_bear and spike_score >= 70 and gamma_pattern == 'Gamma Ramp Down':
+        return 'HIGH PROBABILITY BREAKDOWN', '#ff4444', 'INSTITUTIONAL SELLING DETECTED'
+    elif spike_score >= 60 and spike_direction == 'Bullish':
+        return 'BULLISH ACCELERATION', '#44ff88', 'Smart Money Bullish Activity'
+    elif spike_score >= 60 and spike_direction == 'Bearish':
+        return 'BEARISH ACCELERATION', '#ff6644', 'Smart Money Bearish Activity'
+    elif gamma_pattern == 'Gamma Ramp Up':
+        return 'GAMMA RAMP UP', '#aaffdd', 'Dealer Repositioning Bullish'
+    elif gamma_pattern == 'Gamma Ramp Down':
+        return 'GAMMA RAMP DOWN', '#ffaaaa', 'Dealer Repositioning Bearish'
+    else:
+        return 'MONITORING', '#aaaaaa', 'Normal Market Flow'
+
+
 def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None, live_spot_price=None):
     """Enhanced options chain analysis with expiry selection, HTF pivot data, and VOB data"""
     now = datetime.now(timezone("Asia/Kolkata"))
@@ -4586,6 +5206,22 @@ def main():
         st.session_state.sentiment_history = []
     if 'itm_last_alert' not in st.session_state:
         st.session_state.itm_last_alert = (None, None)
+
+    # ===== NEW ENGINE HISTORIES =====
+    if 'spike_history' not in st.session_state:
+        st.session_state.spike_history = []          # Options Spike Detector snapshots
+    if 'expiry_spike_history' not in st.session_state:
+        st.session_state.expiry_spike_history = []   # Expiry Spike Detector snapshots
+    if 'gamma_seq_history' not in st.session_state:
+        st.session_state.gamma_seq_history = []      # Gamma Sequence snapshots
+    if 'expiry_intel_history' not in st.session_state:
+        st.session_state.expiry_intel_history = []   # Expiry Day Intelligence snapshots
+    if 'last_spike_alert' not in st.session_state:
+        st.session_state.last_spike_alert = None
+    if 'last_gamma_alert' not in st.session_state:
+        st.session_state.last_gamma_alert = None
+    if 'last_expiry_spike_alert' not in st.session_state:
+        st.session_state.last_expiry_spike_alert = None
 
     # Initialize Supabase
     try:
@@ -10123,6 +10759,391 @@ def main():
             file_name=f"nifty_options_summary_{option_data['expiry']}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv"
         )
+
+    # ===== MARKET ACCELERATION ENGINE =====
+    st.markdown("---")
+    with st.expander("🚀 Market Acceleration Engine — Spike · Gamma · Expiry Intelligence", expanded=False):
+        try:
+            _mae_data = option_data
+            _mae_underlying = _mae_data.get('underlying') if _mae_data else None
+            _mae_df = _mae_data.get('df_summary') if _mae_data else None
+            _mae_expiry = _mae_data.get('expiry') if _mae_data else None
+
+            if _mae_df is not None and _mae_underlying and _mae_expiry:
+                _mae_atm = min(_mae_df['Strike'], key=lambda x: abs(x - _mae_underlying))
+                _mae_now_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S')
+
+                # ---- Store snapshot in history (limit to 50 per session) ----
+                _snap = _mae_df.copy()
+                st.session_state.spike_history.append(_snap)
+                if len(st.session_state.spike_history) > 50:
+                    st.session_state.spike_history = st.session_state.spike_history[-50:]
+
+                st.session_state.expiry_spike_history.append(_snap)
+                if len(st.session_state.expiry_spike_history) > 50:
+                    st.session_state.expiry_spike_history = st.session_state.expiry_spike_history[-50:]
+
+                st.session_state.expiry_intel_history.append(_snap)
+                if len(st.session_state.expiry_intel_history) > 50:
+                    st.session_state.expiry_intel_history = st.session_state.expiry_intel_history[-50:]
+
+                # ---- Run engines ----
+                _spike = calculate_options_spike_score(_mae_df, _mae_atm, st.session_state.spike_history)
+                _expiry_spike = calculate_expiry_spike_score(_mae_df, _mae_atm, _mae_expiry, st.session_state.expiry_spike_history)
+                _gamma = calculate_gamma_sequence(_mae_df, _mae_atm, st.session_state.gamma_seq_history)
+                _expiry_intel = calculate_expiry_day_intelligence(_mae_df, _mae_atm, _mae_underlying, _mae_expiry, st.session_state.expiry_intel_history)
+
+                # ---- Store gamma sequence snapshot ----
+                _gamma_snap = dict(_gamma['gamma_values'])
+                _gamma_snap['time'] = _mae_now_str
+                st.session_state.gamma_seq_history.append(_gamma_snap)
+                if len(st.session_state.gamma_seq_history) > 50:
+                    st.session_state.gamma_seq_history = st.session_state.gamma_seq_history[-50:]
+
+                # ---- Get sentiment verdict from session state ----
+                _sent_verdict = 'Neutral'
+                if st.session_state.get('sentiment_history'):
+                    _last_sent = st.session_state.sentiment_history[-1]
+                    _sent_verdict = _last_sent.get('verdict', 'Neutral') if isinstance(_last_sent, dict) else 'Neutral'
+
+                _combined_signal, _combined_color, _combined_label = get_combined_acceleration_signal(
+                    _sent_verdict, _spike, _gamma
+                )
+
+                # ---- Store spike history snapshots in Supabase (background, non-blocking) ----
+                try:
+                    _spike_record = {
+                        'timestamp': datetime.now(pytz.UTC).isoformat(),
+                        'atm_strike': float(_mae_atm),
+                        'spike_score': float(_spike['spike_score']),
+                        'direction': _spike['direction'],
+                        'signal': _spike['signal'],
+                        'conditions_met': int(_spike['conditions_met']),
+                    }
+                    db.save_spike_history(_spike_record)
+
+                    if _expiry_spike['active']:
+                        _expiry_spike_record = {
+                            'timestamp': datetime.now(pytz.UTC).isoformat(),
+                            'atm_strike': float(_mae_atm),
+                            'dte': int(_expiry_spike['dte']),
+                            'expiry_spike_score': float(_expiry_spike['expiry_spike_score']),
+                            'signal': _expiry_spike['signal'],
+                            'short_cover': bool(_expiry_spike['short_cover']),
+                            'long_unwind': bool(_expiry_spike['long_unwind']),
+                        }
+                        db.save_expiry_spike_history(_expiry_spike_record)
+
+                    _gamma_seq_record = {
+                        'timestamp': datetime.now(pytz.UTC).isoformat(),
+                        'atm_strike': float(_mae_atm),
+                        'pattern': _gamma['pattern'],
+                        'direction': _gamma['direction'],
+                        'acceleration': bool(_gamma['acceleration']),
+                        'bull_trap': bool(_gamma['bull_trap']),
+                        'bear_trap': bool(_gamma['bear_trap']),
+                    }
+                    db.save_gamma_sequence_history(_gamma_seq_record)
+                except Exception:
+                    pass
+
+                # ---- TELEGRAM ALERTS ----
+                _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                _alert_minute = _ist_now.strftime('%Y-%m-%d %H:%M')
+
+                if _spike['spike_score'] >= 75 and st.session_state.last_spike_alert != _alert_minute:
+                    _spike_msg = (
+                        f"🚀 <b>INSTITUTIONAL SPIKE DETECTED</b>\n\n"
+                        f"Spike Score: <b>{_spike['spike_score']}</b>\n"
+                        f"Signal: {_spike['signal']}\n"
+                        f"Direction: {_spike['direction']}\n"
+                        f"Conditions Met: {_spike['conditions_met']}/6\n"
+                        f"ATM Strike: {_mae_atm}\n"
+                        f"Gamma Pattern: {_gamma['pattern']}\n"
+                        f"Combined: {_combined_signal}\n"
+                        f"Time: {_mae_now_str} IST"
+                    )
+                    send_telegram_message_sync(_spike_msg)
+                    st.session_state.last_spike_alert = _alert_minute
+
+                if _gamma['pattern'] in ('Gamma Ramp Up', 'Gamma Ramp Down') and st.session_state.last_gamma_alert != _alert_minute:
+                    _gamma_msg = (
+                        f"📊 <b>GAMMA SEQUENCE SIGNAL</b>\n\n"
+                        f"Pattern: <b>{_gamma['pattern']}</b>\n"
+                        f"Direction: {_gamma['direction']}\n"
+                        f"Dealer Signal: {_gamma['dealer_signal']}\n"
+                        f"{'⚡ Dealer Hedge Acceleration!' if _gamma['acceleration'] else ''}\n"
+                        f"{'⚠️ Trap: ' + _gamma['trap_signal'] if _gamma['trap_signal'] else ''}\n"
+                        f"Spike Score: {_spike['spike_score']}\n"
+                        f"Combined: {_combined_signal}\n"
+                        f"Time: {_mae_now_str} IST"
+                    )
+                    send_telegram_message_sync(_gamma_msg)
+                    st.session_state.last_gamma_alert = _alert_minute
+
+                if _expiry_spike['active'] and _expiry_spike['expiry_spike_score'] >= 80 and st.session_state.last_expiry_spike_alert != _alert_minute:
+                    _expiry_msg = (
+                        f"⚡ <b>EXPIRY MOVE DETECTED</b>\n\n"
+                        f"Market Type: {_expiry_intel.get('market_type', 'N/A')}\n"
+                        f"Expiry Spike Score: <b>{_expiry_spike['expiry_spike_score']}</b>\n"
+                        f"Signal: {_expiry_spike['signal']}\n"
+                        f"{'SHORT COVERING DETECTED' if _expiry_spike['short_cover'] else ''}\n"
+                        f"{'LONG UNWINDING DETECTED' if _expiry_spike['long_unwind'] else ''}\n"
+                        f"Breakout Level: {_expiry_intel.get('breakout_level', 'N/A')}\n"
+                        f"Breakdown Level: {_expiry_intel.get('breakdown_level', 'N/A')}\n"
+                        f"Expiry Score: {_expiry_intel.get('expiry_score', 0)}\n"
+                        f"Confidence: HIGH\nTime: {_mae_now_str} IST"
+                    )
+                    send_telegram_message_sync(_expiry_msg)
+                    st.session_state.last_expiry_spike_alert = _alert_minute
+
+                # ---- DASHBOARD DISPLAY ----
+                # Top summary row
+                _mae_c1, _mae_c2, _mae_c3, _mae_c4 = st.columns(4)
+                _spike_color = '#ff4444' if _spike['spike_score'] >= 80 else ('#ffaa00' if _spike['spike_score'] >= 60 else ('#44aaff' if _spike['spike_score'] >= 30 else '#888888'))
+                _gamma_color = '#00ff88' if _gamma['direction'] == 'Bullish' else ('#ff4444' if _gamma['direction'] == 'Bearish' else '#888888')
+                _expiry_color = '#ff6600' if _expiry_spike['active'] and _expiry_spike['expiry_spike_score'] >= 70 else '#aaaaaa'
+
+                with _mae_c1:
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {_spike_color}'>
+                    <div style='color:#aaa;font-size:11px'>SPIKE SCORE</div>
+                    <div style='font-size:28px;font-weight:bold;color:{_spike_color}'>{_spike['spike_score']}</div>
+                    <div style='color:#ccc;font-size:12px'>{_spike['signal']}</div>
+                    <div style='color:#999;font-size:11px'>{_spike['direction']} · {_spike['conditions_met']}/6 cond</div>
+                    </div>""", unsafe_allow_html=True)
+
+                with _mae_c2:
+                    _exp_score_display = f"{_expiry_spike['expiry_spike_score']}" if _expiry_spike['active'] else "N/A (DTE>{_expiry_spike['dte']})"
+                    _exp_signal = _expiry_spike['signal'] if _expiry_spike['active'] else f"DTE {_expiry_spike['dte']}d"
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {_expiry_color}'>
+                    <div style='color:#aaa;font-size:11px'>EXPIRY SPIKE</div>
+                    <div style='font-size:28px;font-weight:bold;color:{_expiry_color}'>{_exp_score_display}</div>
+                    <div style='color:#ccc;font-size:12px'>{_exp_signal}</div>
+                    <div style='color:#999;font-size:11px'>DTE: {_expiry_spike['dte']} day(s)</div>
+                    </div>""", unsafe_allow_html=True)
+
+                with _mae_c3:
+                    _accel_icon = '⚡' if _gamma['acceleration'] else ''
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {_gamma_color}'>
+                    <div style='color:#aaa;font-size:11px'>GAMMA SEQUENCE</div>
+                    <div style='font-size:18px;font-weight:bold;color:{_gamma_color}'>{_gamma['pattern']} {_accel_icon}</div>
+                    <div style='color:#ccc;font-size:12px'>{_gamma['dealer_signal']}</div>
+                    <div style='color:#ff4444;font-size:11px'>{_gamma['trap_signal'] if _gamma['trap_signal'] else ''}</div>
+                    </div>""", unsafe_allow_html=True)
+
+                with _mae_c4:
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {_combined_color}'>
+                    <div style='color:#aaa;font-size:11px'>FINAL SIGNAL</div>
+                    <div style='font-size:16px;font-weight:bold;color:{_combined_color}'>{_combined_signal}</div>
+                    <div style='color:#ccc;font-size:12px'>{_combined_label}</div>
+                    <div style='color:#999;font-size:11px'>Sentiment: {_sent_verdict}</div>
+                    </div>""", unsafe_allow_html=True)
+
+                st.markdown("")
+
+                # ---- Spike Score component breakdown ----
+                st.markdown("### Spike Score Components")
+                _comp_cols = st.columns(5)
+                _comp_labels = ['Volume', 'OI Change', 'Straddle', 'IV', 'Pressure']
+                _comp_scores = [_spike['vol_score'], _spike['oi_score'], _spike['straddle_score'], _spike['iv_score'], _spike['pressure_score']]
+                _comp_flags = [_spike['volume_spike'], _spike['oi_spike'], _spike['straddle_spike'], _spike['iv_spike'], _spike['pressure_spike']]
+                for _ci, (_col, _lbl, _sc, _fl) in enumerate(zip(_comp_cols, _comp_labels, _comp_scores, _comp_flags)):
+                    with _col:
+                        _c = '#00ff88' if _fl else '#888888'
+                        st.markdown(f"""<div style='text-align:center;background:#222;padding:8px;border-radius:6px;border:1px solid {_c}'>
+                        <div style='color:#aaa;font-size:10px'>{_lbl}</div>
+                        <div style='font-size:20px;font-weight:bold;color:{_c}'>{_sc}/20</div>
+                        <div style='font-size:10px;color:{_c}'>{'SPIKE' if _fl else 'Normal'}</div>
+                        </div>""", unsafe_allow_html=True)
+
+                st.markdown("")
+
+                # ---- Gamma values per strike ----
+                st.markdown("### Gamma Map — ATM ±2 Strikes")
+                _gv = _gamma['gamma_values']
+                _gmap_keys = ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']
+                _gmap_cols = st.columns(5)
+                _max_gv = max(_gv.values()) if _gv else 1
+                for _gi, (_gcol, _gk) in enumerate(zip(_gmap_cols, _gmap_keys)):
+                    with _gcol:
+                        _gval = _gv.get(_gk, 0)
+                        _gbar = int(_gval / _max_gv * 100) if _max_gv > 0 else 0
+                        _gc = '#ffaa00' if _gk == 'ATM' else '#00aaff'
+                        st.markdown(f"""<div style='text-align:center;background:#222;padding:8px;border-radius:6px'>
+                        <div style='color:#aaa;font-size:10px'>{_gk}</div>
+                        <div style='font-size:18px;font-weight:bold;color:{_gc}'>{_gval:.4f}</div>
+                        <div style='background:#333;border-radius:3px;height:6px;margin-top:4px'>
+                          <div style='background:{_gc};width:{_gbar}%;height:6px;border-radius:3px'></div>
+                        </div>
+                        </div>""", unsafe_allow_html=True)
+
+                # ---- Expiry Day Intelligence Panel (visible when DTE ≤ 1) ----
+                if _expiry_intel['active']:
+                    st.markdown("---")
+                    st.markdown("### ⚡ Expiry Control Center")
+                    _ei = _expiry_intel
+                    _eic1, _eic2, _eic3, _eic4 = st.columns(4)
+                    with _eic1:
+                        st.metric("Market Type", _ei['market_type'])
+                        st.metric("ATM Straddle", f"₹{_ei['atm_straddle']:.0f}")
+                        st.metric("Straddle ROC", f"{_ei['straddle_roc']:+.2f}%")
+                    with _eic2:
+                        st.metric("Max Pain", f"₹{_ei['max_pain']:.0f}" if _ei['max_pain'] else "—")
+                        st.metric("Gamma Flip", f"₹{_ei['gamma_flip']:.0f}" if _ei['gamma_flip'] else "—")
+                        st.metric("Highest Gamma Strike", f"₹{_ei['highest_gamma_strike']:.0f}" if _ei['highest_gamma_strike'] else "—")
+                    with _eic3:
+                        st.metric("Entry Support", f"₹{_ei['entry_support']:.0f}" if _ei['entry_support'] else "—")
+                        st.metric("Entry Resistance", f"₹{_ei['entry_resistance']:.0f}" if _ei['entry_resistance'] else "—")
+                        st.metric("Expiry Score", f"{_ei['expiry_score']:.1f}")
+                    with _eic4:
+                        st.metric("Breakout Level", f"₹{_ei['breakout_level']:.0f}" if _ei['breakout_level'] else "—")
+                        st.metric("Breakdown Level", f"₹{_ei['breakdown_level']:.0f}" if _ei['breakdown_level'] else "—")
+                        _es_color = '#ff4444' if _ei['expiry_score'] >= 85 else ('#ffaa00' if _ei['expiry_score'] >= 70 else '#aaaaaa')
+                        st.markdown(f"<span style='color:{_es_color};font-weight:bold'>Signal: {_ei['expiry_signal']}</span>", unsafe_allow_html=True)
+
+                    _oi_col, _trap_col = st.columns(2)
+                    with _oi_col:
+                        if _ei['oi_shift_signal']:
+                            st.info(f"OI Shift: **{_ei['oi_shift_signal']}**")
+                        if _ei['max_pain_signal']:
+                            st.caption(f"Max Pain: {_ei['max_pain_signal']}")
+                    with _trap_col:
+                        if _ei['expiry_trap']:
+                            st.warning(f"TRAP DETECTED: **{_ei['expiry_trap']}**")
+
+                # ---- Charts ----
+                st.markdown("---")
+                st.markdown("### Charts")
+                _chart_c1, _chart_c2 = st.columns(2)
+
+                with _chart_c1:
+                    # Spike Score History
+                    if len(st.session_state.spike_history) >= 2:
+                        _sh_times = []
+                        _sh_scores = []
+                        _sh_interval_count = 0
+                        for _snap_i, _snap_df in enumerate(st.session_state.spike_history):
+                            _sh_interval_count += 1
+                            _sh_times.append(f"T-{len(st.session_state.spike_history) - _snap_i}")
+                            _snap_atm_r = _snap_df[_snap_df['Strike'] == _mae_atm] if 'Strike' in _snap_df.columns else pd.DataFrame()
+                            # Recompute spike for chart (simplified: vol ratio only for speed)
+                            _sh_scores.append(0)
+
+                        # Build proper time-stamped history from gamma_seq_history (which has timestamps)
+                        _gsh = st.session_state.gamma_seq_history
+                        _gsh_times = [s.get('time', f'T-{i}') for i, s in enumerate(_gsh)]
+                        _gsh_atm = [_safe(s.get('ATM', 0)) for s in _gsh]
+
+                        _fig_gs = go.Figure()
+                        _fig_gs.add_trace(go.Scatter(
+                            x=list(range(len(_gsh_atm))), y=_gsh_atm,
+                            mode='lines+markers', name='ATM Gamma',
+                            line=dict(color='#ffaa00', width=2),
+                            marker=dict(size=4),
+                            text=_gsh_times, hovertemplate='%{text}<br>ATM Gamma: %{y:.4f}'
+                        ))
+                        _fig_gs.update_layout(
+                            title='ATM Gamma Over Time',
+                            template='plotly_dark', height=260,
+                            margin=dict(l=40, r=20, t=40, b=30),
+                            xaxis=dict(title='Snapshot', showticklabels=False),
+                            yaxis=dict(title='Gamma'),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        )
+                        st.plotly_chart(_fig_gs, use_container_width=True)
+                    else:
+                        st.info("Building Spike/Gamma history...")
+
+                with _chart_c2:
+                    # Gamma Sequence Map — 5 strikes over time (last snapshot)
+                    _gv_keys = ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']
+                    _gv_vals = [_gv.get(k, 0) for k in _gv_keys]
+                    _gmap_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+                    _fig_gmap = go.Figure()
+                    _fig_gmap.add_trace(go.Bar(
+                        x=_gv_keys, y=_gv_vals,
+                        marker_color=_gmap_colors,
+                        name='Gamma by Strike',
+                        text=[f'{v:.4f}' for v in _gv_vals],
+                        textposition='outside'
+                    ))
+                    _fig_gmap.update_layout(
+                        title=f'Gamma Sequence Map — Pattern: {_gamma["pattern"]}',
+                        template='plotly_dark', height=260,
+                        margin=dict(l=40, r=20, t=50, b=30),
+                        xaxis=dict(title='Strike Position'),
+                        yaxis=dict(title='Gamma Value'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                    )
+                    st.plotly_chart(_fig_gmap, use_container_width=True)
+
+                # Expiry Spike Score chart (3rd chart, full width if active)
+                if _expiry_spike['active'] and len(st.session_state.expiry_spike_history) >= 2:
+                    _esh_scores = []
+                    _esh_times = [f'T-{i}' for i in range(len(st.session_state.gamma_seq_history))]
+                    _gsh_data = st.session_state.gamma_seq_history
+                    for _si, _snap_df in enumerate(st.session_state.expiry_spike_history):
+                        _esh_snap = calculate_expiry_spike_score(_snap_df, _mae_atm, _mae_expiry, st.session_state.expiry_spike_history[:_si])
+                        _esh_scores.append(_esh_snap['expiry_spike_score'])
+
+                    _fig_esh = go.Figure()
+                    _fig_esh.add_trace(go.Scatter(
+                        x=list(range(len(_esh_scores))), y=_esh_scores,
+                        mode='lines+markers+text', name='Expiry Spike Score',
+                        line=dict(color='#ff6600', width=2),
+                        marker=dict(size=4),
+                        fill='tozeroy', fillcolor='rgba(255,102,0,0.1)'
+                    ))
+                    _fig_esh.add_hline(y=80, line_dash='dot', line_color='#ff4444', annotation_text='Explosion 80')
+                    _fig_esh.add_hline(y=70, line_dash='dot', line_color='#ffaa00', annotation_text='Breakout 70')
+                    _fig_esh.add_hline(y=40, line_dash='dot', line_color='#aaaaaa', annotation_text='Build-up 40')
+                    _fig_esh.update_layout(
+                        title='Expiry Spike Score History',
+                        template='plotly_dark', height=260,
+                        margin=dict(l=40, r=80, t=40, b=30),
+                        xaxis=dict(title='Snapshot', showticklabels=False),
+                        yaxis=dict(title='Expiry Spike Score', range=[0, 110]),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                    )
+                    st.plotly_chart(_fig_esh, use_container_width=True)
+
+                # Gamma Sequence over time (multi-strike)
+                if len(st.session_state.gamma_seq_history) >= 3:
+                    _gsh_all = st.session_state.gamma_seq_history
+                    _fig_gsh = go.Figure()
+                    _gsh_colors_map = {'ATM-2': '#ff44ff', 'ATM-1': '#cc44cc', 'ATM': '#ffaa00', 'ATM+1': '#00aaff', 'ATM+2': '#0088dd'}
+                    for _gsk in _gv_keys:
+                        _gsk_vals = [_safe(s.get(_gsk, 0)) for s in _gsh_all]
+                        _fig_gsh.add_trace(go.Scatter(
+                            x=list(range(len(_gsk_vals))), y=_gsk_vals,
+                            mode='lines', name=_gsk,
+                            line=dict(color=_gsh_colors_map.get(_gsk, '#aaa'), width=2)
+                        ))
+                    _fig_gsh.update_layout(
+                        title='Gamma Sequence Over Time (ATM ±2)',
+                        template='plotly_dark', height=280,
+                        margin=dict(l=40, r=20, t=40, b=30),
+                        xaxis=dict(title='Snapshot', showticklabels=False),
+                        yaxis=dict(title='Gamma'),
+                        showlegend=True, legend=dict(orientation='h', y=-0.3),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                    )
+                    st.plotly_chart(_fig_gsh, use_container_width=True)
+
+                # Clear button
+                _mae_btn_col1, _mae_btn_col2 = st.columns([4, 1])
+                with _mae_btn_col2:
+                    if st.button("🗑️ Clear MAE History", key="clr_mae"):
+                        st.session_state.spike_history = []
+                        st.session_state.expiry_spike_history = []
+                        st.session_state.gamma_seq_history = []
+                        st.session_state.expiry_intel_history = []
+                        st.rerun()
+
+            else:
+                st.info("Option chain data required for Market Acceleration Engine.")
+        except Exception as _mae_e:
+            st.warning(f"Market Acceleration Engine unavailable: {str(_mae_e)}")
 
     # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
     if enable_signals and option_data and option_data.get('underlying') and not df.empty:
