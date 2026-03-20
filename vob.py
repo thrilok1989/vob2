@@ -2963,10 +2963,10 @@ def _detect_chart_candle_types(df):
     if df.empty or len(df) < 2:
         return []
     patterns = []
-    avg_body = (df['close'] - df['open']).abs().mean()
-    avg_range = (df['high'] - df['low']).mean()
-    if avg_body == 0 or avg_range == 0:
-        return []
+    bodies = (df['close'] - df['open']).abs()
+    ranges = (df['high'] - df['low'])
+    _WINDOW = 15  # rolling window for adaptive thresholds
+
     for i in range(1, len(df)):
         row = df.iloc[i]
         prev = df.iloc[i - 1]
@@ -2981,11 +2981,16 @@ def _detect_chart_candle_types(df):
         ts = row['datetime']
         price = c
 
+        # Adaptive rolling averages — only look at recent candles
+        _win_start = max(0, i - _WINDOW)
+        avg_body = bodies.iloc[_win_start:i].mean() or bodies.mean() or 1
+        avg_range = ranges.iloc[_win_start:i].mean() or ranges.mean() or 1
+
         detected = None
         direction = None
 
         # Doji
-        if body < avg_range * 0.08:
+        if body < avg_range * 0.1:
             detected = 'Doji'
             direction = 'NEUTRAL'
         # Hammer (bullish reversal)
@@ -2997,27 +3002,27 @@ def _detect_chart_candle_types(df):
             detected = 'Shooting Star'
             direction = 'SELL'
         # Bullish Engulfing
-        elif (pc < po and is_bull and c > po and o < pc and body > avg_body * 1.2):
+        elif (pc < po and is_bull and c > po and o < pc and body > avg_body):
             detected = 'Bull Engulfing'
             direction = 'BUY'
         # Bearish Engulfing
-        elif (pc > po and is_bear and c < po and o > pc and body > avg_body * 1.2):
+        elif (pc > po and is_bear and c < po and o > pc and body > avg_body):
             detected = 'Bear Engulfing'
             direction = 'SELL'
         # Strong Bullish (Marubozu-like)
-        elif is_bull and body > avg_body * 1.8 and upper_wick < body * 0.15 and lower_wick < body * 0.15:
+        elif is_bull and body > avg_body * 1.5 and upper_wick < body * 0.2 and lower_wick < body * 0.2:
             detected = 'Marubozu ↑'
             direction = 'BUY'
         # Strong Bearish (Marubozu-like)
-        elif is_bear and body > avg_body * 1.8 and upper_wick < body * 0.15 and lower_wick < body * 0.15:
+        elif is_bear and body > avg_body * 1.5 and upper_wick < body * 0.2 and lower_wick < body * 0.2:
             detected = 'Marubozu ↓'
             direction = 'SELL'
         # Long Upper Wick Rejection (bearish)
-        elif upper_wick > candle_range * 0.60 and upper_wick > body * 1.5:
+        elif upper_wick > candle_range * 0.55 and upper_wick > body * 1.3:
             detected = 'Upper Wick Rej'
             direction = 'SELL'
         # Long Lower Wick Rejection (bullish)
-        elif lower_wick > candle_range * 0.60 and lower_wick > body * 1.5:
+        elif lower_wick > candle_range * 0.55 and lower_wick > body * 1.3:
             detected = 'Lower Wick Rej'
             direction = 'BUY'
 
