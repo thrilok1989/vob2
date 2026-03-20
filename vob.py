@@ -11673,6 +11673,32 @@ def main():
                                 "• Straddle expanding (ROC ≥ 0.5%)\n"
                                 "• Options flow confirmation\n"
                                 "• Confidence ≥ 40")
+                        # ── Today's Signal History ────────────────────────────
+                        _today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+                        _today_hist = [
+                            _h for _h in st.session_state.cie_signal_history
+                            if hasattr(_h.get('time'), 'date') and _h['time'].date() == _today_ist
+                        ]
+                        if _today_hist:
+                            st.markdown("#### 📜 Today's Signal History")
+                            _today_rows = []
+                            for _h in reversed(_today_hist):
+                                _dir_sym = '🟢 BUY' if _h.get('direction') == 'BUY' else '🔴 SELL'
+                                _conf_val = _h.get('confidence', 0)
+                                _today_rows.append({
+                                    'Time': _h['time'].strftime('%H:%M:%S'),
+                                    'Pattern': _h.get('pattern', ''),
+                                    'Direction': _dir_sym,
+                                    'Spot': f"₹{_h.get('spot', 0):.0f}",
+                                    'Price': f"₹{_h.get('price', 0):.0f}",
+                                    'Level': f"₹{_h.get('level', 0):.0f}" if _h.get('level') else 'N/A',
+                                    'Type': _h.get('level_type', ''),
+                                    'Confidence': _conf_val,
+                                    'Strength': _h.get('strength', ''),
+                                })
+                            st.dataframe(pd.DataFrame(_today_rows), use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No signals recorded today yet.")
                     else:
                         _cie_now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
                         for _sig in _cie_signals:
