@@ -7068,6 +7068,9 @@ def main():
         st.markdown("---")
         st.header("📊 Options Chain Analysis")
 
+        # ── 🧠 SMART MONEY PANEL — shown first so it's always visible ────────
+        render_smart_money_master_analysis(option_data, current_price)
+
         # OI Change metrics
         st.markdown("## Open Interest Change (in Lakhs)")
         oi_col1, oi_col2 = st.columns(2)
@@ -7320,9 +7323,6 @@ def main():
             # Max Pain summary
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
-
-        # ===== SMART MONEY & MARKET SENTIMENT MASTER ANALYSIS =====
-        render_smart_money_master_analysis(option_data, current_price)
 
         # ===== KEY LEVELS FROM ORDER BOOK DEPTH CHART (time-series) =====
         st.markdown("---")
