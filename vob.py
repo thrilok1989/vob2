@@ -5144,6 +5144,319 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None, l
         'vob_blocks': vob_blocks
     }
 
+
+def render_smart_money_master_analysis(option_data, current_price):
+    """
+    Complete Master Prompt – Option Chain + Market Sentiment Analysis (14-step framework).
+    Covers: OI build/close, support/resistance strength, ATM±2 snapshot,
+    strike migration, smart money, sentiment, trap & breakout detection.
+    """
+    if option_data is None:
+        return
+    df_summary = option_data.get('df_summary')
+    if df_summary is None or df_summary.empty:
+        return
+
+    underlying   = option_data.get('underlying', current_price or 0)
+    atm_strike   = option_data.get('atm_strike')
+    max_pain     = option_data.get('max_pain_strike')
+    total_ce_chg = option_data.get('total_ce_change', 0)   # lakhs
+    total_pe_chg = option_data.get('total_pe_change', 0)   # lakhs
+
+    if atm_strike is None:
+        return
+
+    def gv(row, col, default=0.0):
+        try:
+            v = row[col]
+            return float(v) if pd.notna(v) else default
+        except Exception:
+            return default
+
+    LOT = 100000  # raw OI → lakhs divisor
+
+    # Sort & locate ATM
+    ds = df_summary.sort_values('Strike').reset_index(drop=True)
+    atm_matches = ds[ds['Strike'] == atm_strike].index.tolist()
+    ai = atm_matches[0] if atm_matches else int((ds['Strike'] - atm_strike).abs().idxmin())
+
+    def safe_row(i):
+        return ds.iloc[i] if 0 <= i < len(ds) else None
+
+    r_m2 = safe_row(ai - 2)
+    r_m1 = safe_row(ai - 1)
+    r_0  = ds.iloc[ai]
+    r_p1 = safe_row(ai + 1)
+    r_p2 = safe_row(ai + 2)
+
+    # ── STEP 1-2: Totals & PCR ──────────────────────────────────────────────
+    total_ce_oi = ds['openInterest_CE'].sum() if 'openInterest_CE' in ds.columns else 0
+    total_pe_oi = ds['openInterest_PE'].sum() if 'openInterest_PE' in ds.columns else 0
+    pcr_overall = (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else 1.0
+
+    max_ce_row = ds.loc[ds['openInterest_CE'].idxmax()] if 'openInterest_CE' in ds.columns else None
+    max_pe_row = ds.loc[ds['openInterest_PE'].idxmax()] if 'openInterest_PE' in ds.columns else None
+    max_ce_strike_val = gv(max_ce_row, 'Strike') if max_ce_row is not None else None
+    max_pe_strike_val = gv(max_pe_row, 'Strike') if max_pe_row is not None else None
+
+    # ── STEP 3: OI Activity ─────────────────────────────────────────────────
+    _price_up = underlying >= st.session_state.get('_oi_prev_underlying', underlying)
+    total_chg  = total_ce_chg + total_pe_chg
+
+    if _price_up and total_pe_chg > 0 and total_pe_chg >= abs(total_ce_chg):
+        oi_activity, oi_detail = "🟢 Long Build-up",   "Price ↑ + Put OI ↑ — bulls adding floor"
+    elif not _price_up and total_ce_chg > 0 and total_ce_chg >= abs(total_pe_chg):
+        oi_activity, oi_detail = "🔴 Short Build-up",  "Price ↓ + Call OI ↑ — bears adding resistance"
+    elif _price_up and total_ce_chg < 0:
+        oi_activity, oi_detail = "🟡 Short Covering",  "Price ↑ + Call OI ↓ — shorts being covered"
+    elif not _price_up and total_pe_chg < 0:
+        oi_activity, oi_detail = "🟠 Long Unwinding",  "Price ↓ + Put OI ↓ — longs being unwound"
+    else:
+        oi_activity, oi_detail = "⚪ Mixed / Neutral",  "No clear directional OI bias"
+
+    # ── STEP 4-5: Support & Resistance Strength ─────────────────────────────
+    pe_chg_atm = gv(r_0,  'changeinOpenInterest_PE')
+    ce_chg_atm = gv(r_0,  'changeinOpenInterest_CE')
+    pe_chg_m1  = gv(r_m1, 'changeinOpenInterest_PE') if r_m1 is not None else 0
+    pe_chg_m2  = gv(r_m2, 'changeinOpenInterest_PE') if r_m2 is not None else 0
+    ce_chg_p1  = gv(r_p1, 'changeinOpenInterest_CE') if r_p1 is not None else 0
+    ce_chg_p2  = gv(r_p2, 'changeinOpenInterest_CE') if r_p2 is not None else 0
+    pe_oi_atm  = gv(r_0,  'openInterest_PE')
+    ce_oi_atm  = gv(r_0,  'openInterest_CE')
+    pe_oi_m1   = gv(r_m1, 'openInterest_PE') if r_m1 is not None else 0
+    ce_oi_p1   = gv(r_p1, 'openInterest_CE') if r_p1 is not None else 0
+
+    sup_score = sum([total_pe_chg > 0, total_pe_chg > abs(total_ce_chg),
+                     pe_chg_atm > 0, pe_chg_m1 > 0, pe_chg_m2 > 0, pe_oi_atm > pe_oi_m1])
+    res_score = sum([total_ce_chg > 0, total_ce_chg > abs(total_pe_chg),
+                     ce_chg_atm > 0, ce_chg_p1 > 0, ce_chg_p2 > 0, ce_oi_atm > ce_oi_p1])
+
+    _sup_labels = ["❌ Very Weak", "⚠️ Weak", "🟡 Moderate", "✅ Strong", "🔒 Very Strong", "💪 Dominant"]
+    _res_labels = ["❌ Very Weak", "⚠️ Weak", "🟡 Moderate", "🔴 Strong", "🚧 Very Strong", "🚨 Dominant"]
+    support_strength    = _sup_labels[min(sup_score, 5)]
+    resistance_strength = _res_labels[min(res_score, 5)]
+
+    # ── STEP 7-8: Strike Migration ───────────────────────────────────────────
+    if ce_chg_atm < 0 and (ce_chg_p1 > 0 or ce_chg_p2 > 0):
+        resist_migration = "⬆️ Shifting Higher (Bullish)"
+    elif ce_chg_atm > 0 and ce_chg_p1 < 0:
+        resist_migration = "⬇️ Shifting Lower (Bearish)"
+    else:
+        resist_migration = "↔️ Stable"
+
+    if pe_chg_atm < 0 and (pe_chg_m1 > 0 or pe_chg_m2 > 0):
+        support_migration = "⬇️ Shifting Lower (Bearish)"
+    elif pe_chg_atm > 0 and pe_chg_m1 < 0:
+        support_migration = "⬆️ Shifting Higher (Bullish)"
+    else:
+        support_migration = "↔️ Stable"
+
+    # ── STEP 9: Smart Money ──────────────────────────────────────────────────
+    smart_signals = []
+    for side, pos_lbl, neg_lbl in [
+        ('CE', '🔴 Institutional Call writing', '🟡 Institutional Call covering'),
+        ('PE', '🟢 Institutional Put writing',  '🟠 Institutional Put covering'),
+    ]:
+        col = f'changeinOpenInterest_{side}'
+        if col in ds.columns:
+            avg_abs = ds[col].abs().mean()
+            spikes  = ds[ds[col].abs() > avg_abs * 3]
+            for _, srow in spikes.head(3).iterrows():
+                lbl = pos_lbl if srow[col] > 0 else neg_lbl
+                smart_signals.append(f"{lbl} at ₹{int(srow['Strike'])}")
+    if not smart_signals:
+        smart_signals = ["✅ No major institutional spikes detected"]
+
+    # ── STEP 10: Sentiment Score ─────────────────────────────────────────────
+    ss = 0
+    ss += 2 if pcr_overall > 1.2 else (1 if pcr_overall > 0.9 else (-2 if pcr_overall < 0.7 else -1))
+    ss += min(sup_score - 2, 2) - min(res_score - 2, 2)
+    if "Long Build"  in oi_activity: ss += 1
+    if "Short Build" in oi_activity: ss -= 1
+    if "Short Cover" in oi_activity: ss += 1
+    if "Long Unwind" in oi_activity: ss -= 1
+    if "Higher" in resist_migration: ss += 1
+    if "Lower"  in support_migration: ss -= 1
+
+    if   ss >= 6:   sentiment, s_clr = "🟢🔥 Strong Bullish", "#00ff88"
+    elif ss >= 4:   sentiment, s_clr = "🟢 Bullish",          "#00cc66"
+    elif ss >= 2:   sentiment, s_clr = "🟡 Mildly Bullish",   "#aacc00"
+    elif ss == 1:   sentiment, s_clr = "🟡 Slight Bullish",   "#cccc00"
+    elif ss == 0:   sentiment, s_clr = "⚪ Neutral / Range",   "#aaaaaa"
+    elif ss == -1:  sentiment, s_clr = "🟠 Slight Bearish",   "#cc9900"
+    elif ss >= -3:  sentiment, s_clr = "🟠 Mildly Bearish",   "#cc6600"
+    elif ss >= -5:  sentiment, s_clr = "🔴 Bearish",          "#cc3333"
+    else:           sentiment, s_clr = "🔴🔥 Strong Bearish", "#ff2222"
+
+    # ── STEP 11: Trap Detection ──────────────────────────────────────────────
+    trap_signals, trap_pts = [], 0
+    if total_pe_chg > 0 and total_ce_chg > total_pe_chg:
+        trap_signals.append("⚠️ Bull Trap: PUT OI building but CALL OI growth stronger"); trap_pts += 2
+    if total_ce_chg > 0 and total_pe_chg > total_ce_chg:
+        trap_signals.append("⚠️ Bear Trap: CALL OI building but PUT OI growth stronger"); trap_pts += 2
+    avg_oi = (total_ce_oi + total_pe_oi) / max(len(ds), 1)
+    if (ce_oi_atm + pe_oi_atm) > avg_oi * 2:
+        trap_signals.append("📍 Gamma Trap: High OI concentration at ATM — price likely pinned"); trap_pts += 2
+    if ce_chg_atm < 0 and pe_chg_atm < 0:
+        trap_signals.append("⚡ Fake Breakout Risk: Both CE & PE OI unwinding at ATM"); trap_pts += 1
+    if not trap_signals:
+        trap_signals = ["✅ No trap patterns detected"]
+    trap_prob = "High" if trap_pts >= 4 else ("Medium" if trap_pts >= 2 else "Low")
+
+    # ── STEP 12: Breakout Detection ──────────────────────────────────────────
+    bo_signals, bo_pts = [], 0
+    if ce_chg_atm < 0: bo_signals.append("📈 ATM Call OI unwinding — resistance weakening"); bo_pts += 1
+    if pe_chg_atm < 0: bo_signals.append("📉 ATM Put OI unwinding — support weakening");    bo_pts += 1
+    if "Higher" in resist_migration: bo_signals.append("⬆️ Resistance shifting higher — bullish breakout setup"); bo_pts += 2
+    if "Lower"  in support_migration: bo_signals.append("⬇️ Support shifting lower — bearish breakdown setup");    bo_pts += 2
+    if total_ce_oi + total_pe_oi > 0:
+        raw_total = (total_ce_oi + total_pe_oi) / LOT
+        if raw_total > 0 and abs(total_chg) / raw_total > 0.05:
+            bo_signals.append("💥 Large total OI movement (>5%) — breakout energy building"); bo_pts += 1
+    if not bo_signals:
+        bo_signals = ["↔️ No breakout signals — range-bound expected"]
+    bo_prob = "High" if bo_pts >= 4 else ("Medium" if bo_pts >= 2 else "Low")
+    bo_dir  = ("⬆️ Upside"   if "Higher" in resist_migration and total_pe_chg > total_ce_chg else
+               "⬇️ Downside" if "Lower"  in support_migration and total_ce_chg > total_pe_chg else
+               "↔️ No clear direction")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # DISPLAY
+    # ══════════════════════════════════════════════════════════════════════
+    st.markdown("---")
+    st.markdown("## 🧠 Smart Money & Market Sentiment Analysis")
+
+    # Row 1 — Sentiment · OI Activity · PCR
+    m1, m2, m3 = st.columns(3)
+    oi_clr  = ("#00ff88" if "Long Build"  in oi_activity else
+               "#ff4444" if "Short Build" in oi_activity else
+               "#FFD700" if "Cover"       in oi_activity else "#ff8800")
+    pcr_clr = "#00cc66" if pcr_overall > 1.1 else ("#ff4444" if pcr_overall < 0.8 else "#FFD700")
+    pcr_lbl = "Bullish" if pcr_overall > 1.1 else ("Bearish" if pcr_overall < 0.8 else "Neutral")
+
+    def _card(col_widget, title, value, subtitle, clr):
+        with col_widget:
+            st.markdown(
+                f"<div style='background:#111827;padding:12px;border-radius:8px;"
+                f"border-left:4px solid {clr};margin-bottom:8px'>"
+                f"<span style='font-size:0.75em;color:#888;text-transform:uppercase'>{title}</span><br>"
+                f"<span style='font-size:1.05em;color:{clr};font-weight:bold'>{value}</span><br>"
+                f"<span style='font-size:0.8em;color:#666'>{subtitle}</span></div>",
+                unsafe_allow_html=True
+            )
+
+    _card(m1, "MARKET SENTIMENT",  sentiment,   f"Score: {ss:+d}", s_clr)
+    _card(m2, "OI ACTIVITY",       oi_activity, oi_detail,         oi_clr)
+    _card(m3, "PCR (OVERALL)",     f"{pcr_overall:.2f} · {pcr_lbl}", "", pcr_clr)
+
+    st.markdown("")
+
+    # Row 2 — Support & Resistance Strength
+    sc1, sc2 = st.columns(2)
+    with sc1:
+        st.markdown("#### 🟢 Support Strength")
+        st.progress(min(sup_score / 6, 1.0), text=support_strength)
+        st.caption(f"Total PE ΔOI: {total_pe_chg:+.1f}L | ATM: {pe_chg_atm/LOT*100:+.1f}L | "
+                   f"ATM-1: {pe_chg_m1/LOT*100:+.1f}L | ATM-2: {pe_chg_m2/LOT*100:+.1f}L")
+    with sc2:
+        st.markdown("#### 🔴 Resistance Strength")
+        st.progress(min(res_score / 6, 1.0), text=resistance_strength)
+        st.caption(f"Total CE ΔOI: {total_ce_chg:+.1f}L | ATM: {ce_chg_atm/LOT*100:+.1f}L | "
+                   f"ATM+1: {ce_chg_p1/LOT*100:+.1f}L | ATM+2: {ce_chg_p2/LOT*100:+.1f}L")
+
+    # ATM ±2 OI Snapshot
+    st.markdown("#### 📊 ATM ±2 Strike OI Snapshot")
+    snap_rows = []
+    for lbl, row in [("ATM-2", r_m2), ("ATM-1", r_m1), ("ATM ★", r_0), ("ATM+1", r_p1), ("ATM+2", r_p2)]:
+        if row is None:
+            continue
+        snap_rows.append({
+            "Zone":       lbl,
+            "Strike":     int(gv(row, 'Strike')),
+            "CE OI(L)":   f"{gv(row,'openInterest_CE')/LOT:.2f}",
+            "CE ΔOI(L)":  f"{gv(row,'changeinOpenInterest_CE')/LOT:+.2f}",
+            "PE OI(L)":   f"{gv(row,'openInterest_PE')/LOT:.2f}",
+            "PE ΔOI(L)":  f"{gv(row,'changeinOpenInterest_PE')/LOT:+.2f}",
+            "PCR":        f"{gv(row,'PCR',1.0):.2f}" if 'PCR' in ds.columns else "—",
+        })
+    if snap_rows:
+        st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+
+    # Strike Migration + Smart Money
+    mig1, mig2 = st.columns(2)
+    with mig1:
+        st.markdown("#### 🔄 Strike Migration")
+        r_clr2 = "#00cc66" if "Higher" in resist_migration else ("#ff4444" if "Lower" in resist_migration else "#888")
+        s_clr2 = "#ff4444" if "Lower"  in support_migration else ("#00cc66" if "Higher" in support_migration else "#888")
+        st.markdown(f"<b style='color:{r_clr2}'>Resistance:</b> {resist_migration}<br>"
+                    f"<b style='color:{s_clr2}'>Support:</b> {support_migration}", unsafe_allow_html=True)
+    with mig2:
+        st.markdown("#### 🏦 Smart Money Signals")
+        for sig in smart_signals[:5]:
+            st.markdown(f"- {sig}")
+
+    # Trap + Breakout
+    tc1, tc2 = st.columns(2)
+    trap_clr = "#ff4444" if trap_prob == "High" else ("#FFD700" if trap_prob == "Medium" else "#00cc66")
+    bo_clr   = "#00ff88" if bo_prob == "High"   else ("#FFD700" if bo_prob == "Medium"   else "#888")
+    with tc1:
+        st.markdown("#### 🪤 Trap Detection")
+        st.markdown(f"**Probability:** <span style='color:{trap_clr};font-size:1.1em'>{trap_prob}</span>",
+                    unsafe_allow_html=True)
+        for sig in trap_signals:
+            st.markdown(f"- {sig}")
+    with tc2:
+        st.markdown("#### 🚀 Breakout Detection")
+        st.markdown(f"**Probability:** <span style='color:{bo_clr};font-size:1.1em'>{bo_prob}</span>"
+                    f" &nbsp; {bo_dir}", unsafe_allow_html=True)
+        for sig in bo_signals[:4]:
+            st.markdown(f"- {sig}")
+
+    # Final Summary Table
+    st.markdown("---")
+    st.markdown("### 📋 Final Analysis Summary")
+    fa1, fa2 = st.columns(2)
+    with fa1:
+        st.markdown(f"""
+| Metric | Value |
+|---|---|
+| **Sentiment** | {sentiment} |
+| **OI Activity** | {oi_activity} |
+| **Support Strength** | {support_strength} |
+| **Resistance Strength** | {resistance_strength} |
+| **PCR Overall** | {pcr_overall:.2f} ({pcr_lbl}) |
+""")
+    with fa2:
+        st.markdown(f"""
+| Metric | Value |
+|---|---|
+| **Resistance Migration** | {resist_migration} |
+| **Support Migration** | {support_migration} |
+| **Trap Probability** | {trap_prob} |
+| **Breakout Probability** | {bo_prob} ({bo_dir}) |
+| **Max Pain** | {'₹' + str(int(max_pain)) if max_pain else 'N/A'} |
+""")
+
+    # Key Levels
+    kl1, kl2, kl3 = st.columns(3)
+    with kl1:
+        if max_pe_strike_val:
+            st.success(f"🟢 Key Support: ₹{int(max_pe_strike_val)}")
+    with kl2:
+        if max_pain:
+            st.info(f"🎯 Max Pain: ₹{int(max_pain)}")
+    with kl3:
+        if max_ce_strike_val:
+            st.error(f"🔴 Key Resistance: ₹{int(max_ce_strike_val)}")
+
+    if trap_prob == "High" or bo_prob == "High":
+        st.warning(
+            "⚠️ **Risk Warning:** "
+            + ("High trap probability — avoid chasing moves. " if trap_prob == "High" else "")
+            + ("High breakout energy — use strict stop-losses." if bo_prob == "High" else "")
+        )
+
+
 def display_analytics_dashboard(db, symbol="NIFTY50"):
     """Display analytics dashboard"""
     st.subheader("Market Analytics Dashboard")
@@ -7007,6 +7320,9 @@ def main():
             # Max Pain summary
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
+
+        # ===== SMART MONEY & MARKET SENTIMENT MASTER ANALYSIS =====
+        render_smart_money_master_analysis(option_data, current_price)
 
         # ===== KEY LEVELS FROM ORDER BOOK DEPTH CHART (time-series) =====
         st.markdown("---")
