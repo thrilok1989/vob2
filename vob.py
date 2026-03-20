@@ -5697,6 +5697,161 @@ def main():
             except Exception:
                 pass
 
+        # ===== COMPOSITE SCORE & VERDICT — TOP DISPLAY =====
+        st.markdown("---")
+        st.markdown("## 🧭 Composite Direction Signal — PCR × ΔOI × GEX")
+        _cs_last   = st.session_state.get('composite_signal_last_valid')
+        _cs_hist   = st.session_state.get('composite_signal_history', [])
+
+        if _cs_last:
+            _cs_verdict      = _cs_last['verdict']
+            _cs_icon         = _cs_last['verdict_icon']
+            _cs_color        = _cs_last['verdict_color']
+            _cs_desc         = _cs_last['verdict_desc']
+            _cs_score        = _cs_last['total_score']
+            _cs_pct          = _cs_last['score_pct']
+            _cs_gex          = _cs_last['total_net_gex']
+            _cs_pcr          = _cs_last['avg_pcr']
+            _cs_chgoi        = _cs_last['avg_chgoi']
+            _cs_max          = 14.0
+            _cs_gex_trending = _cs_gex < -10
+            _cs_gex_pinning  = _cs_gex > 10
+            _cs_gex_lbl      = 'Trending' if _cs_gex_trending else 'Pinning' if _cs_gex_pinning else 'Neutral'
+
+            # Main verdict card
+            st.markdown(f"""
+            <div style="background: linear-gradient(135deg, {_cs_color}15, {_cs_color}30);
+                        padding: 22px; border-radius: 15px; border: 3px solid {_cs_color};
+                        text-align: center; margin-bottom: 16px;">
+                <h1 style="color: {_cs_color}; margin: 0; font-size: 44px;">{_cs_icon} {_cs_verdict}</h1>
+                <p style="color: #cccccc; margin: 8px 0 0 0; font-size: 15px;">{_cs_desc}</p>
+                <p style="color: {_cs_color}; margin: 5px 0 0 0; font-size: 13px;">
+                    Composite Score: {_cs_score:+.1f} / {_cs_max:.0f} ({_cs_pct:+.0f}%) &nbsp;|&nbsp;
+                    Net GEX: {_cs_gex:.1f}L ({_cs_gex_lbl})
+                </p>
+            </div>""", unsafe_allow_html=True)
+
+            # Three metric cards
+            _cm1, _cm2, _cm3 = st.columns(3)
+            with _cm1:
+                _c = "#00ff88" if _cs_pcr > 1.2 else "#ff4444" if _cs_pcr < 0.7 else "#FFD700"
+                st.markdown(f"""
+                <div style="background:{_c}20;padding:12px;border-radius:10px;border:2px solid {_c};text-align:center;">
+                <h4 style="color:{_c};margin:0;">Avg PCR (OI)</h4>
+                <h2 style="color:{_c};margin:5px 0;">{_cs_pcr:.2f}</h2>
+                <p style="color:white;margin:0;font-size:12px;">{'Bullish' if _cs_pcr > 1.2 else 'Bearish' if _cs_pcr < 0.7 else 'Neutral'}</p>
+                </div>""", unsafe_allow_html=True)
+            with _cm2:
+                _c = "#00ff88" if _cs_chgoi > 1.2 else "#ff4444" if _cs_chgoi < 0.7 else "#FFD700"
+                st.markdown(f"""
+                <div style="background:{_c}20;padding:12px;border-radius:10px;border:2px solid {_c};text-align:center;">
+                <h4 style="color:{_c};margin:0;">Avg PCR (ΔOI)</h4>
+                <h2 style="color:{_c};margin:5px 0;">{_cs_chgoi:.2f}</h2>
+                <p style="color:white;margin:0;font-size:12px;">{'Bullish' if _cs_chgoi > 1.2 else 'Bearish' if _cs_chgoi < 0.7 else 'Neutral'}</p>
+                </div>""", unsafe_allow_html=True)
+            with _cm3:
+                _c = "#00ff88" if _cs_gex > 10 else "#ff4444" if _cs_gex < -10 else "#FFD700"
+                st.markdown(f"""
+                <div style="background:{_c}20;padding:12px;border-radius:10px;border:2px solid {_c};text-align:center;">
+                <h4 style="color:{_c};margin:0;">Total GEX (ATM±2)</h4>
+                <h2 style="color:{_c};margin:5px 0;">{_cs_gex:.1f}L</h2>
+                <p style="color:white;margin:0;font-size:12px;">{'Pin/Chop' if _cs_gex > 10 else 'Trend/Accel' if _cs_gex < -10 else 'Neutral'}</p>
+                </div>""", unsafe_allow_html=True)
+
+            # Time-series chart if history available
+            if len(_cs_hist) >= 2:
+                _cs_df = pd.DataFrame(_cs_hist)
+                _cs_marker_colors = [
+                    '#00ff88' if r.get('verdict_numeric', 0) >= 2 else
+                    '#90EE90' if r.get('verdict_numeric', 0) == 1 else
+                    '#ff4444' if r.get('verdict_numeric', 0) <= -2 else
+                    '#FFB6C1' if r.get('verdict_numeric', 0) == -1 else '#FFD700'
+                    for _, r in _cs_df.iterrows()
+                ]
+                _fig_cs = go.Figure()
+                _fig_cs.add_trace(go.Scatter(
+                    x=_cs_df['time'], y=_cs_df['score_pct'],
+                    mode='lines+markers', name='Score %',
+                    line=dict(color='#00aaff', width=3),
+                    marker=dict(size=8, color=_cs_marker_colors),
+                    fill='tozeroy', fillcolor='rgba(0,170,255,0.08)'
+                ))
+                _y_max = max(abs(_cs_df['score_pct'].max()), abs(_cs_df['score_pct'].min()), 30) * 1.2
+                _fig_cs.add_hline(y=0, line_dash="dash", line_color="white", line_width=1.5,
+                                  annotation_text="Neutral (0%)", annotation_position="right")
+                _fig_cs.add_hline(y=15, line_dash="dot", line_color="#00ff88", line_width=1,
+                                  annotation_text="Bullish Zone", annotation_position="right")
+                _fig_cs.add_hline(y=-15, line_dash="dot", line_color="#ff4444", line_width=1,
+                                  annotation_text="Bearish Zone", annotation_position="right")
+                _fig_cs.add_hrect(y0=15, y1=_y_max, fillcolor="rgba(0,255,136,0.06)", line_width=0)
+                _fig_cs.add_hrect(y0=-_y_max, y1=-15, fillcolor="rgba(255,68,68,0.06)", line_width=0)
+                # Sparse verdict labels
+                _step = max(1, len(_cs_df) // 10)
+                for _ci, (_cii, _crow) in enumerate(_cs_df.iterrows()):
+                    if _ci % _step == 0:
+                        _fig_cs.add_annotation(
+                            x=_crow['time'], y=_crow['score_pct'],
+                            text=_crow['verdict'], showarrow=False,
+                            yshift=14, font=dict(size=8, color='white'),
+                            bgcolor='rgba(0,0,0,0.5)', borderpad=2
+                        )
+                # Companion: PCR + GEX sub-charts inline
+                _cc1, _cc2 = st.columns(2)
+                with _cc1:
+                    _fig_cs.update_layout(
+                        title=f"Composite Score Time-Series | Now: {_cs_pct:+.0f}% ({_cs_verdict})",
+                        template='plotly_dark', height=360,
+                        showlegend=False,
+                        xaxis=dict(tickformat='%H:%M', title='Time'),
+                        yaxis=dict(title='Score %', zeroline=True, zerolinecolor='white'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        margin=dict(l=50, r=60, t=55, b=40)
+                    )
+                    st.plotly_chart(_fig_cs, use_container_width=True)
+                with _cc2:
+                    _fig_cs2 = go.Figure()
+                    if 'avg_pcr' in _cs_df.columns:
+                        _fig_cs2.add_trace(go.Scatter(
+                            x=_cs_df['time'], y=_cs_df['avg_pcr'],
+                            mode='lines+markers', name='PCR OI',
+                            line=dict(color='#00aaff', width=2), marker=dict(size=4)
+                        ))
+                    if 'avg_chgoi' in _cs_df.columns:
+                        _fig_cs2.add_trace(go.Scatter(
+                            x=_cs_df['time'], y=_cs_df['avg_chgoi'],
+                            mode='lines+markers', name='PCR ΔOI',
+                            line=dict(color='#ff44ff', width=2), marker=dict(size=4)
+                        ))
+                    if 'total_gex' in _cs_df.columns:
+                        _fig_cs2.add_trace(go.Scatter(
+                            x=_cs_df['time'], y=_cs_df['total_gex'],
+                            mode='lines', name='GEX (L)',
+                            line=dict(color='#FFD700', width=2, dash='dot'),
+                            yaxis='y2'
+                        ))
+                    _fig_cs2.add_hline(y=1.2, line_dash="dot", line_color="#00ff88", line_width=1)
+                    _fig_cs2.add_hline(y=0.7, line_dash="dot", line_color="#ff4444", line_width=1)
+                    _fig_cs2.add_hline(y=1.0, line_dash="dash", line_color="white", line_width=1)
+                    _pcr_all = _cs_df['avg_pcr'].dropna().tolist() + _cs_df['avg_chgoi'].dropna().tolist() + [0.7, 1.2]
+                    _fig_cs2.update_layout(
+                        title="PCR OI · PCR ΔOI · GEX",
+                        template='plotly_dark', height=360,
+                        showlegend=True,
+                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=1, xanchor="right"),
+                        xaxis=dict(tickformat='%H:%M', title=''),
+                        yaxis=dict(title='PCR', range=[max(0, min(_pcr_all)*0.9), max(_pcr_all)*1.1]),
+                        yaxis2=dict(title='GEX (L)', overlaying='y', side='right',
+                                    showgrid=False, zeroline=True, zerolinecolor='rgba(255,255,255,0.3)'),
+                        plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        margin=dict(l=40, r=55, t=55, b=40)
+                    )
+                    st.plotly_chart(_fig_cs2, use_container_width=True)
+
+            st.caption(f"📊 {len(_cs_hist)} data points · updates every ~30s · "
+                       f"Full analysis with per-strike breakdown further below ↓")
+        else:
+            st.info("🕐 Composite Score builds up after first refresh — data will appear here on the next cycle.")
+
         # ===== PRO TRADER DASHBOARD =====
         st.markdown("---")
         st.markdown("## 🚀 Pro Trader Dashboard — Options Flow")
