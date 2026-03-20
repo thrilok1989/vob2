@@ -146,6 +146,22 @@ def send_telegram_message_sync(message):
     except Exception as e:
         st.error(f"Telegram notification error: {e}")
 
+def send_telegram_photo_sync(image_bytes, caption=""):
+    """Send a photo (PNG bytes) to Telegram via sendPhoto"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    try:
+        response = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID, "caption": caption, "parse_mode": "HTML"},
+            files={"photo": ("chart.png", image_bytes, "image/png")},
+            timeout=30,
+        )
+        return response.json() if response.status_code == 200 else None
+    except Exception:
+        pass
+
 def test_telegram_connection():
     """Test if Telegram is properly configured"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -4515,6 +4531,8 @@ def main():
         st.session_state.pcr_chgoi_strike_last_valid = None
     if 'pcr_chgoi_strike_current_strikes' not in st.session_state:
         st.session_state.pcr_chgoi_strike_current_strikes = []
+    if 'pcr_telegram_last_sent' not in st.session_state:
+        st.session_state.pcr_telegram_last_sent = None
 
     # Initialize session state for Composite Direction Signal history
     if 'composite_signal_history' not in st.session_state:
@@ -7438,6 +7456,80 @@ def main():
                             strike_col in history_df.columns and len(history_df) > 0) else 1.0
                         pcr_sig = "🟢 Bull" if cur_pcr > 1.2 else ("🔴 Bear" if cur_pcr < 0.7 else "🟡 Ntrl")
                         st.caption(f"PCR {cur_pcr:.2f} {pcr_sig}")
+
+                # ── Send PCR chart to Telegram every 5 minutes ──
+                _now = datetime.now()
+                _last_sent = st.session_state.pcr_telegram_last_sent
+                _should_send = (
+                    _last_sent is None
+                    or (_now - _last_sent).total_seconds() >= 300
+                )
+                if _should_send and current_strikes:
+                    try:
+                        from plotly.subplots import make_subplots as _make_subplots
+                        _n = len(current_strikes)
+                        _tg_fig = _make_subplots(
+                            rows=1, cols=_n,
+                            subplot_titles=[
+                                f"{position_labels[i]}<br>₹{current_strikes[i]}"
+                                for i in range(_n)
+                            ],
+                        )
+                        for _i, _strike in enumerate(current_strikes):
+                            _sc = str(_strike)
+                            _col_idx = _i + 1
+                            if _sc in history_df.columns:
+                                _tg_fig.add_trace(go.Scatter(
+                                    x=history_df['time'],
+                                    y=history_df[_sc],
+                                    mode='lines',
+                                    name='PCR OI',
+                                    line=dict(color='#00ccff', width=2),
+                                    showlegend=(_i == 0),
+                                ), row=1, col=_col_idx)
+                            if chgoi_history_df is not None and _sc in chgoi_history_df.columns:
+                                _tg_fig.add_trace(go.Scatter(
+                                    x=chgoi_history_df['time'],
+                                    y=chgoi_history_df[_sc],
+                                    mode='lines',
+                                    name='ChgOI PCR',
+                                    line=dict(color='#ffaa00', width=2, dash='dash'),
+                                    showlegend=(_i == 0),
+                                ), row=1, col=_col_idx)
+                            _tg_fig.add_hline(y=1.2, line_dash="dot", line_color="rgba(0,255,136,0.5)",
+                                              line_width=1, row=1, col=_col_idx)
+                            _tg_fig.add_hline(y=0.7, line_dash="dot", line_color="rgba(255,68,68,0.5)",
+                                              line_width=1, row=1, col=_col_idx)
+                        _tg_fig.update_layout(
+                            title="ATM ±2 Strike Comparison — PCR · ChgOI PCR",
+                            template='plotly_dark',
+                            height=350,
+                            width=1400,
+                            paper_bgcolor='#1e1e1e',
+                            plot_bgcolor='#1e1e1e',
+                            margin=dict(l=10, r=10, t=80, b=40),
+                            legend=dict(orientation='h', yanchor='bottom', y=1.06, xanchor='center', x=0.5),
+                        )
+                        _tg_fig.update_xaxes(tickformat='%H:%M', tickfont=dict(size=8))
+                        _tg_fig.update_yaxes(title_text='PCR', tickfont=dict(size=8))
+                        _img_bytes = _tg_fig.to_image(format="png", scale=2)
+                        # Build caption with current PCR values
+                        _caption_parts = [f"<b>ATM ±2 PCR · ChgOI PCR</b>  {_now.strftime('%H:%M')}"]
+                        for _i, _strike in enumerate(current_strikes):
+                            _sc = str(_strike)
+                            _pcr_v = history_df[_sc].iloc[-1] if _sc in history_df.columns and len(history_df) > 0 else None
+                            _chg_v = (chgoi_history_df[_sc].iloc[-1]
+                                      if chgoi_history_df is not None and _sc in chgoi_history_df.columns and len(chgoi_history_df) > 0
+                                      else None)
+                            _lbl = position_labels[_i].split(" ", 1)[-1]  # strip emoji
+                            _sig = "🟢" if (_pcr_v and _pcr_v > 1.2) else ("🔴" if (_pcr_v and _pcr_v < 0.7) else "🟡")
+                            _pcr_str = f"{_pcr_v:.2f}" if _pcr_v is not None else "N/A"
+                            _chg_str = f"{_chg_v:.2f}" if _chg_v is not None else "N/A"
+                            _caption_parts.append(f"{_sig} ₹{_strike} ({_lbl}): OI={_pcr_str} | ChgOI={_chg_str}")
+                        send_telegram_photo_sync(_img_bytes, "\n".join(_caption_parts))
+                        st.session_state.pcr_telegram_last_sent = _now
+                    except Exception as _tg_err:
+                        pass  # silently skip if chart export fails
 
                 # ── ATM ±2 Strike GEX (separate row) ──
                 st.markdown("---")

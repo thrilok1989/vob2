@@ -11,3 +11,4 @@ supabase>=1.0.3
 dhanhq>=2.0.2
 yfinance>=0.2.28
 pandas_ta>=0.3.14
+kaleido>=0.2.1
