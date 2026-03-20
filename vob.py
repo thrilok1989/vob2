@@ -4558,6 +4558,12 @@ def main():
     if 'pressure_last_valid' not in st.session_state:
         st.session_state.pressure_last_valid = None
 
+    # Initialize session state for Pro Trader Dashboard
+    if 'pro_trader_history' not in st.session_state:
+        st.session_state.pro_trader_history = []
+    if 'pro_smart_signal_last' not in st.session_state:
+        st.session_state.pro_smart_signal_last = None
+
     # Initialize Supabase
     try:
         if not supabase_url or not supabase_key:
@@ -5690,6 +5696,564 @@ def main():
                             st.session_state.gex_history = st.session_state.gex_history[-200:]
             except Exception:
                 pass
+
+        # ===== PRO TRADER DASHBOARD =====
+        st.markdown("---")
+        st.markdown("## 🚀 Pro Trader Dashboard — Options Flow")
+        try:
+            _pro_df    = option_data.get('df_summary') if option_data else None
+            _pro_spot  = option_data.get('underlying') if option_data else None
+
+            # Ensure optional columns exist
+            if _pro_df is not None:
+                for _c in ['impliedVolatility_CE', 'impliedVolatility_PE',
+                           'bidQty_CE', 'askQty_CE', 'bidQty_PE', 'askQty_PE',
+                           'Delta_CE', 'Delta_PE', 'Gamma_CE', 'Gamma_PE',
+                           'changeinOpenInterest_CE', 'changeinOpenInterest_PE',
+                           'totalTradedVolume_CE', 'totalTradedVolume_PE']:
+                    if _c not in _pro_df.columns:
+                        _pro_df[_c] = 0.0
+
+            if _pro_df is not None and _pro_spot and 'Zone' in _pro_df.columns:
+                _pro_atm_idx = _pro_df[_pro_df['Zone'] == 'ATM'].index
+                if len(_pro_atm_idx) > 0:
+                    _pro_atm_pos = _pro_df.index.get_loc(_pro_atm_idx[0])
+                    _pro_start   = max(0, _pro_atm_pos - 2)
+                    _pro_end     = min(len(_pro_df), _pro_atm_pos + 3)
+                    _pro_slice   = _pro_df.iloc[_pro_start:_pro_end].copy()
+                    _pro_atm_val = float(_pro_df[_pro_df['Zone'] == 'ATM']['Strike'].values[0])
+                    _pro_strikes = sorted(_pro_slice['Strike'].unique())
+                    _pro_step    = int(_pro_strikes[1] - _pro_strikes[0]) if len(_pro_strikes) >= 2 else 50
+
+                    def _pro_lbl(s):
+                        d = int(round((s - _pro_atm_val) / _pro_step))
+                        if d == 0: return "ATM"
+                        return f"ATM+{d}" if d > 0 else f"ATM{d}"
+
+                    _pro_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                    _pro_lot = 25
+
+                    # ── 1. Straddle per strike ──────────────────────────────────
+                    _pro_straddles = {}
+                    for _, _r in _pro_slice.iterrows():
+                        _lbl = _pro_lbl(_r['Strike'])
+                        _pro_straddles[_lbl] = round(
+                            float(_r.get('lastPrice_CE', 0) or 0) +
+                            float(_r.get('lastPrice_PE', 0) or 0), 2)
+                    _pro_atm_straddle = _pro_straddles.get('ATM', 0)
+
+                    # ── 2. IV per strike ───────────────────────────────────────
+                    _pro_iv_ce, _pro_iv_pe = {}, {}
+                    for _, _r in _pro_slice.iterrows():
+                        _lbl = _pro_lbl(_r['Strike'])
+                        _pro_iv_ce[_lbl] = float(_r.get('impliedVolatility_CE', 0) or 0)
+                        _pro_iv_pe[_lbl] = float(_r.get('impliedVolatility_PE', 0) or 0)
+                    _pro_avg_iv_ce    = sum(_pro_iv_ce.values()) / max(len(_pro_iv_ce), 1)
+                    _pro_avg_iv_pe    = sum(_pro_iv_pe.values()) / max(len(_pro_iv_pe), 1)
+                    _pro_market_iv_sk = round(_pro_avg_iv_pe - _pro_avg_iv_ce, 2)
+
+                    # ── 3. PCR (OI, Volume, ΔOI) ──────────────────────────────
+                    _pro_ce_oi    = _pro_slice['openInterest_CE'].fillna(0).sum()
+                    _pro_pe_oi    = _pro_slice['openInterest_PE'].fillna(0).sum()
+                    _pro_pcr_oi   = round(_pro_pe_oi / (_pro_ce_oi + 1e-6), 3)
+                    _pro_ce_vol   = _pro_slice['totalTradedVolume_CE'].fillna(0).sum()
+                    _pro_pe_vol   = _pro_slice['totalTradedVolume_PE'].fillna(0).sum()
+                    _pro_pcr_vol  = round(_pro_pe_vol / (_pro_ce_vol + 1e-6), 3)
+                    _pro_ce_chg   = _pro_slice['changeinOpenInterest_CE'].fillna(0).sum()
+                    _pro_pe_chg   = _pro_slice['changeinOpenInterest_PE'].fillna(0).sum()
+                    _pro_pcr_chg  = round(abs(_pro_pe_chg) / (abs(_pro_ce_chg) + 1e-6), 3)
+
+                    # ── 4. Bid/Ask Pressure ────────────────────────────────────
+                    _pro_cp_list, _pro_pp_list = [], []
+                    for _, _r in _pro_slice.iterrows():
+                        _bc = float(_r.get('bidQty_CE', 0) or 0)
+                        _ac = float(_r.get('askQty_CE', 0) or 0)
+                        _bp = float(_r.get('bidQty_PE', 0) or 0)
+                        _ap = float(_r.get('askQty_PE', 0) or 0)
+                        _pro_cp_list.append(_bc / (_bc + _ac + 1e-6))
+                        _pro_pp_list.append(_bp / (_bp + _ap + 1e-6))
+                    _pro_call_pres = round(sum(_pro_cp_list) / max(len(_pro_cp_list), 1), 4)
+                    _pro_put_pres  = round(sum(_pro_pp_list) / max(len(_pro_pp_list), 1), 4)
+
+                    # ── 5. Delta Exposure ──────────────────────────────────────
+                    _pro_call_dexp = sum(
+                        float(_r.get('Delta_CE', 0) or 0) *
+                        float(_r.get('openInterest_CE', 0) or 0) * _pro_lot
+                        for _, _r in _pro_slice.iterrows())
+                    _pro_put_dexp  = sum(
+                        float(_r.get('Delta_PE', 0) or 0) *
+                        float(_r.get('openInterest_PE', 0) or 0) * _pro_lot
+                        for _, _r in _pro_slice.iterrows())
+                    _pro_net_delta = round(_pro_call_dexp + _pro_put_dexp, 0)
+
+                    # ── 6. Net Gamma Exposure (Lakhs) ──────────────────────────
+                    _pro_net_gex = round(sum(
+                        (float(_r.get('Gamma_CE', 0) or 0) * float(_r.get('openInterest_CE', 0) or 0) -
+                         float(_r.get('Gamma_PE', 0) or 0) * float(_r.get('openInterest_PE', 0) or 0))
+                        * _pro_lot * _pro_spot
+                        for _, _r in _pro_slice.iterrows()) / 100000, 2)
+
+                    # ── Store in history ───────────────────────────────────────
+                    _pro_entry = {
+                        'time': _pro_now, 'spot': _pro_spot, 'atm_strike': _pro_atm_val,
+                        'straddle_atm': _pro_atm_straddle,
+                        **{f'straddle_{k}': v for k, v in _pro_straddles.items()},
+                        'avg_iv_ce': round(_pro_avg_iv_ce, 2),
+                        'avg_iv_pe': round(_pro_avg_iv_pe, 2),
+                        'iv_skew': _pro_market_iv_sk,
+                        'pcr_oi': _pro_pcr_oi, 'pcr_vol': _pro_pcr_vol, 'pcr_chgoi': _pro_pcr_chg,
+                        'call_pressure': _pro_call_pres, 'put_pressure': _pro_put_pres,
+                        'net_delta': _pro_net_delta, 'net_gex': _pro_net_gex,
+                    }
+                    _pro_should_add = (
+                        not st.session_state.pro_trader_history or
+                        (_pro_now - st.session_state.pro_trader_history[-1]['time']).total_seconds() >= 28
+                    )
+                    if _pro_should_add:
+                        st.session_state.pro_trader_history.append(_pro_entry)
+                        if len(st.session_state.pro_trader_history) > 200:
+                            st.session_state.pro_trader_history = st.session_state.pro_trader_history[-200:]
+
+                    # ── 7. Breakout Probability Score (0–100) ──────────────────
+                    _pro_h    = st.session_state.pro_trader_history
+                    _pro_h_df = pd.DataFrame(_pro_h) if len(_pro_h) >= 2 else None
+
+                    def _rate_of_change(series, window=5):
+                        if series is None or len(series) < 2: return 0.0
+                        s = series.tail(window)
+                        return (s.iloc[-1] - s.iloc[0]) / (abs(s.iloc[0]) + 1e-6) * 100
+
+                    # Straddle momentum score (0–20)
+                    _s1 = 10
+                    if _pro_h_df is not None and 'straddle_atm' in _pro_h_df.columns:
+                        _roc = _rate_of_change(_pro_h_df['straddle_atm'])
+                        _s1 = int(min(20, max(0, _roc * 2 + 10)))
+
+                    # IV expansion score (0–20)
+                    _s2 = 10
+                    if _pro_h_df is not None and 'avg_iv_ce' in _pro_h_df.columns:
+                        _roc_ce = _rate_of_change(_pro_h_df['avg_iv_ce'])
+                        _roc_pe = _rate_of_change(_pro_h_df['avg_iv_pe'])
+                        _s2 = int(min(20, max(0, (_roc_ce + _roc_pe) + 10)))
+
+                    # Gamma shift score — negative GEX → trending (0–20)
+                    _s3 = (20 if _pro_net_gex < -50 else 16 if _pro_net_gex < -20 else
+                           12 if _pro_net_gex < -10 else 10 if _pro_net_gex < 0 else
+                           8  if _pro_net_gex < 10  else 6  if _pro_net_gex < 20  else 4)
+
+                    # Volume spike score (0–20)
+                    _s4 = 10
+                    if _pro_h_df is not None and 'pcr_vol' in _pro_h_df.columns and len(_pro_h_df) >= 3:
+                        _pv = _pro_h_df['pcr_vol']
+                        _dev = abs(_pv.iloc[-1] - _pv.mean()) / (_pv.std() + 1e-6)
+                        _s4 = int(min(20, max(0, _dev * 5 + 8)))
+
+                    # Pressure imbalance score (0–20)
+                    _s5 = int(min(20, max(0, abs(_pro_call_pres - _pro_put_pres) * 80 + 5)))
+
+                    _pro_score = min(100, _s1 + _s2 + _s3 + _s4 + _s5)
+                    if st.session_state.pro_trader_history:
+                        st.session_state.pro_trader_history[-1]['breakout_score'] = _pro_score
+
+                    _pro_mode_color = "#FF5252" if _pro_net_gex < 0 else "#00C853"
+                    _pro_market_mode = "⚡ TRENDING" if _pro_net_gex < 0 else "📌 RANGE"
+                    _bs_color = ("#FF5252" if _pro_score >= 70 else
+                                 "#FFD740" if _pro_score >= 40 else "#00BCD4")
+                    _bs_label = ("🔥 High Prob Breakout" if _pro_score >= 70 else
+                                 "⚡ Possible Move"       if _pro_score >= 40 else "📌 Range")
+
+                    # ── 8. Smart Signal Engine ─────────────────────────────────
+                    _pro_alert = None
+                    _pro_alert_color = "#888"
+                    if _pro_h_df is not None and len(_pro_h_df) >= 3:
+                        _st_rising  = _pro_h_df['straddle_atm'].iloc[-1] > _pro_h_df['straddle_atm'].iloc[-3]
+                        _gex_dec    = _pro_h_df['net_gex'].iloc[-1] < _pro_h_df['net_gex'].iloc[-3]
+                        _nd_rising  = _pro_h_df['net_delta'].iloc[-1] > _pro_h_df['net_delta'].iloc[-3]
+                        if _st_rising and _pro_call_pres > _pro_put_pres and _gex_dec and _nd_rising:
+                            _pro_alert = "🚀 BULLISH BREAKOUT PROBABLE"
+                            _pro_alert_color = "#00C853"
+                        elif _st_rising and _pro_put_pres > _pro_call_pres and _gex_dec and not _nd_rising:
+                            _pro_alert = "🔥 BEARISH BREAKDOWN PROBABLE"
+                            _pro_alert_color = "#FF5252"
+                        if _pro_alert and enable_signals:
+                            _last_sig = st.session_state.pro_smart_signal_last
+                            if (_last_sig is None or
+                                    (_pro_now - _last_sig[0]).total_seconds() > 300 or
+                                    _last_sig[1] != _pro_alert):
+                                send_telegram_message_sync(
+                                    f"<b>VOB2 Pro Alert</b>\n{_pro_alert}\n"
+                                    f"Spot: {_pro_spot:.0f} | ATM: ₹{int(_pro_atm_val)}\n"
+                                    f"Straddle: {_pro_atm_straddle:.0f} | Score: {_pro_score}/100\n"
+                                    f"GEX: {_pro_net_gex:+.1f}L | Δ: {_pro_net_delta:+.0f}"
+                                )
+                                st.session_state.pro_smart_signal_last = (_pro_now, _pro_alert)
+
+                    # ── Supabase write ─────────────────────────────────────────
+                    if _pro_should_add:
+                        try:
+                            db.client.table('pro_trader_metrics').upsert({
+                                'timestamp':      _pro_now.isoformat(),
+                                'spot':           float(_pro_spot),
+                                'atm_strike':     int(_pro_atm_val),
+                                'straddle_atm':   float(_pro_atm_straddle),
+                                'iv_skew':        float(_pro_market_iv_sk),
+                                'pcr_oi':         float(_pro_pcr_oi),
+                                'pcr_vol':        float(_pro_pcr_vol),
+                                'pcr_chgoi':      float(_pro_pcr_chg),
+                                'call_pressure':  float(_pro_call_pres),
+                                'put_pressure':   float(_pro_put_pres),
+                                'net_delta':      float(_pro_net_delta),
+                                'net_gex':        float(_pro_net_gex),
+                                'breakout_score': int(_pro_score),
+                            }, on_conflict='timestamp').execute()
+                        except Exception:
+                            pass  # Supabase table may not exist yet; fail silently
+
+                    # ══════════════════════════════════════════════════════════
+                    # TOP PANEL
+                    # ══════════════════════════════════════════════════════════
+                    _tp1, _tp2, _tp3, _tp4 = st.columns(4)
+                    _prev_atm_st = (_pro_h_df['straddle_atm'].iloc[-2]
+                                    if _pro_h_df is not None and len(_pro_h_df) >= 2
+                                    else _pro_atm_straddle)
+                    _st_chg = _pro_atm_straddle - _prev_atm_st
+                    _st_clr = "#FF5252" if _st_chg > 5 else ("#00C853" if _st_chg < -5 else "#FFD740")
+                    with _tp1:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid #444;">
+                        <div style="color:#aaa;font-size:11px;">SPOT PRICE</div>
+                        <div style="font-size:24px;font-weight:bold;color:#FFD740;">{_pro_spot:,.1f}</div>
+                        <div style="font-size:11px;color:#888;">ATM: ₹{int(_pro_atm_val)}</div>
+                        </div>""", unsafe_allow_html=True)
+                    with _tp2:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:2px solid {_bs_color};">
+                        <div style="color:#aaa;font-size:11px;">BREAKOUT SCORE</div>
+                        <div style="font-size:24px;font-weight:bold;color:{_bs_color};">{_pro_score}/100</div>
+                        <div style="font-size:11px;color:{_bs_color};">{_bs_label}</div>
+                        </div>""", unsafe_allow_html=True)
+                    with _tp3:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:2px solid {_pro_mode_color};">
+                        <div style="color:#aaa;font-size:11px;">MARKET MODE</div>
+                        <div style="font-size:20px;font-weight:bold;color:{_pro_mode_color};">{_pro_market_mode}</div>
+                        <div style="font-size:11px;color:#888;">Net GEX: {_pro_net_gex:+.1f}L</div>
+                        </div>""", unsafe_allow_html=True)
+                    with _tp4:
+                        st.markdown(f"""
+                        <div style="background:#1e1e1e;padding:14px;border-radius:10px;border:1px solid {_st_clr};">
+                        <div style="color:#aaa;font-size:11px;">ATM STRADDLE</div>
+                        <div style="font-size:24px;font-weight:bold;color:{_st_clr};">₹{_pro_atm_straddle:.0f}</div>
+                        <div style="font-size:11px;color:#888;">Chg: {_st_chg:+.1f} · PCR: {_pro_pcr_oi:.2f}</div>
+                        </div>""", unsafe_allow_html=True)
+
+                    # Smart signal alert banner
+                    if _pro_alert:
+                        st.markdown(f"""
+                        <div style="background:{_pro_alert_color}22;border:2px solid {_pro_alert_color};
+                             border-radius:8px;padding:10px;margin:8px 0;text-align:center;">
+                        <span style="font-size:16px;font-weight:bold;color:{_pro_alert_color};">{_pro_alert}</span>
+                        <span style="font-size:13px;color:#ccc;margin-left:16px;">Score: {_pro_score}/100</span>
+                        </div>""", unsafe_allow_html=True)
+
+                    st.markdown("<br>", unsafe_allow_html=True)
+
+                    if _pro_h_df is not None and len(_pro_h_df) >= 2:
+                        # ══════════════════════════════════════════════════════
+                        # MIDDLE CHARTS  (2 × 2)
+                        # ══════════════════════════════════════════════════════
+                        _mc1, _mc2 = st.columns(2)
+                        _pos_keys   = ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']
+                        _pos_colors = ['#ff44ff', '#cc44cc', '#ffaa00', '#00aaff', '#0088dd']
+
+                        with _mc1:
+                            # Straddle Engine Chart
+                            _fig_st = go.Figure()
+                            for _si, _sk in enumerate(_pos_keys):
+                                _col = f'straddle_{_sk}'
+                                if _col in _pro_h_df.columns:
+                                    _cv = _pro_h_df[_col].iloc[-1]
+                                    _fig_st.add_trace(go.Scatter(
+                                        x=_pro_h_df['time'], y=_pro_h_df[_col],
+                                        mode='lines', name=_sk,
+                                        line=dict(color=_pos_colors[_si],
+                                                  width=2.5 if _sk == 'ATM' else 1.5)
+                                    ))
+                                    _fig_st.add_trace(go.Scatter(
+                                        x=[_pro_h_df['time'].iloc[-1]], y=[_cv],
+                                        mode='markers+text', text=[f'{_cv:.0f}'],
+                                        textposition='top right',
+                                        textfont=dict(size=8, color=_pos_colors[_si]),
+                                        marker=dict(size=6, color=_pos_colors[_si]),
+                                        showlegend=False, hoverinfo='skip'
+                                    ))
+                            _fig_st.update_layout(
+                                title=f'Straddle Engine — ATM: ₹{_pro_atm_straddle:.0f}',
+                                height=280, template='plotly_dark',
+                                margin=dict(l=40, r=20, t=45, b=30),
+                                xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                                yaxis=dict(gridcolor='#333', title='₹ Straddle'),
+                                showlegend=True,
+                                legend=dict(orientation='h', y=-0.35, font=dict(size=9)),
+                                paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
+                            )
+                            st.plotly_chart(_fig_st, use_container_width=True)
+
+                        with _mc2:
+                            # IV Skew Engine Chart
+                            _fig_iv2 = go.Figure()
+                            for _col_k, _col_n, _col_c, _tp in [
+                                ('avg_iv_ce', 'Call IV avg', '#00C853', 'top right'),
+                                ('avg_iv_pe', 'Put IV avg',  '#FF5252', 'bottom right'),
+                                ('iv_skew',   'IV Skew (PE−CE)', '#FFD740', 'top left'),
+                            ]:
+                                if _col_k in _pro_h_df.columns:
+                                    _cv = _pro_h_df[_col_k].iloc[-1]
+                                    _fig_iv2.add_trace(go.Scatter(
+                                        x=_pro_h_df['time'], y=_pro_h_df[_col_k],
+                                        mode='lines', name=_col_n,
+                                        line=dict(color=_col_c, width=2,
+                                                  dash='dot' if _col_k == 'iv_skew' else 'solid')
+                                    ))
+                                    _fig_iv2.add_trace(go.Scatter(
+                                        x=[_pro_h_df['time'].iloc[-1]], y=[_cv],
+                                        mode='markers+text',
+                                        text=[f'{_cv:+.1f}' if _col_k == 'iv_skew' else f'{_cv:.1f}%'],
+                                        textposition=_tp, textfont=dict(size=8, color=_col_c),
+                                        marker=dict(size=7, color=_col_c),
+                                        showlegend=False, hoverinfo='skip'
+                                    ))
+                            _fig_iv2.add_hline(y=0, line_color='#555', line_width=1)
+                            _fig_iv2.update_layout(
+                                title=f'IV Skew Engine — PE−CE: {_pro_market_iv_sk:+.1f}',
+                                height=280, template='plotly_dark',
+                                margin=dict(l=40, r=20, t=45, b=30),
+                                xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                                yaxis=dict(gridcolor='#333', title='IV %'),
+                                showlegend=True,
+                                legend=dict(orientation='h', y=-0.35, font=dict(size=9)),
+                                paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
+                            )
+                            st.plotly_chart(_fig_iv2, use_container_width=True)
+
+                        _mc3, _mc4 = st.columns(2)
+
+                        with _mc3:
+                            # PCR Trend Chart
+                            _fig_pcr2 = go.Figure()
+                            for _pk, _pn, _pc, _pd in [
+                                ('pcr_oi',    'PCR OI',     '#00ccff', 'solid'),
+                                ('pcr_vol',   'PCR Volume', '#ffaa00', 'dash'),
+                                ('pcr_chgoi', 'PCR ΔOI',   '#ff44ff', 'dot'),
+                            ]:
+                                if _pk in _pro_h_df.columns:
+                                    _cv = _pro_h_df[_pk].iloc[-1]
+                                    _fig_pcr2.add_trace(go.Scatter(
+                                        x=_pro_h_df['time'], y=_pro_h_df[_pk],
+                                        mode='lines', name=_pn,
+                                        line=dict(color=_pc, width=2, dash=_pd)
+                                    ))
+                                    _fig_pcr2.add_trace(go.Scatter(
+                                        x=[_pro_h_df['time'].iloc[-1]], y=[_cv],
+                                        mode='markers+text', text=[f'{_cv:.2f}'],
+                                        textposition='top right',
+                                        textfont=dict(size=8, color=_pc),
+                                        marker=dict(size=7, color=_pc),
+                                        showlegend=False, hoverinfo='skip'
+                                    ))
+                            _fig_pcr2.add_hline(y=1.2, line_dash='dot',
+                                                line_color='rgba(0,255,136,0.5)',
+                                                annotation_text='Bull 1.2',
+                                                annotation_position='right',
+                                                annotation_font_size=8)
+                            _fig_pcr2.add_hline(y=0.7, line_dash='dot',
+                                                line_color='rgba(255,68,68,0.5)',
+                                                annotation_text='Bear 0.7',
+                                                annotation_position='right',
+                                                annotation_font_size=8)
+                            _fig_pcr2.add_hline(y=1.0, line_color='rgba(255,255,255,0.2)', line_width=1)
+                            _fig_pcr2.update_layout(
+                                title=f'PCR Engine — OI:{_pro_pcr_oi:.2f} Vol:{_pro_pcr_vol:.2f} ΔOI:{_pro_pcr_chg:.2f}',
+                                height=280, template='plotly_dark',
+                                margin=dict(l=40, r=40, t=45, b=30),
+                                xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                                yaxis=dict(gridcolor='#333', title='PCR'),
+                                showlegend=True,
+                                legend=dict(orientation='h', y=-0.35, font=dict(size=9)),
+                                paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
+                            )
+                            st.plotly_chart(_fig_pcr2, use_container_width=True)
+
+                        with _mc4:
+                            # Gamma Pressure Chart
+                            _fig_gam = go.Figure()
+                            if 'net_gex' in _pro_h_df.columns:
+                                _gv = _pro_h_df['net_gex']
+                                _g_cur = _gv.iloc[-1]
+                                _fig_gam.add_trace(go.Scatter(
+                                    x=_pro_h_df['time'], y=_gv,
+                                    mode='lines+markers', name='Net GEX (L)',
+                                    line=dict(color='#FFD740', width=2),
+                                    marker=dict(size=4,
+                                                color=['#00C853' if v >= 0 else '#FF5252' for v in _gv]),
+                                    fill='tozeroy', fillcolor='rgba(255,215,0,0.08)'
+                                ))
+                                _fig_gam.add_hline(y=0, line_color='white', line_width=1.5)
+                                _fig_gam.add_trace(go.Scatter(
+                                    x=[_pro_h_df['time'].iloc[-1]], y=[_g_cur],
+                                    mode='markers+text', text=[f'{_g_cur:+.1f}L'],
+                                    textposition='top right',
+                                    textfont=dict(size=9, color='#FFD740'),
+                                    marker=dict(size=9, color='#FFD740', symbol='circle'),
+                                    showlegend=False, hoverinfo='skip'
+                                ))
+                            _fig_gam.update_layout(
+                                title=f'Gamma Pressure — {_pro_market_mode} (GEX: {_pro_net_gex:+.1f}L)',
+                                height=280, template='plotly_dark',
+                                margin=dict(l=40, r=20, t=45, b=30),
+                                xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                                yaxis=dict(gridcolor='#333', title='GEX (L)',
+                                           zeroline=True, zerolinecolor='white'),
+                                showlegend=False,
+                                paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
+                            )
+                            st.plotly_chart(_fig_gam, use_container_width=True)
+
+                        # ══════════════════════════════════════════════════════
+                        # BOTTOM CHARTS  (3 columns)
+                        # ══════════════════════════════════════════════════════
+                        _bc1, _bc2, _bc3 = st.columns(3)
+
+                        with _bc1:
+                            # Bid/Ask Pressure Chart
+                            _fig_pres2 = go.Figure()
+                            for _pk2, _pn2, _pc2, _tp2 in [
+                                ('call_pressure', 'Call Pressure', '#00C853', 'top right'),
+                                ('put_pressure',  'Put Pressure',  '#FF5252', 'bottom right'),
+                            ]:
+                                if _pk2 in _pro_h_df.columns:
+                                    _cv2 = _pro_h_df[_pk2].iloc[-1]
+                                    _fig_pres2.add_trace(go.Scatter(
+                                        x=_pro_h_df['time'], y=_pro_h_df[_pk2],
+                                        mode='lines', name=_pn2,
+                                        line=dict(color=_pc2, width=2)
+                                    ))
+                                    _fig_pres2.add_trace(go.Scatter(
+                                        x=[_pro_h_df['time'].iloc[-1]], y=[_cv2],
+                                        mode='markers+text', text=[f'{_cv2:.3f}'],
+                                        textposition=_tp2,
+                                        textfont=dict(size=8, color=_pc2),
+                                        marker=dict(size=7, color=_pc2),
+                                        showlegend=False, hoverinfo='skip'
+                                    ))
+                            _fig_pres2.add_hline(y=0.5, line_color='#555', line_width=1)
+                            _fig_pres2.update_layout(
+                                title=f'Bid/Ask Pressure — C:{_pro_call_pres:.3f} P:{_pro_put_pres:.3f}',
+                                height=250, template='plotly_dark',
+                                margin=dict(l=30, r=20, t=45, b=30),
+                                xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                                yaxis=dict(gridcolor='#333', range=[0, 1], title='Pressure'),
+                                showlegend=True,
+                                legend=dict(orientation='h', y=-0.4, font=dict(size=9)),
+                                paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
+                            )
+                            st.plotly_chart(_fig_pres2, use_container_width=True)
+                            _p_sig = ("🚀 Call Dominating" if _pro_call_pres > _pro_put_pres + 0.1
+                                      else "🔥 Put Dominating" if _pro_put_pres > _pro_call_pres + 0.1
+                                      else "⚖️ Balanced")
+                            st.caption(_p_sig)
+
+                        with _bc2:
+                            # Net Delta Shift Chart
+                            _fig_nd = go.Figure()
+                            if 'net_delta' in _pro_h_df.columns:
+                                _nd_vals = _pro_h_df['net_delta']
+                                _nd_cur  = _nd_vals.iloc[-1]
+                                _fig_nd.add_trace(go.Scatter(
+                                    x=_pro_h_df['time'], y=_nd_vals,
+                                    mode='lines+markers', name='Net Delta',
+                                    line=dict(color='#00BCD4', width=2),
+                                    marker=dict(
+                                        size=4,
+                                        color=['#00C853' if v >= 0 else '#FF5252' for v in _nd_vals]),
+                                    fill='tozeroy', fillcolor='rgba(0,188,212,0.08)'
+                                ))
+                                _fig_nd.add_hline(y=0, line_color='white', line_width=1)
+                                _fig_nd.add_trace(go.Scatter(
+                                    x=[_pro_h_df['time'].iloc[-1]], y=[_nd_cur],
+                                    mode='markers+text', text=[f'{_nd_cur:+.0f}'],
+                                    textposition='top right',
+                                    textfont=dict(size=9, color='#00BCD4'),
+                                    marker=dict(size=9, color='#00BCD4', symbol='circle'),
+                                    showlegend=False, hoverinfo='skip'
+                                ))
+                            _fig_nd.update_layout(
+                                title=f'Net Delta Shift — {_pro_net_delta:+,.0f}',
+                                height=250, template='plotly_dark',
+                                margin=dict(l=40, r=20, t=45, b=30),
+                                xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                                yaxis=dict(gridcolor='#333', title='Net Δ', zeroline=True,
+                                           zerolinecolor='white'),
+                                showlegend=False,
+                                paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
+                            )
+                            st.plotly_chart(_fig_nd, use_container_width=True)
+                            _nd_sig = ("📈 Bullish Positioning" if _pro_net_delta > 0
+                                       else "📉 Bearish Positioning")
+                            st.caption(_nd_sig)
+
+                        with _bc3:
+                            # Breakout Probability Bar Chart
+                            _fig_bs = go.Figure()
+                            if 'breakout_score' in _pro_h_df.columns:
+                                _bs_s = _pro_h_df['breakout_score'].dropna()
+                                _bs_t = _pro_h_df['time'].loc[_bs_s.index]
+                                _fig_bs.add_trace(go.Bar(
+                                    x=_bs_t, y=_bs_s,
+                                    marker_color=['#FF5252' if v >= 70
+                                                  else '#FFD740' if v >= 40
+                                                  else '#00BCD4' for v in _bs_s],
+                                    name='Breakout Score'
+                                ))
+                                _fig_bs.add_hline(y=70, line_dash='dot',
+                                                  line_color='rgba(255,82,82,0.7)',
+                                                  annotation_text='Breakout 70',
+                                                  annotation_position='right',
+                                                  annotation_font_size=8)
+                                _fig_bs.add_hline(y=40, line_dash='dot',
+                                                  line_color='rgba(255,215,0,0.7)',
+                                                  annotation_text='Watch 40',
+                                                  annotation_position='right',
+                                                  annotation_font_size=8)
+                            _fig_bs.update_layout(
+                                title=f'Breakout Probability — {_pro_score}/100',
+                                height=250, template='plotly_dark',
+                                margin=dict(l=30, r=50, t=45, b=30),
+                                xaxis=dict(tickformat='%H:%M', gridcolor='#333'),
+                                yaxis=dict(gridcolor='#333', range=[0, 105], title='Score'),
+                                showlegend=False,
+                                paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
+                            )
+                            st.plotly_chart(_fig_bs, use_container_width=True)
+                            st.caption(f"Straddle {_s1}/20 · IV {_s2}/20 · Gamma {_s3}/20 · "
+                                       f"Volume {_s4}/20 · Pressure {_s5}/20")
+
+                    # Controls
+                    _pro_cl, _pro_cr = st.columns([4, 1])
+                    with _pro_cl:
+                        st.caption(f"📊 Pro pts: {len(st.session_state.pro_trader_history)} · "
+                                   f"Refreshes every 30s")
+                    with _pro_cr:
+                        if st.button("🗑️ Clear Pro History"):
+                            st.session_state.pro_trader_history = []
+                            st.session_state.pro_smart_signal_last = None
+                            st.rerun()
+                else:
+                    st.info("ATM strike not identified — Pro Dashboard unavailable.")
+            else:
+                st.info("Option chain data required for Pro Trader Dashboard.")
+        except Exception as _pro_e:
+            st.warning(f"Pro Dashboard error: {str(_pro_e)}")
 
         # ===== ATM ±2 STRIKE COMPARISON: PCR / ChgOI PCR / GEX =====
         st.markdown("---")
