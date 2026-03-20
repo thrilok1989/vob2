@@ -5094,6 +5094,448 @@ def show_market_overview(api, interval="1", days_back=1):
     st.markdown("---")
 
 
+# =====================================================================
+# CANDLESTICK INTELLIGENCE ENGINE — Helper Functions
+# =====================================================================
+
+def _cie_detect_swing_sr(df, lookback=200, cluster_pct=0.003):
+    """Detect swing high/low S/R levels and cluster nearby ones."""
+    if df is None or len(df) < 10:
+        return [], []
+    recent = df.tail(lookback).copy().reset_index(drop=True)
+    n = len(recent)
+    raw_sup, raw_res = [], []
+    for i in range(2, n - 2):
+        lo = recent['low'].iloc[i]
+        hi = recent['high'].iloc[i]
+        if (lo < recent['low'].iloc[i-1] and lo < recent['low'].iloc[i-2] and
+                lo < recent['low'].iloc[i+1] and lo < recent['low'].iloc[i+2]):
+            raw_sup.append(lo)
+        if (hi > recent['high'].iloc[i-1] and hi > recent['high'].iloc[i-2] and
+                hi > recent['high'].iloc[i+1] and hi > recent['high'].iloc[i+2]):
+            raw_res.append(hi)
+
+    def _cluster(levels):
+        if not levels:
+            return []
+        levels = sorted(levels)
+        clusters, group = [], [levels[0]]
+        for lvl in levels[1:]:
+            if abs(lvl - group[-1]) / (group[-1] + 1e-6) <= cluster_pct:
+                group.append(lvl)
+            else:
+                clusters.append(float(np.mean(group)))
+                group = [lvl]
+        clusters.append(float(np.mean(group)))
+        return clusters
+
+    return _cluster(raw_sup), _cluster(raw_res)
+
+
+def _cie_find_nearest_sr(price, supports, resistances, thr=0.002):
+    """Return (level, type, dist_pct) of nearest S/R within threshold."""
+    best_dist, best_lvl, best_type = float('inf'), None, None
+    for lvl in supports:
+        d = abs(price - lvl) / (lvl + 1e-6)
+        if d < best_dist and d <= thr:
+            best_dist, best_lvl, best_type = d, lvl, 'support'
+    for lvl in resistances:
+        d = abs(price - lvl) / (lvl + 1e-6)
+        if d < best_dist and d <= thr:
+            best_dist, best_lvl, best_type = d, lvl, 'resistance'
+    return best_lvl, best_type, best_dist
+
+
+def _cie_detect_patterns(df, supports, resistances):
+    """Detect reversal and continuation patterns near S/R levels."""
+    signals = []
+    if df is None or len(df) < 3:
+        return signals
+
+    n = len(df)
+    avg_body = (df['close'] - df['open']).abs().rolling(20, min_periods=3).mean().fillna(50)
+    avg_vol = df['volume'].rolling(20, min_periods=3).mean().fillna(1)
+    thr = 0.002  # 0.2% proximity threshold
+
+    for i in range(2, n):
+        c  = df.iloc[i]
+        p1 = df.iloc[i - 1]
+        candle_range = c['high'] - c['low']
+        if candle_range < 1e-6:
+            continue
+        body        = abs(c['close'] - c['open'])
+        upper_wick  = c['high'] - max(c['close'], c['open'])
+        lower_wick  = min(c['close'], c['open']) - c['low']
+        is_green    = c['close'] >= c['open']
+        is_red      = c['close'] < c['open']
+        avg_b       = max(avg_body.iloc[i], 1)
+        vol_spike   = bool(c['volume'] > avg_vol.iloc[i] * 1.5)
+        ts          = c['datetime'] if 'datetime' in df.columns else i
+
+        # S/R proximity — check low side for support, high side for resistance
+        probe_sup = c['low'] if is_red else min(c['close'], c['open'])
+        probe_res = c['high'] if is_green else max(c['close'], c['open'])
+        lvl_s, typ_s, dist_s = _cie_find_nearest_sr(probe_sup, supports, resistances, thr)
+        lvl_r, typ_r, dist_r = _cie_find_nearest_sr(probe_res, supports, resistances, thr)
+        near_sup = typ_s == 'support'
+        near_res = typ_r == 'resistance'
+
+        # ── BULLISH REVERSALS AT SUPPORT ────────────────────────────────
+        if near_sup:
+            # 1. Hammer
+            if lower_wick > 2 * max(body, 1) and upper_wick <= body * 0.5 and lower_wick > candle_range * 0.5:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Hammer', 'direction': 'BUY',
+                    'category': 'Reversal', 'price': c['close'], 'level': lvl_s,
+                    'level_type': 'Support', 'dist_pct': dist_s, 'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(lower_wick / candle_range * 28)),
+                })
+            # 2. Long Lower Wick Rejection
+            if lower_wick > candle_range * 0.60:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Long Lower Wick Rejection',
+                    'direction': 'BUY', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(lower_wick / candle_range * 28)),
+                })
+            # 3. Bullish Engulfing
+            if (p1['close'] < p1['open'] and is_green and
+                    min(c['open'], c['close']) <= min(p1['open'], p1['close']) and
+                    max(c['open'], c['close']) >= max(p1['open'], p1['close'])):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bullish Engulfing',
+                    'direction': 'BUY', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 14)),
+                })
+            # 4. Morning Star (3-candle)
+            if i >= 2:
+                c0, c1, c2 = df.iloc[i-2], df.iloc[i-1], c
+                b0 = abs(c0['close'] - c0['open'])
+                b1 = abs(c1['close'] - c1['open'])
+                mid0 = (c0['open'] + c0['close']) / 2
+                if (c0['close'] < c0['open'] and b0 > avg_b * 0.8 and b1 < avg_b * 0.4 and
+                        c2['close'] > c2['open'] and c2['close'] > mid0):
+                    signals.append({
+                        'index': i, 'time': ts, 'pattern': 'Morning Star',
+                        'direction': 'BUY', 'category': 'Reversal', 'price': c2['close'],
+                        'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                        'vol_spike': vol_spike, 'candle_strength': 25,
+                    })
+            # 5. Bullish Marubozu (continuation)
+            if (is_green and body > avg_b * 1.5 and upper_wick < body * 0.1 and lower_wick < body * 0.1):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bullish Marubozu',
+                    'direction': 'BUY', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 12)),
+                })
+            # 6. Inside Bar Breakout (prev candle range small, curr breaks above)
+            p1_rng = p1['high'] - p1['low']
+            if (p1_rng < avg_b * 0.8 and c['high'] > p1['high'] and is_green):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Inside Bar Breakout',
+                    'direction': 'BUY', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike, 'candle_strength': 18,
+                })
+
+        # ── BEARISH REVERSALS AT RESISTANCE ─────────────────────────────
+        if near_res:
+            # 7. Shooting Star
+            if upper_wick > 2 * max(body, 1) and lower_wick <= body * 0.5 and upper_wick > candle_range * 0.5:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Shooting Star',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(upper_wick / candle_range * 28)),
+                })
+            # 8. Upper Wick Rejection
+            if upper_wick > candle_range * 0.60:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Upper Wick Rejection',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(upper_wick / candle_range * 28)),
+                })
+            # 9. Bearish Engulfing
+            if (p1['close'] > p1['open'] and is_red and
+                    min(c['open'], c['close']) <= min(p1['open'], p1['close']) and
+                    max(c['open'], c['close']) >= max(p1['open'], p1['close'])):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bearish Engulfing',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 14)),
+                })
+            # 10. Evening Star (3-candle)
+            if i >= 2:
+                c0, c1, c2 = df.iloc[i-2], df.iloc[i-1], c
+                b0 = abs(c0['close'] - c0['open'])
+                b1 = abs(c1['close'] - c1['open'])
+                mid0 = (c0['open'] + c0['close']) / 2
+                if (c0['close'] > c0['open'] and b0 > avg_b * 0.8 and b1 < avg_b * 0.4 and
+                        c2['close'] < c2['open'] and c2['close'] < mid0):
+                    signals.append({
+                        'index': i, 'time': ts, 'pattern': 'Evening Star',
+                        'direction': 'SELL', 'category': 'Reversal', 'price': c2['close'],
+                        'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                        'vol_spike': vol_spike, 'candle_strength': 25,
+                    })
+            # 11. Bearish Marubozu (continuation)
+            if (is_red and body > avg_b * 1.5 and upper_wick < body * 0.1 and lower_wick < body * 0.1):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bearish Marubozu',
+                    'direction': 'SELL', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 12)),
+                })
+
+    # 12. Lower Low Momentum (last 5 candles making lower highs & lows)
+    if n >= 6:
+        last6 = df.tail(6)
+        if (all(last6['high'].iloc[j] < last6['high'].iloc[j-1] for j in range(1, 6)) and
+                all(last6['low'].iloc[j] < last6['low'].iloc[j-1] for j in range(1, 6))):
+            cl = df.iloc[-1]
+            lvl_r2, _, dr2 = _cie_find_nearest_sr(cl['high'], supports, resistances, 0.005)
+            signals.append({
+                'index': n - 1,
+                'time': cl['datetime'] if 'datetime' in df.columns else n - 1,
+                'pattern': 'Lower Low Momentum', 'direction': 'SELL',
+                'category': 'Continuation', 'price': cl['close'],
+                'level': lvl_r2, 'level_type': 'Resistance', 'dist_pct': dr2,
+                'vol_spike': False, 'candle_strength': 20,
+            })
+
+    # Return only signals from last 4 candles
+    cutoff = max(0, n - 4)
+    return [s for s in signals if s.get('index', 0) >= cutoff]
+
+
+def _cie_options_confirmation(signal, df_summary, straddle_history, underlying_price):
+    """
+    Apply options flow filters and volatility filter.
+    Returns (confirmed: bool, details: dict).
+    """
+    if df_summary is None or underlying_price is None:
+        return False, {'volatility_filter': 'No data'}
+    try:
+        atm_strike = min(df_summary['Strike'].tolist(), key=lambda x: abs(x - underlying_price))
+        atm_rows = df_summary[df_summary['Strike'] == atm_strike]
+        details = {}
+        opt_score = 0
+
+        # Straddle ROC (volatility filter)
+        straddle_roc = 0.0
+        if len(straddle_history) >= 2:
+            s_last = straddle_history[-1].get('straddle', 0) if isinstance(straddle_history[-1], dict) else 0
+            s_prev = straddle_history[-2].get('straddle', 0) if isinstance(straddle_history[-2], dict) else 0
+            if s_prev > 0:
+                straddle_roc = abs((s_last - s_prev) / s_prev * 100)
+        details['straddle_roc'] = round(straddle_roc, 2)
+        details['straddle_expanding'] = straddle_roc >= 0.5
+
+        if straddle_roc < 0.5:
+            details['volatility_filter'] = 'BLOCKED'
+            return False, details
+        details['volatility_filter'] = 'PASS'
+        opt_score += 10
+
+        if not atm_rows.empty:
+            row = atm_rows.iloc[0]
+            pcr    = float(row.get('PCR', 1.0) or 1.0)
+            ce_chg = float(row.get('changeinOpenInterest_CE', 0) or 0)
+            pe_chg = float(row.get('changeinOpenInterest_PE', 0) or 0)
+            d_ce   = float(row.get('Delta_CE', 0) or 0)
+            d_pe   = float(row.get('Delta_PE', 0) or 0)
+            gamma  = row.get('Gamma_SR', '-')
+            details.update({
+                'pcr': round(pcr, 2),
+                'ce_chg_oi': round(ce_chg, 0),
+                'pe_chg_oi': round(pe_chg, 0),
+                'net_delta': round(d_ce + d_pe, 4),
+                'gamma_sr': str(gamma),
+            })
+
+            if signal['direction'] == 'BUY':
+                if pcr > 1.0:
+                    opt_score += 15
+                    details['pcr_conf'] = f'Bullish PCR {pcr:.2f} ✅'
+                if pe_chg > 0:
+                    opt_score += 15
+                    details['oi_conf'] = 'Put Writing ✅'
+                elif ce_chg < 0:
+                    opt_score += 8
+                    details['oi_conf'] = 'Call Unwinding ✅'
+                if 'Support' in str(gamma):
+                    opt_score += 10
+                    details['gamma_conf'] = 'Gamma Support ✅'
+                else:
+                    details['gamma_conf'] = str(gamma) or '-'
+                if (d_ce + d_pe) > 0:
+                    opt_score += 10
+                    details['delta_conf'] = 'Delta Positive ✅'
+            else:  # SELL
+                if pcr < 1.0:
+                    opt_score += 15
+                    details['pcr_conf'] = f'Bearish PCR {pcr:.2f} ✅'
+                if ce_chg > 0:
+                    opt_score += 15
+                    details['oi_conf'] = 'Call Writing ✅'
+                elif pe_chg < 0:
+                    opt_score += 8
+                    details['oi_conf'] = 'Put Unwinding ✅'
+                if 'Resist' in str(gamma):
+                    opt_score += 10
+                    details['gamma_conf'] = 'Gamma Resistance ✅'
+                else:
+                    details['gamma_conf'] = str(gamma) or '-'
+                if (d_ce + d_pe) < 0:
+                    opt_score += 10
+                    details['delta_conf'] = 'Delta Negative ✅'
+
+        details['options_score'] = opt_score
+        confirmed = opt_score >= 20
+        details['confirmed'] = confirmed
+        return confirmed, details
+    except Exception:
+        return False, {'volatility_filter': 'Error'}
+
+
+def _cie_confidence_score(signal, opt_details, opt_confirmed):
+    """
+    Score 0-100:
+      Candle strength     0-28
+      Distance to S/R     0-20
+      OI + options score  0-15
+      Gamma               0-15
+      Straddle expansion  0-10
+      Volume spike        0-10
+      Institutional bonus 0-10 (vol spike + confirmed + strong candle)
+    """
+    score = 0
+    score += min(28, signal.get('candle_strength', 10))
+
+    dist_pct = signal.get('dist_pct') or 0.002
+    score += max(0, min(20, 20 - int(dist_pct / 0.0001)))
+
+    score += min(15, int(opt_details.get('options_score', 0) * 0.25))
+
+    gamma_conf = str(opt_details.get('gamma_conf', ''))
+    if '✅' in gamma_conf:
+        score += 15
+    elif gamma_conf and gamma_conf != '-':
+        score += 4
+
+    if opt_details.get('straddle_expanding'):
+        score += 10
+
+    if signal.get('vol_spike'):
+        score += 10
+
+    if signal.get('vol_spike') and opt_confirmed and signal.get('candle_strength', 0) >= 20:
+        score += 10  # institutional bonus
+
+    return min(100, score)
+
+
+def run_candlestick_intelligence_engine(df, option_data, straddle_history, underlying_price, is_expiry=False):
+    """
+    Main CIE entry point. Returns list of scored, filtered signal dicts.
+    Each signal contains: pattern, direction, category, price, level,
+    level_type, confidence, signal_strength, strength_color, options_details.
+    """
+    if df is None or len(df) < 5 or underlying_price is None:
+        return []
+
+    df_summary = option_data.get('df_summary') if option_data else None
+    sr_data    = option_data.get('sr_data', []) if option_data else []
+    vob_blocks = option_data.get('vob_blocks', {}) if option_data else {}
+
+    # Build S/R from swing detection
+    supports, resistances = _cie_detect_swing_sr(df)
+
+    # Augment with option_data S/R
+    for sr in (sr_data or []):
+        v = sr.get('value', 0)
+        if v > 0:
+            (supports if sr.get('type') == 'low' else resistances).append(float(v))
+
+    if isinstance(vob_blocks, dict):
+        for b in vob_blocks.get('bullish', []):
+            if b.get('mid', 0) > 0:
+                supports.append(float(b['mid']))
+        for b in vob_blocks.get('bearish', []):
+            if b.get('mid', 0) > 0:
+                resistances.append(float(b['mid']))
+
+    # Re-cluster merged levels
+    def _recluster(lvls, pct=0.003):
+        if not lvls:
+            return []
+        lvls = sorted(set([round(l, 1) for l in lvls if l > 0]))
+        clusters, grp = [], [lvls[0]]
+        for l in lvls[1:]:
+            if abs(l - grp[-1]) / (grp[-1] + 1e-6) <= pct:
+                grp.append(l)
+            else:
+                clusters.append(float(np.mean(grp)))
+                grp = [l]
+        clusters.append(float(np.mean(grp)))
+        return clusters
+
+    supports    = _recluster(supports)
+    resistances = _recluster(resistances)
+
+    raw_signals = _cie_detect_patterns(df, supports, resistances)
+    final_signals = []
+
+    for sig in raw_signals:
+        opt_confirmed, opt_details = _cie_options_confirmation(
+            sig, df_summary, straddle_history, underlying_price)
+
+        # Volatility filter — skip unless expiry day
+        if opt_details.get('volatility_filter') == 'BLOCKED' and not is_expiry:
+            continue
+
+        confidence = _cie_confidence_score(sig, opt_details, opt_confirmed)
+        if confidence < 40:
+            continue
+
+        sig['confidence']       = confidence
+        sig['options_confirmed'] = opt_confirmed
+        sig['options_details']  = opt_details
+
+        if confidence >= 85:
+            sig['signal_strength'] = 'INSTITUTIONAL'
+            sig['strength_color']  = '#ff6600'
+        elif confidence >= 70:
+            sig['signal_strength'] = 'STRONG'
+            sig['strength_color']  = '#ffaa00'
+        else:
+            sig['signal_strength'] = 'NORMAL'
+            sig['strength_color']  = '#00aaff'
+
+        final_signals.append(sig)
+
+    # Deduplicate by (pattern, direction), keep highest confidence
+    seen, deduped = set(), []
+    for s in sorted(final_signals, key=lambda x: -x['confidence']):
+        key = (s['pattern'], s['direction'])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(s)
+
+    return deduped
+
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -5222,6 +5664,11 @@ def main():
         st.session_state.last_gamma_alert = None
     if 'last_expiry_spike_alert' not in st.session_state:
         st.session_state.last_expiry_spike_alert = None
+    # Candlestick Intelligence Engine
+    if 'cie_signal_history' not in st.session_state:
+        st.session_state.cie_signal_history = []   # list of signal dicts with timestamp
+    if 'cie_last_alert' not in st.session_state:
+        st.session_state.cie_last_alert = {}        # pattern -> last alert datetime
 
     # Initialize Supabase
     try:
@@ -11150,6 +11597,430 @@ def main():
                 st.info("Option chain data required for Market Acceleration Engine.")
         except Exception as _mae_e:
             st.warning(f"Market Acceleration Engine unavailable: {str(_mae_e)}")
+
+    # ===== CANDLESTICK INTELLIGENCE ENGINE =====
+    st.markdown("---")
+    with st.expander("🕯️ Candlestick Intelligence Engine — Reversal & Continuation Signals", expanded=False):
+        try:
+            if option_data and option_data.get('underlying') and not df.empty:
+                _cie_underlying = option_data['underlying']
+                _cie_df_summary = option_data.get('df_summary')
+                _cie_straddle_hist = st.session_state.straddle_history
+
+                # Determine expiry day (DTE ≤ 2)
+                try:
+                    _cie_expiry_str = option_data.get('expiry', '')
+                    _cie_expiry_dt  = datetime.strptime(_cie_expiry_str, "%Y-%m-%d") if _cie_expiry_str else None
+                    _cie_dte = (_cie_expiry_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days if _cie_expiry_dt else 999
+                    _cie_is_expiry = _cie_dte <= 2
+                except Exception:
+                    _cie_is_expiry = False
+
+                # Run engine
+                _cie_signals = run_candlestick_intelligence_engine(
+                    df, option_data, _cie_straddle_hist, _cie_underlying, is_expiry=_cie_is_expiry
+                )
+
+                # Build S/R for chart display
+                _cie_sup, _cie_res = _cie_detect_swing_sr(df)
+
+                # ── Header metrics ───────────────────────────────────────────
+                _cie_hc1, _cie_hc2, _cie_hc3, _cie_hc4 = st.columns(4)
+                _total_sigs   = len(_cie_signals)
+                _buy_sigs     = sum(1 for s in _cie_signals if s['direction'] == 'BUY')
+                _sell_sigs    = sum(1 for s in _cie_signals if s['direction'] == 'SELL')
+                _inst_sigs    = sum(1 for s in _cie_signals if s.get('signal_strength') == 'INSTITUTIONAL')
+                with _cie_hc1:
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00aaff'>
+                    <div style='color:#aaa;font-size:11px'>ACTIVE SIGNALS</div>
+                    <div style='font-size:28px;font-weight:bold;color:#00aaff'>{_total_sigs}</div>
+                    <div style='color:#ccc;font-size:12px'>Patterns Detected</div>
+                    </div>""", unsafe_allow_html=True)
+                with _cie_hc2:
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00ff88'>
+                    <div style='color:#aaa;font-size:11px'>BUY SIGNALS</div>
+                    <div style='font-size:28px;font-weight:bold;color:#00ff88'>{_buy_sigs}</div>
+                    <div style='color:#ccc;font-size:12px'>Bullish Patterns</div>
+                    </div>""", unsafe_allow_html=True)
+                with _cie_hc3:
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #ff4444'>
+                    <div style='color:#aaa;font-size:11px'>SELL SIGNALS</div>
+                    <div style='font-size:28px;font-weight:bold;color:#ff4444'>{_sell_sigs}</div>
+                    <div style='color:#ccc;font-size:12px'>Bearish Patterns</div>
+                    </div>""", unsafe_allow_html=True)
+                with _cie_hc4:
+                    _inst_clr = '#ff6600' if _inst_sigs > 0 else '#888'
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {_inst_clr}'>
+                    <div style='color:#aaa;font-size:11px'>INSTITUTIONAL</div>
+                    <div style='font-size:28px;font-weight:bold;color:{_inst_clr}'>{_inst_sigs}</div>
+                    <div style='color:#ccc;font-size:12px'>Score ≥ 85</div>
+                    </div>""", unsafe_allow_html=True)
+
+                st.markdown("")
+                if _cie_is_expiry:
+                    st.warning("⚡ **EXPIRY DAY MODE** — Volatility filter relaxed. Prioritising wick rejections, engulfing & marubozu patterns.")
+
+                # ── Tabs ─────────────────────────────────────────────────────
+                _cie_tab1, _cie_tab2, _cie_tab3, _cie_tab4 = st.tabs(
+                    ["📋 Signals", "📈 Price + S/R Chart", "🌊 Options Flow Charts", "📜 Signal History"]
+                )
+
+                # ── TAB 1: Signals ────────────────────────────────────────
+                with _cie_tab1:
+                    if not _cie_signals:
+                        st.info("No qualifying signals at this time. Patterns require:\n"
+                                "• Near S/R level (within 0.2%)\n"
+                                "• Straddle expanding (ROC ≥ 0.5%)\n"
+                                "• Options flow confirmation\n"
+                                "• Confidence ≥ 40")
+                    else:
+                        _cie_now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        for _sig in _cie_signals:
+                            _dir      = _sig['direction']
+                            _pat      = _sig['pattern']
+                            _cat      = _sig.get('category', '')
+                            _price    = _sig['price']
+                            _level    = _sig.get('level')
+                            _lvl_type = _sig.get('level_type', '')
+                            _conf     = _sig['confidence']
+                            _strength = _sig['signal_strength']
+                            _sclr     = _sig['strength_color']
+                            _opt      = _sig.get('options_details', {})
+                            _vol_sp   = '⚡ Vol Spike' if _sig.get('vol_spike') else ''
+                            _dir_emoji = '🟢' if _dir == 'BUY' else '🔴'
+                            _dir_clr   = '#00ff88' if _dir == 'BUY' else '#ff4444'
+                            _level_str = f"₹{_level:.0f}" if _level else 'N/A'
+                            _dist_str  = f"{(_sig.get('dist_pct') or 0)*100:.2f}%"
+                            _pcr_str   = f"PCR {_opt.get('pcr', 'N/A')}" if 'pcr' in _opt else ''
+                            _gamma_str = _opt.get('gamma_conf', _opt.get('gamma_sr', ''))
+                            _oi_str    = _opt.get('oi_conf', '')
+                            _delta_str = _opt.get('delta_conf', '')
+                            _strad_str = f"Straddle ROC {_opt.get('straddle_roc','N/A')}%" if 'straddle_roc' in _opt else ''
+                            _conf_bar_w = int(_conf)
+                            _conf_clr  = '#ff6600' if _conf >= 85 else ('#ffaa00' if _conf >= 70 else '#00aaff')
+
+                            st.markdown(f"""
+<div style='background:#1a1a2e;border:1px solid {_dir_clr};border-radius:10px;padding:16px;margin-bottom:12px'>
+<div style='display:flex;justify-content:space-between;align-items:center'>
+  <span style='font-size:20px;font-weight:bold;color:{_dir_clr}'>{_dir_emoji} {_dir} — {_pat}</span>
+  <span style='background:{_sclr};color:#000;font-size:11px;font-weight:bold;padding:4px 10px;border-radius:12px'>{_strength} {_vol_sp}</span>
+</div>
+<div style='color:#aaa;font-size:12px;margin-top:4px'>{_cat} · {_lvl_type} · Spot: ₹{_cie_underlying:.0f}</div>
+<div style='margin:10px 0 4px;display:flex;gap:16px;flex-wrap:wrap'>
+  <span style='color:#fff'>Price: <b>₹{_price:.0f}</b></span>
+  <span style='color:#aaa'>{_lvl_type}: <b style="color:{_dir_clr}">{_level_str}</b></span>
+  <span style='color:#aaa'>Distance: {_dist_str}</span>
+</div>
+<div style='margin:6px 0;font-size:12px;color:#ccc'>
+  {_pcr_str} &nbsp;|&nbsp; {_gamma_str} &nbsp;|&nbsp; {_oi_str} &nbsp;|&nbsp; {_delta_str} &nbsp;|&nbsp; {_strad_str}
+</div>
+<div style='margin-top:8px'>
+  <div style='font-size:11px;color:#aaa;margin-bottom:2px'>Confidence Score</div>
+  <div style='background:#333;border-radius:4px;height:10px;width:100%'>
+    <div style='background:{_conf_clr};height:10px;width:{_conf_bar_w}%;border-radius:4px'></div>
+  </div>
+  <div style='color:{_conf_clr};font-weight:bold;font-size:14px;margin-top:2px'>{_conf}/100 — {_strength}</div>
+</div>
+</div>""", unsafe_allow_html=True)
+
+                            # Telegram alert (throttled per pattern, 5 min cooldown)
+                            if enable_signals:
+                                _cie_last_ts = st.session_state.cie_last_alert.get(_pat)
+                                _cie_should_alert = (
+                                    _cie_last_ts is None or
+                                    (_cie_now_ist - _cie_last_ts).total_seconds() > 300
+                                )
+                                if _cie_should_alert and _conf >= 70:
+                                    _cie_tg_msg = (
+                                        f"{_dir_emoji} <b>CIE {_dir} SIGNAL — {_pat}</b>\n\n"
+                                        f"Spot: ₹{_cie_underlying:.0f}\n"
+                                        f"Pattern: {_pat} ({_cat})\n"
+                                        f"Price: ₹{_price:.0f}\n"
+                                        f"{_lvl_type}: {_level_str} (dist {_dist_str})\n"
+                                        f"{_pcr_str}\n"
+                                        f"{_gamma_str}\n"
+                                        f"{_oi_str}\n"
+                                        f"Straddle: {'Expanding ✅' if _opt.get('straddle_expanding') else 'Flat'}\n"
+                                        f"Confidence: {_conf}/100 — {_strength}\n"
+                                        f"Time: {_cie_now_ist.strftime('%H:%M:%S')} IST"
+                                    )
+                                    send_telegram_message_sync(_cie_tg_msg)
+                                    st.session_state.cie_last_alert[_pat] = _cie_now_ist
+                                    # Store in history
+                                    st.session_state.cie_signal_history.append({
+                                        'time': _cie_now_ist,
+                                        'pattern': _pat,
+                                        'direction': _dir,
+                                        'price': _price,
+                                        'level': _level,
+                                        'level_type': _lvl_type,
+                                        'confidence': _conf,
+                                        'strength': _strength,
+                                        'spot': _cie_underlying,
+                                    })
+                                    if len(st.session_state.cie_signal_history) > 100:
+                                        st.session_state.cie_signal_history = st.session_state.cie_signal_history[-100:]
+
+                # ── TAB 2: Price + S/R Chart ──────────────────────────────
+                with _cie_tab2:
+                    try:
+                        _cie_chart_df = df.tail(80).copy().reset_index(drop=True)
+                        _cie_fig = go.Figure()
+
+                        # Candlestick
+                        _cie_fig.add_trace(go.Candlestick(
+                            x=_cie_chart_df['datetime'],
+                            open=_cie_chart_df['open'],
+                            high=_cie_chart_df['high'],
+                            low=_cie_chart_df['low'],
+                            close=_cie_chart_df['close'],
+                            name='NIFTY 5m',
+                            increasing_line_color='#00ff88',
+                            decreasing_line_color='#ff4444',
+                        ))
+
+                        # Support levels
+                        for _sl in _cie_sup[-6:]:
+                            _cie_fig.add_hline(y=_sl, line_dash='dash', line_color='rgba(0,255,136,0.4)',
+                                               line_width=1, annotation_text=f'S {_sl:.0f}',
+                                               annotation_font_color='#00ff88', annotation_font_size=9)
+                        # Resistance levels
+                        for _rl in _cie_res[-6:]:
+                            _cie_fig.add_hline(y=_rl, line_dash='dash', line_color='rgba(255,68,68,0.4)',
+                                               line_width=1, annotation_text=f'R {_rl:.0f}',
+                                               annotation_font_color='#ff4444', annotation_font_size=9)
+
+                        # Highlight signal candles
+                        for _sig in _cie_signals:
+                            _sig_idx = _sig.get('index', -1)
+                            _chart_offset = len(df) - len(_cie_chart_df)
+                            _local_idx = _sig_idx - _chart_offset
+                            if 0 <= _local_idx < len(_cie_chart_df):
+                                _sc = _cie_chart_df.iloc[_local_idx]
+                                _sig_clr = 'rgba(0,255,136,0.25)' if _sig['direction'] == 'BUY' else 'rgba(255,68,68,0.25)'
+                                _cie_fig.add_vrect(
+                                    x0=_sc['datetime'], x1=_sc['datetime'],
+                                    fillcolor=_sig_clr, opacity=0.6, line_width=3,
+                                    line_color=_sig['strength_color'],
+                                    annotation_text=_sig['pattern'][:12],
+                                    annotation_position="top left",
+                                    annotation_font_size=9,
+                                    annotation_font_color=_sig['strength_color'],
+                                )
+
+                        # Spot price line
+                        _cie_fig.add_hline(y=_cie_underlying, line_dash='dot', line_color='#ffffff',
+                                           line_width=1.5, annotation_text=f'Spot {_cie_underlying:.0f}',
+                                           annotation_font_color='#fff', annotation_font_size=10)
+
+                        _cie_fig.update_layout(
+                            title='NIFTY 5-Min — Candlestick Intelligence Engine S/R Map',
+                            template='plotly_dark', height=480,
+                            xaxis_rangeslider_visible=False,
+                            margin=dict(l=10, r=80, t=50, b=30),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                            xaxis=dict(type='category', tickangle=-45, nticks=15,
+                                       tickfont=dict(size=8)),
+                        )
+                        st.plotly_chart(_cie_fig, use_container_width=True)
+
+                        # Support / Resistance level table
+                        st.markdown("**Detected S/R Levels**")
+                        _cie_sr_rows = (
+                            [{'Level': f'₹{r:.0f}', 'Type': '🔴 Resistance', 'Zone': 'R'} for r in sorted(_cie_res, reverse=True)[-6:]] +
+                            [{'Level': f'₹{s:.0f}', 'Type': '🟢 Support', 'Zone': 'S'} for s in sorted(_cie_sup, reverse=True)[:6]]
+                        )
+                        if _cie_sr_rows:
+                            st.dataframe(pd.DataFrame(_cie_sr_rows), use_container_width=True, hide_index=True)
+
+                        # ── Detected Reversal Candle Table ─────────────────
+                        st.markdown("**Reversal & Continuation Candles Detected**")
+                        if _cie_signals:
+                            _cie_candle_rows = []
+                            for _sig in _cie_signals:
+                                _ts = _sig.get('time')
+                                if hasattr(_ts, 'strftime'):
+                                    _ts_str = _ts.strftime('%H:%M')
+                                elif hasattr(_ts, 'to_pydatetime'):
+                                    _ts_str = _ts.to_pydatetime().strftime('%H:%M')
+                                else:
+                                    # Fallback: derive from df index
+                                    _si = _sig.get('index', -1)
+                                    if 0 <= _si < len(df) and 'datetime' in df.columns:
+                                        _ts_raw = df['datetime'].iloc[_si]
+                                        _ts_str = _ts_raw.strftime('%H:%M') if hasattr(_ts_raw, 'strftime') else str(_ts_raw)[:5]
+                                    else:
+                                        _ts_str = 'N/A'
+                                _cie_candle_rows.append({
+                                    'Time': _ts_str,
+                                    'Pattern': _sig['pattern'],
+                                    'Signal': _sig['direction'],
+                                    'Category': _sig.get('category', ''),
+                                    'Price': f"₹{_sig['price']:.0f}",
+                                    'Level Type': _sig.get('level_type', ''),
+                                    'Level': f"₹{_sig['level']:.0f}" if _sig.get('level') else 'N/A',
+                                    'Dist %': f"{(_sig.get('dist_pct') or 0)*100:.2f}%",
+                                    'Vol Spike': '⚡ Yes' if _sig.get('vol_spike') else 'No',
+                                    'Confidence': f"{_sig['confidence']}/100",
+                                    'Strength': _sig.get('signal_strength', ''),
+                                })
+                            _cie_candle_df = pd.DataFrame(_cie_candle_rows)
+                            # Color rows by direction
+                            def _cie_color_row(row):
+                                clr = 'background-color: rgba(0,255,136,0.08)' if row['Signal'] == 'BUY' else 'background-color: rgba(255,68,68,0.08)'
+                                return [clr] * len(row)
+                            st.dataframe(
+                                _cie_candle_df.style.apply(_cie_color_row, axis=1),
+                                use_container_width=True, hide_index=True
+                            )
+                        else:
+                            st.info("No patterns detected near S/R levels.")
+                    except Exception as _cie_chart_err:
+                        st.warning(f"Chart error: {str(_cie_chart_err)[:80]}")
+
+                # ── TAB 3: Options Flow Charts ────────────────────────────
+                with _cie_tab3:
+                    _cie_flow_c1, _cie_flow_c2 = st.columns(2)
+
+                    # IV Skew history
+                    with _cie_flow_c1:
+                        _cie_iv_hist = st.session_state.get('iv_skew_history', [])
+                        if len(_cie_iv_hist) >= 3:
+                            _cie_iv_df = pd.DataFrame(_cie_iv_hist)
+                            _cie_iv_fig = go.Figure()
+                            if 'iv_skew' in _cie_iv_df.columns:
+                                _cie_iv_fig.add_trace(go.Scatter(
+                                    x=list(range(len(_cie_iv_df))),
+                                    y=_cie_iv_df['iv_skew'],
+                                    mode='lines', name='IV Skew (PE/CE)',
+                                    line=dict(color='#ff9900', width=2),
+                                ))
+                            _cie_iv_fig.add_hline(y=1.10, line_dash='dot', line_color='#ff4444',
+                                                  annotation_text='Bearish 1.10')
+                            _cie_iv_fig.add_hline(y=0.90, line_dash='dot', line_color='#00ff88',
+                                                  annotation_text='Bullish 0.90')
+                            _cie_iv_fig.update_layout(
+                                title='IV Skew (PE IV / CE IV)',
+                                template='plotly_dark', height=260,
+                                margin=dict(l=30, r=30, t=40, b=20),
+                                plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                                xaxis=dict(title='Snapshot', showticklabels=False),
+                                yaxis=dict(title='Skew'),
+                            )
+                            st.plotly_chart(_cie_iv_fig, use_container_width=True)
+                        else:
+                            st.info("IV Skew history building…")
+
+                    # Bid vs Ask Pressure
+                    with _cie_flow_c2:
+                        _cie_pres_hist = st.session_state.get('pressure_history', [])
+                        if len(_cie_pres_hist) >= 3:
+                            _cie_pres_df = pd.DataFrame(_cie_pres_hist)
+                            _cie_pres_fig = go.Figure()
+                            if 'net_pressure' in _cie_pres_df.columns:
+                                _cie_pres_clrs = ['#00ff88' if v > 0 else '#ff4444'
+                                                  for v in _cie_pres_df['net_pressure']]
+                                _cie_pres_fig.add_trace(go.Bar(
+                                    x=list(range(len(_cie_pres_df))),
+                                    y=_cie_pres_df['net_pressure'],
+                                    marker_color=_cie_pres_clrs,
+                                    name='Net Bid/Ask Pressure',
+                                ))
+                            _cie_pres_fig.add_hline(y=0.15, line_dash='dot', line_color='#00ff88',
+                                                    annotation_text='Bull 0.15')
+                            _cie_pres_fig.add_hline(y=-0.15, line_dash='dot', line_color='#ff4444',
+                                                    annotation_text='Bear -0.15')
+                            _cie_pres_fig.update_layout(
+                                title='Net Bid/Ask Pressure',
+                                template='plotly_dark', height=260,
+                                margin=dict(l=30, r=30, t=40, b=20),
+                                plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                                xaxis=dict(title='Snapshot', showticklabels=False),
+                                yaxis=dict(title='Pressure'),
+                            )
+                            st.plotly_chart(_cie_pres_fig, use_container_width=True)
+                        else:
+                            st.info("Pressure history building…")
+
+                    # Straddle movement
+                    _cie_strad_hist = st.session_state.get('straddle_history', [])
+                    if len(_cie_strad_hist) >= 3:
+                        _cie_strad_df = pd.DataFrame(_cie_strad_hist)
+                        _cie_strad_fig = go.Figure()
+                        if 'straddle' in _cie_strad_df.columns:
+                            _cie_strad_fig.add_trace(go.Scatter(
+                                x=list(range(len(_cie_strad_df))),
+                                y=_cie_strad_df['straddle'],
+                                mode='lines+markers', name='ATM Straddle',
+                                line=dict(color='#ff9900', width=2),
+                                marker=dict(size=3),
+                            ))
+                        _cie_strad_fig.update_layout(
+                            title='ATM Straddle Movement',
+                            template='plotly_dark', height=240,
+                            margin=dict(l=30, r=30, t=40, b=20),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                            xaxis=dict(title='Snapshot', showticklabels=False),
+                            yaxis=dict(title='Straddle ₹'),
+                        )
+                        st.plotly_chart(_cie_strad_fig, use_container_width=True)
+
+                    # Gamma Exposure history
+                    _cie_gex_hist = st.session_state.get('total_gex_history', [])
+                    if len(_cie_gex_hist) >= 3:
+                        _cie_gex_df = pd.DataFrame(_cie_gex_hist)
+                        _cie_gex_fig = go.Figure()
+                        if 'total_gex' in _cie_gex_df.columns:
+                            _cie_gex_clrs = ['#00ff88' if v >= 0 else '#ff4444'
+                                             for v in _cie_gex_df['total_gex']]
+                            _cie_gex_fig.add_trace(go.Bar(
+                                x=list(range(len(_cie_gex_df))),
+                                y=_cie_gex_df['total_gex'],
+                                marker_color=_cie_gex_clrs,
+                                name='Net GEX (L)',
+                            ))
+                        _cie_gex_fig.update_layout(
+                            title='Gamma Exposure (GEX) Over Time',
+                            template='plotly_dark', height=240,
+                            margin=dict(l=30, r=30, t=40, b=20),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                            xaxis=dict(title='Snapshot', showticklabels=False),
+                            yaxis=dict(title='GEX (L)'),
+                        )
+                        st.plotly_chart(_cie_gex_fig, use_container_width=True)
+
+                # ── TAB 4: Signal History ─────────────────────────────────
+                with _cie_tab4:
+                    _cie_hist = st.session_state.cie_signal_history
+                    if not _cie_hist:
+                        st.info("No signals have been alerted yet this session.")
+                    else:
+                        _cie_hist_rows = []
+                        for _h in reversed(_cie_hist[-50:]):
+                            _cie_hist_rows.append({
+                                'Time': _h['time'].strftime('%H:%M:%S') if hasattr(_h.get('time'), 'strftime') else str(_h.get('time', '')),
+                                'Pattern': _h.get('pattern', ''),
+                                'Direction': _h.get('direction', ''),
+                                'Price': f"₹{_h.get('price', 0):.0f}",
+                                'Spot': f"₹{_h.get('spot', 0):.0f}",
+                                'Level': f"₹{_h.get('level', 0):.0f}" if _h.get('level') else 'N/A',
+                                'Type': _h.get('level_type', ''),
+                                'Confidence': _h.get('confidence', 0),
+                                'Strength': _h.get('strength', ''),
+                            })
+                        st.dataframe(pd.DataFrame(_cie_hist_rows), use_container_width=True, hide_index=True)
+
+                    _cie_bcol1, _cie_bcol2 = st.columns([4, 1])
+                    with _cie_bcol2:
+                        if st.button("🗑️ Clear CIE History", key="clr_cie"):
+                            st.session_state.cie_signal_history = []
+                            st.session_state.cie_last_alert = {}
+                            st.rerun()
+
+            else:
+                st.info("Option chain data required for Candlestick Intelligence Engine.")
+        except Exception as _cie_err:
+            st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
 
     # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
     if enable_signals and option_data and option_data.get('underlying') and not df.empty:
