@@ -4020,9 +4020,9 @@ def calculate_expiry_spike_score(df_summary, atm_strike, expiry_date_str, expiry
     return result
 
 
-def calculate_gamma_sequence(df_summary, atm_strike, gamma_seq_history):
+def analyze_gamma_sequence_mae(df_summary, atm_strike, gamma_seq_history):
     """
-    Gamma Sequence Analyzer + Gamma Trap Detector.
+    Gamma Sequence Analyzer + Gamma Trap Detector (Market Acceleration Engine).
     Returns dict with pattern, acceleration, trap, dealer_signal.
     gamma_seq_history: list of per-snapshot dicts [{ATM-2: gamma, ATM-1: gamma, ATM: gamma, ...}].
     """
@@ -10790,7 +10790,7 @@ def main():
                 # ---- Run engines ----
                 _spike = calculate_options_spike_score(_mae_df, _mae_atm, st.session_state.spike_history)
                 _expiry_spike = calculate_expiry_spike_score(_mae_df, _mae_atm, _mae_expiry, st.session_state.expiry_spike_history)
-                _gamma = calculate_gamma_sequence(_mae_df, _mae_atm, st.session_state.gamma_seq_history)
+                _gamma = analyze_gamma_sequence_mae(_mae_df, _mae_atm, st.session_state.gamma_seq_history)
                 _expiry_intel = calculate_expiry_day_intelligence(_mae_df, _mae_atm, _mae_underlying, _mae_expiry, st.session_state.expiry_intel_history)
 
                 # ---- Store gamma sequence snapshot ----
