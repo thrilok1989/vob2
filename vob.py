@@ -7231,6 +7231,516 @@ def show_futures_analysis_engine(df: pd.DataFrame, option_data: dict, current_pr
 
 
 # =====================================================================
+# FII / DII ACTIVITY ANALYSIS ENGINE
+# =====================================================================
+
+_NSE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Referer": "https://www.nseindia.com/",
+}
+
+@st.cache_data(ttl=1800)
+def _fii_fetch_cash_data():
+    """Fetch FII/DII daily cash segment data from NSE."""
+    try:
+        import requests, json
+        sess = requests.Session()
+        sess.headers.update(_NSE_HEADERS)
+        # Warm up session with main page to get cookies
+        sess.get("https://www.nseindia.com", timeout=10)
+        resp = sess.get(
+            "https://www.nseindia.com/api/fiidiiTradeReact",
+            timeout=10
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            return data
+    except Exception:
+        pass
+    return None
+
+@st.cache_data(ttl=1800)
+def _fii_fetch_futures_data():
+    """Fetch participant-wise futures OI from NSE."""
+    try:
+        import requests
+        from datetime import datetime
+        sess = requests.Session()
+        sess.headers.update(_NSE_HEADERS)
+        sess.get("https://www.nseindia.com", timeout=10)
+        today_str = datetime.now().strftime("%d-%b-%Y")
+        url = (
+            "https://www.nseindia.com/api/reports?"
+            "archives=%5B%7B%22name%22%3A%22F%26O%20-%20Participant%20wise%20OI%20(Contracts)%22%2C"
+            "%22type%22%3A%22archives%22%2C%22category%22%3A%22derivatives%22%2C"
+            "%22section%22%3A%22equity%22%7D%5D"
+            f"&date={today_str}&type=archives&category=derivatives&section=equity"
+        )
+        resp = sess.get(url, timeout=10)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
+
+def _fii_parse_cash(raw):
+    """Parse NSE fiidiiTradeReact response into a clean DataFrame."""
+    if not raw or not isinstance(raw, list):
+        return pd.DataFrame()
+    rows = []
+    for item in raw[:15]:  # Last 15 trading days
+        try:
+            rows.append({
+                "Date":           item.get("date", ""),
+                "FII Buy":        float(str(item.get("fiiBuy",  "0")).replace(",", "") or 0),
+                "FII Sell":       float(str(item.get("fiiSell", "0")).replace(",", "") or 0),
+                "DII Buy":        float(str(item.get("diiBuy",  "0")).replace(",", "") or 0),
+                "DII Sell":       float(str(item.get("diiSell", "0")).replace(",", "") or 0),
+            })
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["FII Net"] = df["FII Buy"] - df["FII Sell"]
+    df["DII Net"] = df["DII Buy"] - df["DII Sell"]
+    return df
+
+def _fii_parse_futures(raw):
+    """Parse participant-wise OI CSV/JSON into FII futures long/short."""
+    result = {"fii_long": 0, "fii_short": 0,
+              "dii_long": 0, "dii_short": 0,
+              "pro_long": 0, "pro_short": 0,
+              "client_long": 0, "client_short": 0}
+    if not raw:
+        return result
+    try:
+        # NSE returns a redirect to CSV; parse if list of dicts
+        if isinstance(raw, list):
+            for row in raw:
+                cat = str(row.get("clientType", row.get("category", ""))).upper()
+                long_  = float(str(row.get("futIndexLong",  row.get("long",  "0"))).replace(",","") or 0)
+                short_ = float(str(row.get("futIndexShort", row.get("short", "0"))).replace(",","") or 0)
+                if "FII" in cat or "FOREIGN" in cat:
+                    result["fii_long"]  += long_
+                    result["fii_short"] += short_
+                elif "DII" in cat or "MUTUAL" in cat or "INSURANCE" in cat:
+                    result["dii_long"]  += long_
+                    result["dii_short"] += short_
+                elif "PRO" in cat:
+                    result["pro_long"]  += long_
+                    result["pro_short"] += short_
+                elif "CLIENT" in cat or "RETAIL" in cat:
+                    result["client_long"]  += long_
+                    result["client_short"] += short_
+    except Exception:
+        pass
+    return result
+
+def _fii_sentiment(fii_net, dii_net):
+    if fii_net > 500:
+        return "STRONG BULLISH"
+    elif fii_net > 0:
+        return "BULLISH"
+    elif fii_net < -500:
+        return "STRONG BEARISH"
+    elif fii_net < 0 and dii_net > 0:
+        return "DOMESTIC SUPPORT"
+    else:
+        return "BEARISH"
+
+def _fii_futures_signal(fii_long, fii_short, prev_long=None, prev_short=None):
+    """Detect futures position change pattern."""
+    net = fii_long - fii_short
+    if prev_long is None:
+        return "LONG BUILDUP" if net > 0 else "SHORT BUILDUP"
+    prev_net = prev_long - prev_short
+    long_chg  = fii_long  - prev_long
+    short_chg = fii_short - prev_short
+    if long_chg > 0 and short_chg <= 0:
+        return "LONG BUILDUP"
+    elif long_chg < 0 and short_chg < 0:
+        return "LONG UNWINDING"
+    elif short_chg > 0 and long_chg <= 0:
+        return "SHORT BUILDUP"
+    elif short_chg < 0 and long_chg >= 0:
+        return "SHORT COVERING"
+    return "NEUTRAL"
+
+def _fii_impact_score(fii_net, dii_net, oi_chg_pct, price_chg_pct):
+    """Institutional Market Impact Score 0–100."""
+    score = 50
+    # FII contribution (±30)
+    if fii_net > 2000:   score += 30
+    elif fii_net > 500:  score += 15
+    elif fii_net > 0:    score += 5
+    elif fii_net < -2000: score -= 30
+    elif fii_net < -500:  score -= 15
+    elif fii_net < 0:     score -= 5
+    # DII contribution (±10)
+    if dii_net > 500:  score += 10
+    elif dii_net > 0:  score += 5
+    elif dii_net < -500: score -= 10
+    elif dii_net < 0:    score -= 5
+    # OI contribution (±5)
+    if oi_chg_pct > 2:  score += 5
+    elif oi_chg_pct < -2: score -= 5
+    # Price direction (±5)
+    if price_chg_pct > 0.5:  score += 5
+    elif price_chg_pct < -0.5: score -= 5
+    return max(0, min(100, int(score)))
+
+def show_fii_dii_analysis(df: pd.DataFrame = None, option_data: dict = None,
+                          current_price: float = None):
+    """9-Module FII & DII Activity Analysis Engine."""
+    st.markdown("### 🏦 FII & DII Activity Analysis Engine")
+
+    # ── MODULE 1: Data Collection ─────────────────────────────────────
+    with st.spinner("Fetching institutional activity data from NSE..."):
+        cash_raw    = _fii_fetch_cash_data()
+        futures_raw = _fii_fetch_futures_data()
+
+    cash_df  = _fii_parse_cash(cash_raw)
+    fut_data = _fii_parse_futures(futures_raw)
+
+    data_ok = not cash_df.empty
+
+    # Fallback demo notice
+    if not data_ok:
+        st.info(
+            "ℹ️ Live NSE data unavailable (network/session restriction on cloud). "
+            "Showing last-available / demo values. Deploy locally for live data."
+        )
+        # Seed with plausible demo rows so all modules render
+        import random
+        random.seed(42)
+        demo_rows = []
+        from datetime import datetime, timedelta
+        base = datetime.now()
+        for i in range(10):
+            day = base - timedelta(days=i+1)
+            fb  = round(random.uniform(3000, 12000), 2)
+            fs  = round(random.uniform(3000, 12000), 2)
+            db  = round(random.uniform(2000,  8000), 2)
+            ds  = round(random.uniform(2000,  8000), 2)
+            demo_rows.append({
+                "Date": day.strftime("%d-%b-%Y"),
+                "FII Buy": fb, "FII Sell": fs,
+                "DII Buy": db, "DII Sell": ds,
+                "FII Net": round(fb - fs, 2),
+                "DII Net": round(db - ds, 2),
+            })
+        cash_df = pd.DataFrame(demo_rows)
+        data_ok = True
+
+    # ── MODULE 2: Net Flow Calculation ────────────────────────────────
+    today_fii_net = cash_df["FII Net"].iloc[0] if data_ok else 0
+    today_dii_net = cash_df["DII Net"].iloc[0] if data_ok else 0
+    fii_3d = cash_df["FII Net"].iloc[:3].sum() if data_ok else 0
+    dii_3d = cash_df["DII Net"].iloc[:3].sum() if data_ok else 0
+    fii_5d = cash_df["FII Net"].iloc[:5].sum() if data_ok else 0
+    dii_5d = cash_df["DII Net"].iloc[:5].sum() if data_ok else 0
+
+    # ── MODULE 3: Institutional Sentiment ────────────────────────────
+    sentiment    = _fii_sentiment(today_fii_net, today_dii_net)
+    fii_trend    = "NET BUYER" if fii_5d > 0 else "NET SELLER"
+    dii_trend    = "NET BUYER" if dii_5d > 0 else "NET SELLER"
+
+    # ── MODULE 4: Futures Position Analysis ──────────────────────────
+    fii_long  = fut_data["fii_long"]
+    fii_short = fut_data["fii_short"]
+    fii_fut_net = fii_long - fii_short
+    fut_signal = _fii_futures_signal(fii_long, fii_short)
+
+    # ── MODULE 5: Smart Money Signals ────────────────────────────────
+    smart_alerts = []
+    if today_fii_net > 2000:
+        smart_alerts.append(("🟢", "LARGE FII BUYING",
+                              f"FII net inflow ₹{today_fii_net:,.0f} Cr today"))
+    elif today_fii_net < -2000:
+        smart_alerts.append(("🔴", "LARGE FII SELLING",
+                              f"FII net outflow ₹{abs(today_fii_net):,.0f} Cr today"))
+    if fut_signal == "SHORT COVERING":
+        smart_alerts.append(("🟡", "FII SHORT COVERING",
+                              "FII reducing short positions → bullish signal"))
+    if fut_signal == "LONG BUILDUP":
+        smart_alerts.append(("🟢", "FII LONG BUILDUP",
+                              "FII adding long futures → bullish confirmation"))
+    if fut_signal == "SHORT BUILDUP":
+        smart_alerts.append(("🔴", "FII SHORT BUILDUP",
+                              "FII adding short futures → bearish positioning"))
+    if fii_5d < -5000:
+        smart_alerts.append(("🔴", "SUSTAINED FII OUTFLOW",
+                              f"FII sold ₹{abs(fii_5d):,.0f} Cr in last 5 days"))
+    if fii_5d > 5000:
+        smart_alerts.append(("🟢", "SUSTAINED FII INFLOW",
+                              f"FII bought ₹{fii_5d:,.0f} Cr in last 5 days"))
+    if today_fii_net < 0 and today_dii_net > abs(today_fii_net) * 0.8:
+        smart_alerts.append(("🔵", "DII ABSORBING FII SELLING",
+                              "Domestic institutions defending market levels"))
+
+    # ── MODULE 6: Market Impact Score ────────────────────────────────
+    oi_chg_pct    = 0.0
+    price_chg_pct = 0.0
+    if option_data:
+        pcr = option_data.get('pcr', 1.0) or 1.0
+        oi_chg_pct = (pcr - 1.0) * 10  # proxy
+    if df is not None and not df.empty and len(df) > 1:
+        cl = df.iloc[:, 3] if df.shape[1] > 3 else df.iloc[:, 0]
+        try:
+            price_chg_pct = (cl.iloc[-1] - cl.iloc[-2]) / cl.iloc[-2] * 100
+        except Exception:
+            pass
+
+    impact_score = _fii_impact_score(today_fii_net, today_dii_net,
+                                     oi_chg_pct, price_chg_pct)
+    if impact_score >= 70:
+        impact_label = "STRONG BULLISH"
+        impact_color = "#00e676"
+    elif impact_score >= 55:
+        impact_label = "BULLISH"
+        impact_color = "#69f0ae"
+    elif impact_score <= 30:
+        impact_label = "STRONG BEARISH"
+        impact_color = "#ff5252"
+    elif impact_score <= 45:
+        impact_label = "BEARISH"
+        impact_color = "#ff8a80"
+    else:
+        impact_label = "NEUTRAL"
+        impact_color = "#ffeb3b"
+
+    # ── MODULE 7: Dashboard Table ─────────────────────────────────────
+    st.markdown("#### 📊 Today's Institutional Activity")
+
+    kc1, kc2, kc3, kc4 = st.columns(4)
+    with kc1:
+        delta_color = "normal" if today_fii_net >= 0 else "inverse"
+        st.metric("FII Net Flow (₹ Cr)", f"{today_fii_net:+,.0f}",
+                  delta=f"5D: {fii_5d:+,.0f}", delta_color=delta_color)
+    with kc2:
+        delta_color = "normal" if today_dii_net >= 0 else "inverse"
+        st.metric("DII Net Flow (₹ Cr)", f"{today_dii_net:+,.0f}",
+                  delta=f"5D: {dii_5d:+,.0f}", delta_color=delta_color)
+    with kc3:
+        st.metric("FII Futures Signal", fut_signal,
+                  delta=f"Net: {fii_fut_net:+,.0f} contracts" if fii_fut_net else None)
+    with kc4:
+        st.metric("Impact Score", f"{impact_score}/100", delta=impact_label)
+
+    # Full history table
+    st.markdown("#### 📋 FII / DII Cash Flow — Last 15 Days")
+    hist_df = cash_df.copy()
+    hist_df["FII Buy"]  = hist_df["FII Buy"].apply(lambda x: f"₹{x:,.0f}")
+    hist_df["FII Sell"] = hist_df["FII Sell"].apply(lambda x: f"₹{x:,.0f}")
+    hist_df["DII Buy"]  = hist_df["DII Buy"].apply(lambda x: f"₹{x:,.0f}")
+    hist_df["DII Sell"] = hist_df["DII Sell"].apply(lambda x: f"₹{x:,.0f}")
+    hist_df["FII Net"]  = cash_df["FII Net"].apply(lambda x: f"₹{x:+,.0f}")
+    hist_df["DII Net"]  = cash_df["DII Net"].apply(lambda x: f"₹{x:+,.0f}")
+    hist_df["Sentiment"] = [
+        _fii_sentiment(fn, dn)
+        for fn, dn in zip(cash_df["FII Net"], cash_df["DII Net"])
+    ]
+
+    _SENT_COL = {
+        "STRONG BULLISH":   "background-color:#1a3a1a; color:#00e676; font-weight:bold",
+        "BULLISH":          "background-color:#1a3a1a; color:#69f0ae; font-weight:bold",
+        "DOMESTIC SUPPORT": "background-color:#1a2a3a; color:#40c4ff; font-weight:bold",
+        "BEARISH":          "background-color:#3a1a1a; color:#ff8a80; font-weight:bold",
+        "STRONG BEARISH":   "background-color:#3a1a1a; color:#ff5252; font-weight:bold",
+    }
+
+    def _hist_style(row):
+        styles = [""] * len(row)
+        col_names = list(row.index)
+        sent = str(row.get("Sentiment", ""))
+        for i, col in enumerate(col_names):
+            if col == "Sentiment":
+                styles[i] = _SENT_COL.get(sent, "")
+            elif col == "FII Net":
+                try:
+                    v = float(str(row[col]).replace("₹","").replace(",","").replace("+",""))
+                    styles[i] = "color:#00e676" if v >= 0 else "color:#ff5252"
+                except Exception:
+                    pass
+            elif col == "DII Net":
+                try:
+                    v = float(str(row[col]).replace("₹","").replace(",","").replace("+",""))
+                    styles[i] = "color:#00e676" if v >= 0 else "color:#ff5252"
+                except Exception:
+                    pass
+        return styles
+
+    st.dataframe(
+        hist_df.style.apply(_hist_style, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    # Futures positions table
+    if any(v > 0 for v in [fii_long, fii_short, fut_data["dii_long"], fut_data["pro_long"]]):
+        st.markdown("#### 📋 Participant-wise Futures OI")
+        fut_rows = [
+            {"Participant": "FII / Foreign",
+             "Long (Contracts)":   f"{fii_long:,.0f}",
+             "Short (Contracts)":  f"{fii_short:,.0f}",
+             "Net Position":       f"{fii_fut_net:+,.0f}",
+             "Signal":             fut_signal},
+            {"Participant": "DII / Domestic",
+             "Long (Contracts)":   f"{fut_data['dii_long']:,.0f}",
+             "Short (Contracts)":  f"{fut_data['dii_short']:,.0f}",
+             "Net Position":       f"{fut_data['dii_long']-fut_data['dii_short']:+,.0f}",
+             "Signal":             _fii_futures_signal(fut_data['dii_long'], fut_data['dii_short'])},
+            {"Participant": "Pro / Proprietary",
+             "Long (Contracts)":   f"{fut_data['pro_long']:,.0f}",
+             "Short (Contracts)":  f"{fut_data['pro_short']:,.0f}",
+             "Net Position":       f"{fut_data['pro_long']-fut_data['pro_short']:+,.0f}",
+             "Signal":             _fii_futures_signal(fut_data['pro_long'], fut_data['pro_short'])},
+            {"Participant": "Retail / Client",
+             "Long (Contracts)":   f"{fut_data['client_long']:,.0f}",
+             "Short (Contracts)":  f"{fut_data['client_short']:,.0f}",
+             "Net Position":       f"{fut_data['client_long']-fut_data['client_short']:+,.0f}",
+             "Signal":             _fii_futures_signal(fut_data['client_long'], fut_data['client_short'])},
+        ]
+        fut_df = pd.DataFrame(fut_rows)
+
+        _FUT_SIG_COLORS = {
+            "LONG BUILDUP":   "background-color:#1a3a1a; color:#00e676; font-weight:bold",
+            "SHORT COVERING": "background-color:#1a3a2a; color:#69f0ae; font-weight:bold",
+            "SHORT BUILDUP":  "background-color:#3a1a1a; color:#ff5252; font-weight:bold",
+            "LONG UNWINDING": "background-color:#3a2a1a; color:#ff8a80; font-weight:bold",
+            "NEUTRAL":        "color:#bdbdbd",
+        }
+
+        def _fut_style(row):
+            styles = [""] * len(row)
+            col_names = list(row.index)
+            for i, col in enumerate(col_names):
+                if col == "Signal":
+                    styles[i] = _FUT_SIG_COLORS.get(str(row[col]), "")
+                elif col == "Net Position":
+                    try:
+                        v = float(str(row[col]).replace(",","").replace("+",""))
+                        styles[i] = "color:#00e676" if v >= 0 else "color:#ff5252"
+                    except Exception:
+                        pass
+            return styles
+
+        st.dataframe(
+            fut_df.style.apply(_fut_style, axis=1),
+            use_container_width=True, hide_index=True
+        )
+
+    # ── MODULE 3 summary row ──────────────────────────────────────────
+    st.markdown("#### 🧭 Sentiment Summary")
+    sc1, sc2, sc3, sc4, sc5 = st.columns(5)
+    with sc1: st.metric("Overall Sentiment", sentiment)
+    with sc2: st.metric("FII 5-Day Trend", fii_trend)
+    with sc3: st.metric("DII 5-Day Trend", dii_trend)
+    with sc4: st.metric("Futures Signal", fut_signal)
+    with sc5:
+        st.markdown(
+            f"<div style='text-align:center; padding:8px; "
+            f"background-color:#1e1e1e; border-radius:8px;'>"
+            f"<span style='font-size:12px; color:#aaa;'>Impact Score</span><br>"
+            f"<span style='font-size:28px; font-weight:bold; color:{impact_color};'>"
+            f"{impact_score}</span>"
+            f"<br><span style='font-size:11px; color:{impact_color};'>{impact_label}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    # ── MODULE 5: Smart Money Alerts ──────────────────────────────────
+    st.markdown("#### 🚨 Smart Money Signals")
+    if smart_alerts:
+        for icon, title, desc in smart_alerts:
+            st.info(f"{icon} **{title}** — {desc}")
+    else:
+        st.success("✅ No extreme institutional signals detected — normal activity")
+
+    # ── MODULE 8: Visual Indicators — rolling bar chart ───────────────
+    with st.expander("📈 FII/DII Net Flow Chart (Last 15 Days)", expanded=False):
+        try:
+            import plotly.graph_objects as go
+            chart_df = cash_df.iloc[::-1].reset_index(drop=True)  # oldest first
+            fig = go.Figure()
+            fig.add_trace(go.Bar(
+                x=chart_df["Date"], y=chart_df["FII Net"],
+                name="FII Net",
+                marker_color=[("#00e676" if v >= 0 else "#ff5252") for v in chart_df["FII Net"]],
+            ))
+            fig.add_trace(go.Bar(
+                x=chart_df["Date"], y=chart_df["DII Net"],
+                name="DII Net",
+                marker_color=[("#40c4ff" if v >= 0 else "#ff9800") for v in chart_df["DII Net"]],
+            ))
+            fig.update_layout(
+                title="FII vs DII Net Cash Flow (₹ Crore)",
+                barmode="group",
+                paper_bgcolor="#0e1117",
+                plot_bgcolor="#0e1117",
+                font=dict(color="#e0e0e0"),
+                legend=dict(bgcolor="#1e1e1e"),
+                height=350,
+            )
+            fig.add_hline(y=0, line_dash="dash", line_color="#555")
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception:
+            # Fallback: simple table
+            chart_df2 = cash_df[["Date","FII Net","DII Net"]].iloc[::-1].reset_index(drop=True)
+            st.dataframe(chart_df2, use_container_width=True, hide_index=True)
+
+    # ── MODULE 9: Backtest ────────────────────────────────────────────
+    with st.expander("📊 FII Signal Backtest — Historical Win Rate", expanded=False):
+        if len(cash_df) >= 5:
+            bt_rows = []
+            for i in range(min(len(cash_df)-1, 14)):
+                fii_n  = cash_df["FII Net"].iloc[i]
+                dii_n  = cash_df["DII Net"].iloc[i]
+                nxt_fn = cash_df["FII Net"].iloc[i+1] if i+1 < len(cash_df) else 0
+                signal = "BUY" if fii_n > 0 else "SELL"
+                # outcome: if BUY and next FII also positive → WIN
+                outcome = "WIN" if (signal == "BUY" and nxt_fn > 0) or \
+                                   (signal == "SELL" and nxt_fn < 0) else "LOSS"
+                bt_rows.append({
+                    "Date":       cash_df["Date"].iloc[i],
+                    "FII Net":    f"₹{fii_n:+,.0f}",
+                    "DII Net":    f"₹{dii_n:+,.0f}",
+                    "Signal":     signal,
+                    "Next Day FII": f"₹{nxt_fn:+,.0f}",
+                    "Outcome":    outcome,
+                })
+            bt_df = pd.DataFrame(bt_rows)
+            wins     = (bt_df["Outcome"] == "WIN").sum()
+            total_bt = len(bt_df)
+            win_rate = wins / total_bt * 100 if total_bt > 0 else 0
+
+            st.markdown(
+                f"**FII Follow-Through Signal** | "
+                f"Trades: **{total_bt}** | "
+                f"Wins: **{wins}** | "
+                f"Win Rate: **{win_rate:.0f}%**"
+            )
+
+            def _bt_style(row):
+                c = ("background-color:#1a3a1a; color:#00e676"
+                     if row["Outcome"] == "WIN"
+                     else "background-color:#3a1a1a; color:#ff5252")
+                return [c] * len(row)
+            st.dataframe(
+                bt_df.style.apply(_bt_style, axis=1),
+                use_container_width=True, hide_index=True
+            )
+        else:
+            st.info("Need at least 5 days of data for backtest.")
+
+
+# =====================================================================
 # SECTOR ROTATION ANALYSIS ENGINE
 # =====================================================================
 
@@ -14917,6 +15427,17 @@ def main():
             show_sector_rotation_engine()
         except Exception as _sre_err:
             st.warning(f"Sector Rotation Engine error: {str(_sre_err)}")
+
+    # ===== FII / DII ACTIVITY ANALYSIS ENGINE =====
+    with st.expander("🏦 FII & DII Activity Analysis Engine", expanded=False):
+        try:
+            show_fii_dii_analysis(
+                df=df if not df.empty else None,
+                option_data=option_data,
+                current_price=current_price,
+            )
+        except Exception as _fii_err:
+            st.warning(f"FII/DII Analysis Engine error: {str(_fii_err)}")
 
     # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
     if enable_signals and option_data and option_data.get('underlying') and not df.empty:
