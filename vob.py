@@ -400,51 +400,73 @@ CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
             }
     
     def save_market_analytics(self, symbol, analytics_data):
-        """Save daily market analytics"""
+        """Save daily market analytics — skips silently on schema mismatches."""
         try:
             today = datetime.now(pytz.timezone('Asia/Kolkata')).date()
-            
+            # Try with symbol column first; fall back to date-only if column missing
             data = {
-                'symbol': symbol,
                 'date': today.isoformat(),
-                'day_high': analytics_data['day_high'],
-                'day_low': analytics_data['day_low'],
-                'day_open': analytics_data['day_open'],
-                'day_close': analytics_data['day_close'],
-                'total_volume': analytics_data['total_volume'],
-                'avg_price': analytics_data['avg_price'],
-                'price_change': analytics_data['price_change'],
-                'price_change_pct': analytics_data['price_change_pct']
+                'day_high':        analytics_data.get('day_high'),
+                'day_low':         analytics_data.get('day_low'),
+                'day_open':        analytics_data.get('day_open'),
+                'day_close':       analytics_data.get('day_close'),
+                'total_volume':    analytics_data.get('total_volume'),
+                'avg_price':       analytics_data.get('avg_price'),
+                'price_change':    analytics_data.get('price_change'),
+                'price_change_pct':analytics_data.get('price_change_pct'),
             }
-            
-            self.client.table('market_analytics').upsert(
-                data, 
-                on_conflict="symbol,date"
-            ).execute()
-            
-        except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving analytics: {str(e)}")
-    
+            try:
+                # Attempt full upsert with symbol
+                self.client.table('market_analytics').upsert(
+                    {'symbol': symbol, **data},
+                    on_conflict="symbol,date"
+                ).execute()
+            except Exception as _e1:
+                err_str = str(_e1).lower()
+                if "symbol" in err_str or "42703" in err_str or "column" in err_str:
+                    # Table missing symbol column — upsert without it
+                    try:
+                        self.client.table('market_analytics').upsert(
+                            data, on_conflict="date"
+                        ).execute()
+                    except Exception:
+                        pass  # silently skip — analytics saving is non-critical
+                elif "23505" not in err_str and "duplicate key" not in err_str:
+                    pass  # suppress all other analytics errors
+
+        except Exception:
+            pass  # analytics saving is non-critical; never surface to user
+
     def get_market_analytics(self, symbol, days_back=30):
-        """Get historical market analytics"""
+        """Get historical market analytics — schema-resilient."""
         try:
             cutoff_date = datetime.now().date() - timedelta(days=days_back)
-            
-            result = self.client.table('market_analytics')\
-                .select('*')\
-                .eq('symbol', symbol)\
-                .gte('date', cutoff_date.isoformat())\
-                .order('date', desc=False)\
-                .execute()
-            
+            try:
+                # Try with symbol filter
+                result = self.client.table('market_analytics')\
+                    .select('*')\
+                    .eq('symbol', symbol)\
+                    .gte('date', cutoff_date.isoformat())\
+                    .order('date', desc=False)\
+                    .execute()
+            except Exception as _e1:
+                err_str = str(_e1).lower()
+                if "symbol" in err_str or "42703" in err_str or "column" in err_str:
+                    # Table has no symbol column — query without it
+                    result = self.client.table('market_analytics')\
+                        .select('*')\
+                        .gte('date', cutoff_date.isoformat())\
+                        .order('date', desc=False)\
+                        .execute()
+                else:
+                    return pd.DataFrame()
+
             if result.data:
                 return pd.DataFrame(result.data)
-            else:
-                return pd.DataFrame()
-                
-        except Exception as e:
-            st.error(f"Error retrieving analytics: {str(e)}")
+            return pd.DataFrame()
+
+        except Exception:
+            # Never surface DB schema errors to the dashboard
             return pd.DataFrame()
 
     def save_spike_history(self, record):
@@ -15600,9 +15622,22 @@ def main():
                         st.rerun()
 
             else:
-                st.info("Option chain data required for Market Acceleration Engine.")
+                st.markdown(
+                    "<div style='padding:18px;border-radius:8px;"
+                    "background:#1e2530;border-left:4px solid #f0a500;'>"
+                    "<b>⚠️ Option Chain Data Not Loaded</b><br>"
+                    "The Market Acceleration Engine requires live option chain data.<br>"
+                    "<ul style='margin:8px 0 0 16px;color:#ccc'>"
+                    "<li>Ensure your <b>Dhan API token</b> is valid and not expired</li>"
+                    "<li>Check that the <b>option chain loaded successfully</b> in the "
+                    "Options Analysis panel above</li>"
+                    "<li>If running on Streamlit Cloud, the Dhan CDN may block shared IPs — "
+                    "try <b>running locally</b></li>"
+                    "</ul></div>",
+                    unsafe_allow_html=True
+                )
         except Exception as _mae_e:
-            st.warning(f"Market Acceleration Engine unavailable: {str(_mae_e)}")
+            st.warning(f"Market Acceleration Engine error: {str(_mae_e)}")
 
     # ===== CANDLESTICK INTELLIGENCE ENGINE =====
     st.markdown("---")
@@ -16050,7 +16085,21 @@ def main():
                             st.rerun()
 
             else:
-                st.info("Option chain data required for Candlestick Intelligence Engine.")
+                st.markdown(
+                    "<div style='padding:18px;border-radius:8px;"
+                    "background:#1e2530;border-left:4px solid #f0a500;'>"
+                    "<b>⚠️ Option Chain Data Not Loaded</b><br>"
+                    "The Candlestick Intelligence Engine requires live option chain data "
+                    "to compute ATM strike, support/resistance, and OI confluence levels.<br>"
+                    "<ul style='margin:8px 0 0 16px;color:#ccc'>"
+                    "<li>Ensure your <b>Dhan API token</b> is active</li>"
+                    "<li>Confirm the <b>Options Analysis</b> panel above shows a valid "
+                    "expiry and option chain table</li>"
+                    "<li>On Streamlit Cloud: Dhan's CloudFront may block the shared IP — "
+                    "run the app <b>locally</b> for full functionality</li>"
+                    "</ul></div>",
+                    unsafe_allow_html=True
+                )
         except Exception as _cie_err:
             st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
 
