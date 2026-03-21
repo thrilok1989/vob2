@@ -10046,6 +10046,767 @@ def show_intraday_sector_rotation():
 
 
 # =====================================================================
+# ADVANCED MARKET INTELLIGENCE ENGINE
+# =====================================================================
+
+def _amie_detect_chart_pattern(df: pd.DataFrame) -> tuple:
+    """
+    Detect chart patterns from OHLCV data.
+    Returns (pattern_name, pattern_type, pattern_score 0-100)
+    """
+    if df is None or len(df) < 10:
+        return "No Pattern", "Neutral", 0
+
+    try:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        cl = df2["close"].values
+        hi = df2["high"].values if "high" in df2.columns else cl
+        lo = df2["low"].values  if "low"  in df2.columns else cl
+
+        n = len(cl)
+        last  = cl[-1]
+        prev5 = cl[-6:-1] if n >= 6 else cl[:-1]
+        prev10 = cl[-11:-1] if n >= 11 else cl[:-1]
+
+        # Local pivots
+        def _local_mins(arr, w=3):
+            return [i for i in range(w, len(arr)-w) if arr[i] == min(arr[i-w:i+w+1])]
+        def _local_maxs(arr, w=3):
+            return [i for i in range(w, len(arr)-w) if arr[i] == max(arr[i-w:i+w+1])]
+
+        lows  = _local_mins(lo)
+        highs = _local_maxs(hi)
+
+        # ── Double Bottom ──────────────────────────────────────────────
+        if len(lows) >= 2:
+            l1, l2 = lows[-2], lows[-1]
+            if abs(lo[l1] - lo[l2]) / (lo[l1] + 1e-6) < 0.005 and l2 > l1:
+                if last > (lo[l1] + lo[l2]) / 2 * 1.005:
+                    return "Double Bottom", "Bullish Reversal", 78
+
+        # ── Double Top ────────────────────────────────────────────────
+        if len(highs) >= 2:
+            h1, h2 = highs[-2], highs[-1]
+            if abs(hi[h1] - hi[h2]) / (hi[h1] + 1e-6) < 0.005 and h2 > h1:
+                if last < (hi[h1] + hi[h2]) / 2 * 0.995:
+                    return "Double Top", "Bearish Reversal", 78
+
+        # ── Head & Shoulders ─────────────────────────────────────────
+        if len(highs) >= 3:
+            h1, h2, h3 = highs[-3], highs[-2], highs[-1]
+            if hi[h2] > hi[h1] and hi[h2] > hi[h3] and abs(hi[h1] - hi[h3]) / (hi[h1] + 1e-6) < 0.01:
+                neckline = (lo[h1] + lo[h3]) / 2 if h3 < len(lo) else lo[-1]
+                if last < neckline:
+                    return "Head & Shoulders", "Bearish Reversal", 82
+
+        # ── Inverse H&S ───────────────────────────────────────────────
+        if len(lows) >= 3:
+            l1, l2, l3 = lows[-3], lows[-2], lows[-1]
+            if lo[l2] < lo[l1] and lo[l2] < lo[l3] and abs(lo[l1] - lo[l3]) / (lo[l1] + 1e-6) < 0.01:
+                neckline = (hi[l1] + hi[l3]) / 2 if l3 < len(hi) else hi[-1]
+                if last > neckline:
+                    return "Inverse Head & Shoulders", "Bullish Reversal", 82
+
+        # ── Falling Wedge ─────────────────────────────────────────────
+        if n >= 15:
+            hi15 = hi[-15:]
+            lo15 = lo[-15:]
+            if hi15[-1] < hi15[0] and lo15[-1] < lo15[0]:
+                hi_drop = (hi15[0] - hi15[-1]) / hi15[0]
+                lo_drop = (lo15[0] - lo15[-1]) / lo15[0]
+                if lo_drop > hi_drop and hi_drop > 0.01:
+                    return "Falling Wedge", "Bullish Reversal", 70
+
+        # ── Rising Wedge ──────────────────────────────────────────────
+        if n >= 15:
+            hi15 = hi[-15:]
+            lo15 = lo[-15:]
+            if hi15[-1] > hi15[0] and lo15[-1] > lo15[0]:
+                hi_rise = (hi15[-1] - hi15[0]) / hi15[0]
+                lo_rise = (lo15[-1] - lo15[0]) / lo15[0]
+                if lo_rise > hi_rise and hi_rise > 0.01:
+                    return "Rising Wedge", "Bearish Reversal", 70
+
+        # ── Bull Flag ─────────────────────────────────────────────────
+        if n >= 20:
+            impulse = cl[-20:-10]
+            flag    = cl[-10:]
+            imp_rtn = (impulse[-1] - impulse[0]) / (impulse[0] + 1e-6)
+            flag_rtn = (flag[-1] - flag[0]) / (flag[0] + 1e-6)
+            if imp_rtn > 0.015 and -0.01 < flag_rtn < 0.003:
+                return "Bull Flag", "Bullish Continuation", 72
+
+        # ── Bear Flag ─────────────────────────────────────────────────
+        if n >= 20:
+            impulse = cl[-20:-10]
+            flag    = cl[-10:]
+            imp_rtn = (impulse[-1] - impulse[0]) / (impulse[0] + 1e-6)
+            flag_rtn = (flag[-1] - flag[0]) / (flag[0] + 1e-6)
+            if imp_rtn < -0.015 and -0.003 < flag_rtn < 0.01:
+                return "Bear Flag", "Bearish Continuation", 72
+
+        # ── Ascending Triangle ────────────────────────────────────────
+        if len(highs) >= 2 and len(lows) >= 2:
+            h_flat = abs(hi[highs[-1]] - hi[highs[-2]]) / (hi[highs[-1]] + 1e-6) < 0.005
+            l_rising = lo[lows[-1]] > lo[lows[-2]]
+            if h_flat and l_rising:
+                return "Ascending Triangle", "Bullish Continuation", 68
+
+        # ── Descending Triangle ───────────────────────────────────────
+        if len(lows) >= 2 and len(highs) >= 2:
+            l_flat   = abs(lo[lows[-1]] - lo[lows[-2]]) / (lo[lows[-1]] + 1e-6) < 0.005
+            h_falling = hi[highs[-1]] < hi[highs[-2]]
+            if l_flat and h_falling:
+                return "Descending Triangle", "Bearish Continuation", 68
+
+        # ── Range Breakout / Breakdown ────────────────────────────────
+        if n >= 20:
+            rng = cl[-21:-1]
+            rng_hi = max(rng)
+            rng_lo = min(rng)
+            if last > rng_hi * 1.003:
+                return "Range Breakout", "Bullish Continuation", 75
+            elif last < rng_lo * 0.997:
+                return "Range Breakdown", "Bearish Continuation", 75
+
+        return "No Clear Pattern", "Neutral", 40
+
+    except Exception:
+        return "No Pattern", "Neutral", 30
+
+
+def _amie_oi_behavior(option_data: dict, df: pd.DataFrame) -> tuple:
+    """
+    Returns (oi_behavior, support_signal, resistance_signal, oi_score 0-100)
+    """
+    if not option_data:
+        return "Mixed / Neutral", "Unknown", "Unknown", 50
+
+    ds = option_data.get('df_summary')
+    underlying = option_data.get('underlying', 0)
+    total_ce_chg = option_data.get('total_ce_change', 0) or 0
+    total_pe_chg = option_data.get('total_pe_change', 0) or 0
+
+    if ds is None or ds.empty:
+        return "Mixed / Neutral", "Unknown", "Unknown", 50
+
+    # Price direction
+    price_up = True
+    if df is not None and not df.empty:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        if "close" in df2.columns and len(df2) >= 2:
+            price_up = df2["close"].iloc[-1] >= df2["close"].iloc[-2]
+
+    # OI behavior
+    if price_up and total_pe_chg > 0 and total_pe_chg >= abs(total_ce_chg):
+        oi_behavior = "Long Build-up"
+        oi_score = 72
+    elif not price_up and total_ce_chg > 0 and total_ce_chg >= abs(total_pe_chg):
+        oi_behavior = "Short Build-up"
+        oi_score = 28
+    elif price_up and total_ce_chg < 0:
+        oi_behavior = "Short Covering"
+        oi_score = 65
+    elif not price_up and total_pe_chg < 0:
+        oi_behavior = "Long Unwinding"
+        oi_score = 35
+    else:
+        oi_behavior = "Mixed / Neutral"
+        oi_score = 50
+
+    # Support & Resistance
+    try:
+        atm_idx = ds['Strike'].sub(underlying).abs().idxmin()
+        ai = ds.index.get_loc(atm_idx)
+
+        def safe_row(i):
+            return ds.iloc[i] if 0 <= i < len(ds) else None
+
+        r0   = ds.iloc[ai]
+        rm1  = safe_row(ai - 1)
+        rp1  = safe_row(ai + 1)
+
+        def gv(row, col, default=0):
+            if row is None: return default
+            return float(row.get(col, default) or default)
+
+        pe_chg_atm = gv(r0, 'changeinOpenInterest_PE')
+        ce_chg_atm = gv(r0, 'changeinOpenInterest_CE')
+        pe_chg_m1  = gv(rm1, 'changeinOpenInterest_PE') if rm1 is not None else 0
+        ce_chg_p1  = gv(rp1, 'changeinOpenInterest_CE') if rp1 is not None else 0
+
+        support_signal = "Building" if (total_pe_chg > 0 and pe_chg_atm > 0 and pe_chg_m1 > 0) else \
+                         "Weakening" if (total_pe_chg < 0 and pe_chg_atm < 0) else "Stable"
+        resistance_signal = "Building" if (total_ce_chg > 0 and ce_chg_atm > 0 and ce_chg_p1 > 0) else \
+                            "Weakening" if (total_ce_chg < 0 and ce_chg_atm < 0) else "Stable"
+    except Exception:
+        support_signal = "Unknown"
+        resistance_signal = "Unknown"
+
+    return oi_behavior, support_signal, resistance_signal, oi_score
+
+
+def _amie_atm_analysis(option_data: dict) -> dict:
+    """
+    ATM ±2 strike intelligence.
+    Returns dict with strike data, migration, smart money flags.
+    """
+    result = {
+        'atm': None, 'strikes': {},
+        'resist_migration': 'Stable', 'support_migration': 'Stable',
+        'smart_money': [], 'gamma_zone': None,
+        'score': 50
+    }
+    if not option_data:
+        return result
+
+    ds = option_data.get('df_summary')
+    underlying = option_data.get('underlying', 0)
+    if ds is None or ds.empty or underlying <= 0:
+        return result
+
+    try:
+        atm_idx = ds['Strike'].sub(underlying).abs().idxmin()
+        ai = ds.index.get_loc(atm_idx)
+        atm = float(ds.iloc[ai]['Strike'])
+        result['atm'] = atm
+
+        def gv(row, col, default=0):
+            return float(row.get(col, default) or default) if row is not None else default
+
+        strikes_info = {}
+        for offset, label in [(-2,'ATM-2'), (-1,'ATM-1'), (0,'ATM'), (1,'ATM+1'), (2,'ATM+2')]:
+            idx = ai + offset
+            if 0 <= idx < len(ds):
+                row = ds.iloc[idx]
+                strikes_info[label] = {
+                    'strike':    float(row.get('Strike', 0)),
+                    'ce_oi':     gv(row, 'openInterest_CE'),
+                    'pe_oi':     gv(row, 'openInterest_PE'),
+                    'ce_chg':    gv(row, 'changeinOpenInterest_CE'),
+                    'pe_chg':    gv(row, 'changeinOpenInterest_PE'),
+                    'ce_vol':    gv(row, 'totalTradedVolume_CE'),
+                    'pe_vol':    gv(row, 'totalTradedVolume_PE'),
+                    'ce_iv':     gv(row, 'impliedVolatility_CE'),
+                    'pe_iv':     gv(row, 'impliedVolatility_PE'),
+                    'ce_bid':    gv(row, 'bidQty_CE'),
+                    'pe_bid':    gv(row, 'bidQty_PE'),
+                    'ce_ask':    gv(row, 'askQty_CE'),
+                    'pe_ask':    gv(row, 'askQty_PE'),
+                }
+        result['strikes'] = strikes_info
+
+        atm_s = strikes_info.get('ATM', {})
+        atm1  = strikes_info.get('ATM+1', {})
+        atm2  = strikes_info.get('ATM+2', {})
+        atm_m1 = strikes_info.get('ATM-1', {})
+        atm_m2 = strikes_info.get('ATM-2', {})
+
+        # Resistance migration
+        if atm_s.get('ce_chg', 0) < 0 and (atm1.get('ce_chg', 0) > 0 or atm2.get('ce_chg', 0) > 0):
+            result['resist_migration'] = 'Shifting Higher (Bullish)'
+            result['score'] += 8
+        elif atm_s.get('ce_chg', 0) > 0 and atm1.get('ce_chg', 0) < 0:
+            result['resist_migration'] = 'Shifting Lower (Bearish)'
+            result['score'] -= 8
+
+        # Support migration
+        if atm_s.get('pe_chg', 0) < 0 and (atm_m1.get('pe_chg', 0) > 0 or atm_m2.get('pe_chg', 0) > 0):
+            result['support_migration'] = 'Shifting Lower (Bearish)'
+            result['score'] -= 8
+        elif atm_s.get('pe_chg', 0) > 0 and atm_m1.get('pe_chg', 0) < 0:
+            result['support_migration'] = 'Shifting Higher (Bullish)'
+            result['score'] += 8
+
+        # Smart money (large OI spikes > 3x avg)
+        for side, key in [('CE', 'ce_chg'), ('PE', 'pe_chg')]:
+            col = f'changeinOpenInterest_{side}'
+            if col in ds.columns:
+                avg_abs = ds[col].abs().mean()
+                spikes = ds[ds[col].abs() > avg_abs * 3]
+                for _, srow in spikes.head(2).iterrows():
+                    v = float(srow[col])
+                    lbl = (f"Institutional {'Call' if side=='CE' else 'Put'} "
+                           f"{'Writing' if v > 0 else 'Covering'} @ ₹{int(srow['Strike'])}")
+                    result['smart_money'].append(lbl)
+
+        # Gamma zone (highest combined gamma)
+        if 'GammaExp_Net' in ds.columns:
+            idx_g = ds['GammaExp_Net'].abs().idxmax()
+            result['gamma_zone'] = float(ds.loc[idx_g, 'Strike'])
+
+        result['score'] = max(0, min(100, result['score']))
+    except Exception:
+        pass
+
+    return result
+
+
+def _amie_depth_signal(option_data: dict) -> tuple:
+    """
+    Market depth reaction from bid/ask OI proxy.
+    Returns (signal_str, score 0-100, detail)
+    """
+    if not option_data:
+        return "Balanced", 50, "No data"
+
+    ds = option_data.get('df_summary')
+    if ds is None or ds.empty:
+        return "Balanced", 50, "No depth data"
+
+    try:
+        bid_cols = [c for c in ds.columns if 'bidQty' in c]
+        ask_cols = [c for c in ds.columns if 'askQty' in c]
+        if not bid_cols or not ask_cols:
+            return "Balanced", 50, "Bid/Ask not available"
+
+        total_bid = ds[bid_cols].sum().sum()
+        total_ask = ds[ask_cols].sum().sum()
+        sentiment_score = total_bid - total_ask
+        ratio = total_bid / (total_ask + 1e-6)
+
+        if ratio > 1.5:
+            signal = "Buyers Strong"
+            score = 72
+            detail = f"Bid/Ask ratio {ratio:.2f} — strong buying pressure"
+        elif ratio > 1.15:
+            signal = "Mild Buy Pressure"
+            score = 62
+            detail = f"Bid/Ask ratio {ratio:.2f} — moderate buying"
+        elif ratio < 0.67:
+            signal = "Sellers Strong"
+            score = 28
+            detail = f"Bid/Ask ratio {ratio:.2f} — heavy sell pressure"
+        elif ratio < 0.87:
+            signal = "Mild Sell Pressure"
+            score = 38
+            detail = f"Bid/Ask ratio {ratio:.2f} — moderate selling"
+        else:
+            signal = "Balanced"
+            score = 50
+            detail = f"Bid/Ask ratio {ratio:.2f} — equilibrium"
+
+        return signal, score, detail
+    except Exception:
+        return "Balanced", 50, "Calculation error"
+
+
+def _amie_sector_signal(session_state) -> tuple:
+    """
+    Extract sector signal from session state or return N/A.
+    Returns (signal_str, score 0-100)
+    """
+    try:
+        leaders = session_state.get("intra_prev_leaders", [])
+        if not leaders:
+            return "Data Unavailable", 50
+
+        banking_strong = any(s in leaders for s in ["NIFTY BANK", "FIN SERVICE", "Private Bank"])
+        it_strong = any(s in leaders for s in ["NIFTY IT", "IT"])
+
+        if banking_strong and it_strong:
+            return "Sectors Strong (Bank+IT Lead)", 72
+        elif banking_strong:
+            return "Banking Leads", 65
+        elif it_strong:
+            return "IT Leads", 62
+        else:
+            sector_name = leaders[0] if leaders else "Unknown"
+            return f"{sector_name} Leads", 58
+    except Exception:
+        return "Data Unavailable", 50
+
+
+def _amie_spike_type(session_state, option_data: dict) -> tuple:
+    """
+    Detect spike type: Normal vs Expiry Gamma.
+    Returns (spike_type, spike_score 0-100)
+    """
+    if not option_data:
+        return "No Spike", 50
+
+    expiry = option_data.get('expiry', '')
+    ds = option_data.get('df_summary')
+    underlying = option_data.get('underlying', 0)
+
+    try:
+        # Check DTE
+        dte = 999
+        if expiry:
+            try:
+                exp_dt = datetime.strptime(expiry, "%Y-%m-%d")
+                now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                dte = (exp_dt.date() - now.date()).days
+            except Exception:
+                pass
+
+        spike_history = session_state.get('spike_history', [])
+        expiry_history = session_state.get('expiry_spike_history', [])
+
+        # Calculate OI movement rate
+        oi_surge = False
+        if ds is not None and not ds.empty and len(spike_history) >= 2:
+            prev_snap = spike_history[-2]
+            if 'openInterest_CE' in prev_snap.columns and 'openInterest_CE' in ds.columns:
+                prev_total = prev_snap['openInterest_CE'].sum() + prev_snap.get('openInterest_PE', pd.Series([0])).sum()
+                curr_total = ds['openInterest_CE'].sum() + ds.get('openInterest_PE', pd.Series([0])).sum()
+                if prev_total > 0:
+                    oi_change_rate = abs(curr_total - prev_total) / prev_total
+                    oi_surge = oi_change_rate > 0.03
+
+        if dte <= 1 and oi_surge:
+            return "Expiry Gamma Spike", 85
+        elif dte <= 1:
+            return "Expiry Day Normal", 70
+        elif oi_surge:
+            return "Normal Spike", 68
+        else:
+            return "No Spike", 50
+    except Exception:
+        return "Unknown", 50
+
+
+def _amie_confidence(pattern_score, oi_score, depth_score, sector_score,
+                      spike_score, atm_score) -> int:
+    """
+    Composite confidence: weighted average of all signals.
+    Reduces if signals conflict.
+    """
+    weights = {
+        'pattern': 0.20,
+        'oi':      0.25,
+        'depth':   0.20,
+        'sector':  0.15,
+        'spike':   0.10,
+        'atm':     0.10,
+    }
+    scores = {
+        'pattern': pattern_score,
+        'oi':      oi_score,
+        'depth':   depth_score,
+        'sector':  sector_score,
+        'spike':   spike_score,
+        'atm':     atm_score,
+    }
+
+    weighted = sum(scores[k] * weights[k] for k in weights)
+
+    # Conflict penalty: measure spread of signals
+    vals = list(scores.values())
+    spread = max(vals) - min(vals)
+    conflict_penalty = spread * 0.10  # up to 10 pts penalty for high spread
+
+    confidence = int(max(35, min(95, weighted - conflict_penalty)))
+    return confidence
+
+
+def _amie_expected_move(pattern_type: str, oi_behavior: str, support_signal: str,
+                         resistance_signal: str, resist_migration: str,
+                         support_migration: str, depth_signal: str) -> tuple:
+    """
+    Predict expected move direction, breakout/reversal probability.
+    Returns (direction, bo_prob_pct, reversal_prob_pct, target_info)
+    """
+    bull_signals = 0
+    bear_signals = 0
+
+    if "Bullish" in pattern_type:          bull_signals += 2
+    if "Bearish" in pattern_type:          bear_signals += 2
+    if "Long Build" in oi_behavior:        bull_signals += 1
+    if "Short Cover" in oi_behavior:       bull_signals += 1
+    if "Short Build" in oi_behavior:       bear_signals += 1
+    if "Long Unwind" in oi_behavior:       bear_signals += 1
+    if "Building" in support_signal:       bull_signals += 1
+    if "Weakening" in support_signal:      bear_signals += 1
+    if "Building" in resistance_signal:    bear_signals += 1
+    if "Weakening" in resistance_signal:   bull_signals += 1
+    if "Higher" in resist_migration:       bull_signals += 1
+    if "Lower"  in support_migration:      bear_signals += 1
+    if "Buy" in depth_signal or "Buyer" in depth_signal:   bull_signals += 1
+    if "Sell" in depth_signal or "Seller" in depth_signal: bear_signals += 1
+
+    total = bull_signals + bear_signals + 1e-6
+    bull_pct = int(bull_signals / total * 100)
+    bear_pct = int(bear_signals / total * 100)
+
+    if bull_pct > 60:
+        direction = "Uptrend Expected"
+        bo_prob = min(bull_pct + 10, 90)
+        rv_prob = 100 - bo_prob
+    elif bear_pct > 60:
+        direction = "Downtrend Expected"
+        bo_prob = min(bear_pct + 10, 90)
+        rv_prob = 100 - bo_prob
+    elif "Continuation" in pattern_type:
+        direction = "Trend Continuation"
+        bo_prob = 65
+        rv_prob = 35
+    elif "Reversal" in pattern_type:
+        direction = "Reversal Setup"
+        bo_prob = 55
+        rv_prob = 45
+    else:
+        direction = "Range Bound"
+        bo_prob = 45
+        rv_prob = 55
+
+    target_info = f"Bo: {bo_prob}% | Rev: {rv_prob}%"
+    return direction, bo_prob, rv_prob, target_info
+
+
+def show_advanced_market_intelligence_engine(
+    df: pd.DataFrame = None,
+    option_data: dict = None,
+    current_price: float = None,
+):
+    """
+    Advanced Market Intelligence Engine — 12-Step NIFTY Analysis.
+    Combines: Chart Patterns · OI · ATM±2 · Depth · Sectors · Spikes · Smart Money.
+    Generates a timestamped analysis table with confidence scores.
+    """
+    st.markdown("## 🧠 Advanced Market Intelligence Engine")
+    st.caption("12-Step NIFTY Analysis · Pattern · OI · ATM±2 · Depth · Sectors · Spikes · Smart Money")
+
+    spot = current_price or 0.0
+    if spot <= 0 and option_data:
+        spot = float(option_data.get("underlying", 0) or 0)
+
+    if spot <= 0 and (df is None or df.empty):
+        st.warning("No market data available. Load NIFTY data first.")
+        return
+
+    now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+    ts = now_ist.strftime('%H:%M')
+
+    # ── STEP 1: Chart Pattern ──────────────────────────────────────────
+    pattern_name, pattern_type, pattern_score = _amie_detect_chart_pattern(df)
+
+    # ── STEP 2: Sentiment ─────────────────────────────────────────────
+    pcr = option_data.get('pcr', 1.0) if option_data else 1.0
+    if pcr > 1.3:   base_sentiment, sent_type = "Bullish",  "Breakout Setup"
+    elif pcr > 1.1: base_sentiment, sent_type = "Bullish",  "Continuation"
+    elif pcr < 0.7: base_sentiment, sent_type = "Bearish",  "Breakdown Setup"
+    elif pcr < 0.9: base_sentiment, sent_type = "Bearish",  "Continuation"
+    else:           base_sentiment, sent_type = "Neutral",  "Range"
+
+    if "Trap" in pattern_name:
+        sent_type = "Trap Setup"
+
+    # ── STEP 3: OI Behavior ───────────────────────────────────────────
+    oi_behavior, support_signal, resistance_signal, oi_score = _amie_oi_behavior(option_data, df)
+
+    # ── STEP 4: ATM ±2 Intelligence ───────────────────────────────────
+    atm_result = _amie_atm_analysis(option_data)
+    resist_migration = atm_result['resist_migration']
+    support_migration = atm_result['support_migration']
+    atm_score = atm_result['score']
+    smart_money_signals = atm_result['smart_money']
+    gamma_zone = atm_result['gamma_zone']
+
+    # ── STEP 5: Market Depth ─────────────────────────────────────────
+    depth_signal, depth_score, depth_detail = _amie_depth_signal(option_data)
+
+    # ── STEP 6: Sector Signal ────────────────────────────────────────
+    sector_signal, sector_score = _amie_sector_signal(st.session_state)
+
+    # ── STEP 7: Spike Detection ───────────────────────────────────────
+    spike_type, spike_score = _amie_spike_type(st.session_state, option_data)
+
+    # ── STEP 8: Smart Money Summary ───────────────────────────────────
+    if not smart_money_signals:
+        smart_money_signals = ["No major institutional spikes detected"]
+
+    # ── STEP 9: Expected Move ─────────────────────────────────────────
+    direction, bo_prob, rv_prob, target_info = _amie_expected_move(
+        pattern_type, oi_behavior, support_signal, resistance_signal,
+        resist_migration, support_migration, depth_signal
+    )
+
+    # ── STEP 10 & 11: Confidence Score ────────────────────────────────
+    confidence = _amie_confidence(
+        pattern_score, oi_score, depth_score, sector_score,
+        spike_score, atm_score
+    )
+
+    # ── DISPLAY ───────────────────────────────────────────────────────
+    # Row 1: Key metrics
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        clr = "#00cc66" if "Bull" in base_sentiment else ("#ff4444" if "Bear" in base_sentiment else "#FFD700")
+        st.markdown(f"""
+        <div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:3px solid {clr};'>
+        <div style='color:#aaa;font-size:0.75rem;'>SENTIMENT</div>
+        <div style='color:{clr};font-size:1.1rem;font-weight:bold;'>{base_sentiment}</div>
+        <div style='color:#888;font-size:0.75rem;'>{sent_type}</div>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        oi_clr = "#00cc66" if "Long Build" in oi_behavior or "Short Cover" in oi_behavior else \
+                 "#ff4444" if "Short Build" in oi_behavior or "Long Unwind" in oi_behavior else "#FFD700"
+        st.markdown(f"""
+        <div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:3px solid {oi_clr};'>
+        <div style='color:#aaa;font-size:0.75rem;'>OI BEHAVIOR</div>
+        <div style='color:{oi_clr};font-size:1.1rem;font-weight:bold;'>{oi_behavior}</div>
+        <div style='color:#888;font-size:0.75rem;'>Sup: {support_signal} · Res: {resistance_signal}</div>
+        </div>""", unsafe_allow_html=True)
+    with c3:
+        dep_clr = "#00cc66" if "Buy" in depth_signal else ("#ff4444" if "Sell" in depth_signal else "#FFD700")
+        st.markdown(f"""
+        <div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:3px solid {dep_clr};'>
+        <div style='color:#aaa;font-size:0.75rem;'>DEPTH SIGNAL</div>
+        <div style='color:{dep_clr};font-size:1.1rem;font-weight:bold;'>{depth_signal}</div>
+        <div style='color:#888;font-size:0.75rem;'>{depth_detail[:40]}</div>
+        </div>""", unsafe_allow_html=True)
+    with c4:
+        conf_clr = "#00ff88" if confidence >= 75 else ("#FFD700" if confidence >= 55 else "#ff4444")
+        st.markdown(f"""
+        <div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:3px solid {conf_clr};'>
+        <div style='color:#aaa;font-size:0.75rem;'>CONFIDENCE</div>
+        <div style='color:{conf_clr};font-size:1.5rem;font-weight:bold;'>{confidence}%</div>
+        <div style='color:#888;font-size:0.75rem;'>{target_info}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # Main Analysis Table (Step 10)
+    st.markdown("### 📊 Analysis Table")
+    analysis_row = {
+        "Time":          ts,
+        "Pattern":       pattern_name,
+        "Sentiment":     base_sentiment,
+        "Type":          sent_type,
+        "OI Behavior":   oi_behavior,
+        "Depth Signal":  depth_signal,
+        "Sector Signal": sector_signal,
+        "Spike Type":    spike_type,
+        "Expected Move": direction,
+        "Confidence":    f"{confidence}%",
+    }
+
+    # Store in session_state for history
+    if 'amie_history' not in st.session_state:
+        st.session_state.amie_history = []
+    # Only append if new timestamp
+    if (not st.session_state.amie_history or
+            st.session_state.amie_history[-1].get('Time') != ts or
+            st.session_state.amie_history[-1].get('Pattern') != pattern_name):
+        st.session_state.amie_history.append(analysis_row.copy())
+        if len(st.session_state.amie_history) > 20:
+            st.session_state.amie_history = st.session_state.amie_history[-20:]
+
+    # Display history table (most recent first)
+    history_rows = list(reversed(st.session_state.amie_history))
+    df_table = pd.DataFrame(history_rows)
+
+    def _amie_style(row):
+        styles = []
+        for val in row:
+            val_str = str(val)
+            if any(x in val_str for x in ["Bullish", "Long Build", "Short Cover", "Buyers", "Up", "Strong"]):
+                styles.append("background-color: #1a3a1a; color: #00cc66;")
+            elif any(x in val_str for x in ["Bearish", "Short Build", "Long Unwind", "Sellers", "Down", "Weak"]):
+                styles.append("background-color: #3a1a1a; color: #ff4444;")
+            elif "%" in val_str:
+                pct = int(val_str.replace('%', '')) if val_str.replace('%', '').isdigit() else 50
+                if pct >= 75:
+                    styles.append("background-color: #1a3a1a; color: #00ff88; font-weight: bold;")
+                elif pct >= 55:
+                    styles.append("background-color: #2a2a1a; color: #FFD700; font-weight: bold;")
+                else:
+                    styles.append("background-color: #3a1a1a; color: #ff4444; font-weight: bold;")
+            else:
+                styles.append("")
+        return styles
+
+    styled = df_table.style.apply(_amie_style, axis=1)
+    st.dataframe(styled, use_container_width=True)
+
+    # ── ATM ±2 Intelligence Table ─────────────────────────────────────
+    if atm_result['strikes']:
+        st.markdown("### 🎯 ATM ±2 Strike Intelligence")
+        strike_rows = []
+        for label in ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']:
+            s = atm_result['strikes'].get(label)
+            if s:
+                # Dominant side
+                ce_total = s.get('ce_oi', 0) + abs(s.get('ce_chg', 0))
+                pe_total = s.get('pe_oi', 0) + abs(s.get('pe_chg', 0))
+                dom = "CALLS" if ce_total > pe_total else "PUTS"
+                strike_rows.append({
+                    "Label":    label,
+                    "Strike":   f"₹{int(s.get('strike', 0))}",
+                    "CE OI":    f"{int(s.get('ce_oi', 0)):,}",
+                    "PE OI":    f"{int(s.get('pe_oi', 0)):,}",
+                    "CE ΔOI":   f"{int(s.get('ce_chg', 0)):+,}",
+                    "PE ΔOI":   f"{int(s.get('pe_chg', 0)):+,}",
+                    "CE IV%":   f"{s.get('ce_iv', 0):.1f}",
+                    "PE IV%":   f"{s.get('pe_iv', 0):.1f}",
+                    "Dominant": dom,
+                })
+        if strike_rows:
+            df_atm = pd.DataFrame(strike_rows)
+            def _atm_highlight(row):
+                if row.get("Label") == "ATM":
+                    return ["background-color: #1a2a3a; font-weight: bold;"] * len(row)
+                return [""] * len(row)
+            st.dataframe(
+                df_atm.style.apply(_atm_highlight, axis=1),
+                use_container_width=True
+            )
+
+        # Migration signal
+        ma_col1, ma_col2 = st.columns(2)
+        with ma_col1:
+            mig_clr = "#00cc66" if "Higher" in resist_migration else ("#ff4444" if "Lower" in resist_migration else "#FFD700")
+            st.markdown(f"**Resistance Migration:** <span style='color:{mig_clr}'>{resist_migration}</span>", unsafe_allow_html=True)
+        with ma_col2:
+            sup_clr = "#00cc66" if "Higher" in support_migration else ("#ff4444" if "Lower" in support_migration else "#FFD700")
+            st.markdown(f"**Support Migration:** <span style='color:{sup_clr}'>{support_migration}</span>", unsafe_allow_html=True)
+
+        if gamma_zone:
+            st.markdown(f"**⚡ Gamma Zone:** ₹{int(gamma_zone)} — highest gamma concentration")
+
+    # ── Smart Money Section ───────────────────────────────────────────
+    st.markdown("### 🏦 Smart Money & Institutional Activity")
+    for sig in smart_money_signals[:5]:
+        icon = "🟢" if "Writing" in sig else "🟠"
+        st.markdown(f"{icon} {sig}")
+
+    # ── Expected Move Summary ─────────────────────────────────────────
+    st.markdown("### 🎯 Expected Move Prediction")
+    dir_clr = "#00cc66" if "Up" in direction else ("#ff4444" if "Down" in direction else "#FFD700")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric("Direction", direction)
+    with col_b:
+        st.metric("Breakout Probability", f"{bo_prob}%")
+    with col_c:
+        st.metric("Reversal Probability", f"{rv_prob}%")
+
+    # ── PCR & Max Pain ────────────────────────────────────────────────
+    max_pain = option_data.get('max_pain_strike') if option_data else None
+    atm_str  = option_data.get('atm_strike') if option_data else None
+    st.markdown("### 📈 Key Levels")
+    kl1, kl2, kl3, kl4 = st.columns(4)
+    with kl1:
+        st.metric("Spot Price", f"₹{spot:,.0f}")
+    with kl2:
+        st.metric("ATM Strike", f"₹{int(atm_str):,}" if atm_str else "N/A")
+    with kl3:
+        st.metric("Max Pain", f"₹{int(max_pain):,}" if max_pain else "N/A")
+    with kl4:
+        pcr_clr_lbl = "↑ Bullish" if pcr > 1.1 else ("↓ Bearish" if pcr < 0.9 else "→ Neutral")
+        st.metric("PCR", f"{pcr:.2f}", delta=pcr_clr_lbl)
+
+    # Clear history button
+    st.markdown("")
+    if st.button("🗑️ Clear AMIE History", key="clr_amie"):
+        st.session_state.amie_history = []
+        st.rerun()
+
+
+# =====================================================================
 # FINAL INTELLIGENCE DASHBOARD
 # =====================================================================
 
@@ -17784,6 +18545,18 @@ def main():
             )
         except Exception as _mse_err:
             st.warning(f"Market Sentiment Engine error: {str(_mse_err)}")
+
+    # ===== ADVANCED MARKET INTELLIGENCE ENGINE =====
+    st.markdown("---")
+    with st.expander("🧠 Advanced Market Intelligence Engine — 12-Step Analysis", expanded=True):
+        try:
+            show_advanced_market_intelligence_engine(
+                df=df if not df.empty else None,
+                option_data=option_data,
+                current_price=current_price,
+            )
+        except Exception as _amie_err:
+            st.warning(f"Advanced Market Intelligence Engine error: {str(_amie_err)}")
 
     # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
     if enable_signals and option_data and option_data.get('underlying') and not df.empty:
