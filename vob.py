@@ -7598,6 +7598,100 @@ def show_market_depth_engine(api=None, option_data: dict = None,
         else:
             st.info("No resistance levels detected above spot.")
 
+    # ── MAJOR S/R LEVELS (from all depth + OI data) ──────────────────
+    st.markdown("#### 🏔️ Major Support & Resistance Levels")
+
+    # Identify top-3 support levels (highest bid volumes below spot)
+    major_supports    = sorted([b for b in bid_levels if b["price"] < spot],
+                                key=lambda x: x["qty"], reverse=True)[:3]
+    # Identify top-3 resistance levels (highest ask volumes above spot)
+    major_resistances = sorted([a for a in ask_levels if a["price"] > spot],
+                                key=lambda x: x["qty"], reverse=True)[:3]
+
+    # Augment with OI data from option_chain if synthetic source
+    if data_source == "option_chain" and option_data:
+        df_sum_aug = option_data.get("df_summary")
+        if df_sum_aug is not None and not df_sum_aug.empty:
+            # Major support = strikes with highest Put OI below spot
+            put_oi_below = df_sum_aug[df_sum_aug["Strike"] < spot].copy() if "openInterest_PE" in df_sum_aug.columns else pd.DataFrame()
+            call_oi_above = df_sum_aug[df_sum_aug["Strike"] > spot].copy() if "openInterest_CE" in df_sum_aug.columns else pd.DataFrame()
+
+            if not put_oi_below.empty:
+                top_put = put_oi_below.nlargest(3, "openInterest_PE")
+                for _, row in top_put.iterrows():
+                    price = float(row["Strike"])
+                    oi_val = float(row["openInterest_PE"]) / 100000  # to Lakhs
+                    # Only add if not already in major_supports
+                    if not any(abs(m["price"] - price) < 50 for m in major_supports):
+                        major_supports.append({
+                            "price": price, "qty": oi_val * 1000,
+                            "strength_label": "🏛️ Institutional Support (OI)",
+                            "color": "#7c4dff", "_oi_label": f"PE OI: {oi_val:.1f}L"
+                        })
+
+            if not call_oi_above.empty:
+                top_call = call_oi_above.nlargest(3, "openInterest_CE")
+                for _, row in top_call.iterrows():
+                    price = float(row["Strike"])
+                    oi_val = float(row["openInterest_CE"]) / 100000
+                    if not any(abs(m["price"] - price) < 50 for m in major_resistances):
+                        major_resistances.append({
+                            "price": price, "qty": oi_val * 1000,
+                            "strength_label": "🏛️ Institutional Resistance (OI)",
+                            "color": "#7c4dff", "_oi_label": f"CE OI: {oi_val:.1f}L"
+                        })
+
+    # Sort final lists
+    major_supports    = sorted(major_supports,    key=lambda x: x["qty"], reverse=True)[:5]
+    major_resistances = sorted(major_resistances, key=lambda x: x["qty"], reverse=True)[:5]
+
+    msr1, msr2 = st.columns(2)
+    with msr1:
+        st.markdown("##### 🟢 Major Support Levels")
+        sup_rows = []
+        for i, s in enumerate(major_supports, 1):
+            dist = spot - s["price"]
+            oi_note = s.get("_oi_label", "")
+            sup_rows.append({
+                "Rank": f"#{i}",
+                "Strike (₹)": f"₹{s['price']:,.0f}",
+                "Volume": f"{s['qty']:,.0f}",
+                "Strength": s["strength_label"],
+                "Distance": f"{dist:.0f} pts ({dist/spot*100:.2f}%)",
+                "OI Info": oi_note,
+            })
+        if sup_rows:
+            sup_df = pd.DataFrame(sup_rows)
+            def _sup_major_style(row):
+                if "Institutional" in str(row["Strength"]):
+                    return [""] + ["background-color:#1a0a3a;color:#ce93d8;font-weight:bold"] * (len(row)-1)
+                return [""] + ["background-color:#1a3a1a;color:#00e676"] * (len(row)-1)
+            st.dataframe(sup_df.style.apply(_sup_major_style, axis=1),
+                         use_container_width=True, hide_index=True)
+
+    with msr2:
+        st.markdown("##### 🔴 Major Resistance Levels")
+        res_rows = []
+        for i, r in enumerate(major_resistances, 1):
+            dist = r["price"] - spot
+            oi_note = r.get("_oi_label", "")
+            res_rows.append({
+                "Rank": f"#{i}",
+                "Strike (₹)": f"₹{r['price']:,.0f}",
+                "Volume": f"{r['qty']:,.0f}",
+                "Strength": r["strength_label"],
+                "Distance": f"{dist:.0f} pts ({dist/spot*100:.2f}%)",
+                "OI Info": oi_note,
+            })
+        if res_rows:
+            res_df = pd.DataFrame(res_rows)
+            def _res_major_style(row):
+                if "Institutional" in str(row["Strength"]):
+                    return [""] + ["background-color:#1a0a3a;color:#ce93d8;font-weight:bold"] * (len(row)-1)
+                return [""] + ["background-color:#3a1a1a;color:#ff5252"] * (len(row)-1)
+            st.dataframe(res_df.style.apply(_res_major_style, axis=1),
+                         use_container_width=True, hide_index=True)
+
     # ── MODULE 3+4+7: Full Depth Table ────────────────────────────────
     st.markdown("#### 📋 Full Order Book — 10 Levels Each Side")
 
@@ -9671,6 +9765,569 @@ def show_sector_rotation_engine():
             st.info(al)
     else:
         st.success("✅ No critical sector rotation alerts at this time.")
+
+
+# =====================================================================
+# INTRADAY SECTOR ROTATION ENGINE
+# =====================================================================
+
+_INTRA_SECTORS = [
+    {"name": "NIFTY BANK",    "yf": "^NSEBANK",   "weight": 3},
+    {"name": "NIFTY IT",      "yf": "^CNXIT",     "weight": 2},
+    {"name": "NIFTY AUTO",    "yf": "^CNXAUTO",   "weight": 2},
+    {"name": "NIFTY FMCG",   "yf": "^CNXFMCG",   "weight": 1},
+    {"name": "NIFTY PHARMA", "yf": "^CNXPHARMA",  "weight": 1},
+    {"name": "NIFTY METAL",  "yf": "^CNXMETAL",   "weight": 1},
+    {"name": "NIFTY ENERGY", "yf": "^CNXENERGY",  "weight": 2},
+    {"name": "PSU BANK",     "yf": "^CNXPSUBANK", "weight": 1},
+    {"name": "NIFTY REALTY", "yf": "^CNXREALTY",  "weight": 1},
+]
+_INTRA_BENCH = "^NSEI"
+
+@st.cache_data(ttl=180)
+def _intra_fetch_all():
+    """Fetch 2-day 5m data for sectors + NIFTY50 benchmark."""
+    if not _YF_AVAILABLE:
+        return {}
+    import yfinance as yf
+    tickers = [s["yf"] for s in _INTRA_SECTORS] + [_INTRA_BENCH]
+    try:
+        raw = yf.download(
+            tickers, period="2d", interval="5m",
+            group_by="ticker", auto_adjust=True, progress=False
+        )
+        out = {}
+        for sym in tickers:
+            try:
+                if len(tickers) == 1:
+                    df_s = raw.copy()
+                else:
+                    df_s = raw[sym].copy() if sym in raw.columns.get_level_values(0) else pd.DataFrame()
+                df_s.columns = [c.lower() for c in df_s.columns]
+                df_s = df_s.dropna(subset=["close"])
+                out[sym] = df_s
+            except Exception:
+                out[sym] = pd.DataFrame()
+        return out
+    except Exception:
+        return {}
+
+def _intra_momentum(cl: pd.Series, bars: int) -> float:
+    if len(cl) < bars + 1:
+        return np.nan
+    return (cl.iloc[-1] / cl.iloc[-bars - 1] - 1) * 100
+
+def _intra_phase(rs_ratio: float, rs_slope: float,
+                 mom5: float, mom15: float, mom1h: float) -> str:
+    if rs_ratio > 100 and rs_slope > 0 and mom15 > 0 and mom1h > 0:
+        return "LEADING"
+    if rs_ratio < 100 and rs_slope > 0 and mom5 > 0:
+        return "IMPROVING"
+    if rs_ratio > 100 and rs_slope < 0 and mom5 < 0:
+        return "WEAKENING"
+    if rs_ratio < 100 and rs_slope < 0 and mom15 < 0:
+        return "LAGGING"
+    return "NEUTRAL"
+
+def _intra_sector_score(mom5: float, mom15: float, mom1h: float) -> float:
+    """Sector_Score = mom5×0.35 + mom15×0.35 + mom1h×0.30, normalised 0–100."""
+    vals = [v for v in [mom5, mom15, mom1h] if not np.isnan(v)]
+    if not vals:
+        return 50.0
+    raw = mom5 * 0.35 + mom15 * 0.35 + mom1h * 0.30
+    # Sigmoid-style map: raw ±2% → 0–100
+    return max(0, min(100, 50 + raw * 12.5))
+
+def show_intraday_sector_rotation():
+    """Intraday Sector Rotation Engine — 5m/15m/1h RS and phase detection."""
+    st.markdown("### ⚡ Sector Rotation Engine — Intraday Version")
+
+    if not _YF_AVAILABLE:
+        st.warning("yfinance required. Check requirements.txt.")
+        return
+
+    with st.spinner("Fetching intraday sector data (5m)..."):
+        data = _intra_fetch_all()
+
+    if not data:
+        st.error("Could not fetch sector data.")
+        return
+
+    bench_df = data.get(_INTRA_BENCH, pd.DataFrame())
+    if bench_df.empty or "close" not in bench_df.columns:
+        st.warning("NIFTY 50 benchmark data unavailable.")
+        return
+
+    bench_cl = bench_df["close"]
+    bench_now = bench_cl.iloc[-1]
+    # bars for each window (5m data): 5m=1, 15m=3, 1h=12
+    B5, B15, B1H = 1, 3, 12
+
+    rows = []
+    prev_leaders_key = "intra_prev_leaders"
+    if prev_leaders_key not in st.session_state:
+        st.session_state[prev_leaders_key] = []
+
+    for sec in _INTRA_SECTORS:
+        sym   = sec["yf"]
+        name  = sec["name"]
+        df_s  = data.get(sym, pd.DataFrame())
+
+        if df_s.empty or "close" not in df_s.columns or len(df_s) < 2:
+            rows.append({"Sector": name, "RS Ratio": "N/A", "Momentum 5m": "N/A",
+                         "Momentum 15m": "N/A", "Momentum 1h": "N/A",
+                         "Phase": "UNKNOWN", "Strength Score": 50, "Rotation Signal": "—",
+                         "_raw_score": 50.0, "_phase": "UNKNOWN"})
+            continue
+
+        cl = df_s["close"]
+        now_price = cl.iloc[-1]
+
+        # RS Ratio
+        bench_aligned = bench_cl.reindex(cl.index, method="ffill").dropna()
+        cl_aligned = cl.reindex(bench_aligned.index).dropna()
+        idx = cl_aligned.index.intersection(bench_aligned.index)
+        rs = (cl_aligned.loc[idx].iloc[-1] / bench_aligned.loc[idx].iloc[-1] * 100) \
+            if len(idx) > 0 else 100.0
+
+        # RS Slope (current vs 3 bars ago)
+        if len(idx) >= 4:
+            rs_prev = (cl_aligned.loc[idx].iloc[-4] / bench_aligned.loc[idx].iloc[-4] * 100)
+        else:
+            rs_prev = rs
+        rs_slope = rs - rs_prev
+
+        # Momentum windows
+        mom5  = _intra_momentum(cl, B5)
+        mom15 = _intra_momentum(cl, B15)
+        mom1h = _intra_momentum(cl, B1H)
+
+        phase = _intra_phase(rs, rs_slope, mom5 or 0, mom15 or 0, mom1h or 0)
+        score = _intra_sector_score(mom5 or 0, mom15 or 0, mom1h or 0)
+
+        def _fmt(v):
+            return f"{v:+.2f}%" if not np.isnan(v) else "N/A"
+
+        rows.append({
+            "Sector":        name,
+            "RS Ratio":      f"{rs:.1f}",
+            "Momentum 5m":   _fmt(mom5),
+            "Momentum 15m":  _fmt(mom15),
+            "Momentum 1h":   _fmt(mom1h),
+            "Phase":         phase,
+            "Strength Score":int(score),
+            "Rotation Signal": "—",
+            "_raw_score":    score,
+            "_phase":        phase,
+            "_mom5":         mom5 or 0,
+            "_mom15":        mom15 or 0,
+            "_rs":           rs,
+        })
+
+    # Sort by score
+    rows_sorted = sorted(rows, key=lambda x: x["_raw_score"], reverse=True)
+
+    # ── Module 6+7: Leadership & Rotation Detection ──────────────────
+    top3   = [r["Sector"] for r in rows_sorted[:3]]
+    bot3   = [r["Sector"] for r in rows_sorted[-3:]]
+    prev_l = st.session_state.get(prev_leaders_key, [])
+    rotation_alerts = []
+
+    for r in rows_sorted:
+        if r["Sector"] in top3:
+            r["Rotation Signal"] = "⭐ LEADER"
+        elif r["Sector"] in bot3:
+            r["Rotation Signal"] = "⚠️ WEAK"
+
+    # Detect rotation: previous leader now not in top3
+    if prev_l:
+        for old_lead in prev_l:
+            if old_lead not in top3:
+                new_lead = top3[0] if top3 else "Unknown"
+                rotation_alerts.append(
+                    f"🔄 **ROTATION ALERT**: Money rotating from **{old_lead}** → **{new_lead}**"
+                )
+    st.session_state[prev_leaders_key] = top3
+
+    # ── Module 8: Market Bias ─────────────────────────────────────────
+    leading_count  = sum(1 for r in rows if r["_phase"] == "LEADING")
+    lagging_count  = sum(1 for r in rows if r["_phase"] == "LAGGING")
+    heavy_leading  = sum(1 for r in rows_sorted[:3] if r["_phase"] == "LEADING")
+    if heavy_leading >= 2:
+        mkt_bias, bias_color = "BULLISH", "#00e676"
+    elif lagging_count >= 5:
+        mkt_bias, bias_color = "BEARISH", "#ff5252"
+    else:
+        mkt_bias, bias_color = "RANGE / NEUTRAL", "#ffeb3b"
+
+    # ── KPI strip ────────────────────────────────────────────────────
+    kc1, kc2, kc3, kc4 = st.columns(4)
+    with kc1:
+        st.markdown(
+            f"<div style='padding:10px;background:#1e1e1e;border-radius:8px;"
+            f"border-left:4px solid {bias_color};'>"
+            f"<span style='font-size:11px;color:#aaa'>Market Bias</span><br>"
+            f"<span style='font-size:20px;font-weight:bold;color:{bias_color}'>{mkt_bias}</span>"
+            f"</div>", unsafe_allow_html=True)
+    with kc2:
+        st.metric("Leading Sectors", leading_count)
+    with kc3:
+        st.metric("Top Leader", top3[0] if top3 else "—")
+    with kc4:
+        st.metric("Weakest Sector", bot3[-1] if bot3 else "—")
+
+    # ── Module 9: Dashboard Table ─────────────────────────────────────
+    st.markdown("#### 📊 Intraday Sector Dashboard")
+    _PHASE_STYLES = {
+        "LEADING":   "background-color:#1a3a1a; color:#00e676; font-weight:bold",
+        "IMPROVING": "background-color:#1a2a3a; color:#40c4ff; font-weight:bold",
+        "WEAKENING": "background-color:#2a2a1a; color:#ffeb3b; font-weight:bold",
+        "LAGGING":   "background-color:#3a1a1a; color:#ff5252; font-weight:bold",
+        "NEUTRAL":   "color:#bdbdbd",
+        "UNKNOWN":   "color:#757575",
+    }
+
+    disp_cols = ["Sector","RS Ratio","Momentum 5m","Momentum 15m",
+                 "Momentum 1h","Phase","Strength Score","Rotation Signal"]
+    disp_df = pd.DataFrame([{c: r[c] for c in disp_cols} for r in rows_sorted])
+
+    def _intra_style(row):
+        styles = [""] * len(row)
+        col_names = list(row.index)
+        phase = str(row.get("Phase", ""))
+        for i, col in enumerate(col_names):
+            if col == "Phase":
+                styles[i] = _PHASE_STYLES.get(phase, "")
+            elif col == "Strength Score":
+                score_v = int(row[col]) if str(row[col]).isdigit() else 50
+                if score_v >= 65:   styles[i] = "color:#00e676; font-weight:bold"
+                elif score_v >= 55: styles[i] = "color:#69f0ae"
+                elif score_v <= 35: styles[i] = "color:#ff5252; font-weight:bold"
+                elif score_v <= 45: styles[i] = "color:#ff8a80"
+                else:               styles[i] = "color:#bdbdbd"
+            elif col in ("Momentum 5m","Momentum 15m","Momentum 1h"):
+                try:
+                    v = float(str(row[col]).replace("%","").replace("+",""))
+                    styles[i] = "color:#00e676" if v > 0 else ("color:#ff5252" if v < 0 else "")
+                except Exception:
+                    pass
+            elif col == "Rotation Signal" and "LEADER" in str(row[col]):
+                styles[i] = "color:#ffd700; font-weight:bold"
+            elif col == "Rotation Signal" and "WEAK" in str(row[col]):
+                styles[i] = "color:#ff8a80"
+        return styles
+
+    st.dataframe(
+        disp_df.style.apply(_intra_style, axis=1),
+        use_container_width=True, hide_index=True, height=380
+    )
+
+    # ── Phase Summary ─────────────────────────────────────────────────
+    st.markdown("#### 🔄 Intraday Phase Distribution")
+    pc1, pc2, pc3, pc4 = st.columns(4)
+    with pc1:
+        leading_list = [r["Sector"] for r in rows if r["_phase"]=="LEADING"]
+        st.success(f"**LEADING** ({len(leading_list)})\n\n" + "\n".join(f"• {s}" for s in leading_list) if leading_list else "None")
+    with pc2:
+        improving_list = [r["Sector"] for r in rows if r["_phase"]=="IMPROVING"]
+        st.info(f"**IMPROVING** ({len(improving_list)})\n\n" + "\n".join(f"• {s}" for s in improving_list) if improving_list else "None")
+    with pc3:
+        weakening_list = [r["Sector"] for r in rows if r["_phase"]=="WEAKENING"]
+        st.warning(f"**WEAKENING** ({len(weakening_list)})\n\n" + "\n".join(f"• {s}" for s in weakening_list) if weakening_list else "None")
+    with pc4:
+        lagging_list = [r["Sector"] for r in rows if r["_phase"]=="LAGGING"]
+        st.error(f"**LAGGING** ({len(lagging_list)})\n\n" + "\n".join(f"• {s}" for s in lagging_list) if lagging_list else "None")
+
+    # Rotation alerts
+    if rotation_alerts:
+        st.markdown("#### 🚨 Rotation Alerts")
+        for a in rotation_alerts:
+            st.warning(a)
+
+
+# =====================================================================
+# FINAL INTELLIGENCE DASHBOARD
+# =====================================================================
+
+def _fid_ema_align(df: pd.DataFrame) -> tuple:
+    """Returns (trend_str, score_0_100) from EMA stack."""
+    try:
+        cl = df["close"] if "close" in df.columns else df.iloc[:, 3]
+        e9  = cl.ewm(span=9,  adjust=False).mean().iloc[-1]
+        e21 = cl.ewm(span=21, adjust=False).mean().iloc[-1]
+        e50 = cl.ewm(span=50, adjust=False).mean().iloc[-1]
+        if e9 > e21 > e50:   return "BULLISH STACK",  78
+        if e9 < e21 < e50:   return "BEARISH STACK",  22
+        if e9 > e21:         return "SHORT-TERM BULL", 60
+        return "SHORT-TERM BEAR", 40
+    except Exception:
+        return "UNKNOWN", 50
+
+def _fid_adx(df: pd.DataFrame) -> float:
+    try:
+        hi, lo, cl = df["high"], df["low"], df["close"]
+        tr = pd.concat([hi-lo, (hi-cl.shift()).abs(), (lo-cl.shift()).abs()], axis=1).max(axis=1)
+        dm_p = hi.diff().clip(lower=0)
+        dm_m = (-lo.diff()).clip(lower=0)
+        dm_p = dm_p.where(dm_p > dm_m, 0)
+        dm_m = dm_m.where(dm_m > dm_p, 0)
+        atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+        di_p  = 100 * dm_p.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+        di_m  = 100 * dm_m.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+        dx    = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, np.nan)
+        return float(dx.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+    except Exception:
+        return 20.0
+
+def show_final_intelligence_dashboard(df: pd.DataFrame = None,
+                                       option_data: dict = None,
+                                       current_price: float = None):
+    """
+    Master Intelligence Dashboard — aggregates ALL engines into one
+    institutional-grade summary panel.
+    """
+    st.markdown("## 🎯 NIFTY Intelligence Summary — Master Dashboard")
+    st.caption("Real-time composite view across Options · Futures · FII · Sectors · News · Depth")
+
+    spot = current_price or 0.0
+    if spot <= 0 and option_data:
+        spot = float(option_data.get("underlying", 0) or 0)
+
+    # ── Pull from option_data ─────────────────────────────────────────
+    pcr       = option_data.get("pcr", 1.0) if option_data else 1.0
+    max_pain  = option_data.get("max_pain_strike") if option_data else None
+    atm       = option_data.get("atm_strike") if option_data else None
+    expiry    = option_data.get("expiry", "") if option_data else ""
+    df_sum    = option_data.get("df_summary") if option_data else None
+    total_ce_chg = option_data.get("total_ce_change", 0) if option_data else 0
+    total_pe_chg = option_data.get("total_pe_change", 0) if option_data else 0
+
+    # ── Compute GEX quick ─────────────────────────────────────────────
+    gex_total, gex_flip, gex_signal = 0.0, None, "N/A"
+    if df_sum is not None and not df_sum.empty and spot > 0:
+        gex_data = calculate_dealer_gex(df_sum, spot, 25)
+        if gex_data:
+            gex_total = gex_data.get("total_gex", 0)
+            gex_flip  = gex_data.get("gamma_flip_level")
+            gex_signal = gex_data.get("gex_signal", "N/A")
+
+    # ── Compute OI S/R walls ──────────────────────────────────────────
+    max_ce_strike, max_pe_strike = None, None
+    if df_sum is not None and not df_sum.empty:
+        if "openInterest_CE" in df_sum.columns:
+            max_ce_strike = float(df_sum.loc[df_sum["openInterest_CE"].idxmax(), "Strike"])
+        if "openInterest_PE" in df_sum.columns:
+            max_pe_strike = float(df_sum.loc[df_sum["openInterest_PE"].idxmax(), "Strike"])
+
+    # ── EMA + ADX from price chart ────────────────────────────────────
+    ema_trend, ema_score = "UNKNOWN", 50
+    adx_val = 20.0
+    price_chg_pct = 0.0
+    if df is not None and not df.empty and len(df) >= 10:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        if "close" in df2.columns:
+            ema_trend, ema_score = _fid_ema_align(df2)
+            adx_val = _fid_adx(df2)
+            cl2 = df2["close"]
+            if len(cl2) > 1:
+                price_chg_pct = (cl2.iloc[-1] - cl2.iloc[-2]) / cl2.iloc[-2] * 100
+
+    # ── Composite scoring ─────────────────────────────────────────────
+    # Price Action (30%)
+    pa_score = ema_score
+
+    # Options / OI (20%)
+    oi_score = 50
+    if pcr > 1.3:   oi_score = 72
+    elif pcr > 1.1: oi_score = 60
+    elif pcr < 0.7: oi_score = 28
+    elif pcr < 0.9: oi_score = 40
+
+    # GEX contribution to oi_score
+    if gex_total > 50:  oi_score = min(oi_score + 5, 100)
+    elif gex_total < -50: oi_score = max(oi_score - 5, 0)
+
+    # FII (20%) — try session state if FII engine ran
+    fii_score = 50
+    fii_net_str = "N/A"
+    try:
+        _fii_raw = _fii_fetch_cash_data()
+        if _fii_raw:
+            _fii_cd = _fii_parse_cash(_fii_raw)
+            if not _fii_cd.empty:
+                fii_net = float(_fii_cd["FII Net"].iloc[0])
+                fii_net_str = f"₹{fii_net:+,.0f} Cr"
+                if fii_net > 2000:   fii_score = 82
+                elif fii_net > 500:  fii_score = 65
+                elif fii_net < -2000: fii_score = 18
+                elif fii_net < -500:  fii_score = 35
+    except Exception:
+        pass
+
+    # News (20%) — use cached value from session if available
+    news_score = st.session_state.get("_fid_news_score", 50)
+
+    # Sector (10%)
+    sect_score = st.session_state.get("_fid_sector_score", 50)
+
+    # Combined composite
+    weights = {"PA": 0.30, "OI": 0.20, "FII": 0.20, "News": 0.20, "Sector": 0.10}
+    scores  = {"PA": pa_score, "OI": oi_score, "FII": fii_score, "News": news_score, "Sector": sect_score}
+    composite = int(sum(scores[k] * weights[k] for k in scores))
+
+    # Trend probability
+    trend_prob = composite
+    # Breakout probability
+    adx_boost = 10 if adx_val > 25 else -5
+    vol_boost  = 10 if abs(price_chg_pct) > 0.5 else 0
+    breakout_prob = min(100, max(0, composite + adx_boost + vol_boost))
+    # Risk level
+    indecision = abs(composite - 50)
+    risk_level = "HIGH" if indecision < 10 else ("LOW" if indecision > 25 else "MEDIUM")
+
+    # Direction label
+    if composite >= 70:
+        direction, dir_color, dir_icon = "STRONG BULLISH",  "#00e676", "🟢"
+    elif composite >= 55:
+        direction, dir_color, dir_icon = "BULLISH",         "#69f0ae", "🟢"
+    elif composite <= 30:
+        direction, dir_color, dir_icon = "STRONG BEARISH",  "#ff5252", "🔴"
+    elif composite <= 45:
+        direction, dir_color, dir_icon = "BEARISH",         "#ff8a80", "🔴"
+    else:
+        direction, dir_color, dir_icon = "NEUTRAL / RANGE", "#ffeb3b", "🟡"
+
+    # Trend strength label from ADX
+    if adx_val >= 40:    trend_str = "VERY STRONG"
+    elif adx_val >= 25:  trend_str = "STRONG"
+    elif adx_val >= 18:  trend_str = "MODERATE"
+    else:                trend_str = "WEAK / CHOPPY"
+
+    # ── SECTION 1: Hero metrics ───────────────────────────────────────
+    st.markdown("---")
+    h1, h2, h3, h4, h5 = st.columns(5)
+
+    def _hero(col, title, value, sub, color, icon=""):
+        col.markdown(
+            f"<div style='text-align:center;padding:14px;background:#1e1e1e;"
+            f"border-radius:10px;border:1px solid {color};'>"
+            f"<div style='font-size:10px;color:#888;text-transform:uppercase'>{title}</div>"
+            f"<div style='font-size:22px;font-weight:bold;color:{color};margin:4px 0'>{icon} {value}</div>"
+            f"<div style='font-size:11px;color:#aaa'>{sub}</div>"
+            f"</div>", unsafe_allow_html=True
+        )
+
+    _hero(h1, "Market Direction",    direction,            f"Composite: {composite}/100",   dir_color,    dir_icon)
+    _hero(h2, "Trend Strength",      trend_str,            f"ADX: {adx_val:.1f}",           "#40c4ff",    "📈")
+    _hero(h3, "Breakout Probability",f"{breakout_prob}%",  f"Vol Δ: {price_chg_pct:+.2f}%", "#ffeb3b",    "⚡")
+    _hero(h4, "Risk Level",          risk_level,           f"Indecision: {indecision}pts",  "#ff9800",    "⚠️")
+    _hero(h5, "Institutional Flow",  fii_net_str if fii_net_str != "N/A" else "N/A",
+          f"FII Score: {fii_score}",  "#ce93d8",    "🏛️")
+
+    st.markdown("---")
+
+    # ── SECTION 2: Engine Pillar Scores ──────────────────────────────
+    st.markdown("#### 🧠 Intelligence Pillar Breakdown")
+
+    def _score_style(s):
+        if s >= 65: return "#00e676", "BULLISH"
+        if s >= 55: return "#69f0ae", "SLIGHTLY BULLISH"
+        if s <= 35: return "#ff5252", "BEARISH"
+        if s <= 45: return "#ff8a80", "SLIGHTLY BEARISH"
+        return "#ffeb3b", "NEUTRAL"
+
+    pillar_rows = []
+    pillar_info = [
+        ("Price Action (EMA+ADX)",  pa_score,   "30%", ema_trend),
+        ("Options / OI (PCR+GEX)",  oi_score,   "20%", f"PCR={pcr:.2f} GEX={gex_signal}"),
+        ("FII / DII Flow",          fii_score,  "20%", fii_net_str),
+        ("News Sentiment",          news_score, "20%", "Keyword-scored RSS"),
+        ("Sector Rotation",         sect_score, "10%", "RS-Ratio vs NIFTY"),
+    ]
+    for name, sc, wt, detail in pillar_info:
+        clr, lbl = _score_style(sc)
+        pillar_rows.append({"Pillar": name, "Score": sc, "Weight": wt,
+                             "Signal": lbl, "Detail": detail, "_clr": clr})
+
+    pillar_df = pd.DataFrame(pillar_rows)
+
+    def _pillar_style(row):
+        clr, _ = _score_style(int(row["Score"]))
+        styles = ["", f"color:{clr};font-weight:bold", "", f"color:{clr};font-weight:bold", "", ""]
+        return styles
+
+    st.dataframe(
+        pillar_df.drop(columns=["_clr"]).style.apply(_pillar_style, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    # ── SECTION 3: Options Pressure Panel ────────────────────────────
+    st.markdown("#### 📊 Options Intelligence Summary")
+    oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
+    oc1.metric("PCR (OI)",        f"{pcr:.2f}",   delta="Bullish" if pcr > 1.0 else "Bearish")
+    oc2.metric("ATM Strike",      f"{atm:,.0f}"  if atm else "N/A")
+    oc3.metric("Max Pain",        f"{max_pain:,.0f}" if max_pain else "N/A")
+    oc4.metric("Call Wall (Res)", f"{max_ce_strike:,.0f}" if max_ce_strike else "N/A")
+    oc5.metric("Put Wall (Sup)",  f"{max_pe_strike:,.0f}" if max_pe_strike else "N/A")
+    oc6.metric("GEX Signal",      gex_signal,
+               delta=f"Total: {gex_total:+.0f}",
+               delta_color="normal" if gex_total > 0 else "inverse")
+
+    # ── SECTION 4: Gamma Levels ───────────────────────────────────────
+    st.markdown("#### 🎯 Gamma & Key Price Levels")
+    gc1, gc2, gc3, gc4 = st.columns(4)
+    gc1.metric("Spot Price",       f"₹{spot:,.0f}")
+    gc2.metric("Gamma Flip Level", f"₹{gex_flip:,.0f}" if gex_flip else "N/A",
+               delta="Above Flip" if gex_flip and spot > gex_flip else "Below Flip")
+    gc3.metric("Max Pain Level",   f"₹{max_pain:,.0f}" if max_pain else "N/A",
+               delta=f"{spot-max_pain:+.0f} pts" if max_pain else None)
+    gc4.metric("Expiry", expiry if expiry else "N/A")
+
+    # Key S/R from OI
+    if max_ce_strike and max_pe_strike:
+        sr_dist = max_ce_strike - max_pe_strike
+        st.markdown(
+            f"<div style='padding:10px;background:#1e2530;border-radius:8px;margin:6px 0'>"
+            f"🟢 <b>Support (Put Wall)</b>: ₹{max_pe_strike:,.0f} &nbsp;&nbsp;"
+            f"| 🔴 <b>Resistance (Call Wall)</b>: ₹{max_ce_strike:,.0f} &nbsp;&nbsp;"
+            f"| 📏 <b>Range Width</b>: {sr_dist:.0f} pts &nbsp;&nbsp;"
+            f"| 📍 <b>Spot vs Range</b>: "
+            f"{'Upper Half' if spot > (max_pe_strike+max_ce_strike)/2 else 'Lower Half'}"
+            f"</div>", unsafe_allow_html=True
+        )
+
+    # ── SECTION 5: OI Activity ────────────────────────────────────────
+    st.markdown("#### 📦 Real-Time OI Activity")
+    oia1, oia2, oia3 = st.columns(3)
+    oia1.metric("CE OI Change (L)", f"{total_ce_chg:+.1f}", delta_color="inverse")
+    oia2.metric("PE OI Change (L)", f"{total_pe_chg:+.1f}", delta_color="normal")
+    net_chg = total_pe_chg - total_ce_chg
+    oia3.metric("Net OI Bias",
+                "BUY PRESSURE" if net_chg > 0 else "SELL PRESSURE",
+                delta=f"{net_chg:+.1f}L")
+
+    # ── SECTION 6: Final Verdict ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 🏁 Final Verdict")
+    v1, v2, v3 = st.columns([2, 1, 1])
+    with v1:
+        st.markdown(
+            f"<div style='padding:18px;background:#1e1e1e;border-radius:12px;"
+            f"border:2px solid {dir_color};text-align:center'>"
+            f"<div style='font-size:13px;color:#aaa'>COMPOSITE MARKET DIRECTION</div>"
+            f"<div style='font-size:36px;font-weight:bold;color:{dir_color};margin:8px 0'>"
+            f"{dir_icon} {direction}</div>"
+            f"<div style='font-size:12px;color:#888'>"
+            f"Score {composite}/100 | ADX {adx_val:.0f} | {trend_str} trend"
+            f"</div></div>", unsafe_allow_html=True
+        )
+    with v2:
+        st.metric("Trend Probability",    f"{trend_prob}%")
+        st.metric("Breakout Probability", f"{breakout_prob}%")
+    with v3:
+        st.metric("Risk Level", risk_level)
+        st.metric("EMA Alignment", ema_trend.split()[0])
 
 
 # =====================================================================
@@ -16178,6 +16835,18 @@ def main():
             mime="text/csv"
         )
 
+    # ===== FINAL INTELLIGENCE DASHBOARD (Master Summary) =====
+    st.markdown("---")
+    with st.expander("🎯 NIFTY Intelligence Summary — Master Dashboard", expanded=True):
+        try:
+            show_final_intelligence_dashboard(
+                df=df if not df.empty else None,
+                option_data=option_data,
+                current_price=current_price,
+            )
+        except Exception as _fid_err:
+            st.warning(f"Intelligence Dashboard error: {str(_fid_err)}")
+
     # ===== MARKET ACCELERATION ENGINE =====
     st.markdown("---")
     with st.expander("🚀 Market Acceleration Engine — Spike · Gamma · Expiry Intelligence", expanded=False):
@@ -17055,6 +17724,13 @@ def main():
             show_sector_rotation_engine()
         except Exception as _sre_err:
             st.warning(f"Sector Rotation Engine error: {str(_sre_err)}")
+
+    # ===== INTRADAY SECTOR ROTATION ENGINE =====
+    with st.expander("⚡ Sector Rotation Engine — Intraday (5m/15m/1h)", expanded=False):
+        try:
+            show_intraday_sector_rotation()
+        except Exception as _isr_err:
+            st.warning(f"Intraday Sector Rotation error: {str(_isr_err)}")
 
     # ===== FII / DII ACTIVITY ANALYSIS ENGINE =====
     _fii_net_today_for_news = 0.0
