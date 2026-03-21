@@ -5410,6 +5410,11 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None, l
             df.rename(columns={f"{old_col}_CE": f"{new_col}_CE"}, inplace=True)
         if f"{old_col}_PE" in df.columns:
             df.rename(columns={f"{old_col}_PE": f"{new_col}_PE"}, inplace=True)
+    # Also try alternate field names Dhan may use for security ID
+    for _alt in ('scrip_cd', 'scripCd', 'scripCode', 'scrip_code'):
+        for _sfx in ('_CE', '_PE'):
+            if f"{_alt}{_sfx}" in df.columns and f"scrp_cd{_sfx}" not in df.columns:
+                df.rename(columns={f"{_alt}{_sfx}": f"scrp_cd{_sfx}"}, inplace=True)
     
     df['changeinOpenInterest_CE'] = df['openInterest_CE'] - df['previousOpenInterest_CE']
     df['changeinOpenInterest_PE'] = df['openInterest_PE'] - df['previousOpenInterest_PE']
@@ -5437,6 +5442,9 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None, l
         greeks_pe = calculate_greeks('PE', underlying, strike, T, r, iv_pe / 100)
         df.at[idx, 'Delta_CE'], df.at[idx, 'Gamma_CE'], df.at[idx, 'Vega_CE'], df.at[idx, 'Theta_CE'], df.at[idx, 'Rho_CE'] = greeks_ce
         df.at[idx, 'Delta_PE'], df.at[idx, 'Gamma_PE'], df.at[idx, 'Vega_PE'], df.at[idx, 'Theta_PE'], df.at[idx, 'Rho_PE'] = greeks_pe
+        # Persist resolved IV back to dataframe so display sections show correct values
+        df.at[idx, 'impliedVolatility_CE'] = iv_ce
+        df.at[idx, 'impliedVolatility_PE'] = iv_pe
 
     atm_strike = min(df['strikePrice'], key=lambda x: abs(x - underlying))
     
@@ -11798,6 +11806,8 @@ def main():
         st.session_state.pressure_history = []
     if 'pressure_last_valid' not in st.session_state:
         st.session_state.pressure_last_valid = None
+    if 'iv_skew_signal_last' not in st.session_state:
+        st.session_state.iv_skew_signal_last = None  # (timestamp, signal_text)
 
     # Initialize session state for Pro Trader Dashboard
     if 'pro_trader_history' not in st.session_state:
@@ -16814,6 +16824,41 @@ def main():
                         })
                         if len(st.session_state.pressure_history) > 200:
                             st.session_state.pressure_history = st.session_state.pressure_history[-200:]
+
+                    # --- IV SKEW TELEGRAM SIGNALS ---
+                    if enable_signals:
+                        _actionable = _final_signal not in ("⏳ No Clear Edge",)
+                        _last_iv_sig = st.session_state.iv_skew_signal_last
+                        _cooldown_ok = (
+                            _last_iv_sig is None or
+                            (_ivp_now - _last_iv_sig[0]).total_seconds() > 300 or
+                            _last_iv_sig[1] != _final_signal
+                        )
+                        if _actionable and _cooldown_ok:
+                            _iv_tg_msg = (
+                                f"📡 <b>IV Skew Signal</b>\n"
+                                f"Signal: {_final_signal}\n"
+                                f"Spot: ₹{_ivp_underlying:.0f}\n"
+                                f"IV Skew: {_iv_skew:.3f} (CE {_avg_iv_ce:.1f}% / PE {_avg_iv_pe:.1f}%)\n"
+                                f"Net Pressure: {_net_pressure:+.3f}\n"
+                                f"IV Momentum: {_iv_momentum}"
+                            )
+                            if _spike_alert:
+                                _iv_tg_msg += f"\n⚡ {_spike_alert}"
+                            send_telegram_message_sync(_iv_tg_msg)
+                            st.session_state.iv_skew_signal_last = (_ivp_now, _final_signal)
+                        # Pressure spike alert (independent of signal cooldown)
+                        elif enable_signals and _spike_alert and (
+                            _last_iv_sig is None or
+                            (_ivp_now - _last_iv_sig[0]).total_seconds() > 60
+                        ):
+                            send_telegram_message_sync(
+                                f"⚡ <b>Pressure Spike Detected</b>\n"
+                                f"Spot: ₹{_ivp_underlying:.0f}\n"
+                                f"Net Pressure: {_net_pressure:+.3f} (Δ {_pressure_change:+.3f})\n"
+                                f"Current Signal: {_final_signal}"
+                            )
+                            st.session_state.iv_skew_signal_last = (_ivp_now, _final_signal)
 
                     # ======== UI OUTPUT ========
                     _ivp_c1, _ivp_c2, _ivp_c3 = st.columns(3)
