@@ -211,15 +211,34 @@ class SupabaseDB:
         except:
             st.info("Database tables may need to be created. Please run the SQL setup first.")
     
+    _DB_SCHEMA_SQL = """
+-- Run this once in your Supabase SQL editor to create the required table:
+CREATE TABLE IF NOT EXISTS candle_data (
+    id          bigserial PRIMARY KEY,
+    symbol      text        NOT NULL,
+    exchange    text        NOT NULL,
+    timeframe   text        NOT NULL,
+    timestamp   bigint      NOT NULL,
+    datetime    timestamptz NOT NULL,
+    open        double precision,
+    high        double precision,
+    low         double precision,
+    close       double precision,
+    volume      bigint,
+    UNIQUE (symbol, exchange, timeframe, timestamp)
+);
+CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
+    ON candle_data (symbol, exchange, timeframe, datetime DESC);
+"""
+
     def save_candle_data(self, symbol, exchange, timeframe, df):
-        """Save candle data to Supabase"""
+        """Save candle data to Supabase — silently skips on schema errors."""
         if df.empty:
             return
-        
         try:
             records = []
             for _, row in df.iterrows():
-                record = {
+                records.append({
                     'symbol': symbol,
                     'exchange': exchange,
                     'timeframe': timeframe,
@@ -229,24 +248,31 @@ class SupabaseDB:
                     'high': float(row['high']),
                     'low': float(row['low']),
                     'close': float(row['close']),
-                    'volume': int(row['volume'])
-                }
-                records.append(record)
-            
+                    'volume': int(row['volume']),
+                })
             self.client.table('candle_data').upsert(
-                records, 
+                records,
                 on_conflict="symbol,exchange,timeframe,timestamp"
             ).execute()
-            
         except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving candle data: {str(e)}")
-    
+            err = str(e)
+            if "23505" in err or "duplicate key" in err.lower():
+                return   # ignore duplicate inserts
+            if "does not exist" in err or "42703" in err or "42P01" in err:
+                # Schema mismatch — show SQL once and skip silently
+                if not st.session_state.get('_db_schema_warn_shown'):
+                    st.session_state['_db_schema_warn_shown'] = True
+                    st.warning(
+                        "⚠️ **Supabase table schema mismatch** — candle caching disabled.\n\n"
+                        "Run this SQL in your Supabase SQL editor, then reload:\n"
+                        f"```sql{self._DB_SCHEMA_SQL}```"
+                    )
+            # All other errors: silently skip (don't block the chart)
+
     def get_candle_data(self, symbol, exchange, timeframe, hours_back=24):
-        """Retrieve candle data from Supabase"""
+        """Retrieve candle data from Supabase — returns empty df on schema errors."""
         try:
             cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours_back)
-            
             result = self.client.table('candle_data')\
                 .select('*')\
                 .eq('symbol', symbol)\
@@ -255,16 +281,22 @@ class SupabaseDB:
                 .gte('datetime', cutoff_time.isoformat())\
                 .order('timestamp', desc=False)\
                 .execute()
-            
             if result.data:
                 df = pd.DataFrame(result.data)
                 df['datetime'] = pd.to_datetime(df['datetime'])
                 return df
-            else:
-                return pd.DataFrame()
-                
+            return pd.DataFrame()
         except Exception as e:
-            st.error(f"Error retrieving candle data: {str(e)}")
+            err = str(e)
+            if "does not exist" in err or "42703" in err or "42P01" in err:
+                if not st.session_state.get('_db_schema_warn_shown'):
+                    st.session_state['_db_schema_warn_shown'] = True
+                    st.warning(
+                        "⚠️ **Supabase `candle_data` table missing or wrong schema** — "
+                        "cache disabled, fetching live from API.\n\n"
+                        "Fix: run this SQL in Supabase → SQL Editor:\n"
+                        f"```sql{self._DB_SCHEMA_SQL}```"
+                    )
             return pd.DataFrame()
     
     def clear_old_candle_data(self, days_old=7):
@@ -448,6 +480,29 @@ class DhanAPI:
             'access-token': self.access_token,
             'client-id': self.client_id
         }
+
+    def _handle_api_error(self, status_code, body=""):
+        """Show a clean, actionable error for known Dhan API status codes."""
+        if status_code == 403:
+            if not st.session_state.get('_dhan_403_shown'):
+                st.session_state['_dhan_403_shown'] = True
+                st.error(
+                    "🔐 **Dhan API — Access Denied (403)**\n\n"
+                    "Your access token has **expired or is invalid**.\n\n"
+                    "**Fix:**\n"
+                    "1. Log in to [Dhan Developer Console](https://developer.dhan.co)\n"
+                    "2. Generate a new Access Token\n"
+                    "3. Update `DHAN_ACCESS_TOKEN` in your Streamlit secrets (`.streamlit/secrets.toml`)\n"
+                    "4. Reload the app"
+                )
+        elif status_code == 401:
+            st.error("🔐 **Dhan API — Unauthorised (401):** Invalid client ID or token. Check your credentials.")
+        elif status_code == 429:
+            st.warning("⏳ **Dhan API — Rate Limited (429):** Too many requests. Please wait a moment and refresh.")
+        elif status_code >= 500:
+            st.warning(f"🌐 **Dhan API — Server Error ({status_code}):** Dhan servers are temporarily unavailable. Try again shortly.")
+        else:
+            st.error(f"**Dhan API Error {status_code}** — please check your credentials and network.")
         
     def get_intraday_data(self, security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval="1", days_back=1):
         """Get intraday historical data"""
@@ -472,10 +527,10 @@ class DhanAPI:
             if response.status_code == 200:
                 return response.json()
             else:
-                st.error(f"API Error: {response.status_code} - {response.text}")
+                self._handle_api_error(response.status_code, response.text)
                 return None
         except Exception as e:
-            st.error(f"Error fetching data: {str(e)}")
+            st.error(f"Network error fetching chart data: {str(e)}")
             return None
 
     def get_intraday_data_range(self, security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval="1", from_date=None, to_date=None):
@@ -501,10 +556,10 @@ class DhanAPI:
             if response.status_code == 200:
                 return response.json()
             else:
-                st.error(f"API Error: {response.status_code} - {response.text}")
+                self._handle_api_error(response.status_code, response.text)
                 return None
         except Exception as e:
-            st.error(f"Error fetching data: {str(e)}")
+            st.error(f"Network error fetching range data: {str(e)}")
             return None
 
     def get_ltp_data(self, security_id="13", exchange_segment="IDX_I"):
@@ -520,10 +575,10 @@ class DhanAPI:
             if response.status_code == 200:
                 return response.json()
             else:
-                st.error(f"LTP API Error: {response.status_code}")
+                self._handle_api_error(response.status_code, response.text)
                 return None
         except Exception as e:
-            st.error(f"Error fetching LTP: {str(e)}")
+            st.error(f"Network error fetching LTP: {str(e)}")
             return None
 
 @st.cache_data(ttl=300)  # Cache expiry list for 5 minutes
