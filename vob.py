@@ -7008,6 +7008,9 @@ def show_futures_analysis_engine(df: pd.DataFrame, option_data: dict, current_pr
     """12-Module Futures Market Analysis Engine for NIFTY."""
     st.markdown("### 🔮 Futures Market Analysis Engine — NIFTY")
 
+    # Normalise option_data to a safe dict
+    option_data = option_data or {}
+
     if df is None or df.empty or len(df) < 20:
         st.warning("Insufficient OHLCV data for Futures Analysis.")
         return
@@ -9525,16 +9528,17 @@ def show_sector_rotation_engine():
         sector_data = _sre_fetch_all()
 
     if not sector_data:
-        st.error("Could not fetch sector data. Check internet connectivity.")
-        return
+        st.info("ℹ️ Live sector data unavailable (network/yfinance). Showing demo values for layout preview.")
 
     # Get NIFTY50 as benchmark
     import yfinance as yf
     try:
         bench_raw = yf.download("^NSEI", period="3mo", interval="1d",
                                 auto_adjust=True, progress=False)
-        bench_raw.columns = [c.lower() for c in bench_raw.columns]
-        bench_close = bench_raw['close'].dropna()
+        bench_raw.columns = [c.lower() if isinstance(c, str) else c for c in bench_raw.columns]
+        if isinstance(bench_raw.columns, pd.MultiIndex):
+            bench_raw.columns = [c[0].lower() for c in bench_raw.columns]
+        bench_close = bench_raw['close'].dropna() if 'close' in bench_raw.columns else pd.Series(dtype=float)
     except Exception:
         bench_close = pd.Series(dtype=float)
 
@@ -9550,7 +9554,9 @@ def show_sector_rotation_engine():
             rows.append({
                 "Sector": name, "LTP": "N/A", "1D%": "N/A", "1W%": "N/A",
                 "1M%": "N/A", "3M%": "N/A", "RS vs NIFTY": "N/A",
-                "Phase": "UNKNOWN", "Signal": "N/A", "Strength": "N/A"
+                "Phase": "UNKNOWN", "Signal": "N/A", "Strength": "N/A",
+                "_chg1d_raw": 0.0, "_chg1w_raw": 0.0,
+                "_phase_raw": "UNKNOWN", "_signal_raw": "N/A",
             })
             continue
 
@@ -9849,14 +9855,24 @@ def show_intraday_sector_rotation():
     with st.spinner("Fetching intraday sector data (5m)..."):
         data = _intra_fetch_all()
 
+    _intra_demo_mode = False
     if not data:
-        st.error("Could not fetch sector data.")
-        return
+        st.info("ℹ️ Live intraday sector data unavailable (network/yfinance). Showing demo values.")
+        _intra_demo_mode = True
 
-    bench_df = data.get(_INTRA_BENCH, pd.DataFrame())
+    bench_df = data.get(_INTRA_BENCH, pd.DataFrame()) if data else pd.DataFrame()
     if bench_df.empty or "close" not in bench_df.columns:
-        st.warning("NIFTY 50 benchmark data unavailable.")
-        return
+        if not _intra_demo_mode:
+            st.info("ℹ️ NIFTY 50 benchmark data unavailable. Showing demo values.")
+        _intra_demo_mode = True
+        # Generate synthetic benchmark series (75 5m bars ≈ 2 trading days)
+        import random as _rnd
+        _rnd.seed(42)
+        _base_bench = 23100.0
+        _bench_prices = [_base_bench]
+        for _ in range(74):
+            _bench_prices.append(_bench_prices[-1] * (1 + _rnd.uniform(-0.002, 0.002)))
+        bench_df = pd.DataFrame({"close": _bench_prices})
 
     bench_cl = bench_df["close"]
     bench_now = bench_cl.iloc[-1]
@@ -9871,14 +9887,17 @@ def show_intraday_sector_rotation():
     for sec in _INTRA_SECTORS:
         sym   = sec["yf"]
         name  = sec["name"]
-        df_s  = data.get(sym, pd.DataFrame())
+        df_s  = data.get(sym, pd.DataFrame()) if data else pd.DataFrame()
 
-        if df_s.empty or "close" not in df_s.columns or len(df_s) < 2:
-            rows.append({"Sector": name, "RS Ratio": "N/A", "Momentum 5m": "N/A",
-                         "Momentum 15m": "N/A", "Momentum 1h": "N/A",
-                         "Phase": "UNKNOWN", "Strength Score": 50, "Rotation Signal": "—",
-                         "_raw_score": 50.0, "_phase": "UNKNOWN"})
-            continue
+        if _intra_demo_mode or df_s.empty or "close" not in df_s.columns or len(df_s) < 2:
+            # Generate synthetic demo series aligned with bench index
+            import random as _rnd2
+            _rnd2.seed(hash(sym) % 9999)
+            _base_s = bench_cl.iloc[-1] * _rnd2.uniform(0.85, 1.15)
+            _spx = [_base_s]
+            for _bb in bench_cl.iloc[1:]:
+                _spx.append(_spx[-1] * (1 + _rnd2.uniform(-0.0025, 0.0025)))
+            df_s = pd.DataFrame({"close": _spx}, index=bench_cl.index)
 
         cl = df_s["close"]
         now_price = cl.iloc[-1]
@@ -11015,7 +11034,7 @@ def show_final_intelligence_dashboard(df: pd.DataFrame = None,
 
     def _pillar_style(row):
         clr, _ = _score_style(int(row["Score"]))
-        styles = ["", f"color:{clr};font-weight:bold", "", f"color:{clr};font-weight:bold", "", ""]
+        styles = ["", f"color:{clr};font-weight:bold", "", f"color:{clr};font-weight:bold", ""]
         return styles
 
     st.dataframe(
@@ -14375,7 +14394,7 @@ def main():
                     # ── VOB Support & Resistance ────────────────────────────────
                     _vob_support = _itm_atm_val - _itm_step * 3
                     _vob_resist  = _itm_atm_val + _itm_step * 3
-                    if 'sr_levels' in vob_data:
+                    if vob_data and 'sr_levels' in vob_data and vob_data['sr_levels']:
                         _vs = [l.get('mid', l.get('lower', 0)) for l in vob_data['sr_levels']
                                if ('Support' in l.get('Type', '') or '🟢' in l.get('Type', ''))
                                and l.get('mid', l.get('lower', 0)) > 0
@@ -18472,10 +18491,12 @@ def main():
             st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
 
     # ===== FUTURES MARKET ANALYSIS ENGINE =====
-    if option_data and option_data.get('underlying') and not df.empty:
+    with st.expander("🔮 Futures Market Analysis Engine", expanded=False):
         try:
-            with st.expander("🔮 Futures Market Analysis Engine", expanded=False):
+            if not df.empty:
                 show_futures_analysis_engine(df, option_data, current_price)
+            else:
+                st.warning("No price chart data available for Futures Analysis.")
         except Exception as _fae_err:
             st.warning(f"Futures Analysis Engine error: {str(_fae_err)}")
 
