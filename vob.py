@@ -6810,56 +6810,31 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
     st.markdown("## 📐 Geometric & Reversal Pattern Analysis")
     st.caption(f"Detecting 10 pattern types on NIFTY50 — {date_label}")
 
-    # Real-time alerts
+    # ── Pattern Alerts — single unified table ─────────────────────────
+    st.markdown("### 🔔 Pattern Alerts")
     if live_patterns:
-        st.markdown("### 🔔 Pattern Alerts")
-        for p in live_patterns:
+        _alert_rows = []
+        for p in sorted(live_patterns, key=lambda x: x['time'], reverse=True):
             sig = p['signal']
-            color = '#00ff88' if sig == 'BUY' else ('#ff4444' if sig == 'SELL' else '#FFD700')
             icon = '🟢' if sig == 'BUY' else ('🔴' if sig == 'SELL' else '🟡')
-            conf = p['confidence']
+            sig_lbl = f"{icon} {sig}"
             ts = p['time']
             time_str = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else str(ts)
-            st.markdown(
-                f"<div style='background:#111827;padding:10px 14px;border-radius:8px;"
-                f"border-left:4px solid {color};margin:4px 0'>"
-                f"<b style='color:{color}'>{icon} {p['pattern']}</b> &nbsp;|&nbsp; "
-                f"<span style='color:#aaa'>{p['sentiment']}</span> &nbsp;|&nbsp; "
-                f"Signal: <b style='color:{color}'>{sig}</b> &nbsp;|&nbsp; "
-                f"Breakout @ <b>₹{p['entry']:.0f}</b> &nbsp;|&nbsp; "
-                f"SL: ₹{p['stoploss']:.0f} &nbsp;|&nbsp; "
-                f"Target: ₹{p['target']:.0f} &nbsp;|&nbsp; "
-                f"RR: {p['rr']:.2f} &nbsp;|&nbsp; "
-                f"<span style='color:#FFD700'>Confidence: {conf}</span> &nbsp;|&nbsp; "
-                f"Time: {time_str}</div>",
-                unsafe_allow_html=True
-            )
-    else:
-        st.info("No geometric patterns detected on current price data. Patterns will appear when confirmed breakouts occur.")
-
-    # ── Results Table (live patterns) ─────────────────────────────────
-    if live_patterns:
-        st.markdown("### 📊 Pattern Detection Table")
-        rows = []
-        for p in live_patterns:
-            ts = p['time']
-            time_str = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else str(ts)
-            sig = p['signal']
-            sig_lbl = '🟢 BUY' if sig == 'BUY' else ('🔴 SELL' if sig == 'SELL' else '🟡 NEUTRAL')
-            rows.append({
+            _alert_rows.append({
                 'Time': time_str,
-                'Pattern': p['pattern'],
-                'Type': p['pattern_type'],
+                'Pattern': f"{icon} {p['pattern']}",
                 'Sentiment': p['sentiment'],
                 'Signal': sig_lbl,
-                'Entry (₹)': f"{p['entry']:.1f}",
-                'SL (₹)': f"{p['stoploss']:.1f}",
-                'Target (₹)': f"{p['target']:.1f}",
+                'Breakout (₹)': f"₹{p['entry']:.0f}",
+                'SL (₹)': f"₹{p['stoploss']:.0f}",
+                'Target (₹)': f"₹{p['target']:.0f}",
                 'RR': f"{p['rr']:.2f}",
-                'Move %': f"{p['move_pct']:+.2f}%",
                 'Confidence': p['confidence'],
+                'Move %': f"{p['move_pct']:+.2f}%",
             })
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(_alert_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No geometric patterns detected on current price data. Patterns will appear when confirmed breakouts occur.")
 
     # ── Pattern Heatmap (frequency by pattern name) ───────────────────
     st.markdown("### 🗺️ Pattern Heatmap")
