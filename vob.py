@@ -10718,6 +10718,114 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
     iv_trend = _trend(iv_h, 'avg_iv_ce', window=5)
     signals['IV_TREND'] = iv_trend * -0.5  # rising CE IV = fear/uncertainty
 
+    # ── N. MACRO SIGNALS (VIX, USD/INR, CRUDE) — Inverse correlation ─────────
+    macro_signal_data = {}
+    _bn_data = None
+    try:
+        if _YF_AVAILABLE:
+            _bn_data = _bn_fetch_yf_data(tf1="15m", tf2="60m")
+    except Exception:
+        _bn_data = None
+
+    vix_pct, usdinr_pct, crude_pct = 0.0, 0.0, 0.0
+    if _bn_data is not None:
+        _vix_m   = _bn_ticker_metrics(_bn_data, "^INDIAVIX")
+        _usd_m   = _bn_ticker_metrics(_bn_data, "USDINR=X")
+        _crude_m = _bn_ticker_metrics(_bn_data, "CL=F")
+        if _vix_m:
+            vix_pct = _vix_m["pct_d"]
+        if _usd_m:
+            usdinr_pct = _usd_m["pct_d"]
+        if _crude_m:
+            crude_pct = _crude_m["pct_d"]
+
+    # Rising VIX / USD/INR / Crude = bearish for market → negate %change
+    signals['MACRO_VIX']    = min(1, max(-1, -vix_pct   / 2.0))
+    signals['MACRO_USDINR'] = min(1, max(-1, -usdinr_pct / 1.5))
+    signals['MACRO_CRUDE']  = min(1, max(-1, -crude_pct  / 3.0))
+    macro_signal_data = {
+        "vix_pct": vix_pct, "usdinr_pct": usdinr_pct, "crude_pct": crude_pct,
+    }
+
+    # ── O. NIFTY 50 INDICATOR DASHBOARD (multi-TF) ───────────────────────────
+    ind_rsi_score = 0.0
+    ind_vwap_score = 0.0
+    ind_trend_score = 0.0
+    ind_metrics = {}
+    if _bn_data is not None:
+        try:
+            ind_metrics = _bn_indicator_metrics(_bn_data, "^NSEI", tf_keys=("daily", "tf1", "tf2"))
+            _rsi_vals, _vwap_count, _trend_count, _tf_count = [], 0, 0, 0
+            for tf_key in ("daily", "tf1", "tf2"):
+                m = ind_metrics.get(tf_key)
+                if m is None:
+                    continue
+                _tf_count += 1
+                # RSI contribution
+                rsi_v = m.get("rsi")
+                if rsi_v is not None and not (isinstance(rsi_v, float) and np.isnan(rsi_v)):
+                    _rsi_vals.append(float(rsi_v))
+                # VWAP: price above VWAP = bullish
+                ltp_v, vwap_v = m.get("ltp", 0), m.get("vwap")
+                if vwap_v is not None and not (isinstance(vwap_v, float) and np.isnan(vwap_v)):
+                    _vwap_count += 1 if ltp_v > vwap_v else -1
+                # Trend: SuperTrend & EMA
+                st_dir = m.get("st_dir")
+                ema_v = m.get("ema")
+                if st_dir is not None:
+                    _trend_count += 1 if st_dir == -1 else -1  # -1 = bullish in supertrend calc
+                if ema_v is not None and not (isinstance(ema_v, float) and np.isnan(ema_v)):
+                    _trend_count += 1 if ltp_v > ema_v else -1
+            if _rsi_vals:
+                avg_rsi = sum(_rsi_vals) / len(_rsi_vals)
+                ind_rsi_score = min(1, max(-1, (avg_rsi - 50) / 50))
+            if _tf_count > 0:
+                ind_vwap_score  = min(1, max(-1, _vwap_count  / _tf_count))
+                ind_trend_score = min(1, max(-1, _trend_count / (_tf_count * 2)))
+        except Exception:
+            pass
+
+    signals['IND_RSI_MULTI']   = ind_rsi_score
+    signals['IND_VWAP_MULTI']  = ind_vwap_score
+    signals['IND_TREND_MULTI'] = ind_trend_score
+
+    # ── P. CANDLE PATTERNS (recent bars from df) ──────────────────────────────
+    candle_pattern_data = []
+    candle_sig = 0.0
+    if df is not None and len(df) >= 2:
+        try:
+            _recent_df = df.iloc[-30:].copy()  # last 30 bars
+            _cp_list = _detect_chart_candle_types(_recent_df)
+            candle_pattern_data = _cp_list
+            _cp_buy  = sum(1 for p in _cp_list if p['direction'] == 'BUY')
+            _cp_sell = sum(1 for p in _cp_list if p['direction'] == 'SELL')
+            _cp_tot  = _cp_buy + _cp_sell
+            candle_sig = (_cp_buy - _cp_sell) / _cp_tot if _cp_tot > 0 else 0.0
+            candle_sig = min(1, max(-1, candle_sig))
+        except Exception:
+            pass
+    signals['CANDLE_PATTERN'] = candle_sig
+
+    # ── Q. GEOMETRIC & REVERSAL PATTERNS ─────────────────────────────────────
+    geo_pattern_data = []
+    geo_sig = 0.0
+    if df is not None and len(df) >= 15:
+        try:
+            _geo_det = GeometricPatternDetector()
+            geo_pattern_data = _geo_det.detect_all(df)
+            _conf_map = {'Low': 0.25, 'Moderate': 0.5, 'High': 0.75,
+                         'Strong': 1.0, 'Institutional Setup': 1.0}
+            _geo_w_sum, _geo_score = 0.0, 0.0
+            for pat in geo_pattern_data:
+                _cw = _conf_map.get(pat.get('confidence', 'Low'), 0.25)
+                _geo_w_sum += _cw
+                _geo_score += _cw if pat.get('signal') == 'BUY' else (-_cw if pat.get('signal') == 'SELL' else 0)
+            if _geo_w_sum > 0:
+                geo_sig = min(1, max(-1, _geo_score / _geo_w_sum))
+        except Exception:
+            pass
+    signals['GEO_PATTERN'] = geo_sig
+
     # ── 3. WEIGHTED ENSEMBLE (ML-style Random Forest voting) ─────────────────
     weights = {
         'PCR_OI':         0.12,
@@ -10736,6 +10844,17 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         'NEWS':           0.05,
         'SECTOR':         0.03,
         'IV_TREND':       0.06,
+        # Macro signals (inverse — rising = bearish)
+        'MACRO_VIX':      0.07,
+        'MACRO_USDINR':   0.04,
+        'MACRO_CRUDE':    0.03,
+        # NIFTY 50 multi-TF indicator signals
+        'IND_RSI_MULTI':   0.07,
+        'IND_VWAP_MULTI':  0.05,
+        'IND_TREND_MULTI': 0.06,
+        # Pattern signals
+        'CANDLE_PATTERN':  0.06,
+        'GEO_PATTERN':     0.08,
     }
     # Normalise weights
     w_total = sum(weights.values())
@@ -10883,6 +11002,75 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
     else:
         fii_text = "FII/DII cash data unavailable (weekend/holiday or NSE API blocked)."
 
+    # Macro narrative
+    macro_lines = []
+    if _bn_data is not None:
+        vix_emoji = "🔴" if vix_pct > 1.0 else ("🟢" if vix_pct < -1.0 else "🟡")
+        macro_lines.append(f"{vix_emoji} India VIX {vix_pct:+.2f}% — {'Rising VIX signals fear/uncertainty (bearish)' if vix_pct > 1.0 else ('Falling VIX signals calm/confidence (bullish)' if vix_pct < -1.0 else 'VIX stable, no major macro fear')}")
+        usd_emoji = "🔴" if usdinr_pct > 0.3 else ("🟢" if usdinr_pct < -0.3 else "🟡")
+        macro_lines.append(f"{usd_emoji} USD/INR {usdinr_pct:+.2f}% — {'Rupee weakening, foreign outflows likely (bearish)' if usdinr_pct > 0.3 else ('Rupee strengthening, supportive for FII flows (bullish)' if usdinr_pct < -0.3 else 'Rupee stable')}")
+        crude_emoji = "🔴" if crude_pct > 2.0 else ("🟢" if crude_pct < -2.0 else "🟡")
+        macro_lines.append(f"{crude_emoji} Crude Oil {crude_pct:+.2f}% — {'Rising oil raises import costs, CAD risk (bearish)' if crude_pct > 2.0 else ('Falling oil eases inflation, positive for India (bullish)' if crude_pct < -2.0 else 'Crude stable, neutral macro impact')}")
+        macro_text = "\n".join(macro_lines)
+    else:
+        macro_text = "⚠ Macro data unavailable (yfinance not installed or network issue). VIX / USD/INR / Crude signals skipped."
+
+    # Indicator dashboard narrative
+    ind_lines = []
+    for tf_label, tf_key in [("Current (Daily)", "daily"), ("15m", "tf1"), ("60m", "tf2")]:
+        m = ind_metrics.get(tf_key)
+        if m is None:
+            ind_lines.append(f"[{tf_label}] — data unavailable")
+            continue
+        ltp_v  = m.get("ltp", 0)
+        vwap_v = m.get("vwap")
+        ema_v  = m.get("ema")
+        rsi_v  = m.get("rsi")
+        st_dir = m.get("st_dir")
+        adx_v  = m.get("adx", 0)
+        dip_v  = m.get("dip", 0)
+        dim_v  = m.get("dim", 0)
+        vwap_str = ("Above VWAP ✅" if ltp_v > vwap_v else "Below VWAP ❌") if vwap_v is not None else "—"
+        ema_str  = ("Above EMA20 ✅" if ltp_v > ema_v else "Below EMA20 ❌") if ema_v is not None else "—"
+        st_str   = ("SuperTrend UP ✅" if st_dir == -1 else "SuperTrend DOWN ❌") if st_dir is not None else "—"
+        rsi_str  = f"RSI {rsi_v:.1f}" if rsi_v is not None and not (isinstance(rsi_v, float) and np.isnan(rsi_v)) else "RSI —"
+        adx_str  = f"ADX {adx_v:.1f} ({'Trend' if adx_v >= 25 else 'Weak'})" if not (isinstance(adx_v, float) and np.isnan(adx_v)) else "ADX —"
+        di_str   = f"DI+ {dip_v:.1f} vs DI- {dim_v:.1f} → {'Bull' if dip_v > dim_v else 'Bear'}"
+        ind_lines.append(f"[{tf_label}] {vwap_str} | {ema_str} | {st_str} | {rsi_str} | {adx_str} | {di_str}")
+    ind_text = "\n".join(ind_lines) if ind_lines else "NIFTY 50 indicator data unavailable."
+
+    # Candle pattern narrative
+    if candle_pattern_data:
+        _cp_buy_list  = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'BUY']
+        _cp_sell_list = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'SELL']
+        _cp_neut_list = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'NEUTRAL']
+        _cp_last = candle_pattern_data[-1]
+        candle_text = (
+            f"Last 30 bars: {len(_cp_buy_list)} BUY patterns, {len(_cp_sell_list)} SELL patterns, {len(_cp_neut_list)} NEUTRAL.\n"
+            f"Most recent: {_cp_last['pattern']} ({_cp_last['direction']}) @ ₹{_cp_last['price']:,.2f}\n"
+        )
+        if _cp_buy_list:
+            candle_text += f"Bullish candles: {', '.join(dict.fromkeys(_cp_buy_list))}\n"
+        if _cp_sell_list:
+            candle_text += f"Bearish candles: {', '.join(dict.fromkeys(_cp_sell_list))}"
+    else:
+        candle_text = "No candle patterns detected in the last 30 bars (insufficient data or no significant pattern formed)."
+
+    # Geometric pattern narrative
+    if geo_pattern_data:
+        geo_lines = []
+        for pat in geo_pattern_data:
+            sig_icon = "🟢" if pat.get('signal') == 'BUY' else ("🔴" if pat.get('signal') == 'SELL' else "🟡")
+            geo_lines.append(
+                f"{sig_icon} {pat['pattern']} — {pat.get('sentiment', '')} | "
+                f"Entry ₹{pat.get('entry', 0):,.0f} | SL ₹{pat.get('stoploss', 0):,.0f} | "
+                f"Target ₹{pat.get('target', 0):,.0f} | RR {pat.get('rr', 0):.1f}x | "
+                f"Confidence: {pat.get('confidence', '—')}"
+            )
+        geo_text = "\n".join(geo_lines)
+    else:
+        geo_text = "No geometric or reversal patterns detected on current data (pattern requires ≥15 bars with sufficient pivot swing structure)."
+
     # Risk assessment
     signal_spread = max(vals) - min(vals) if vals else 0
     if signal_spread > 1.5 and confidence < 55:
@@ -10919,7 +11107,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
     """, unsafe_allow_html=True)
 
     # Signal radar bar
-    st.markdown("#### 📊 Signal Radar — All 16 Inputs")
+    st.markdown("#### 📊 Signal Radar — All 24 Inputs")
     _sig_names  = list(weights.keys())
     _sig_values = [signals.get(k, 0) for k in _sig_names]
     _sig_colors = ['#00C853' if v > 0.05 else ('#FF5252' if v < -0.05 else '#FFD740') for v in _sig_values]
@@ -10937,7 +11125,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         yaxis=dict(range=[-1.2, 1.2], zeroline=True, zerolinecolor='#555',
                    gridcolor='#333', title='Signal Value (-1 bear … +1 bull)'),
         xaxis=dict(tickangle=-35, gridcolor='#333'),
-        title=dict(text='ML Feature Vector (all signals normalised to -1…+1)', font=dict(size=12)),
+        title=dict(text='ML Feature Vector — 24 signals normalised to -1…+1', font=dict(size=12)),
     )
     _fig_radar.add_hline(y=0.12,  line_dash='dash', line_color='#00C853', line_width=1)
     _fig_radar.add_hline(y=-0.12, line_dash='dash', line_color='#FF5252', line_width=1)
@@ -10955,6 +11143,10 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         ("📈 Price Action (EMA)",        pa_text),
         ("🏦 Institutional Flow (FII)",  fii_text),
         ("🛡️ Risk & Conviction",         risk_text),
+        ("⚠ Macro Signals",             macro_text),
+        ("📐 NIFTY Indicator Dashboard", ind_text),
+        ("🕯️ Candle Patterns Detected",  candle_text),
+        ("🔔 Geometric & Reversal Patterns", geo_text),
     ]
 
     for title, body in sections:
@@ -11025,7 +11217,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         )
         st.plotly_chart(_fig_mh, use_container_width=True)
 
-    st.caption(f"🤖 ML Ensemble: 16 signals · {len(weights)} weighted features · Updates every ~30s · "
+    st.caption(f"🤖 ML Ensemble: 24 signals · {len(weights)} weighted features · Updates every ~30s · "
                f"{len(st.session_state.ml_report_history)} data points")
 
 
