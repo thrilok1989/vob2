@@ -17,6 +17,11 @@ from scipy.stats import norm
 from pytz import timezone
 import io
 import os
+try:
+    import yfinance as yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
 
 # Page configuration - ADD THIS AT THE VERY TOP
 st.set_page_config(
@@ -129,6 +134,24 @@ NIFTY_UNDERLYING_SEG = "IDX_I"
 
 SENSEX_SCRIP_ID = "51"        # BSE Sensex security ID in Dhan API
 SENSEX_EXCHANGE_SEG = "IDX_I"  # All indices (NSE + BSE) share IDX_I segment in Dhan API
+
+# ── BankNifty Dashboard: yfinance symbol map ──────────────────────────
+BN_DASH_TICKERS = [
+    {"name": "BANKNIFTY", "yf": "^NSEBANK",    "weight": 35.0, "inverse": False},
+    {"name": "RELIANCE",  "yf": "RELIANCE.NS",  "weight": 25.0, "inverse": False},
+    {"name": "NIFTY AUTO","yf": "^CNXAUTO",     "weight": 10.0, "inverse": False},
+    {"name": "NIFTY IT",  "yf": "^CNXIT",       "weight":  8.0, "inverse": False},
+    {"name": "HDFCBANK",  "yf": "HDFCBANK.NS",  "weight":  8.0, "inverse": False},
+    {"name": "ICICIBANK", "yf": "ICICIBANK.NS",  "weight":  7.0, "inverse": False},
+    {"name": "KOTAKBANK", "yf": "KOTAKBANK.NS",  "weight":  4.0, "inverse": False},
+    {"name": "SBIN",      "yf": "SBIN.NS",       "weight":  3.0, "inverse": False},
+    {"name": "SENSEX",    "yf": "^BSESN",        "weight":  0.0, "inverse": False},
+]
+BN_MACRO_TICKERS = [
+    {"name": "INDIA VIX", "yf": "^INDIAVIX", "inverse": True},
+    {"name": "USD/INR",   "yf": "USDINR=X",  "inverse": True},
+    {"name": "CRUDE OIL", "yf": "CL=F",      "inverse": True},
+]
 
 # Cached functions for performance
 @st.cache_data(ttl=300)  # Cache for 5 minutes
@@ -6401,6 +6424,1143 @@ def show_market_overview(api, interval="1", days_back=1):
 
 
 # =====================================================================
+# BANK NIFTY DASHBOARD — Helper Calculations
+# =====================================================================
+
+def _bn_calc_rsi(series: pd.Series, period: int = 14) -> float:
+    """Wilder RSI – returns latest value."""
+    if len(series) < period + 1:
+        return float("nan")
+    delta = series.diff().dropna()
+    gain = delta.clip(lower=0)
+    loss = (-delta).clip(lower=0)
+    avg_g = gain.ewm(com=period - 1, min_periods=period).mean()
+    avg_l = loss.ewm(com=period - 1, min_periods=period).mean()
+    rs = avg_g / avg_l.replace(0, np.nan)
+    rsi = 100 - 100 / (1 + rs)
+    return float(rsi.iloc[-1])
+
+
+def _bn_calc_ema(series: pd.Series, period: int = 20) -> float:
+    if len(series) < period:
+        return float("nan")
+    return float(series.ewm(span=period, adjust=False).mean().iloc[-1])
+
+
+def _bn_calc_vwap(df: pd.DataFrame) -> float:
+    """Session VWAP (cumulative from first bar)."""
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3
+    vol = df["Volume"].replace(0, np.nan)
+    vwap = (tp * vol).cumsum() / vol.cumsum()
+    return float(vwap.iloc[-1])
+
+
+def _bn_calc_supertrend(df: pd.DataFrame, period: int = 10, mult: float = 2.0):
+    """Returns (supertrend_value, direction) where direction=-1 up-trend, 1 down-trend."""
+    if len(df) < period + 1:
+        return float("nan"), 0
+    high = df["High"].values
+    low  = df["Low"].values
+    close = df["Close"].values
+    # ATR
+    tr = np.maximum(high[1:] - low[1:],
+         np.maximum(abs(high[1:] - close[:-1]),
+                    abs(low[1:]  - close[:-1])))
+    atr = np.zeros(len(close))
+    atr[period] = tr[:period].mean()
+    for i in range(period + 1, len(close)):
+        atr[i] = (atr[i-1] * (period - 1) + tr[i-1]) / period
+    hl2 = (high + low) / 2
+    upper = hl2 + mult * atr
+    lower = hl2 - mult * atr
+    supertrend = np.zeros(len(close))
+    direction  = np.zeros(len(close), dtype=int)
+    direction[period] = 1
+    for i in range(period + 1, len(close)):
+        if close[i - 1] > supertrend[i - 1]:
+            lower[i] = max(lower[i], lower[i - 1])
+        if close[i - 1] < supertrend[i - 1]:
+            upper[i] = min(upper[i], upper[i - 1])
+        if close[i] > upper[i - 1]:
+            direction[i] = -1
+        elif close[i] < lower[i - 1]:
+            direction[i] = 1
+        else:
+            direction[i] = direction[i - 1]
+        supertrend[i] = lower[i] if direction[i] == -1 else upper[i]
+    return float(supertrend[-1]), int(direction[-1])
+
+
+def _bn_calc_adx_dmi(df: pd.DataFrame, period: int = 13, smooth: int = 8):
+    """Returns (adx, di_plus, di_minus) latest values."""
+    if len(df) < period + smooth + 5:
+        return float("nan"), float("nan"), float("nan")
+    high  = df["High"].values
+    low   = df["Low"].values
+    close = df["Close"].values
+    n = len(close)
+    dm_plus  = np.zeros(n)
+    dm_minus = np.zeros(n)
+    tr_arr   = np.zeros(n)
+    for i in range(1, n):
+        up   = high[i]  - high[i-1]
+        down = low[i-1] - low[i]
+        dm_plus[i]  = up   if up > down and up > 0   else 0
+        dm_minus[i] = down if down > up and down > 0 else 0
+        tr_arr[i] = max(high[i] - low[i],
+                        abs(high[i] - close[i-1]),
+                        abs(low[i]  - close[i-1]))
+    def _wilder(arr, p):
+        out = np.zeros(n)
+        out[p] = arr[1:p+1].sum()
+        for i in range(p + 1, n):
+            out[i] = out[i-1] - out[i-1] / p + arr[i]
+        return out
+    atr_w  = _wilder(tr_arr,   period)
+    dmp_w  = _wilder(dm_plus,  period)
+    dmm_w  = _wilder(dm_minus, period)
+    dip = np.where(atr_w > 0, 100 * dmp_w / atr_w, 0)
+    dim = np.where(atr_w > 0, 100 * dmm_w / atr_w, 0)
+    dx  = np.where((dip + dim) > 0, 100 * abs(dip - dim) / (dip + dim), 0)
+    adx = np.zeros(n)
+    adx[period * 2] = dx[period:period*2+1].mean()
+    for i in range(period * 2 + 1, n):
+        adx[i] = (adx[i-1] * (smooth - 1) + dx[i]) / smooth
+    return float(adx[-1]), float(dip[-1]), float(dim[-1])
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _bn_fetch_yf_data(tf1: str = "15m", tf2: str = "60m"):
+    """Fetch daily + TF1 + TF2 OHLCV for all BN dashboard symbols via yfinance."""
+    if not _YF_AVAILABLE:
+        return None
+    all_tickers = [t["yf"] for t in BN_DASH_TICKERS] + [t["yf"] for t in BN_MACRO_TICKERS]
+    try:
+        daily = yf.download(all_tickers, period="5d", interval="1d",
+                            group_by="ticker", auto_adjust=True, progress=False, threads=True)
+        intra15 = yf.download(all_tickers, period="2d", interval="15m",
+                              group_by="ticker", auto_adjust=True, progress=False, threads=True)
+        intra60 = yf.download(all_tickers, period="5d", interval="60m",
+                              group_by="ticker", auto_adjust=True, progress=False, threads=True)
+        return {"daily": daily, "tf1": intra15, "tf2": intra60}
+    except Exception:
+        return None
+
+
+def _bn_extract_ticker(data_dict, yf_ticker, key="daily"):
+    """Extract single-ticker DataFrame from multi-ticker yfinance download."""
+    raw = data_dict.get(key)
+    if raw is None or raw.empty:
+        return pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        try:
+            df = raw[yf_ticker].dropna(how="all")
+        except KeyError:
+            return pd.DataFrame()
+    else:
+        df = raw.dropna(how="all")
+    return df
+
+
+def _bn_ticker_metrics(data, yf_ticker, tf1_key="tf1", tf2_key="tf2"):
+    """Compute LTP, daily %chg, TF1 %chg, TF2 %chg for one ticker."""
+    daily = _bn_extract_ticker(data, yf_ticker, "daily")
+    tf1   = _bn_extract_ticker(data, yf_ticker, tf1_key)
+    tf2   = _bn_extract_ticker(data, yf_ticker, tf2_key)
+    if daily.empty or len(daily) < 2:
+        return None
+    ltp        = float(daily["Close"].iloc[-1])
+    prev_close = float(daily["Close"].iloc[-2])
+    chng       = ltp - prev_close
+    pct_d      = (chng / prev_close * 100) if prev_close else 0.0
+    # TF1: % change from last completed bar's close
+    pct_tf1 = 0.0
+    if not tf1.empty and len(tf1) >= 2:
+        ref = float(tf1["Close"].iloc[-2])
+        pct_tf1 = (ltp - ref) / ref * 100 if ref else 0.0
+    # TF2: % change from last completed bar's close
+    pct_tf2 = 0.0
+    if not tf2.empty and len(tf2) >= 2:
+        ref = float(tf2["Close"].iloc[-2])
+        pct_tf2 = (ltp - ref) / ref * 100 if ref else 0.0
+    return {"ltp": ltp, "chng": chng, "pct_d": pct_d,
+            "pct_tf1": pct_tf1, "pct_tf2": pct_tf2}
+
+
+def _bn_indicator_metrics(data, yf_ticker, ema_period=20, rsi_period=14, tf_keys=("daily", "tf1", "tf2")):
+    """Compute VWAP, EMA, SuperTrend, RSI, ADX, DI+, DI- for 3 timeframes."""
+    results = {}
+    for key in tf_keys:
+        df = _bn_extract_ticker(data, yf_ticker, key)
+        if df.empty or len(df) < 20:
+            results[key] = None
+            continue
+        close = df["Close"]
+        ltp   = float(close.iloc[-1])
+        vwap  = _bn_calc_vwap(df)
+        ema   = _bn_calc_ema(close, ema_period)
+        rsi   = _bn_calc_rsi(close, rsi_period)
+        st_val, st_dir = _bn_calc_supertrend(df)
+        adx, dip, dim  = _bn_calc_adx_dmi(df)
+        results[key] = {
+            "ltp": ltp, "vwap": vwap, "ema": ema,
+            "rsi": rsi, "st": st_val, "st_dir": st_dir,
+            "adx": adx, "dip": dip, "dim": dim,
+        }
+    return results
+
+
+def _bn_color_cell(val, is_positive: bool, inverse: bool = False) -> str:
+    """Return CSS background color string."""
+    bull = "#1a472a"   # dark green
+    bear = "#7f1d1d"   # dark red
+    neut = "#374151"   # gray
+    if is_positive:
+        return bull if not inverse else bear
+    return bear if not inverse else bull
+
+
+def _bn_trend_label(pct: float, inverse: bool = False) -> str:
+    if abs(pct) < 0.05:
+        return "🟡"
+    return ("🔴" if inverse else "🟢") if pct > 0 else ("🟢" if inverse else "🔴")
+
+
+def show_bn_dashboard(nifty_df: pd.DataFrame = None, interval: str = "1"):
+    """Full Bank Nifty Dashboard — Pine Script converted to Python/Streamlit."""
+    st.markdown("### 📊 Bank Nifty Multi-Ticker Dashboard")
+
+    if not _YF_AVAILABLE:
+        st.warning("yfinance not available. Install it to use the BankNifty Dashboard.")
+        return
+
+    with st.spinner("Fetching market data…"):
+        data = _bn_fetch_yf_data(tf1="15m", tf2="60m")
+
+    if data is None:
+        st.error("Could not fetch market data. Check your network connection.")
+        return
+
+    # ── Build Ticker Table ─────────────────────────────────────────────
+    rows = []
+    sent_score = 0.0
+    for t in BN_DASH_TICKERS:
+        m = _bn_ticker_metrics(data, t["yf"])
+        if m is None:
+            rows.append({
+                "Sentiment": "—", "Symbol": t["name"],
+                "LTP": "—", "Chng": "—", "%Chng": "—",
+                "TF1 15m%": "—", "TF2 60m%": "—",
+                "Weight": f"{int(t['weight'])}%",
+                "_pct_d": 0, "_pct_tf1": 0, "_pct_tf2": 0, "_inverse": False,
+            })
+            continue
+        sent_score += m["pct_d"] * t["weight"]
+        rows.append({
+            "Sentiment": _bn_trend_label(m["pct_d"]),
+            "Symbol":    t["name"],
+            "LTP":       f"{m['ltp']:,.2f}",
+            "Chng":      f"{m['chng']:+.2f}",
+            "%Chng":     f"{m['pct_d']:+.2f}%",
+            "TF1 15m%":  f"{m['pct_tf1']:+.2f}%",
+            "TF2 60m%":  f"{m['pct_tf2']:+.2f}%",
+            "Weight":    f"{int(t['weight'])}%",
+            "_pct_d": m["pct_d"], "_pct_tf1": m["pct_tf1"],
+            "_pct_tf2": m["pct_tf2"], "_inverse": False,
+        })
+    sent_score /= 100.0
+
+    # Macro penalty
+    macro_penalty = 0.0
+    macro_rows = []
+    macro_weights = [0.5, 0.4, 0.3]
+    for i, t in enumerate(BN_MACRO_TICKERS):
+        m = _bn_ticker_metrics(data, t["yf"])
+        if m is None:
+            macro_rows.append({
+                "Sentiment": "—", "Symbol": t["name"],
+                "LTP": "—", "Chng": "—", "%Chng": "—",
+                "TF1 15m%": "—", "TF2 60m%": "—",
+                "Weight": "Inverse",
+                "_pct_d": 0, "_pct_tf1": 0, "_pct_tf2": 0, "_inverse": True,
+            })
+            continue
+        macro_penalty += m["pct_d"] * macro_weights[i]
+        macro_rows.append({
+            "Sentiment": _bn_trend_label(m["pct_d"], inverse=True),
+            "Symbol":    t["name"],
+            "LTP":       f"{m['ltp']:,.4f}" if t["yf"] == "USDINR=X" else f"{m['ltp']:,.2f}",
+            "Chng":      f"{m['chng']:+.4f}" if t["yf"] == "USDINR=X" else f"{m['chng']:+.2f}",
+            "%Chng":     f"{m['pct_d']:+.2f}%",
+            "TF1 15m%":  f"{m['pct_tf1']:+.2f}%",
+            "TF2 60m%":  f"{m['pct_tf2']:+.2f}%",
+            "Weight":    "Inverse",
+            "_pct_d": m["pct_d"], "_pct_tf1": m["pct_tf1"],
+            "_pct_tf2": m["pct_tf2"], "_inverse": True,
+        })
+
+    final_score = sent_score - macro_penalty * 10
+    if final_score > 3.0:
+        sent_text, sent_bg = "🟢 BULLISH", "#14532d"
+    elif final_score < -3.0:
+        sent_text, sent_bg = "🔴 BEARISH", "#7f1d1d"
+    else:
+        sent_text, sent_bg = "🟡 NEUTRAL", "#374151"
+
+    # Overall sentiment header row (injected at top)
+    header_row = {
+        "Sentiment": sent_text, "Symbol": "NIFTY SCORE",
+        "LTP": f"{final_score:.2f}", "Chng": "", "%Chng": "",
+        "TF1 15m%": "", "TF2 60m%": "", "Weight": "100%",
+        "_pct_d": final_score, "_pct_tf1": 0, "_pct_tf2": 0, "_inverse": False,
+    }
+    display_cols = ["Sentiment", "Symbol", "LTP", "Chng", "%Chng", "TF1 15m%", "TF2 60m%", "Weight"]
+
+    all_rows = [header_row] + rows
+
+    def _style_ticker_table(df):
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        for i, row in df.iterrows():
+            inv = row.get("_inverse", False)
+            for col, pct_key in [("%Chng", "_pct_d"), ("TF1 15m%", "_pct_tf1"), ("TF2 60m%", "_pct_tf2")]:
+                val = row.get(pct_key, 0)
+                try:
+                    fval = float(val)
+                except (TypeError, ValueError):
+                    fval = 0.0
+                pos = fval >= 0
+                bg = _bn_color_cell(fval, pos, inv)
+                styles.at[i, col] = f"background-color: {bg}; color: white"
+            styles.at[i, "Sentiment"] = "background-color: #1f2937; color: white; font-size:1.1em"
+            styles.at[i, "Symbol"] = "background-color: #111827; color: white; font-weight: bold"
+        styles.at[0, "LTP"] = f"background-color: {sent_bg}; color: white; font-weight: bold"
+        styles.at[0, "Sentiment"] = f"background-color: {sent_bg}; color: white; font-weight: bold"
+        return styles
+
+    df_display = pd.DataFrame(all_rows)
+    df_styled = df_display[display_cols + ["_pct_d", "_pct_tf1", "_pct_tf2", "_inverse"]].copy()
+    df_final = df_styled.style.apply(lambda _: _style_ticker_table(df_styled), axis=None)\
+                               .hide(axis="index")\
+                               .hide(["_pct_d", "_pct_tf1", "_pct_tf2", "_inverse"], axis="columns")
+
+    st.dataframe(df_final, use_container_width=True, height=420)
+
+    # ── Macro Section ──────────────────────────────────────────────────
+    st.markdown("#### ⚠ Macro Signals (Inverse — Up = Bearish for Market)")
+    macro_display = pd.DataFrame(macro_rows)
+    if not macro_display.empty:
+        macro_styled = macro_display[display_cols + ["_pct_d", "_pct_tf1", "_pct_tf2", "_inverse"]].copy()
+
+        def _style_macro(df):
+            styles = pd.DataFrame("", index=df.index, columns=df.columns)
+            for i, row in df.iterrows():
+                for col, pct_key in [("%Chng", "_pct_d"), ("TF1 15m%", "_pct_tf1"), ("TF2 60m%", "_pct_tf2")]:
+                    val = row.get(pct_key, 0)
+                    try:
+                        fval = float(val)
+                    except (TypeError, ValueError):
+                        fval = 0.0
+                    bg = _bn_color_cell(fval, fval >= 0, inverse=True)
+                    styles.at[i, col] = f"background-color: {bg}; color: white"
+                styles.at[i, "Sentiment"] = "background-color: #1f2937; color: #fbbf24"
+                styles.at[i, "Symbol"] = "background-color: #111827; color: #fbbf24; font-weight: bold"
+                styles.at[i, "Weight"] = "background-color: #111827; color: #fbbf24"
+            return styles
+
+        st.dataframe(
+            macro_styled.style.apply(lambda _: _style_macro(macro_styled), axis=None)
+                               .hide(axis="index")
+                               .hide(["_pct_d", "_pct_tf1", "_pct_tf2", "_inverse"], axis="columns"),
+            use_container_width=True, height=160
+        )
+
+    # ── Indicator Dashboard (NIFTY 50 across 3 TFs) ───────────────────
+    st.markdown("#### 📐 Indicator Dashboard — NIFTY 50 (Current | 15m | 60m)")
+    nifty_yf = "^NSEI"
+    ind = _bn_indicator_metrics(data, nifty_yf, tf_keys=("daily", "tf1", "tf2"))
+
+    def _ind_val(key, field, fmt=".1f"):
+        m = ind.get(key)
+        if m is None or m.get(field) is None:
+            return "—"
+        v = m[field]
+        if isinstance(v, float) and np.isnan(v):
+            return "—"
+        return f"{v:{fmt}}"
+
+    def _ind_dir(key, close_field, ref_field):
+        m = ind.get(key)
+        if m is None:
+            return "—"
+        ltp = m.get("ltp")
+        ref = m.get(ref_field)
+        if ltp is None or ref is None:
+            return "—"
+        return "UP" if ltp > ref else "Down"
+
+    def _st_dir_text(key):
+        m = ind.get(key)
+        if m is None:
+            return "—"
+        ltp, st_val, st_dir = m.get("ltp"), m.get("st"), m.get("st_dir")
+        if ltp is None or st_val is None:
+            return "—"
+        return "UP" if st_dir == -1 else "Down"
+
+    def _adx_text(key):
+        m = ind.get(key)
+        if m is None:
+            return "—"
+        adx, dip, dim = m.get("adx", 0), m.get("dip", 0), m.get("dim", 0)
+        if isinstance(adx, float) and np.isnan(adx):
+            return "—"
+        if adx >= 25 and dip > dim:
+            return "Strong UP"
+        elif adx >= 25 and dip <= dim:
+            return "Strong Down"
+        elif adx >= 20 and dip > dim:
+            return "UP"
+        elif adx >= 20 and dip <= dim:
+            return "Down"
+        return "Neutral"
+
+    ind_rows = [
+        {"Indicator": "VWAP",
+         "Value (Curr)":  _ind_val("daily", "vwap", ",.0f"),
+         "Trend (Curr)":  _ind_dir("daily", "ltp", "vwap"),
+         "TF1 15m":       _ind_val("tf1",   "vwap", ",.0f"),
+         "TF2 60m":       _ind_val("tf2",   "vwap", ",.0f"),
+         "_up_curr":  (ind.get("daily") or {}).get("ltp", 0) > (ind.get("daily") or {}).get("vwap", 0),
+         "_up_tf1":   (ind.get("tf1")   or {}).get("ltp", 0) > (ind.get("tf1")   or {}).get("vwap", 0),
+         "_up_tf2":   (ind.get("tf2")   or {}).get("ltp", 0) > (ind.get("tf2")   or {}).get("vwap", 0),
+         "_field": "vwap"},
+        {"Indicator": "EMA 20",
+         "Value (Curr)":  _ind_val("daily", "ema", ",.0f"),
+         "Trend (Curr)":  _ind_dir("daily", "ltp", "ema"),
+         "TF1 15m":       _ind_val("tf1",   "ema", ",.0f"),
+         "TF2 60m":       _ind_val("tf2",   "ema", ",.0f"),
+         "_up_curr":  (ind.get("daily") or {}).get("ltp", 0) > (ind.get("daily") or {}).get("ema", 0),
+         "_up_tf1":   (ind.get("tf1")   or {}).get("ltp", 0) > (ind.get("tf1")   or {}).get("ema", 0),
+         "_up_tf2":   (ind.get("tf2")   or {}).get("ltp", 0) > (ind.get("tf2")   or {}).get("ema", 0),
+         "_field": "ema"},
+        {"Indicator": "SuperTrend",
+         "Value (Curr)":  _ind_val("daily", "st", ",.0f"),
+         "Trend (Curr)":  _st_dir_text("daily"),
+         "TF1 15m":       _ind_val("tf1",   "st", ",.0f"),
+         "TF2 60m":       _ind_val("tf2",   "st", ",.0f"),
+         "_up_curr": (ind.get("daily") or {}).get("st_dir", 1) == -1,
+         "_up_tf1":  (ind.get("tf1")   or {}).get("st_dir", 1) == -1,
+         "_up_tf2":  (ind.get("tf2")   or {}).get("st_dir", 1) == -1,
+         "_field": "st"},
+        {"Indicator": "RSI (14)",
+         "Value (Curr)":  _ind_val("daily", "rsi", ".1f"),
+         "Trend (Curr)":  "UP" if float(_ind_val("daily", "rsi", ".1f").replace("—","50")) > 50 else "Down",
+         "TF1 15m":       _ind_val("tf1",   "rsi", ".1f"),
+         "TF2 60m":       _ind_val("tf2",   "rsi", ".1f"),
+         "_up_curr": float(_ind_val("daily", "rsi", ".1f").replace("—","50")) > 50,
+         "_up_tf1":  float(_ind_val("tf1",   "rsi", ".1f").replace("—","50")) > 50,
+         "_up_tf2":  float(_ind_val("tf2",   "rsi", ".1f").replace("—","50")) > 50,
+         "_field": "rsi"},
+        {"Indicator": "ADX (13)",
+         "Value (Curr)":  _ind_val("daily", "adx", ".1f"),
+         "Trend (Curr)":  _adx_text("daily"),
+         "TF1 15m":       _ind_val("tf1",   "adx", ".1f"),
+         "TF2 60m":       _ind_val("tf2",   "adx", ".1f"),
+         "_up_curr": "UP" in _adx_text("daily"),
+         "_up_tf1":  "UP" in _adx_text("tf1"),
+         "_up_tf2":  "UP" in _adx_text("tf2"),
+         "_field": "adx"},
+        {"Indicator": "DI+",
+         "Value (Curr)":  _ind_val("daily", "dip", ".1f"),
+         "Trend (Curr)":  "UP" if float(_ind_val("daily","dip",".1f").replace("—","0")) >= 25 else "-",
+         "TF1 15m":       _ind_val("tf1",   "dip", ".1f"),
+         "TF2 60m":       _ind_val("tf2",   "dip", ".1f"),
+         "_up_curr": float(_ind_val("daily","dip",".1f").replace("—","0")) >= 25,
+         "_up_tf1":  float(_ind_val("tf1",  "dip",".1f").replace("—","0")) >= 25,
+         "_up_tf2":  float(_ind_val("tf2",  "dip",".1f").replace("—","0")) >= 25,
+         "_field": "dip"},
+        {"Indicator": "DI-",
+         "Value (Curr)":  _ind_val("daily", "dim", ".1f"),
+         "Trend (Curr)":  "Down" if float(_ind_val("daily","dim",".1f").replace("—","0")) >= 25 else "-",
+         "TF1 15m":       _ind_val("tf1",   "dim", ".1f"),
+         "TF2 60m":       _ind_val("tf2",   "dim", ".1f"),
+         "_up_curr": float(_ind_val("daily","dim",".1f").replace("—","0")) < 25,
+         "_up_tf1":  float(_ind_val("tf1",  "dim",".1f").replace("—","0")) < 25,
+         "_up_tf2":  float(_ind_val("tf2",  "dim",".1f").replace("—","0")) < 25,
+         "_field": "dim"},
+    ]
+
+    ind_cols = ["Indicator", "Value (Curr)", "Trend (Curr)", "TF1 15m", "TF2 60m"]
+    df_ind = pd.DataFrame(ind_rows)
+
+    def _style_ind_table(df):
+        styles = pd.DataFrame("", index=df.index, columns=df.columns)
+        for i, row in df.iterrows():
+            styles.at[i, "Indicator"] = "background-color: #111827; color: white; font-weight: bold"
+            for col, up_key in [("Value (Curr)", "_up_curr"), ("Trend (Curr)", "_up_curr"),
+                                 ("TF1 15m", "_up_tf1"), ("TF2 60m", "_up_tf2")]:
+                up = bool(row.get(up_key, False))
+                styles.at[i, col] = f"background-color: {'#1a472a' if up else '#7f1d1d'}; color: white"
+        return styles
+
+    st.dataframe(
+        df_ind[ind_cols + ["_up_curr", "_up_tf1", "_up_tf2"]].style
+              .apply(lambda _: _style_ind_table(df_ind[ind_cols + ["_up_curr","_up_tf1","_up_tf2"]]), axis=None)
+              .hide(axis="index")
+              .hide(["_up_curr", "_up_tf1", "_up_tf2"], axis="columns"),
+        use_container_width=True, height=310
+    )
+
+
+# =====================================================================
+# FUTURES MARKET ANALYSIS ENGINE
+# =====================================================================
+
+def _fae_calc_ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
+
+def _fae_calc_rsi(series, period=14):
+    delta = series.diff()
+    gain = delta.clip(lower=0)
+    loss = -delta.clip(upper=0)
+    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def _fae_calc_atr(df, period=14):
+    hi, lo, cl = df['high'], df['low'], df['close']
+    tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
+    return tr.ewm(alpha=1/period, adjust=False).mean()
+
+def _fae_supertrend(df, period=10, mult=3.0):
+    atr = _fae_calc_atr(df, period)
+    mid = (df['high'] + df['low']) / 2
+    upper = mid + mult * atr
+    lower = mid - mult * atr
+    st = pd.Series(index=df.index, dtype=float)
+    trend = pd.Series(index=df.index, dtype=int)
+    for i in range(1, len(df)):
+        prev_upper = upper.iloc[i-1]
+        prev_lower = lower.iloc[i-1]
+        curr_close = df['close'].iloc[i]
+        upper.iloc[i] = min(upper.iloc[i], prev_upper) if curr_close > prev_upper else upper.iloc[i]
+        lower.iloc[i] = max(lower.iloc[i], prev_lower) if curr_close < prev_lower else lower.iloc[i]
+        if pd.isna(st.iloc[i-1]):
+            trend.iloc[i] = 1
+        elif st.iloc[i-1] == prev_upper:
+            trend.iloc[i] = -1 if curr_close < upper.iloc[i] else 1
+        else:
+            trend.iloc[i] = 1 if curr_close > lower.iloc[i] else -1
+        st.iloc[i] = lower.iloc[i] if trend.iloc[i] == 1 else upper.iloc[i]
+    return st, trend
+
+def _fae_adx(df, period=14):
+    hi, lo, cl = df['high'], df['low'], df['close']
+    tr = pd.concat([hi - lo, (hi - cl.shift()).abs(), (lo - cl.shift()).abs()], axis=1).max(axis=1)
+    dm_plus = hi.diff().clip(lower=0)
+    dm_minus = (-lo.diff()).clip(lower=0)
+    dm_plus = dm_plus.where(dm_plus > dm_minus, 0)
+    dm_minus = dm_minus.where(dm_minus > dm_plus, 0)
+    atr14 = tr.ewm(alpha=1/period, adjust=False).mean()
+    di_plus = 100 * dm_plus.ewm(alpha=1/period, adjust=False).mean() / atr14.replace(0, np.nan)
+    di_minus = 100 * dm_minus.ewm(alpha=1/period, adjust=False).mean() / atr14.replace(0, np.nan)
+    dx = 100 * (di_plus - di_minus).abs() / (di_plus + di_minus).replace(0, np.nan)
+    adx = dx.ewm(alpha=1/period, adjust=False).mean()
+    return adx, di_plus, di_minus
+
+def show_futures_analysis_engine(df: pd.DataFrame, option_data: dict, current_price: float):
+    """12-Module Futures Market Analysis Engine for NIFTY."""
+    st.markdown("### 🔮 Futures Market Analysis Engine — NIFTY")
+
+    if df is None or df.empty or len(df) < 20:
+        st.warning("Insufficient OHLCV data for Futures Analysis.")
+        return
+
+    # Normalise columns
+    df2 = df.copy()
+    df2.columns = [c.lower() for c in df2.columns]
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        if col not in df2.columns:
+            st.warning(f"Missing column: {col}")
+            return
+    df2 = df2.dropna(subset=['open', 'high', 'low', 'close']).copy()
+
+    close = df2['close']
+    volume = df2['volume'].fillna(0)
+
+    # ── MODULE 1: Trend Detection ──────────────────────────────────────
+    ema9   = _fae_calc_ema(close, 9)
+    ema21  = _fae_calc_ema(close, 21)
+    ema50  = _fae_calc_ema(close, 50)
+    ema200 = _fae_calc_ema(close, 200)
+    _, st_trend = _fae_supertrend(df2, 10, 3.0)
+    adx_val, di_plus, di_minus = _fae_adx(df2, 14)
+
+    curr_ema9   = ema9.iloc[-1]
+    curr_ema21  = ema21.iloc[-1]
+    curr_ema50  = ema50.iloc[-1]
+    curr_ema200 = ema200.iloc[-1]
+    curr_adx    = adx_val.iloc[-1]
+    curr_di_p   = di_plus.iloc[-1]
+    curr_di_m   = di_minus.iloc[-1]
+    curr_st     = st_trend.iloc[-1] if not pd.isna(st_trend.iloc[-1]) else 0
+
+    price_above_200 = current_price > curr_ema200
+    price_above_50  = current_price > curr_ema50
+    ema_bull = curr_ema9 > curr_ema21 > curr_ema50
+    adx_strong = curr_adx > 25
+    trend_dir = "BULLISH" if (ema_bull and curr_st >= 0) else ("BEARISH" if (not ema_bull and curr_st <= 0) else "SIDEWAYS")
+
+    # ── MODULE 2: OI Analysis ─────────────────────────────────────────
+    oi_data   = option_data.get('df_summary', pd.DataFrame())
+    pcr_oi    = option_data.get('pcr', None)
+    max_pain  = option_data.get('max_pain', None)
+    if isinstance(oi_data, pd.DataFrame) and not oi_data.empty:
+        call_oi = oi_data.get('call_oi', pd.Series(dtype=float)).sum() if 'call_oi' in oi_data.columns else 0
+        put_oi  = oi_data.get('put_oi',  pd.Series(dtype=float)).sum() if 'put_oi'  in oi_data.columns else 0
+    else:
+        call_oi, put_oi = 0, 0
+    pcr_num = pcr_oi if isinstance(pcr_oi, (int, float)) else 0
+    oi_sentiment = "BULLISH" if pcr_num > 1.2 else ("BEARISH" if pcr_num < 0.8 else "NEUTRAL")
+
+    # ── MODULE 3: Volume & Institutional Activity ──────────────────────
+    avg_vol_20 = volume.rolling(20).mean().iloc[-1]
+    curr_vol   = volume.iloc[-1]
+    vol_ratio  = (curr_vol / avg_vol_20) if avg_vol_20 > 0 else 0
+    vol_label  = "HIGH" if vol_ratio > 1.5 else ("LOW" if vol_ratio < 0.7 else "NORMAL")
+    price_chg  = (close.iloc[-1] - close.iloc[-2]) / close.iloc[-2] * 100 if len(close) > 1 else 0
+    if vol_ratio > 1.5:
+        inst_signal = "INSTITUTIONAL BUYING" if price_chg > 0 else "INSTITUTIONAL SELLING"
+    else:
+        inst_signal = "RETAIL ACTIVITY"
+
+    # ── MODULE 4: Basis / Premium ──────────────────────────────────────
+    risk_free = 0.065
+    days_to_expiry = option_data.get('days_to_expiry', 7) or 7
+    theoretical_fut = current_price * (1 + risk_free * days_to_expiry / 365)
+    basis_pts = theoretical_fut - current_price
+    basis_pct = (basis_pts / current_price) * 100
+    basis_signal = "FAIR" if abs(basis_pct) < 0.3 else ("CONTANGO" if basis_pct > 0 else "BACKWARDATION")
+
+    # ── MODULE 5: Options Confirmation ────────────────────────────────
+    iv_skew  = option_data.get('iv_skew', None)
+    atm_iv   = option_data.get('atm_iv',  None)
+    put_call_iv = "CALL SKEW (BULLISH)" if (isinstance(iv_skew, (int, float)) and iv_skew < 0) \
+                  else ("PUT SKEW (BEARISH)" if (isinstance(iv_skew, (int, float)) and iv_skew > 0) else "NEUTRAL")
+    atm_iv_str = f"{atm_iv:.1f}%" if isinstance(atm_iv, (int, float)) else "N/A"
+
+    # ── MODULE 6: Expiry Behaviour ────────────────────────────────────
+    dte = int(days_to_expiry)
+    if dte <= 1:
+        expiry_phase = "EXPIRY DAY — High Gamma Risk"
+    elif dte <= 3:
+        expiry_phase = "NEAR EXPIRY — Pinning possible"
+    elif dte <= 7:
+        expiry_phase = "LAST WEEK — Vol crush risk"
+    else:
+        expiry_phase = "MID CYCLE — Normal trading"
+    max_pain_str = f"{max_pain:,.0f}" if isinstance(max_pain, (int, float)) and max_pain else "N/A"
+
+    # ── MODULE 7: Trade Setup ─────────────────────────────────────────
+    bulls = sum([
+        trend_dir == "BULLISH",
+        oi_sentiment == "BULLISH",
+        vol_ratio > 1.0 and price_chg > 0,
+        curr_st > 0,
+        price_above_50,
+        curr_di_p > curr_di_m,
+    ])
+    bears = sum([
+        trend_dir == "BEARISH",
+        oi_sentiment == "BEARISH",
+        vol_ratio > 1.0 and price_chg < 0,
+        curr_st < 0,
+        not price_above_50,
+        curr_di_m > curr_di_p,
+    ])
+    conf_score = round((bulls / 6) * 100)
+    if conf_score >= 70:
+        setup = "STRONG BUY"
+    elif conf_score >= 55:
+        setup = "BUY"
+    elif conf_score <= 30:
+        setup = "STRONG SELL"
+    elif conf_score <= 45:
+        setup = "SELL"
+    else:
+        setup = "NEUTRAL / WAIT"
+
+    # ── MODULE 9: Market Day Classification ──────────────────────────
+    atr_val  = _fae_calc_atr(df2, 14).iloc[-1]
+    day_range = df2['high'].iloc[-1] - df2['low'].iloc[-1]
+    range_ratio = day_range / atr_val if atr_val > 0 else 1.0
+    if range_ratio > 1.5:
+        day_type = "TRENDING DAY"
+    elif range_ratio < 0.5:
+        day_type = "INSIDE / TIGHT"
+    else:
+        day_type = "RANGE-BOUND DAY"
+
+    # ── MODULE 10: Visual / Support-Resistance ────────────────────────
+    recent_high = df2['high'].rolling(20).max().iloc[-1]
+    recent_low  = df2['low'].rolling(20).min().iloc[-1]
+    pivot       = (recent_high + recent_low + close.iloc[-1]) / 3
+    r1 = 2 * pivot - recent_low
+    s1 = 2 * pivot - recent_high
+
+    # ── MODULE 12: Alerts ─────────────────────────────────────────────
+    alerts = []
+    if adx_strong and curr_st > 0 and ema_bull:
+        alerts.append("🟢 Strong Bullish Trend — EMA aligned + SuperTrend up + ADX>25")
+    if adx_strong and curr_st < 0 and not ema_bull:
+        alerts.append("🔴 Strong Bearish Trend — EMA aligned + SuperTrend down + ADX>25")
+    if vol_ratio > 2.0:
+        alerts.append(f"⚡ Volume Spike: {vol_ratio:.1f}x average — Watch for breakout")
+    if dte <= 1:
+        alerts.append("⏰ Expiry Today — Avoid naked options, high gamma")
+    if pcr_num < 0.7:
+        alerts.append("🔴 Very Low PCR — Heavy call writing / Bearish OI buildup")
+    if pcr_num > 1.5:
+        alerts.append("🟢 High PCR — Heavy put writing / Bullish OI support")
+
+    # ── MODULE 8: Dashboard Table ─────────────────────────────────────
+    st.markdown("#### 📋 Futures Analysis Dashboard")
+
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric("Trend Direction", trend_dir)
+        st.metric("ADX (Trend Strength)", f"{curr_adx:.1f}", delta="Strong" if adx_strong else "Weak")
+        st.metric("SuperTrend", "BULLISH" if curr_st > 0 else "BEARISH")
+        st.metric("EMA Stack", "BULLISH" if ema_bull else "BEARISH/MIXED")
+    with col2:
+        st.metric("PCR (OI)", f"{pcr_num:.2f}", delta=oi_sentiment)
+        st.metric("Max Pain", max_pain_str)
+        st.metric("Basis Signal", basis_signal, delta=f"{basis_pts:.1f} pts")
+        st.metric("ATM IV", atm_iv_str)
+    with col3:
+        st.metric("Volume Ratio", f"{vol_ratio:.2f}x", delta=vol_label)
+        st.metric("Day Type", day_type)
+        st.metric("DTE", str(dte))
+        st.metric("Trade Setup", setup, delta=f"{conf_score}% confidence")
+
+    # Summary table
+    summary_rows = [
+        ("MODULE 1 — Trend",        trend_dir,          f"EMA9={curr_ema9:.0f} EMA50={curr_ema50:.0f} ADX={curr_adx:.1f}"),
+        ("MODULE 2 — OI",           oi_sentiment,       f"PCR={pcr_num:.2f} MaxPain={max_pain_str}"),
+        ("MODULE 3 — Volume",       vol_label,          f"Ratio={vol_ratio:.2f}x | {inst_signal}"),
+        ("MODULE 4 — Basis",        basis_signal,       f"{basis_pts:.1f} pts ({basis_pct:.3f}%) | DTE={dte}"),
+        ("MODULE 5 — IV Skew",      put_call_iv,        f"ATM IV={atm_iv_str}"),
+        ("MODULE 6 — Expiry",       expiry_phase,       f"DTE={dte} | MaxPain={max_pain_str}"),
+        ("MODULE 7 — Trade Setup",  setup,              f"Confidence={conf_score}% ({bulls}/6 bulls)"),
+        ("MODULE 9 — Day Type",     day_type,           f"Range={day_range:.0f} ATR={atr_val:.0f} Ratio={range_ratio:.2f}"),
+        ("MODULE 10 — S/R Levels",  f"Pvt={pivot:.0f}", f"R1={r1:.0f} | S1={s1:.0f}"),
+    ]
+
+    def _fae_color(val, col_idx):
+        bull_kw = {"BULLISH", "BUY", "HIGH", "STRONG BUY", "INSTITUTIONAL BUYING", "CALL SKEW (BULLISH)"}
+        bear_kw = {"BEARISH", "SELL", "STRONG SELL", "INSTITUTIONAL SELLING", "PUT SKEW (BEARISH)"}
+        if col_idx == 1:
+            if any(k in str(val).upper() for k in [b.upper() for b in bull_kw]):
+                return "background-color:#1a3a1a; color:#00e676"
+            if any(k in str(val).upper() for k in [b.upper() for b in bear_kw]):
+                return "background-color:#3a1a1a; color:#ff5252"
+        return ""
+
+    sum_df = pd.DataFrame(summary_rows, columns=["Module", "Signal", "Details"])
+
+    def _style_fae(row):
+        styles = ["", "", ""]
+        bull_kw = ["BULLISH", "BUY", "HIGH", "INSTITUTIONAL BUYING", "CALL SKEW"]
+        bear_kw = ["BEARISH", "SELL", "INSTITUTIONAL SELLING", "PUT SKEW"]
+        sig = str(row["Signal"]).upper()
+        if any(k in sig for k in bull_kw):
+            styles[1] = "background-color:#1a3a1a; color:#00e676; font-weight:bold"
+        elif any(k in sig for k in bear_kw):
+            styles[1] = "background-color:#3a1a1a; color:#ff5252; font-weight:bold"
+        else:
+            styles[1] = "background-color:#2a2a1a; color:#ffeb3b; font-weight:bold"
+        return styles
+
+    st.dataframe(
+        sum_df.style.apply(_style_fae, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    # Alerts
+    if alerts:
+        st.markdown("#### 🚨 Active Alerts")
+        for a in alerts:
+            st.info(a)
+    else:
+        st.success("✅ No critical alerts — Market conditions normal")
+
+    # ── MODULE 11: Mini Backtest ──────────────────────────────────────
+    with st.expander("📈 EMA Crossover Backtest (last 50 bars)", expanded=False):
+        trades = []
+        in_trade = False
+        entry_price = 0
+        for i in range(21, min(len(df2), 52)):
+            e9  = ema9.iloc[i]
+            e21 = ema21.iloc[i]
+            pe9 = ema9.iloc[i-1]
+            pe21= ema21.iloc[i-1]
+            c   = close.iloc[i]
+            if not in_trade and e9 > e21 and pe9 <= pe21:
+                in_trade = True; entry_price = c
+            elif in_trade and e9 < e21 and pe9 >= pe21:
+                pnl = c - entry_price
+                trades.append({"Entry": entry_price, "Exit": c, "PnL": round(pnl, 2),
+                                "Result": "WIN" if pnl > 0 else "LOSS"})
+                in_trade = False
+        if trades:
+            bt_df = pd.DataFrame(trades)
+            wins  = (bt_df["PnL"] > 0).sum()
+            total = len(bt_df)
+            win_rate = wins / total * 100
+            total_pnl = bt_df["PnL"].sum()
+            st.markdown(f"**Trades:** {total} | **Win Rate:** {win_rate:.0f}% | **Total PnL:** {total_pnl:+.1f} pts")
+
+            def _bt_style(row):
+                c = "background-color:#1a3a1a; color:#00e676" if row["Result"] == "WIN" \
+                    else "background-color:#3a1a1a; color:#ff5252"
+                return [c] * len(row)
+            st.dataframe(bt_df.style.apply(_bt_style, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.info("No completed EMA crossover trades in the last 50 bars.")
+
+
+# =====================================================================
+# SECTOR ROTATION ANALYSIS ENGINE
+# =====================================================================
+
+_SECTOR_TICKERS = [
+    {"name": "NIFTY BANK",    "yf": "^NSEBANK",  "sector": "Banking"},
+    {"name": "NIFTY IT",      "yf": "^CNXIT",    "sector": "IT"},
+    {"name": "NIFTY AUTO",    "yf": "^CNXAUTO",  "sector": "Auto"},
+    {"name": "NIFTY FMCG",    "yf": "^CNXFMCG",  "sector": "FMCG"},
+    {"name": "NIFTY PHARMA",  "yf": "^CNXPHARMA","sector": "Pharma"},
+    {"name": "NIFTY METAL",   "yf": "^CNXMETAL", "sector": "Metal"},
+    {"name": "NIFTY ENERGY",  "yf": "^CNXENERGY","sector": "Energy"},
+    {"name": "NIFTY REALTY",  "yf": "^CNXREALTY","sector": "Realty"},
+    {"name": "NIFTY PSU BANK","yf": "^CNXPSUBANK","sector": "PSU Bank"},
+]
+
+@st.cache_data(ttl=300)
+def _sre_fetch_all():
+    """Fetch 3-month daily data for all sector indices via yfinance."""
+    if not _YF_AVAILABLE:
+        return {}
+    import yfinance as yf
+    results = {}
+    tickers = [t["yf"] for t in _SECTOR_TICKERS]
+    try:
+        raw = yf.download(tickers, period="3mo", interval="1d",
+                          group_by="ticker", auto_adjust=True, progress=False)
+        for t_info in _SECTOR_TICKERS:
+            sym = t_info["yf"]
+            try:
+                if len(tickers) == 1:
+                    df_sym = raw.copy()
+                else:
+                    df_sym = raw[sym].copy() if sym in raw.columns.get_level_values(0) else pd.DataFrame()
+                df_sym.columns = [c.lower() for c in df_sym.columns]
+                df_sym = df_sym.dropna(subset=["close"])
+                results[sym] = df_sym
+            except Exception:
+                results[sym] = pd.DataFrame()
+    except Exception:
+        pass
+    return results
+
+def _sre_momentum(close_series, period):
+    if len(close_series) < period + 1:
+        return np.nan
+    return (close_series.iloc[-1] / close_series.iloc[-period] - 1) * 100
+
+def _sre_rs_ratio(sector_close, bench_close):
+    """Relative strength ratio of sector vs benchmark."""
+    s = sector_close.reindex(bench_close.index, method='ffill').dropna()
+    b = bench_close.reindex(s.index).dropna()
+    idx = s.index.intersection(b.index)
+    if len(idx) < 2:
+        return np.nan
+    return (s.loc[idx].iloc[-1] / b.loc[idx].iloc[-1]) * 100
+
+def _sre_rotation_phase(rs_ratio_vals):
+    """
+    JdK RS-Ratio + RS-Momentum simplified:
+    Leading (RS>100, RS rising), Weakening (RS>100, RS falling),
+    Lagging (RS<100, RS falling), Improving (RS<100, RS rising)
+    """
+    if len(rs_ratio_vals) < 2 or any(np.isnan(v) for v in rs_ratio_vals[-2:]):
+        return "UNKNOWN"
+    curr, prev = rs_ratio_vals[-1], rs_ratio_vals[-2]
+    rising = curr > prev
+    if curr >= 100 and rising:
+        return "LEADING"
+    elif curr >= 100 and not rising:
+        return "WEAKENING"
+    elif curr < 100 and not rising:
+        return "LAGGING"
+    else:
+        return "IMPROVING"
+
+def show_sector_rotation_engine():
+    """14-Module Sector Rotation Analysis Engine."""
+    st.markdown("### 🔄 Sector Rotation Analysis Engine — NSE India")
+
+    if not _YF_AVAILABLE:
+        st.warning("yfinance not available. Install it (requirements.txt) to enable this engine.")
+        return
+
+    with st.spinner("Fetching sector data..."):
+        sector_data = _sre_fetch_all()
+
+    if not sector_data:
+        st.error("Could not fetch sector data. Check internet connectivity.")
+        return
+
+    # Get NIFTY50 as benchmark
+    import yfinance as yf
+    try:
+        bench_raw = yf.download("^NSEI", period="3mo", interval="1d",
+                                auto_adjust=True, progress=False)
+        bench_raw.columns = [c.lower() for c in bench_raw.columns]
+        bench_close = bench_raw['close'].dropna()
+    except Exception:
+        bench_close = pd.Series(dtype=float)
+
+    rows = []
+    rs_history = {}
+
+    for t_info in _SECTOR_TICKERS:
+        sym  = t_info["yf"]
+        name = t_info["name"]
+        df_s = sector_data.get(sym, pd.DataFrame())
+
+        if df_s.empty or 'close' not in df_s.columns or len(df_s) < 5:
+            rows.append({
+                "Sector": name, "LTP": "N/A", "1D%": "N/A", "1W%": "N/A",
+                "1M%": "N/A", "3M%": "N/A", "RS vs NIFTY": "N/A",
+                "Phase": "UNKNOWN", "Signal": "N/A", "Strength": "N/A"
+            })
+            continue
+
+        cl = df_s['close']
+        ltp = cl.iloc[-1]
+        chg_1d = _sre_momentum(cl, 1)
+        chg_1w = _sre_momentum(cl, 5)
+        chg_1m = _sre_momentum(cl, 21)
+        chg_3m = _sre_momentum(cl, 63)
+
+        # Relative strength
+        rs_val = _sre_rs_ratio(cl, bench_close) if not bench_close.empty else np.nan
+
+        # Build rolling RS for phase detection (last 5 daily values)
+        rs_series = []
+        if not bench_close.empty:
+            for i in range(min(5, len(cl))):
+                idx_offset = -(i+1)
+                s_slice = cl.iloc[:len(cl)+idx_offset] if idx_offset < 0 else cl
+                b_slice = bench_close.iloc[:len(bench_close)+idx_offset] if idx_offset < 0 else bench_close
+                rs_series.insert(0, _sre_rs_ratio(s_slice, b_slice))
+        rs_history[sym] = rs_series
+
+        phase = _sre_rotation_phase(rs_series) if rs_series else "UNKNOWN"
+
+        # Signal based on phase + momentum
+        if phase == "LEADING" and chg_1w > 0:
+            signal = "OVERWEIGHT"
+        elif phase == "WEAKENING":
+            signal = "REDUCE"
+        elif phase == "LAGGING":
+            signal = "UNDERWEIGHT"
+        elif phase == "IMPROVING" and chg_1d > 0:
+            signal = "ACCUMULATE"
+        else:
+            signal = "NEUTRAL"
+
+        # Strength score (0-100)
+        score_parts = [
+            min(max(chg_1d * 10 + 50, 0), 100) if not np.isnan(chg_1d) else 50,
+            min(max(chg_1w * 5  + 50, 0), 100) if not np.isnan(chg_1w) else 50,
+            min(max(chg_1m * 2  + 50, 0), 100) if not np.isnan(chg_1m) else 50,
+        ]
+        strength = int(np.mean(score_parts))
+
+        rows.append({
+            "Sector":      name,
+            "LTP":         f"{ltp:,.0f}",
+            "1D%":         f"{chg_1d:+.2f}%" if not np.isnan(chg_1d) else "N/A",
+            "1W%":         f"{chg_1w:+.2f}%" if not np.isnan(chg_1w) else "N/A",
+            "1M%":         f"{chg_1m:+.2f}%" if not np.isnan(chg_1m) else "N/A",
+            "3M%":         f"{chg_3m:+.2f}%" if not np.isnan(chg_3m) else "N/A",
+            "RS vs NIFTY": f"{rs_val:.1f}" if not np.isnan(rs_val) else "N/A",
+            "Phase":       phase,
+            "Signal":      signal,
+            "Strength":    strength,
+            "_chg1d_raw":  chg_1d if not np.isnan(chg_1d) else 0,
+            "_chg1w_raw":  chg_1w if not np.isnan(chg_1w) else 0,
+            "_phase_raw":  phase,
+            "_signal_raw": signal,
+        })
+
+    if not rows:
+        st.warning("No sector data available.")
+        return
+
+    full_df = pd.DataFrame(rows)
+    display_cols = ["Sector","LTP","1D%","1W%","1M%","3M%","RS vs NIFTY","Phase","Signal","Strength"]
+    disp_df = full_df[display_cols].copy()
+
+    # ── MODULE 2: Heatmap-style styling ──────────────────────────────
+    def _sre_style_row(row):
+        styles = [""] * len(row)
+        phase  = str(row.get("Phase", ""))
+        signal = str(row.get("Signal", ""))
+        phase_colors = {
+            "LEADING":   ("background-color:#1a3a1a", "color:#00e676"),
+            "IMPROVING": ("background-color:#1a2a3a", "color:#40c4ff"),
+            "WEAKENING": ("background-color:#2a2a1a", "color:#ffeb3b"),
+            "LAGGING":   ("background-color:#3a1a1a", "color:#ff5252"),
+        }
+        sig_colors = {
+            "OVERWEIGHT":  "color:#00e676; font-weight:bold",
+            "ACCUMULATE":  "color:#40c4ff; font-weight:bold",
+            "NEUTRAL":     "color:#bdbdbd",
+            "REDUCE":      "color:#ffeb3b; font-weight:bold",
+            "UNDERWEIGHT": "color:#ff5252; font-weight:bold",
+        }
+        col_names = list(row.index)
+        for i, col in enumerate(col_names):
+            if col == "Phase":
+                bg, fg = phase_colors.get(phase, ("", ""))
+                styles[i] = f"{bg}; {fg}"
+            elif col == "Signal":
+                styles[i] = sig_colors.get(signal, "")
+            elif col in ("1D%", "1W%", "1M%", "3M%"):
+                try:
+                    val = float(str(row[col]).replace("%","").replace("+",""))
+                    if val > 1:
+                        styles[i] = "color:#00e676"
+                    elif val < -1:
+                        styles[i] = "color:#ff5252"
+                    else:
+                        styles[i] = "color:#bdbdbd"
+                except Exception:
+                    pass
+        return styles
+
+    # ── MODULE 10: Dashboard Table ────────────────────────────────────
+    st.markdown("#### 📊 Sector Rotation Table")
+    st.dataframe(
+        disp_df.style.apply(_sre_style_row, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    # ── MODULE 3: Money Flow Heatmap ──────────────────────────────────
+    st.markdown("#### 💹 Money Flow Heatmap (1W Performance)")
+    heat_data = []
+    for r in rows:
+        try:
+            pct = float(str(r["1W%"]).replace("%","").replace("+",""))
+        except Exception:
+            pct = 0
+        heat_data.append({"Sector": r["Sector"], "1W%": pct})
+    heat_df = pd.DataFrame(heat_data).sort_values("1W%", ascending=False)
+
+    def _heat_color(val):
+        if val > 2:    return "background-color:#00600a; color:white"
+        elif val > 0:  return "background-color:#1b5e20; color:#e8f5e9"
+        elif val > -2: return "background-color:#b71c1c; color:#ffcdd2"
+        else:          return "background-color:#7f0000; color:white"
+
+    st.dataframe(
+        heat_df.style.applymap(_heat_color, subset=["1W%"]),
+        use_container_width=True, hide_index=True
+    )
+
+    # ── MODULE 4: Relative Strength Rankings ─────────────────────────
+    st.markdown("#### 🏆 Relative Strength Rankings (vs NIFTY 50)")
+    rs_rows = []
+    for r in rows:
+        rs_val_str = r.get("RS vs NIFTY", "N/A")
+        try:
+            rs_num = float(rs_val_str)
+        except Exception:
+            rs_num = np.nan
+        phase = r.get("Phase", "UNKNOWN")
+        rs_rows.append({
+            "Sector": r["Sector"],
+            "RS Ratio": rs_val_str,
+            "Phase": phase,
+            "Rank Signal": "OUTPERFORM" if (not np.isnan(rs_num) and rs_num >= 100) else "UNDERPERFORM"
+        })
+    rs_df = pd.DataFrame(rs_rows)
+
+    def _rs_style(row):
+        if row["Rank Signal"] == "OUTPERFORM":
+            return [""] + ["background-color:#1a3a1a; color:#00e676"] * (len(row)-1)
+        return [""] + ["background-color:#3a1a1a; color:#ff5252"] * (len(row)-1)
+
+    st.dataframe(rs_df.style.apply(_rs_style, axis=1), use_container_width=True, hide_index=True)
+
+    # ── MODULE 5: Rotation Signals Summary ───────────────────────────
+    leading   = [r["Sector"] for r in rows if r["Phase"] == "LEADING"]
+    improving = [r["Sector"] for r in rows if r["Phase"] == "IMPROVING"]
+    weakening = [r["Sector"] for r in rows if r["Phase"] == "WEAKENING"]
+    lagging   = [r["Sector"] for r in rows if r["Phase"] == "LAGGING"]
+
+    st.markdown("#### 🔄 Rotation Phase Summary")
+    rc1, rc2, rc3, rc4 = st.columns(4)
+    with rc1:
+        st.success(f"**LEADING** ({len(leading)})\n\n" + "\n".join(f"• {s}" for s in leading) if leading else "None")
+    with rc2:
+        st.info(f"**IMPROVING** ({len(improving)})\n\n" + "\n".join(f"• {s}" for s in improving) if improving else "None")
+    with rc3:
+        st.warning(f"**WEAKENING** ({len(weakening)})\n\n" + "\n".join(f"• {s}" for s in weakening) if weakening else "None")
+    with rc4:
+        st.error(f"**LAGGING** ({len(lagging)})\n\n" + "\n".join(f"• {s}" for s in lagging) if lagging else "None")
+
+    # ── MODULE 6: Intraday Tracker (1D momentum rankings) ────────────
+    with st.expander("⚡ Intraday Sector Momentum Tracker", expanded=False):
+        intra_rows = sorted(rows, key=lambda x: x["_chg1d_raw"], reverse=True)
+        intra_df = pd.DataFrame([
+            {"Rank": i+1, "Sector": r["Sector"], "1D Change": r["1D%"], "Signal": r["Signal"]}
+            for i, r in enumerate(intra_rows)
+        ])
+
+        def _intra_style(row):
+            try:
+                val = float(str(row["1D Change"]).replace("%","").replace("+",""))
+                c = "color:#00e676" if val > 0 else "color:#ff5252"
+            except Exception:
+                c = ""
+            return ["", "", c, ""]
+        st.dataframe(intra_df.style.apply(_intra_style, axis=1), use_container_width=True, hide_index=True)
+
+    # ── MODULE 7: Alerts ──────────────────────────────────────────────
+    st.markdown("#### 🚨 Sector Rotation Alerts")
+    sector_alerts = []
+    for r in rows:
+        if r["Phase"] == "IMPROVING" and r["_chg1w_raw"] > 2:
+            sector_alerts.append(f"🟢 **{r['Sector']}** entering IMPROVING phase with strong 1W gain ({r['1W%']})")
+        if r["Phase"] == "WEAKENING" and r["_chg1w_raw"] < -1:
+            sector_alerts.append(f"🟡 **{r['Sector']}** WEAKENING — consider reducing exposure ({r['1W%']})")
+        if r["Phase"] == "LAGGING" and r["_chg1d_raw"] < -1.5:
+            sector_alerts.append(f"🔴 **{r['Sector']}** LAGGING with today's drop ({r['1D%']}) — avoid")
+        if r["Phase"] == "LEADING" and r["_chg1w_raw"] > 3:
+            sector_alerts.append(f"⚡ **{r['Sector']}** LEADING strongly ({r['1W%']} in 1W) — momentum play")
+
+    if sector_alerts:
+        for al in sector_alerts:
+            st.info(al)
+    else:
+        st.success("✅ No critical sector rotation alerts at this time.")
+
+
+# =====================================================================
 # CANDLESTICK INTELLIGENCE ENGINE — Helper Functions
 # =====================================================================
 
@@ -7363,6 +8523,10 @@ def main():
 
     # ===== MARKET OVERVIEW (NIFTY + SENSEX) =====
     show_market_overview(api, interval=timeframes.get(selected_timeframe, "1"), days_back=days_back)
+
+    # ===== BANK NIFTY MULTI-TICKER DASHBOARD =====
+    with st.expander("📊 Bank Nifty Dashboard — Multi-Ticker & Indicator Table", expanded=False):
+        show_bn_dashboard(interval=timeframes.get(selected_timeframe, "1"))
 
     # Main layout - Trading chart and Options analysis side by side
     col1, col2 = st.columns([2, 1])
@@ -13738,6 +14902,21 @@ def main():
                 st.info("Option chain data required for Candlestick Intelligence Engine.")
         except Exception as _cie_err:
             st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
+
+    # ===== FUTURES MARKET ANALYSIS ENGINE =====
+    if option_data and option_data.get('underlying') and not df.empty:
+        try:
+            with st.expander("🔮 Futures Market Analysis Engine", expanded=False):
+                show_futures_analysis_engine(df, option_data, current_price)
+        except Exception as _fae_err:
+            st.warning(f"Futures Analysis Engine error: {str(_fae_err)}")
+
+    # ===== SECTOR ROTATION ANALYSIS ENGINE =====
+    with st.expander("🔄 Sector Rotation Analysis Engine", expanded=False):
+        try:
+            show_sector_rotation_engine()
+        except Exception as _sre_err:
+            st.warning(f"Sector Rotation Engine error: {str(_sre_err)}")
 
     # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
     if enable_signals and option_data and option_data.get('underlying') and not df.empty:
