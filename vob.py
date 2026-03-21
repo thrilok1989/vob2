@@ -3088,7 +3088,713 @@ def _detect_chart_candle_types(df):
     return patterns
 
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None, candle_patterns=None):
+class GeometricPatternDetector:
+    """
+    Detects geometric and reversal chart patterns on NIFTY50 price data.
+    Patterns: Double Bottom/Top, H&S, Inv H&S, Triangles, Falling Wedge,
+              Flag, Range Breakout, Channel, Trendline Breakout.
+    Each detected pattern returns entry, SL, target, RR, confidence score,
+    draw instructions for chart overlay, and sentiment classification.
+    """
+
+    TOLERANCE = 0.015   # 1.5% price similarity for double tops/bottoms
+    MIN_PATTERN_BARS = 5  # minimum bars between pivots
+
+    # ── internal helpers ──────────────────────────────────────────────────
+    @staticmethod
+    def _find_pivots(df, order=3):
+        """Return indices of swing highs and lows using rolling window."""
+        highs, lows = [], []
+        closes = df['close'].values
+        n = len(closes)
+        for i in range(order, n - order):
+            window_h = closes[i - order:i + order + 1]
+            window_l = closes[i - order:i + order + 1]
+            if closes[i] == window_h.max():
+                highs.append(i)
+            if closes[i] == window_l.min():
+                lows.append(i)
+        return highs, lows
+
+    @staticmethod
+    def _slope_intercept(x1, y1, x2, y2):
+        if x2 == x1:
+            return 0, y1
+        slope = (y2 - y1) / (x2 - x1)
+        intercept = y1 - slope * x1
+        return slope, intercept
+
+    @staticmethod
+    def _confidence_score(df, breakout_idx, signal, rsi_data=None):
+        """Score 0-8. Maps to Low/Moderate/High/Strong/Institutional."""
+        score = 0
+        closes = df['close'].values
+        volumes = df['volume'].values if 'volume' in df.columns else None
+        n = len(closes)
+        if breakout_idx >= n:
+            breakout_idx = n - 1
+
+        # Volume spike
+        if volumes is not None and breakout_idx > 5:
+            avg_vol = volumes[max(0, breakout_idx - 10):breakout_idx].mean()
+            if avg_vol > 0 and volumes[breakout_idx] > avg_vol * 1.5:
+                score += 2
+
+        # Breakout momentum (candle body size)
+        if breakout_idx > 0:
+            body = abs(closes[breakout_idx] - df['open'].values[breakout_idx])
+            avg_body = abs(closes[max(0, breakout_idx - 10):breakout_idx] -
+                          df['open'].values[max(0, breakout_idx - 10):breakout_idx]).mean()
+            if avg_body > 0 and body > avg_body * 1.3:
+                score += 1
+
+        # RSI confirmation
+        if rsi_data is not None and len(rsi_data) > breakout_idx:
+            rsi_val = rsi_data[breakout_idx]
+            if signal == 'BUY' and 45 < rsi_val < 75:
+                score += 2
+            elif signal == 'SELL' and 25 < rsi_val < 55:
+                score += 2
+
+        # Strong close (close near high for BUY, low for SELL)
+        if breakout_idx < n:
+            hi = df['high'].values[breakout_idx]
+            lo = df['low'].values[breakout_idx]
+            rng = hi - lo if hi != lo else 0.001
+            if signal == 'BUY' and (closes[breakout_idx] - lo) / rng > 0.6:
+                score += 1
+            elif signal == 'SELL' and (hi - closes[breakout_idx]) / rng > 0.6:
+                score += 1
+
+        # Trend alignment: last N bars direction matches signal
+        if n >= 20:
+            recent_slope = np.polyfit(range(10), closes[-10:], 1)[0]
+            if signal == 'BUY' and recent_slope > 0:
+                score += 1
+            elif signal == 'SELL' and recent_slope < 0:
+                score += 1
+
+        labels = ['Low', 'Low', 'Moderate', 'Moderate', 'High', 'High', 'Strong', 'Strong', 'Institutional Setup']
+        return labels[min(score, 8)]
+
+    @staticmethod
+    def _win_loss(move_pct, signal):
+        if signal == 'BUY':
+            return 'WIN' if move_pct > 0 else 'LOSS'
+        else:
+            return 'WIN' if move_pct < 0 else 'LOSS'
+
+    # ── pattern detectors ─────────────────────────────────────────────────
+    def _detect_double_bottom(self, df):
+        results = []
+        _, lows = self._find_pivots(df, order=3)
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+
+        for i in range(len(lows) - 1):
+            b1, b2 = lows[i], lows[i + 1]
+            if b2 - b1 < self.MIN_PATTERN_BARS:
+                continue
+            p1, p2 = closes[b1], closes[b2]
+            if abs(p1 - p2) / max(p1, p2) > self.TOLERANCE:
+                continue
+            # Neckline = highest close between the two bottoms
+            neckline = closes[b1:b2].max()
+            # Check breakout: candle after b2 closes above neckline
+            bo_idx = b2 + 1
+            if bo_idx >= n:
+                continue
+            if closes[bo_idx] > neckline:
+                pattern_height = neckline - min(p1, p2)
+                entry = neckline
+                sl = min(lows_arr[b1], lows_arr[b2])
+                target = entry + pattern_height
+                rr = (target - entry) / (entry - sl) if (entry - sl) > 0 else 0
+                move_pct = (closes[min(bo_idx + 5, n - 1)] - entry) / entry * 100
+                results.append({
+                    'pattern': 'Double Bottom', 'pattern_type': 'Reversal',
+                    'sentiment': 'Bullish Reversal', 'signal': 'BUY',
+                    'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                    'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                    'move_pct': round(move_pct, 2),
+                    'confidence': self._confidence_score(df, bo_idx, 'BUY'),
+                    'highlight_idx': bo_idx,
+                    'draw_lines': [
+                        (df['datetime'].iloc[b1], p1, df['datetime'].iloc[b2], p2, '#00ff88'),
+                        (df['datetime'].iloc[b1], neckline, df['datetime'].iloc[bo_idx], neckline, '#FFD700'),
+                    ],
+                    'sr_zones': [(min(p1, p2) * 0.998, min(p1, p2) * 1.002, 'rgba(0,255,136,0.15)')],
+                })
+        return results
+
+    def _detect_double_top(self, df):
+        results = []
+        highs, _ = self._find_pivots(df, order=3)
+        closes = df['close'].values
+        lows_arr = df['low'].values
+        highs_arr = df['high'].values
+        n = len(closes)
+
+        for i in range(len(highs) - 1):
+            t1, t2 = highs[i], highs[i + 1]
+            if t2 - t1 < self.MIN_PATTERN_BARS:
+                continue
+            p1, p2 = closes[t1], closes[t2]
+            if abs(p1 - p2) / max(p1, p2) > self.TOLERANCE:
+                continue
+            neckline = closes[t1:t2].min()
+            bo_idx = t2 + 1
+            if bo_idx >= n:
+                continue
+            if closes[bo_idx] < neckline:
+                pattern_height = max(p1, p2) - neckline
+                entry = neckline
+                sl = max(highs_arr[t1], highs_arr[t2])
+                target = entry - pattern_height
+                rr = (entry - target) / (sl - entry) if (sl - entry) > 0 else 0
+                move_pct = (closes[min(bo_idx + 5, n - 1)] - entry) / entry * 100
+                results.append({
+                    'pattern': 'Double Top', 'pattern_type': 'Reversal',
+                    'sentiment': 'Bearish Reversal', 'signal': 'SELL',
+                    'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                    'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                    'move_pct': round(move_pct, 2),
+                    'confidence': self._confidence_score(df, bo_idx, 'SELL'),
+                    'highlight_idx': bo_idx,
+                    'draw_lines': [
+                        (df['datetime'].iloc[t1], p1, df['datetime'].iloc[t2], p2, '#ff4444'),
+                        (df['datetime'].iloc[t1], neckline, df['datetime'].iloc[bo_idx], neckline, '#FFD700'),
+                    ],
+                    'sr_zones': [(max(p1, p2) * 0.998, max(p1, p2) * 1.002, 'rgba(255,68,68,0.15)')],
+                })
+        return results
+
+    def _detect_head_shoulders(self, df):
+        results = []
+        highs, _ = self._find_pivots(df, order=3)
+        closes = df['close'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        if len(highs) < 3:
+            return results
+
+        for i in range(len(highs) - 2):
+            ls, head, rs = highs[i], highs[i + 1], highs[i + 2]
+            if head - ls < 3 or rs - head < 3:
+                continue
+            p_ls, p_head, p_rs = closes[ls], closes[head], closes[rs]
+            if p_head <= max(p_ls, p_rs):
+                continue
+            if abs(p_ls - p_rs) / p_head > 0.04:
+                continue
+            # Neckline: trough between ls-head and head-rs
+            t1_low = lows_arr[ls:head].min()
+            t2_low = lows_arr[head:rs].min()
+            neckline = (t1_low + t2_low) / 2
+            bo_idx = rs + 1
+            if bo_idx >= n:
+                continue
+            if closes[bo_idx] < neckline:
+                pattern_height = p_head - neckline
+                entry = neckline
+                sl = closes[rs] * 1.005
+                target = neckline - pattern_height
+                rr = (entry - target) / (sl - entry) if (sl - entry) > 0 else 0
+                move_pct = (closes[min(bo_idx + 5, n - 1)] - entry) / entry * 100
+                results.append({
+                    'pattern': 'Head & Shoulders', 'pattern_type': 'Reversal',
+                    'sentiment': 'Bearish Reversal', 'signal': 'SELL',
+                    'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                    'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                    'move_pct': round(move_pct, 2),
+                    'confidence': self._confidence_score(df, bo_idx, 'SELL'),
+                    'highlight_idx': bo_idx,
+                    'draw_lines': [
+                        (df['datetime'].iloc[ls], p_ls, df['datetime'].iloc[head], p_head, '#ff4444'),
+                        (df['datetime'].iloc[head], p_head, df['datetime'].iloc[rs], p_rs, '#ff4444'),
+                        (df['datetime'].iloc[ls], neckline, df['datetime'].iloc[bo_idx], neckline, '#FFD700'),
+                    ],
+                    'sr_zones': [],
+                })
+        return results
+
+    def _detect_inv_head_shoulders(self, df):
+        results = []
+        _, lows = self._find_pivots(df, order=3)
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        n = len(closes)
+        if len(lows) < 3:
+            return results
+
+        for i in range(len(lows) - 2):
+            ls, head, rs = lows[i], lows[i + 1], lows[i + 2]
+            if head - ls < 3 or rs - head < 3:
+                continue
+            p_ls, p_head, p_rs = closes[ls], closes[head], closes[rs]
+            if p_head >= min(p_ls, p_rs):
+                continue
+            if abs(p_ls - p_rs) / max(abs(p_head), 1) > 0.04:
+                continue
+            t1_high = highs_arr[ls:head].max()
+            t2_high = highs_arr[head:rs].max()
+            neckline = (t1_high + t2_high) / 2
+            bo_idx = rs + 1
+            if bo_idx >= n:
+                continue
+            if closes[bo_idx] > neckline:
+                pattern_height = neckline - p_head
+                entry = neckline
+                sl = closes[rs] * 0.995
+                target = neckline + pattern_height
+                rr = (target - entry) / (entry - sl) if (entry - sl) > 0 else 0
+                move_pct = (closes[min(bo_idx + 5, n - 1)] - entry) / entry * 100
+                results.append({
+                    'pattern': 'Inv Head & Shoulders', 'pattern_type': 'Reversal',
+                    'sentiment': 'Bullish Reversal', 'signal': 'BUY',
+                    'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                    'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                    'move_pct': round(move_pct, 2),
+                    'confidence': self._confidence_score(df, bo_idx, 'BUY'),
+                    'highlight_idx': bo_idx,
+                    'draw_lines': [
+                        (df['datetime'].iloc[ls], p_ls, df['datetime'].iloc[head], p_head, '#00ff88'),
+                        (df['datetime'].iloc[head], p_head, df['datetime'].iloc[rs], p_rs, '#00ff88'),
+                        (df['datetime'].iloc[ls], neckline, df['datetime'].iloc[bo_idx], neckline, '#FFD700'),
+                    ],
+                    'sr_zones': [],
+                })
+        return results
+
+    def _detect_triangles(self, df):
+        results = []
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        window = min(30, n - 1)
+        if n < window + 2:
+            return results
+
+        seg = slice(n - window - 1, n - 1)
+        xs = np.arange(window + 1)
+        h_slope, h_int = np.polyfit(xs, highs_arr[seg], 1)
+        l_slope, l_int = np.polyfit(xs, lows_arr[seg], 1)
+        tol = closes[-1] * 0.003
+        bo_idx = n - 1
+        entry = closes[bo_idx]
+        upper_at_end = h_slope * window + h_int
+        lower_at_end = l_slope * window + l_int
+
+        def _make(pat, sent, sig, sl, tgt):
+            rr = abs(tgt - entry) / abs(entry - sl) if abs(entry - sl) > 0 else 0
+            move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+            return {
+                'pattern': pat, 'pattern_type': 'Breakout',
+                'sentiment': sent, 'signal': sig,
+                'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                'stoploss': sl, 'target': tgt, 'rr': round(rr, 2),
+                'move_pct': round(move_pct, 2),
+                'confidence': self._confidence_score(df, bo_idx, sig),
+                'highlight_idx': bo_idx,
+                'draw_lines': [
+                    (df['datetime'].iloc[n - window - 1], h_int, df['datetime'].iloc[bo_idx], upper_at_end, '#FFD700'),
+                    (df['datetime'].iloc[n - window - 1], l_int, df['datetime'].iloc[bo_idx], lower_at_end, '#FFD700'),
+                ],
+                'sr_zones': [],
+            }
+
+        # Ascending triangle: flat resistance, rising support
+        if abs(h_slope) < tol * 0.1 and l_slope > tol * 0.05:
+            if entry > upper_at_end:
+                pat_h = upper_at_end - lower_at_end
+                results.append(_make('Ascending Triangle', 'Bullish Breakout', 'BUY',
+                                     lower_at_end, upper_at_end + pat_h))
+        # Descending triangle: falling resistance, flat support
+        elif abs(l_slope) < tol * 0.1 and h_slope < -tol * 0.05:
+            if entry < lower_at_end:
+                pat_h = upper_at_end - lower_at_end
+                results.append(_make('Descending Triangle', 'Bearish Breakdown', 'SELL',
+                                     upper_at_end, lower_at_end - pat_h))
+        # Symmetrical triangle: converging lines
+        elif h_slope < -tol * 0.05 and l_slope > tol * 0.05:
+            mid = (upper_at_end + lower_at_end) / 2
+            if entry > upper_at_end:
+                pat_h = upper_at_end - lower_at_end
+                results.append(_make('Symmetrical Triangle', 'Bullish Breakout', 'BUY',
+                                     lower_at_end, upper_at_end + pat_h))
+            elif entry < lower_at_end:
+                pat_h = upper_at_end - lower_at_end
+                results.append(_make('Symmetrical Triangle', 'Bearish Breakdown', 'SELL',
+                                     upper_at_end, lower_at_end - pat_h))
+        return results
+
+    def _detect_falling_wedge(self, df):
+        results = []
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        window = min(25, n - 1)
+        if n < window + 2:
+            return results
+
+        seg = slice(n - window - 1, n - 1)
+        xs = np.arange(window + 1)
+        h_slope, h_int = np.polyfit(xs, highs_arr[seg], 1)
+        l_slope, l_int = np.polyfit(xs, lows_arr[seg], 1)
+
+        # Both slopes negative, resistance falling faster than support
+        if h_slope < 0 and l_slope < 0 and h_slope < l_slope:
+            bo_idx = n - 1
+            upper_at_end = h_slope * window + h_int
+            lower_at_end = l_slope * window + l_int
+            if closes[bo_idx] > upper_at_end:
+                entry = closes[bo_idx]
+                sl = lower_at_end
+                target = entry + (upper_at_end - lower_at_end) * 2
+                rr = (target - entry) / (entry - sl) if (entry - sl) > 0 else 0
+                move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+                results.append({
+                    'pattern': 'Falling Wedge', 'pattern_type': 'Reversal',
+                    'sentiment': 'Bullish', 'signal': 'BUY',
+                    'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                    'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                    'move_pct': round(move_pct, 2),
+                    'confidence': self._confidence_score(df, bo_idx, 'BUY'),
+                    'highlight_idx': bo_idx,
+                    'draw_lines': [
+                        (df['datetime'].iloc[n - window - 1], h_int, df['datetime'].iloc[bo_idx], upper_at_end, '#00ff88'),
+                        (df['datetime'].iloc[n - window - 1], l_int, df['datetime'].iloc[bo_idx], lower_at_end, '#00ff88'),
+                    ],
+                    'sr_zones': [],
+                })
+        return results
+
+    def _detect_flag(self, df):
+        results = []
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        if n < 20:
+            return results
+
+        # Detect flagpole: strong move in last 10-15 bars
+        pole_end = n - 6
+        pole_start = max(0, pole_end - 10)
+        pole_move = closes[pole_end] - closes[pole_start]
+        pole_pct = pole_move / closes[pole_start] if closes[pole_start] > 0 else 0
+
+        flag_window = 5
+        flag_seg = closes[n - flag_window:n]
+        flag_slope, _ = np.polyfit(range(flag_window), flag_seg, 1)
+
+        bo_idx = n - 1
+        entry = closes[bo_idx]
+
+        # Bull flag: upward pole, slight downward flag, breakout above flag top
+        if pole_pct > 0.01 and flag_slope < 0:
+            flag_top = highs_arr[n - flag_window:n].max()
+            if closes[bo_idx] > flag_top:
+                sl = lows_arr[n - flag_window:n].min()
+                target = entry + abs(pole_move)
+                rr = (target - entry) / (entry - sl) if (entry - sl) > 0 else 0
+                move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+                results.append({
+                    'pattern': 'Bull Flag', 'pattern_type': 'Continuation',
+                    'sentiment': 'Bullish Continuation', 'signal': 'BUY',
+                    'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                    'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                    'move_pct': round(move_pct, 2),
+                    'confidence': self._confidence_score(df, bo_idx, 'BUY'),
+                    'highlight_idx': bo_idx,
+                    'draw_lines': [
+                        (df['datetime'].iloc[pole_start], closes[pole_start],
+                         df['datetime'].iloc[pole_end], closes[pole_end], '#00ff88'),
+                    ],
+                    'sr_zones': [(sl * 0.998, flag_top * 1.002, 'rgba(0,255,136,0.1)')],
+                })
+
+        # Bear flag: downward pole, slight upward flag, breakout below flag bottom
+        elif pole_pct < -0.01 and flag_slope > 0:
+            flag_bottom = lows_arr[n - flag_window:n].min()
+            if closes[bo_idx] < flag_bottom:
+                sl = highs_arr[n - flag_window:n].max()
+                target = entry - abs(pole_move)
+                rr = (entry - target) / (sl - entry) if (sl - entry) > 0 else 0
+                move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+                results.append({
+                    'pattern': 'Bear Flag', 'pattern_type': 'Continuation',
+                    'sentiment': 'Bearish Continuation', 'signal': 'SELL',
+                    'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                    'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                    'move_pct': round(move_pct, 2),
+                    'confidence': self._confidence_score(df, bo_idx, 'SELL'),
+                    'highlight_idx': bo_idx,
+                    'draw_lines': [
+                        (df['datetime'].iloc[pole_start], closes[pole_start],
+                         df['datetime'].iloc[pole_end], closes[pole_end], '#ff4444'),
+                    ],
+                    'sr_zones': [(flag_bottom * 0.998, sl * 1.002, 'rgba(255,68,68,0.1)')],
+                })
+        return results
+
+    def _detect_range_breakout(self, df):
+        results = []
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        window = min(20, n - 2)
+        if n < window + 2:
+            return results
+
+        seg_h = highs_arr[n - window - 1:n - 1]
+        seg_l = lows_arr[n - window - 1:n - 1]
+        resistance = seg_h.max()
+        support = seg_l.min()
+        rng = resistance - support
+        if rng / max(support, 1) < 0.003:  # Range too narrow
+            return results
+
+        bo_idx = n - 1
+        entry = closes[bo_idx]
+
+        # Breakout above resistance
+        if entry > resistance:
+            sl = support
+            target = resistance + rng
+            rr = (target - entry) / (entry - sl) if (entry - sl) > 0 else 0
+            move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+            results.append({
+                'pattern': 'Range Breakout', 'pattern_type': 'Breakout',
+                'sentiment': 'Bullish Momentum', 'signal': 'BUY',
+                'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                'move_pct': round(move_pct, 2),
+                'confidence': self._confidence_score(df, bo_idx, 'BUY'),
+                'highlight_idx': bo_idx,
+                'draw_lines': [
+                    (df['datetime'].iloc[n - window - 1], resistance,
+                     df['datetime'].iloc[bo_idx], resistance, '#FFD700'),
+                    (df['datetime'].iloc[n - window - 1], support,
+                     df['datetime'].iloc[bo_idx], support, '#FFD700'),
+                ],
+                'sr_zones': [(support, resistance, 'rgba(255,215,0,0.08)')],
+            })
+        # Breakdown below support
+        elif entry < support:
+            sl = resistance
+            target = support - rng
+            rr = (entry - target) / (sl - entry) if (sl - entry) > 0 else 0
+            move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+            results.append({
+                'pattern': 'Range Breakdown', 'pattern_type': 'Breakout',
+                'sentiment': 'Bearish Momentum', 'signal': 'SELL',
+                'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                'move_pct': round(move_pct, 2),
+                'confidence': self._confidence_score(df, bo_idx, 'SELL'),
+                'highlight_idx': bo_idx,
+                'draw_lines': [
+                    (df['datetime'].iloc[n - window - 1], resistance,
+                     df['datetime'].iloc[bo_idx], resistance, '#FFD700'),
+                    (df['datetime'].iloc[n - window - 1], support,
+                     df['datetime'].iloc[bo_idx], support, '#FFD700'),
+                ],
+                'sr_zones': [(support, resistance, 'rgba(255,215,0,0.08)')],
+            })
+        return results
+
+    def _detect_channel(self, df):
+        results = []
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        window = min(25, n - 1)
+        if n < window + 2:
+            return results
+
+        seg = slice(n - window - 1, n - 1)
+        xs = np.arange(window + 1)
+        h_slope, h_int = np.polyfit(xs, highs_arr[seg], 1)
+        l_slope, l_int = np.polyfit(xs, lows_arr[seg], 1)
+
+        # Parallel channel: slopes roughly equal
+        slope_diff = abs(h_slope - l_slope) / (abs(h_slope) + 0.001)
+        if slope_diff > 0.5:
+            return results
+
+        bo_idx = n - 1
+        upper_at_end = h_slope * window + h_int
+        lower_at_end = l_slope * window + l_int
+        entry = closes[bo_idx]
+        channel_height = upper_at_end - lower_at_end
+
+        # Channel breakdown (bearish)
+        if entry < lower_at_end:
+            sl = upper_at_end
+            target = lower_at_end - channel_height
+            rr = (entry - target) / (sl - entry) if (sl - entry) > 0 else 0
+            move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+            color = '#ff4444'
+            results.append({
+                'pattern': 'Channel Breakdown', 'pattern_type': 'Breakout',
+                'sentiment': 'Bearish Momentum', 'signal': 'SELL',
+                'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                'move_pct': round(move_pct, 2),
+                'confidence': self._confidence_score(df, bo_idx, 'SELL'),
+                'highlight_idx': bo_idx,
+                'draw_lines': [
+                    (df['datetime'].iloc[n - window - 1], h_int, df['datetime'].iloc[bo_idx], upper_at_end, color),
+                    (df['datetime'].iloc[n - window - 1], l_int, df['datetime'].iloc[bo_idx], lower_at_end, color),
+                ],
+                'sr_zones': [],
+            })
+        # Channel breakout (bullish)
+        elif entry > upper_at_end:
+            sl = lower_at_end
+            target = upper_at_end + channel_height
+            rr = (target - entry) / (entry - sl) if (entry - sl) > 0 else 0
+            move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+            color = '#00ff88'
+            results.append({
+                'pattern': 'Channel Breakout', 'pattern_type': 'Breakout',
+                'sentiment': 'Bullish Momentum', 'signal': 'BUY',
+                'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                'move_pct': round(move_pct, 2),
+                'confidence': self._confidence_score(df, bo_idx, 'BUY'),
+                'highlight_idx': bo_idx,
+                'draw_lines': [
+                    (df['datetime'].iloc[n - window - 1], h_int, df['datetime'].iloc[bo_idx], upper_at_end, color),
+                    (df['datetime'].iloc[n - window - 1], l_int, df['datetime'].iloc[bo_idx], lower_at_end, color),
+                ],
+                'sr_zones': [],
+            })
+        return results
+
+    def _detect_trendline_breakout(self, df):
+        results = []
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        window = min(20, n - 1)
+        if n < window + 2:
+            return results
+
+        seg = slice(n - window - 1, n - 1)
+        xs = np.arange(window + 1)
+        h_slope, h_int = np.polyfit(xs, highs_arr[seg], 1)
+        l_slope, l_int = np.polyfit(xs, lows_arr[seg], 1)
+
+        bo_idx = n - 1
+        upper_at_end = h_slope * window + h_int
+        lower_at_end = l_slope * window + l_int
+        entry = closes[bo_idx]
+
+        # Trendline breakout up: price was in downtrend (h_slope < 0), breaks above
+        if h_slope < 0 and entry > upper_at_end:
+            sl = lower_at_end
+            target = entry + (entry - sl) * 1.5
+            rr = (target - entry) / (entry - sl) if (entry - sl) > 0 else 0
+            move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+            results.append({
+                'pattern': 'Trendline Breakout Up', 'pattern_type': 'Breakout',
+                'sentiment': 'Bullish Trend Change', 'signal': 'BUY',
+                'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                'move_pct': round(move_pct, 2),
+                'confidence': self._confidence_score(df, bo_idx, 'BUY'),
+                'highlight_idx': bo_idx,
+                'draw_lines': [
+                    (df['datetime'].iloc[n - window - 1], h_int,
+                     df['datetime'].iloc[bo_idx], upper_at_end, '#00ff88'),
+                ],
+                'sr_zones': [],
+            })
+        # Trendline breakdown: price was in uptrend (l_slope > 0), breaks below
+        elif l_slope > 0 and entry < lower_at_end:
+            sl = upper_at_end
+            target = entry - (sl - entry) * 1.5
+            rr = (entry - target) / (sl - entry) if (sl - entry) > 0 else 0
+            move_pct = (closes[min(bo_idx + 3, n - 1)] - entry) / entry * 100
+            results.append({
+                'pattern': 'Trendline Breakdown', 'pattern_type': 'Breakout',
+                'sentiment': 'Bearish Trend Change', 'signal': 'SELL',
+                'time': df['datetime'].iloc[bo_idx], 'entry': entry,
+                'stoploss': sl, 'target': target, 'rr': round(rr, 2),
+                'move_pct': round(move_pct, 2),
+                'confidence': self._confidence_score(df, bo_idx, 'SELL'),
+                'highlight_idx': bo_idx,
+                'draw_lines': [
+                    (df['datetime'].iloc[n - window - 1], l_int,
+                     df['datetime'].iloc[bo_idx], lower_at_end, '#ff4444'),
+                ],
+                'sr_zones': [],
+            })
+        return results
+
+    # ── public API ────────────────────────────────────────────────────────
+    def detect_all(self, df):
+        """Run all pattern detectors. Returns merged list of pattern dicts."""
+        if df is None or df.empty or len(df) < 15:
+            return []
+        results = []
+        for detector in [
+            self._detect_double_bottom,
+            self._detect_double_top,
+            self._detect_head_shoulders,
+            self._detect_inv_head_shoulders,
+            self._detect_triangles,
+            self._detect_falling_wedge,
+            self._detect_flag,
+            self._detect_range_breakout,
+            self._detect_channel,
+            self._detect_trendline_breakout,
+        ]:
+            try:
+                results.extend(detector(df))
+            except Exception:
+                pass
+        # Sort by time and deduplicate by pattern name (keep most recent)
+        seen = {}
+        for r in sorted(results, key=lambda x: x['time']):
+            seen[r['pattern']] = r
+        return list(seen.values())
+
+    def backtest_scan(self, df, step=5):
+        """
+        Walk forward scan: at each step, call detect_all on df[:i].
+        Returns list of pattern occurrences with win/loss evaluation.
+        """
+        results = []
+        n = len(df)
+        for i in range(30, n, step):
+            sub_df = df.iloc[:i].copy()
+            patterns = self.detect_all(sub_df)
+            for p in patterns:
+                # Look ahead to evaluate outcome
+                future_close = df['close'].iloc[min(i + 5, n - 1)]
+                actual_move = (future_close - p['entry']) / p['entry'] * 100 if p['entry'] > 0 else 0
+                result = 'WIN' if (
+                    (p['signal'] == 'BUY' and future_close > p['entry']) or
+                    (p['signal'] == 'SELL' and future_close < p['entry'])
+                ) else 'LOSS'
+                p2 = dict(p)
+                p2['actual_move_pct'] = round(actual_move, 2)
+                p2['result'] = result
+                results.append(p2)
+        return results
+
+
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, rsi_sz_data=None, ultimate_rsi_data=None, candle_patterns=None, geo_patterns=None):
     """Create TradingView-style candlestick chart with optional pivot levels, VOB zones, POC lines, Swing data, RSI Suppression Zones, and Ultimate RSI"""
     if df.empty:
         return go.Figure()
@@ -3667,6 +4373,85 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
                 ), row=1, col=1)
         except Exception:
             pass  # Candle pattern markers failed, skip
+
+    # ── Geometric / Reversal pattern overlays ─────────────────────────────
+    if geo_patterns:
+        try:
+            for gp in geo_patterns:
+                sig = gp.get('signal', 'BUY')
+                pat_color = '#00ff88' if sig == 'BUY' else ('#ff4444' if sig == 'SELL' else '#FFD700')
+
+                # Draw trendlines / necklines for this pattern
+                for (x0, y0, x1, y1, line_color) in gp.get('draw_lines', []):
+                    fig.add_shape(
+                        type='line', x0=x0, y0=y0, x1=x1, y1=y1,
+                        line=dict(color=line_color, width=2, dash='dash'),
+                        row=1, col=1
+                    )
+
+                # Draw S/R zones
+                for (low_z, high_z, fill_color) in gp.get('sr_zones', []):
+                    fig.add_shape(
+                        type='rect',
+                        x0=df['datetime'].min(), x1=df['datetime'].max(),
+                        y0=low_z, y1=high_z,
+                        fillcolor=fill_color,
+                        line=dict(width=0),
+                        row=1, col=1
+                    )
+
+                # Highlight breakout candle
+                hi_idx = gp.get('highlight_idx')
+                if hi_idx is not None and 0 <= hi_idx < len(df):
+                    hi_time = df['datetime'].iloc[hi_idx]
+                    hi_price = df['close'].iloc[hi_idx]
+                    marker_symbol = 'triangle-up' if sig == 'BUY' else ('triangle-down' if sig == 'SELL' else 'diamond')
+                    text_pos = 'bottom center' if sig == 'BUY' else 'top center'
+                    fig.add_trace(go.Scatter(
+                        x=[hi_time], y=[hi_price],
+                        mode='markers+text',
+                        marker=dict(symbol=marker_symbol, size=14, color=pat_color,
+                                    line=dict(color='white', width=1)),
+                        text=[gp.get('pattern', '')[:10]],
+                        textposition=text_pos,
+                        textfont=dict(color=pat_color, size=8),
+                        name=gp.get('pattern', 'Pattern'),
+                        hovertemplate=(
+                            f"{gp.get('pattern','')} | {gp.get('sentiment','')}<br>"
+                            f"Signal: {sig}<br>"
+                            f"Entry: ₹{gp.get('entry',0):.1f}<br>"
+                            f"SL: ₹{gp.get('stoploss',0):.1f}<br>"
+                            f"Target: ₹{gp.get('target',0):.1f}<br>"
+                            f"RR: {gp.get('rr',0):.2f}<br>"
+                            f"Confidence: {gp.get('confidence','')}<extra></extra>"
+                        ),
+                        showlegend=True
+                    ), row=1, col=1)
+
+                    # Draw entry, SL, target horizontal lines
+                    x_end = df['datetime'].max()
+                    x_start = hi_time
+                    for level, lbl, lcolor in [
+                        (gp.get('entry', 0), 'Entry', pat_color),
+                        (gp.get('stoploss', 0), 'SL', '#ff8800'),
+                        (gp.get('target', 0), 'Target', '#00ccff'),
+                    ]:
+                        if level:
+                            fig.add_shape(
+                                type='line', x0=x_start, y0=level, x1=x_end, y1=level,
+                                line=dict(color=lcolor, width=1, dash='dot'),
+                                row=1, col=1
+                            )
+                            fig.add_annotation(
+                                x=x_end, y=level,
+                                text=f"{lbl} {level:.0f}",
+                                showarrow=False,
+                                font=dict(color=lcolor, size=9),
+                                xanchor='left',
+                                row=1, col=1
+                            )
+        except Exception:
+            pass  # geo pattern drawing failed, skip
 
     fig.update_layout(
         title=title,
@@ -6035,6 +6820,176 @@ def run_candlestick_intelligence_engine(df, option_data, straddle_history, under
     return deduped
 
 
+# ══════════════════════════════════════════════════════════════════════════════
+# GEOMETRIC PATTERN ANALYSIS — UI RENDERING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_geo_pattern_analysis(df, df_full, date_label='Today'):
+    """
+    Render the full Pattern Analysis panel:
+      1. Real-time pattern alerts
+      2. Pattern detection results table
+      3. Backtest chart + summary
+    """
+    if df is None or df.empty:
+        return
+
+    detector = GeometricPatternDetector()
+
+    # ── Live patterns on today's / selected-date df ────────────────────
+    live_patterns = detector.detect_all(df)
+
+    st.markdown("---")
+    st.markdown("## 📐 Geometric & Reversal Pattern Analysis")
+    st.caption(f"Detecting 10 pattern types on NIFTY50 — {date_label}")
+
+    # Real-time alerts
+    if live_patterns:
+        st.markdown("### 🔔 Pattern Alerts")
+        for p in live_patterns:
+            sig = p['signal']
+            color = '#00ff88' if sig == 'BUY' else ('#ff4444' if sig == 'SELL' else '#FFD700')
+            icon = '🟢' if sig == 'BUY' else ('🔴' if sig == 'SELL' else '🟡')
+            conf = p['confidence']
+            ts = p['time']
+            time_str = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else str(ts)
+            st.markdown(
+                f"<div style='background:#111827;padding:10px 14px;border-radius:8px;"
+                f"border-left:4px solid {color};margin:4px 0'>"
+                f"<b style='color:{color}'>{icon} {p['pattern']}</b> &nbsp;|&nbsp; "
+                f"<span style='color:#aaa'>{p['sentiment']}</span> &nbsp;|&nbsp; "
+                f"Signal: <b style='color:{color}'>{sig}</b> &nbsp;|&nbsp; "
+                f"Breakout @ <b>₹{p['entry']:.0f}</b> &nbsp;|&nbsp; "
+                f"SL: ₹{p['stoploss']:.0f} &nbsp;|&nbsp; "
+                f"Target: ₹{p['target']:.0f} &nbsp;|&nbsp; "
+                f"RR: {p['rr']:.2f} &nbsp;|&nbsp; "
+                f"<span style='color:#FFD700'>Confidence: {conf}</span> &nbsp;|&nbsp; "
+                f"Time: {time_str}</div>",
+                unsafe_allow_html=True
+            )
+    else:
+        st.info("No geometric patterns detected on current price data. Patterns will appear when confirmed breakouts occur.")
+
+    # ── Results Table (live patterns) ─────────────────────────────────
+    if live_patterns:
+        st.markdown("### 📊 Pattern Detection Table")
+        rows = []
+        for p in live_patterns:
+            ts = p['time']
+            time_str = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else str(ts)
+            sig = p['signal']
+            sig_lbl = '🟢 BUY' if sig == 'BUY' else ('🔴 SELL' if sig == 'SELL' else '🟡 NEUTRAL')
+            rows.append({
+                'Time': time_str,
+                'Pattern': p['pattern'],
+                'Type': p['pattern_type'],
+                'Sentiment': p['sentiment'],
+                'Signal': sig_lbl,
+                'Entry (₹)': f"{p['entry']:.1f}",
+                'SL (₹)': f"{p['stoploss']:.1f}",
+                'Target (₹)': f"{p['target']:.1f}",
+                'RR': f"{p['rr']:.2f}",
+                'Move %': f"{p['move_pct']:+.2f}%",
+                'Confidence': p['confidence'],
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ── Pattern Heatmap (frequency by pattern name) ───────────────────
+    st.markdown("### 🗺️ Pattern Heatmap")
+    if df_full is not None and not df_full.empty and len(df_full) >= 30:
+        bt_results = detector.backtest_scan(df_full, step=10)
+        if bt_results:
+            from collections import Counter
+            pat_counts = Counter(r['pattern'] for r in bt_results)
+            pat_wins   = {}
+            pat_total  = {}
+            for r in bt_results:
+                k = r['pattern']
+                pat_total[k] = pat_total.get(k, 0) + 1
+                if r.get('result') == 'WIN':
+                    pat_wins[k] = pat_wins.get(k, 0) + 1
+
+            heatmap_rows = []
+            for pat, cnt in sorted(pat_counts.items(), key=lambda x: -x[1]):
+                wins = pat_wins.get(pat, 0)
+                total = pat_total.get(pat, 1)
+                wr = wins / total * 100
+                heatmap_rows.append({
+                    'Pattern': pat,
+                    'Occurrences': cnt,
+                    'Win Rate %': f"{wr:.1f}%",
+                    'Wins': wins,
+                    'Losses': total - wins,
+                })
+            st.dataframe(pd.DataFrame(heatmap_rows), use_container_width=True, hide_index=True)
+
+            # Most frequent pattern indicator
+            top_pat = max(pat_counts, key=pat_counts.get)
+            best_wr_pat = max(pat_wins, key=lambda k: pat_wins[k] / pat_total.get(k, 1)) if pat_wins else top_pat
+            worst_wr_pat = min(pat_total, key=lambda k: pat_wins.get(k, 0) / pat_total[k]) if pat_total else top_pat
+
+            col_h1, col_h2, col_h3 = st.columns(3)
+            with col_h1:
+                st.metric("Most Frequent Pattern", top_pat, f"{pat_counts[top_pat]} times")
+            with col_h2:
+                best_wr = pat_wins.get(best_wr_pat, 0) / pat_total.get(best_wr_pat, 1) * 100
+                st.metric("Highest Win Rate", best_wr_pat, f"{best_wr:.1f}%")
+            with col_h3:
+                worst_wr = pat_wins.get(worst_wr_pat, 0) / pat_total.get(worst_wr_pat, 1) * 100
+                st.metric("Lowest Win Rate", worst_wr_pat, f"{worst_wr:.1f}%")
+
+            # ── Backtest Summary Panel ─────────────────────────────────
+            st.markdown("### 📋 Backtest Summary")
+            total_detected = len(bt_results)
+            total_wins = sum(1 for r in bt_results if r.get('result') == 'WIN')
+            overall_wr = total_wins / total_detected * 100 if total_detected > 0 else 0
+            avg_move = np.mean([abs(r.get('actual_move_pct', 0)) for r in bt_results]) if bt_results else 0
+            buy_results = [r for r in bt_results if r['signal'] == 'BUY']
+            sell_results = [r for r in bt_results if r['signal'] == 'SELL']
+
+            bs_col1, bs_col2, bs_col3, bs_col4 = st.columns(4)
+            with bs_col1:
+                st.metric("Total Patterns Detected", total_detected)
+            with bs_col2:
+                st.metric("Overall Win Rate", f"{overall_wr:.1f}%",
+                          delta=f"{total_wins}W / {total_detected - total_wins}L")
+            with bs_col3:
+                st.metric("Avg Move After Breakout", f"{avg_move:.2f}%")
+            with bs_col4:
+                buy_wr = sum(1 for r in buy_results if r.get('result') == 'WIN') / max(len(buy_results), 1) * 100
+                st.metric("BUY Signal Win Rate", f"{buy_wr:.1f}%", f"{len(buy_results)} signals")
+
+            # Backtest table (last 30 entries)
+            st.markdown("#### Recent Backtest Results (last 30)")
+            bt_table_rows = []
+            for r in bt_results[-30:]:
+                ts = r['time']
+                time_str = ts.strftime('%d-%b %H:%M') if hasattr(ts, 'strftime') else str(ts)
+                sig = r['signal']
+                sig_lbl = '🟢 BUY' if sig == 'BUY' else '🔴 SELL'
+                result = r.get('result', '')
+                res_lbl = '✅ WIN' if result == 'WIN' else '❌ LOSS'
+                bt_table_rows.append({
+                    'Time': time_str,
+                    'Pattern': r['pattern'],
+                    'Sentiment': r['sentiment'],
+                    'Signal': sig_lbl,
+                    'Entry (₹)': f"{r['entry']:.1f}",
+                    'SL (₹)': f"{r['stoploss']:.1f}",
+                    'Target (₹)': f"{r['target']:.1f}",
+                    'RR': f"{r['rr']:.2f}",
+                    'Actual Move %': f"{r.get('actual_move_pct', 0):+.2f}%",
+                    'Result': res_lbl,
+                    'Confidence': r['confidence'],
+                })
+            if bt_table_rows:
+                st.dataframe(pd.DataFrame(bt_table_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough historical data to run backtest scan.")
+    else:
+        st.info("Load more data (increase 'Days Back') to enable backtest scan.")
+
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -6566,6 +7521,14 @@ def main():
             # ── Detect candle patterns for chart markers ──────────────────
             _chart_candle_markers = _detect_chart_candle_types(_df_today)
 
+            # ── Detect geometric / reversal patterns ──────────────────────
+            _geo_detector = GeometricPatternDetector()
+            _geo_patterns_live = []
+            try:
+                _geo_patterns_live = _geo_detector.detect_all(_df_today)
+            except Exception:
+                _geo_patterns_live = []
+
             fig = create_candlestick_chart(
                 _df_today,
                 f"Nifty 50 - {selected_timeframe} Chart ({_chart_label}) {'with Pivot Levels' if show_pivots else ''}",
@@ -6577,7 +7540,8 @@ def main():
                 swing_data=swing_data_for_chart,
                 rsi_sz_data=rsi_sz_data_for_chart,
                 ultimate_rsi_data=ultimate_rsi_data_for_chart,
-                candle_patterns=_chart_candle_markers
+                candle_patterns=_chart_candle_markers,
+                geo_patterns=_geo_patterns_live
             )
             st.plotly_chart(fig, use_container_width=True)
             
@@ -6628,6 +7592,9 @@ def main():
                         'Low (₹)': f"{_cp['low']:.1f}",
                     })
                 st.dataframe(pd.DataFrame(_ctype_rows), use_container_width=True, hide_index=True)
+
+            # ── Geometric & Reversal Pattern Analysis ──────────────────────
+            render_geo_pattern_analysis(_df_today, df, date_label=_date_label)
 
             # ── HTF Support & Resistance + VOB Summary ────────────────────
             st.markdown("---")
@@ -7066,7 +8033,13 @@ def main():
     # ===== OPTIONS CHAIN AND HTF S/R TABLES BELOW CHART =====
     if option_data and option_data.get('underlying'):
         st.markdown("---")
+        # Anchor for sidebar navigation
+        st.markdown('<a name="smart-money-panel"></a>', unsafe_allow_html=True)
         st.header("📊 Options Chain Analysis")
+        st.info(
+            "⬇️ **Smart Money & Market Sentiment Analysis** panel is directly below — scroll down to see "
+            "OI activity, sentiment score, trap & breakout detection, support/resistance strength, and key levels."
+        )
 
         # ── 🧠 SMART MONEY PANEL — shown first so it's always visible ────────
         render_smart_money_master_analysis(option_data, current_price)
