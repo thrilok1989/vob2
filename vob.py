@@ -15643,21 +15643,33 @@ def main():
     st.markdown("---")
     with st.expander("🕯️ Candlestick Intelligence Engine — Reversal & Continuation Signals", expanded=False):
         try:
-            if option_data and option_data.get('underlying') and not df.empty:
-                _cie_underlying = option_data['underlying']
-                _cie_df_summary = option_data.get('df_summary')
+            # CIE can run on price data alone; option_data augments S/R with OI levels
+            _cie_has_data = not df.empty and current_price
+            if _cie_has_data:
+                # Use option_data underlying if available, else fall back to current_price
+                _cie_underlying = (option_data.get('underlying')
+                                   if option_data and option_data.get('underlying')
+                                   else current_price)
                 _cie_straddle_hist = st.session_state.straddle_history
+
+                # Show a notice when running without option chain (price-only mode)
+                if not (option_data and option_data.get('underlying')):
+                    st.info(
+                        "ℹ️ **Running in Price-Only Mode** — Candlestick patterns, S/R levels, "
+                        "EMA and momentum signals are active. OI-based level augmentation requires "
+                        "a live option chain (Dhan API)."
+                    )
 
                 # Determine expiry day (DTE ≤ 2)
                 try:
-                    _cie_expiry_str = option_data.get('expiry', '')
+                    _cie_expiry_str = option_data.get('expiry', '') if option_data else ''
                     _cie_expiry_dt  = datetime.strptime(_cie_expiry_str, "%Y-%m-%d") if _cie_expiry_str else None
                     _cie_dte = (_cie_expiry_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days if _cie_expiry_dt else 999
                     _cie_is_expiry = _cie_dte <= 2
                 except Exception:
                     _cie_is_expiry = False
 
-                # Run engine
+                # Run engine — option_data=None is handled gracefully inside
                 _cie_signals = run_candlestick_intelligence_engine(
                     df, option_data, _cie_straddle_hist, _cie_underlying, is_expiry=_cie_is_expiry
                 )
@@ -16085,21 +16097,7 @@ def main():
                             st.rerun()
 
             else:
-                st.markdown(
-                    "<div style='padding:18px;border-radius:8px;"
-                    "background:#1e2530;border-left:4px solid #f0a500;'>"
-                    "<b>⚠️ Option Chain Data Not Loaded</b><br>"
-                    "The Candlestick Intelligence Engine requires live option chain data "
-                    "to compute ATM strike, support/resistance, and OI confluence levels.<br>"
-                    "<ul style='margin:8px 0 0 16px;color:#ccc'>"
-                    "<li>Ensure your <b>Dhan API token</b> is active</li>"
-                    "<li>Confirm the <b>Options Analysis</b> panel above shows a valid "
-                    "expiry and option chain table</li>"
-                    "<li>On Streamlit Cloud: Dhan's CloudFront may block the shared IP — "
-                    "run the app <b>locally</b> for full functionality</li>"
-                    "</ul></div>",
-                    unsafe_allow_html=True
-                )
+                st.warning("No price chart data available. Load NIFTY chart data to enable this engine.")
         except Exception as _cie_err:
             st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
 
