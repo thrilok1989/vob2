@@ -10789,6 +10789,43 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
     signals['IND_VWAP_MULTI']  = ind_vwap_score
     signals['IND_TREND_MULTI'] = ind_trend_score
 
+    # ── P. CANDLE PATTERNS (recent bars from df) ──────────────────────────────
+    candle_pattern_data = []
+    candle_sig = 0.0
+    if df is not None and len(df) >= 2:
+        try:
+            _recent_df = df.iloc[-30:].copy()  # last 30 bars
+            _cp_list = _detect_chart_candle_types(_recent_df)
+            candle_pattern_data = _cp_list
+            _cp_buy  = sum(1 for p in _cp_list if p['direction'] == 'BUY')
+            _cp_sell = sum(1 for p in _cp_list if p['direction'] == 'SELL')
+            _cp_tot  = _cp_buy + _cp_sell
+            candle_sig = (_cp_buy - _cp_sell) / _cp_tot if _cp_tot > 0 else 0.0
+            candle_sig = min(1, max(-1, candle_sig))
+        except Exception:
+            pass
+    signals['CANDLE_PATTERN'] = candle_sig
+
+    # ── Q. GEOMETRIC & REVERSAL PATTERNS ─────────────────────────────────────
+    geo_pattern_data = []
+    geo_sig = 0.0
+    if df is not None and len(df) >= 15:
+        try:
+            _geo_det = GeometricPatternDetector()
+            geo_pattern_data = _geo_det.detect_all(df)
+            _conf_map = {'Low': 0.25, 'Moderate': 0.5, 'High': 0.75,
+                         'Strong': 1.0, 'Institutional Setup': 1.0}
+            _geo_w_sum, _geo_score = 0.0, 0.0
+            for pat in geo_pattern_data:
+                _cw = _conf_map.get(pat.get('confidence', 'Low'), 0.25)
+                _geo_w_sum += _cw
+                _geo_score += _cw if pat.get('signal') == 'BUY' else (-_cw if pat.get('signal') == 'SELL' else 0)
+            if _geo_w_sum > 0:
+                geo_sig = min(1, max(-1, _geo_score / _geo_w_sum))
+        except Exception:
+            pass
+    signals['GEO_PATTERN'] = geo_sig
+
     # ── 3. WEIGHTED ENSEMBLE (ML-style Random Forest voting) ─────────────────
     weights = {
         'PCR_OI':         0.12,
@@ -10815,6 +10852,9 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         'IND_RSI_MULTI':   0.07,
         'IND_VWAP_MULTI':  0.05,
         'IND_TREND_MULTI': 0.06,
+        # Pattern signals
+        'CANDLE_PATTERN':  0.06,
+        'GEO_PATTERN':     0.08,
     }
     # Normalise weights
     w_total = sum(weights.values())
@@ -10999,6 +11039,38 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         ind_lines.append(f"[{tf_label}] {vwap_str} | {ema_str} | {st_str} | {rsi_str} | {adx_str} | {di_str}")
     ind_text = "\n".join(ind_lines) if ind_lines else "NIFTY 50 indicator data unavailable."
 
+    # Candle pattern narrative
+    if candle_pattern_data:
+        _cp_buy_list  = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'BUY']
+        _cp_sell_list = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'SELL']
+        _cp_neut_list = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'NEUTRAL']
+        _cp_last = candle_pattern_data[-1]
+        candle_text = (
+            f"Last 30 bars: {len(_cp_buy_list)} BUY patterns, {len(_cp_sell_list)} SELL patterns, {len(_cp_neut_list)} NEUTRAL.\n"
+            f"Most recent: {_cp_last['pattern']} ({_cp_last['direction']}) @ ₹{_cp_last['price']:,.2f}\n"
+        )
+        if _cp_buy_list:
+            candle_text += f"Bullish candles: {', '.join(dict.fromkeys(_cp_buy_list))}\n"
+        if _cp_sell_list:
+            candle_text += f"Bearish candles: {', '.join(dict.fromkeys(_cp_sell_list))}"
+    else:
+        candle_text = "No candle patterns detected in the last 30 bars (insufficient data or no significant pattern formed)."
+
+    # Geometric pattern narrative
+    if geo_pattern_data:
+        geo_lines = []
+        for pat in geo_pattern_data:
+            sig_icon = "🟢" if pat.get('signal') == 'BUY' else ("🔴" if pat.get('signal') == 'SELL' else "🟡")
+            geo_lines.append(
+                f"{sig_icon} {pat['pattern']} — {pat.get('sentiment', '')} | "
+                f"Entry ₹{pat.get('entry', 0):,.0f} | SL ₹{pat.get('stoploss', 0):,.0f} | "
+                f"Target ₹{pat.get('target', 0):,.0f} | RR {pat.get('rr', 0):.1f}x | "
+                f"Confidence: {pat.get('confidence', '—')}"
+            )
+        geo_text = "\n".join(geo_lines)
+    else:
+        geo_text = "No geometric or reversal patterns detected on current data (pattern requires ≥15 bars with sufficient pivot swing structure)."
+
     # Risk assessment
     signal_spread = max(vals) - min(vals) if vals else 0
     if signal_spread > 1.5 and confidence < 55:
@@ -11035,7 +11107,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
     """, unsafe_allow_html=True)
 
     # Signal radar bar
-    st.markdown("#### 📊 Signal Radar — All 22 Inputs")
+    st.markdown("#### 📊 Signal Radar — All 24 Inputs")
     _sig_names  = list(weights.keys())
     _sig_values = [signals.get(k, 0) for k in _sig_names]
     _sig_colors = ['#00C853' if v > 0.05 else ('#FF5252' if v < -0.05 else '#FFD740') for v in _sig_values]
@@ -11053,7 +11125,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         yaxis=dict(range=[-1.2, 1.2], zeroline=True, zerolinecolor='#555',
                    gridcolor='#333', title='Signal Value (-1 bear … +1 bull)'),
         xaxis=dict(tickangle=-35, gridcolor='#333'),
-        title=dict(text='ML Feature Vector — 22 signals normalised to -1…+1', font=dict(size=12)),
+        title=dict(text='ML Feature Vector — 24 signals normalised to -1…+1', font=dict(size=12)),
     )
     _fig_radar.add_hline(y=0.12,  line_dash='dash', line_color='#00C853', line_width=1)
     _fig_radar.add_hline(y=-0.12, line_dash='dash', line_color='#FF5252', line_width=1)
@@ -11073,6 +11145,8 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         ("🛡️ Risk & Conviction",         risk_text),
         ("⚠ Macro Signals",             macro_text),
         ("📐 NIFTY Indicator Dashboard", ind_text),
+        ("🕯️ Candle Patterns Detected",  candle_text),
+        ("🔔 Geometric & Reversal Patterns", geo_text),
     ]
 
     for title, body in sections:
@@ -11143,7 +11217,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         )
         st.plotly_chart(_fig_mh, use_container_width=True)
 
-    st.caption(f"🤖 ML Ensemble: 22 signals · {len(weights)} weighted features · Updates every ~30s · "
+    st.caption(f"🤖 ML Ensemble: 24 signals · {len(weights)} weighted features · Updates every ~30s · "
                f"{len(st.session_state.ml_report_history)} data points")
 
 
