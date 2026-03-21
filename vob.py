@@ -7721,6 +7721,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
     with dt1:
         st.markdown("##### 🟢 Support Levels (Bids)")
         bid_rows = []
+        bid_color_lookup = []
         for b in bid_levels:
             pct_of_total = b["qty"] / total_bid_vol * 100 if total_bid_vol > 0 else 0
             bid_rows.append({
@@ -7729,17 +7730,16 @@ def show_market_depth_engine(api=None, option_data: dict = None,
                 "% of Total":  f"{pct_of_total:.1f}%",
                 "Strength":    b["strength_label"],
                 "Dist (pts)":  f"{spot - b['price']:.0f}" if b['price'] < spot else "—",
-                "_color":      b["color"],
             })
+            bid_color_lookup.append(b["color"])
         bid_df = pd.DataFrame(bid_rows)
 
         def _bid_style(row):
-            clr = _SIDE_STYLES.get(str(row["_color"]), "")
-            styles = ["", "", "", clr, "", ""]
-            return styles
+            clr = _SIDE_STYLES.get(str(bid_color_lookup[row.name]), "")
+            return ["", "", "", clr, ""]
 
         st.dataframe(
-            bid_df.drop(columns=["_color"]).style.apply(_bid_style, axis=1),
+            bid_df.style.apply(_bid_style, axis=1),
             use_container_width=True, hide_index=True
         )
 
@@ -7747,6 +7747,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
     with dt2:
         st.markdown("##### 🔴 Resistance Levels (Asks)")
         ask_rows = []
+        ask_color_lookup = []
         for a in ask_levels:
             pct_of_total = a["qty"] / total_ask_vol * 100 if total_ask_vol > 0 else 0
             ask_rows.append({
@@ -7755,8 +7756,8 @@ def show_market_depth_engine(api=None, option_data: dict = None,
                 "% of Total":  f"{pct_of_total:.1f}%",
                 "Strength":    a["strength_label"],
                 "Dist (pts)":  f"{a['price'] - spot:.0f}" if a['price'] > spot else "—",
-                "_color":      a["color"],
             })
+            ask_color_lookup.append(a["color"])
         ask_df = pd.DataFrame(ask_rows)
 
         def _ask_style(row):
@@ -7766,13 +7767,13 @@ def show_market_depth_engine(api=None, option_data: dict = None,
                 "#ffeb3b": "background-color:#2a1a1a; color:#ff8a80",
                 "#757575": "color:#757575",
             }
-            clr = clr_map.get(str(row["_color"]),
+            clr = clr_map.get(str(ask_color_lookup[row.name]),
                               "background-color:#3a1a1a; color:#ff5252; font-weight:bold"
                               if "Institutional" in str(row["Strength"]) else "")
-            return ["", "", "", clr, "", ""]
+            return ["", "", "", clr, ""]
 
         st.dataframe(
-            ask_df.drop(columns=["_color"]).style.apply(_ask_style, axis=1),
+            ask_df.style.apply(_ask_style, axis=1),
             use_container_width=True, hide_index=True
         )
 
