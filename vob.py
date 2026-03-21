@@ -7741,6 +7741,647 @@ def show_fii_dii_analysis(df: pd.DataFrame = None, option_data: dict = None,
 
 
 # =====================================================================
+# MARKET NEWS INTELLIGENCE ENGINE
+# =====================================================================
+
+# ── Keyword dictionaries ──────────────────────────────────────────────
+_NWS_BULL_KW = [
+    "surge", "rally", "jump", "gain", "rise", "soar", "breakout", "bullish",
+    "record high", "all-time high", "profit", "growth", "beat", "positive",
+    "upgrade", "outperform", "buy", "recover", "rebound", "expansion",
+    "gdp growth", "rate cut", "stimulus", "reform", "boost", "strong",
+    "fii buying", "foreign inflow", "green", "upside", "support",
+]
+_NWS_BEAR_KW = [
+    "fall", "drop", "slump", "decline", "crash", "bearish", "sell-off",
+    "selling", "loss", "miss", "downgrade", "underperform", "sell",
+    "rate hike", "inflation", "tension", "war", "geopolit", "sanction",
+    "recession", "slowdown", "default", "crisis", "fii selling", "outflow",
+    "red", "downside", "resistance", "worry", "concern", "weak",
+]
+_NWS_HIGH_IMPACT_KW = [
+    "rbi", "reserve bank", "repo rate", "monetary policy", "mpc",
+    "federal reserve", "fed", "fomc", "rate decision",
+    "budget", "fiscal", "union budget", "finance minister",
+    "gdp", "cpi", "inflation data", "trade data", "wpi",
+    "war", "geopolit", "sanction", "oil price", "crude",
+    "election", "political", "government policy",
+]
+_NWS_SECTOR_MAP = {
+    "Banking":  ["bank", "rbi", "npa", "credit", "loan", "hdfc", "icici", "sbi", "kotak", "axis", "repo"],
+    "IT":       ["infosys", "tcs", "wipro", "hcl", "tech mahindra", "it sector", "software", "outsourcing", "dollar"],
+    "Auto":     ["auto", "maruti", "tata motors", "bajaj", "hero", "ev", "electric vehicle", "fuel", "diesel"],
+    "FMCG":     ["fmcg", "hul", "hindustan unilever", "iTC", "nestle", "dabur", "consumer", "rural demand"],
+    "Pharma":   ["pharma", "drug", "fda", "cipla", "sun pharma", "divi", "aurobindo", "biocon", "medicine"],
+    "Metal":    ["metal", "steel", "tata steel", "jsw", "hindalco", "vedanta", "aluminium", "iron ore", "coal"],
+    "Energy":   ["oil", "crude", "ongc", "reliance", "bharat petroleum", "gas", "power", "ntpc", "energy"],
+    "Realty":   ["realty", "real estate", "dlf", "godrej properties", "housing", "construction", "reit"],
+    "PSU Bank": ["psu bank", "sbi", "pnb", "bank of baroda", "canara", "state bank", "public sector bank"],
+}
+_NWS_CATEGORY_MAP = {
+    "Market Moving":   ["nifty", "sensex", "index", "market", "stock exchange", "bull", "bear"],
+    "Sector Specific": list(_NWS_SECTOR_MAP.keys()),
+    "Company Specific":["quarterly result", "earnings", "profit", "revenue", "eps", "ipo", "merger", "acquisition"],
+    "Global Impact":   ["us", "china", "global", "world", "international", "fed", "dollar", "euro"],
+    "Economic Data":   ["gdp", "cpi", "wpi", "inflation", "iip", "trade", "current account", "fiscal deficit"],
+    "Policy / Govt":   ["government", "policy", "budget", "rbi", "sebi", "ministry", "parliament", "reform"],
+}
+
+_NEWS_RSS_FEEDS = [
+    {
+        "name":  "Economic Times Markets",
+        "url":   "https://economictimes.indiatimes.com/markets/rssfeeds/1977021501.cms",
+    },
+    {
+        "name":  "Moneycontrol Top News",
+        "url":   "https://www.moneycontrol.com/rss/MCtopnews.xml",
+    },
+    {
+        "name":  "LiveMint Markets",
+        "url":   "https://www.livemint.com/rss/markets",
+    },
+    {
+        "name":  "Google Finance India",
+        "url":   "https://news.google.com/rss/search?q=NIFTY+India+stock+market&hl=en-IN&gl=IN&ceid=IN:en",
+    },
+    {
+        "name":  "Business Standard Markets",
+        "url":   "https://www.business-standard.com/rss/markets-106.rss",
+    },
+]
+
+@st.cache_data(ttl=600)
+def _nws_fetch_all_news():
+    """Fetch and parse all RSS feeds, return list of article dicts."""
+    import urllib.request, xml.etree.ElementTree as ET, html
+    from datetime import datetime, timezone
+    articles = []
+    for feed in _NEWS_RSS_FEEDS:
+        try:
+            req = urllib.request.Request(
+                feed["url"],
+                headers={"User-Agent": "Mozilla/5.0 (compatible; MarketBot/1.0)"}
+            )
+            with urllib.request.urlopen(req, timeout=8) as resp:
+                content = resp.read()
+            root = ET.fromstring(content)
+            ns = {"atom": "http://www.w3.org/2005/Atom"}
+            # RSS 2.0 items
+            for item in root.iter("item"):
+                title = item.findtext("title", "").strip()
+                desc  = item.findtext("description", "").strip()
+                pub   = item.findtext("pubDate", "")
+                link  = item.findtext("link", "")
+                if not title:
+                    continue
+                # Clean HTML entities
+                title = html.unescape(title)
+                desc  = html.unescape(desc)
+                articles.append({
+                    "source":  feed["name"],
+                    "title":   title,
+                    "summary": desc[:200] if desc else "",
+                    "pubDate": pub,
+                    "link":    link,
+                })
+                if len(articles) >= 80:
+                    break
+        except Exception:
+            continue
+    return articles[:80]
+
+def _nws_score_sentiment(text: str):
+    """Keyword-based sentiment score: +1 bull, 0 neutral, -1 bear."""
+    t = text.lower()
+    bull = sum(1 for kw in _NWS_BULL_KW if kw in t)
+    bear = sum(1 for kw in _NWS_BEAR_KW if kw in t)
+    if bull > bear:
+        return 1, "BULLISH"
+    elif bear > bull:
+        return -1, "BEARISH"
+    return 0, "NEUTRAL"
+
+def _nws_categorize(text: str):
+    t = text.lower()
+    for cat, kws in _NWS_CATEGORY_MAP.items():
+        if any(kw.lower() in t for kw in kws):
+            return cat
+    return "General"
+
+def _nws_sector_impact(text: str):
+    t = text.lower()
+    hits = []
+    for sector, kws in _NWS_SECTOR_MAP.items():
+        if any(kw.lower() in t for kw in kws):
+            hits.append(sector)
+    return hits if hits else ["General Market"]
+
+def _nws_is_high_impact(text: str):
+    t = text.lower()
+    return any(kw in t for kw in _NWS_HIGH_IMPACT_KW)
+
+def _nws_importance(score, high_impact, sectors):
+    if high_impact and abs(score) == 1:
+        return "🔴 HIGH"
+    elif high_impact or abs(score) == 1:
+        return "🟡 MEDIUM"
+    return "⚪ LOW"
+
+def _nws_process_articles(articles):
+    """Enrich raw articles with sentiment, category, sectors, importance."""
+    processed = []
+    for a in articles:
+        full_text = a["title"] + " " + a.get("summary", "")
+        score, sentiment = _nws_score_sentiment(full_text)
+        category    = _nws_categorize(full_text)
+        sectors     = _nws_sector_impact(full_text)
+        high_impact = _nws_is_high_impact(full_text)
+        importance  = _nws_importance(score, high_impact, sectors)
+        processed.append({
+            **a,
+            "sentiment":   sentiment,
+            "score":       score,
+            "category":    category,
+            "sectors":     ", ".join(sectors),
+            "high_impact": high_impact,
+            "importance":  importance,
+        })
+    return processed
+
+def _nws_aggregate_scores(processed):
+    """Return total sentiment score, bull/bear/neutral counts, sector scores."""
+    total   = sum(a["score"] for a in processed)
+    bulls   = sum(1 for a in processed if a["score"] == 1)
+    bears   = sum(1 for a in processed if a["score"] == -1)
+    neutral = sum(1 for a in processed if a["score"] == 0)
+    sector_scores = {s: 0 for s in _NWS_SECTOR_MAP}
+    for a in processed:
+        for s in a["sectors"].split(", "):
+            if s in sector_scores:
+                sector_scores[s] += a["score"]
+    return total, bulls, bears, neutral, sector_scores
+
+def _nws_market_reaction_label(news_score, price_chg_pct):
+    """Module 6 — how price reacted relative to news tone."""
+    if news_score > 0 and price_chg_pct > 0.3:
+        return "✅ CONFIRMED BULLISH — News + price aligned"
+    elif news_score < 0 and price_chg_pct < -0.3:
+        return "✅ CONFIRMED BEARISH — News + price aligned"
+    elif news_score > 0 and price_chg_pct < -0.3:
+        return "⚠️ DIVERGENCE — Bullish news but price falling"
+    elif news_score < 0 and price_chg_pct > 0.3:
+        return "⚠️ DIVERGENCE — Bearish news but price rising"
+    return "🔵 NEUTRAL — No strong confirmation"
+
+def _nws_impact_score(news_score, n_articles, bulls, bears,
+                      vol_ratio, price_chg_pct, sector_hit_count,
+                      fii_net=0):
+    """Module 8 — Market News Impact Score 0–100."""
+    base = 50
+    # News sentiment contribution (±25)
+    if n_articles > 0:
+        sent_pct = (bulls - bears) / n_articles
+        base += int(sent_pct * 25)
+    # Volume reaction (±10)
+    if vol_ratio > 1.5:   base += 10
+    elif vol_ratio > 1.0: base += 5
+    elif vol_ratio < 0.6: base -= 5
+    # Price direction (±10)
+    base += int(min(max(price_chg_pct * 5, -10), 10))
+    # Sector spread (±5)
+    base += min(sector_hit_count, 5)
+    # FII alignment (±5)
+    if fii_net > 500:   base += 5
+    elif fii_net < -500: base -= 5
+    return max(0, min(100, base))
+
+def show_news_intelligence_engine(df: pd.DataFrame = None,
+                                   option_data: dict = None,
+                                   current_price: float = None,
+                                   fii_net_today: float = 0.0):
+    """12-Module Market News Intelligence Engine."""
+    st.markdown("### 📰 Market News Intelligence Engine")
+
+    # ── MODULE 1: Fetch news ──────────────────────────────────────────
+    with st.spinner("Fetching latest market news..."):
+        raw_articles = _nws_fetch_all_news()
+
+    if not raw_articles:
+        st.warning(
+            "No news articles fetched. RSS feeds may be blocked in this environment. "
+            "Showing demo analysis."
+        )
+        raw_articles = [
+            {"source": "Demo", "title": "RBI keeps repo rate unchanged; maintains accommodative stance",
+             "summary": "Reserve Bank of India MPC voted to hold repo rate steady. Positive for banking sector.",
+             "pubDate": "", "link": ""},
+            {"source": "Demo", "title": "Nifty rallies 200 points as FII buying surges",
+             "summary": "Strong FII inflow boosts market sentiment. Banking and IT lead gains.",
+             "pubDate": "", "link": ""},
+            {"source": "Demo", "title": "Crude oil prices rise on geopolitical tensions",
+             "summary": "Oil climbs amid Middle East tensions, putting pressure on energy-importing nations.",
+             "pubDate": "", "link": ""},
+            {"source": "Demo", "title": "US Fed signals rate cut; dollar weakens",
+             "summary": "Federal Reserve hints at rate cuts boosting global risk appetite.",
+             "pubDate": "", "link": ""},
+            {"source": "Demo", "title": "IT sector outlook positive; TCS beats estimates",
+             "summary": "TCS quarterly results beat street estimates; management guides for strong FY growth.",
+             "pubDate": "", "link": ""},
+            {"source": "Demo", "title": "GDP growth slows to 6.4%; concerns about slowdown",
+             "summary": "India GDP growth misses forecast. Analysts worry about consumption slowdown.",
+             "pubDate": "", "link": ""},
+        ]
+
+    # ── MODULE 2+3+4+5: Enrich ───────────────────────────────────────
+    processed = _nws_process_articles(raw_articles)
+    total_score, bulls, bears, neutral, sector_scores = _nws_aggregate_scores(processed)
+
+    # Price context
+    price_chg_pct = 0.0
+    vol_ratio     = 1.0
+    if df is not None and not df.empty and len(df) > 1:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        if "close" in df2.columns:
+            cl = df2["close"]
+            price_chg_pct = (cl.iloc[-1] - cl.iloc[-2]) / cl.iloc[-2] * 100
+        if "volume" in df2.columns:
+            vol = df2["volume"].fillna(0)
+            avg_vol = vol.rolling(20).mean().iloc[-1]
+            if avg_vol > 0:
+                vol_ratio = vol.iloc[-1] / avg_vol
+
+    n_art = len(processed)
+    sector_hit_count = sum(1 for v in sector_scores.values() if v != 0)
+    impact_score = _nws_impact_score(
+        total_score, n_art, bulls, bears,
+        vol_ratio, price_chg_pct, sector_hit_count, fii_net_today
+    )
+
+    # ── MODULE 8: Impact score label ─────────────────────────────────
+    if impact_score >= 70:
+        impact_label, impact_color = "STRONG BULLISH", "#00e676"
+    elif impact_score >= 58:
+        impact_label, impact_color = "BULLISH",         "#69f0ae"
+    elif impact_score <= 30:
+        impact_label, impact_color = "STRONG BEARISH",  "#ff5252"
+    elif impact_score <= 42:
+        impact_label, impact_color = "BEARISH",          "#ff8a80"
+    else:
+        impact_label, impact_color = "NEUTRAL",          "#ffeb3b"
+
+    # ── Top KPI row ───────────────────────────────────────────────────
+    kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+    with kc1: st.metric("Total Articles", n_art)
+    with kc2: st.metric("🟢 Bullish",  bulls)
+    with kc3: st.metric("🔴 Bearish",  bears)
+    with kc4: st.metric("Net Sentiment Score", f"{total_score:+d}")
+    with kc5:
+        st.markdown(
+            f"<div style='text-align:center;padding:8px;"
+            f"background:#1e1e1e;border-radius:8px'>"
+            f"<span style='font-size:11px;color:#aaa'>News Impact Score</span><br>"
+            f"<span style='font-size:28px;font-weight:bold;color:{impact_color}'>"
+            f"{impact_score}</span><br>"
+            f"<span style='font-size:11px;color:{impact_color}'>{impact_label}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    # ── MODULE 6: Market reaction ─────────────────────────────────────
+    reaction = _nws_market_reaction_label(total_score, price_chg_pct)
+    st.info(f"**Market Reaction:** {reaction}  |  Price Change: {price_chg_pct:+.2f}%  |  Volume Ratio: {vol_ratio:.2f}x")
+
+    # ── MODULE 9: News Panel ──────────────────────────────────────────
+    st.markdown("#### 📋 Latest Market News Panel")
+
+    # Filters
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        sent_filter = st.selectbox("Filter Sentiment", ["All","BULLISH","BEARISH","NEUTRAL"],
+                                   key="nws_sent_filter")
+    with fc2:
+        imp_filter = st.selectbox("Filter Importance", ["All","HIGH","MEDIUM","LOW"],
+                                  key="nws_imp_filter")
+    with fc3:
+        cat_filter = st.selectbox("Filter Category",
+                                  ["All"] + list(_NWS_CATEGORY_MAP.keys()) + ["General"],
+                                  key="nws_cat_filter")
+
+    filtered = processed
+    if sent_filter != "All":
+        filtered = [a for a in filtered if a["sentiment"] == sent_filter]
+    if imp_filter != "All":
+        filtered = [a for a in filtered if imp_filter in a["importance"]]
+    if cat_filter != "All":
+        filtered = [a for a in filtered if a["category"] == cat_filter]
+
+    if filtered:
+        panel_rows = []
+        for a in filtered[:30]:
+            panel_rows.append({
+                "Source":     a["source"],
+                "Headline":   a["title"][:90] + ("…" if len(a["title"]) > 90 else ""),
+                "Sentiment":  a["sentiment"],
+                "Category":   a["category"],
+                "Sector":     a["sectors"],
+                "Importance": a["importance"],
+            })
+        panel_df = pd.DataFrame(panel_rows)
+
+        _SENT_STYLE = {
+            "BULLISH":  "background-color:#1a3a1a; color:#00e676; font-weight:bold",
+            "BEARISH":  "background-color:#3a1a1a; color:#ff5252; font-weight:bold",
+            "NEUTRAL":  "color:#bdbdbd",
+        }
+        _IMP_STYLE = {
+            "🔴 HIGH":    "color:#ff5252; font-weight:bold",
+            "🟡 MEDIUM":  "color:#ffeb3b",
+            "⚪ LOW":     "color:#757575",
+        }
+
+        def _panel_style(row):
+            styles = [""] * len(row)
+            col_names = list(row.index)
+            for i, col in enumerate(col_names):
+                if col == "Sentiment":
+                    styles[i] = _SENT_STYLE.get(str(row[col]), "")
+                elif col == "Importance":
+                    styles[i] = _IMP_STYLE.get(str(row[col]), "")
+            return styles
+
+        st.dataframe(
+            panel_df.style.apply(_panel_style, axis=1),
+            use_container_width=True, hide_index=True, height=400
+        )
+    else:
+        st.info("No articles match the selected filters.")
+
+    # ── MODULE 5: High Impact Alerts ──────────────────────────────────
+    high_impact_arts = [a for a in processed if a["high_impact"]]
+    if high_impact_arts:
+        st.markdown("#### 🚨 High Impact News Alerts")
+        for a in high_impact_arts[:8]:
+            icon = "🟢" if a["score"] == 1 else ("🔴" if a["score"] == -1 else "🔵")
+            st.warning(f"{icon} **[{a['importance']}]** {a['title']} *(Source: {a['source']})*")
+
+    # ── MODULE 4: Sector Impact Panel ────────────────────────────────
+    st.markdown("#### 🏭 Sector News Impact")
+    sect_rows = []
+    for sector, score in sector_scores.items():
+        articles_count = sum(1 for a in processed if sector in a["sectors"])
+        if articles_count == 0:
+            continue
+        label = "BULLISH" if score > 0 else ("BEARISH" if score < 0 else "NEUTRAL")
+        sect_rows.append({
+            "Sector": sector,
+            "News Count": articles_count,
+            "Net Score": f"{score:+d}",
+            "Direction": label,
+        })
+    if sect_rows:
+        sect_df = pd.DataFrame(sect_rows).sort_values("News Count", ascending=False)
+
+        def _sect_style(row):
+            d = str(row["Direction"])
+            c = ("background-color:#1a3a1a; color:#00e676" if d == "BULLISH" else
+                 "background-color:#3a1a1a; color:#ff5252" if d == "BEARISH" else
+                 "color:#bdbdbd")
+            return ["", "", "", c]
+        st.dataframe(sect_df.style.apply(_sect_style, axis=1),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No sector-specific news detected.")
+
+    # ── MODULE 7: Smart Signal Alerts ────────────────────────────────
+    st.markdown("#### ⚡ Smart News Signals")
+    signals = []
+    if bulls >= bears * 2 and bulls >= 3:
+        signals.append(("🟢", "BULLISH NEWS MOMENTUM",
+                         f"{bulls} bullish vs {bears} bearish articles — market positive"))
+    if bears >= bulls * 2 and bears >= 3:
+        signals.append(("🔴", "BEARISH NEWS PRESSURE",
+                         f"{bears} bearish vs {bulls} bullish articles — market under pressure"))
+    leading_sector = max(sector_scores, key=sector_scores.get)
+    lagging_sector = min(sector_scores, key=sector_scores.get)
+    if sector_scores[leading_sector] > 1:
+        signals.append(("🏭", "SECTOR ROTATION SIGNAL",
+                         f"{leading_sector} strongest in news ({sector_scores[leading_sector]:+d}) "
+                         f"| {lagging_sector} weakest ({sector_scores[lagging_sector]:+d})"))
+    if high_impact_arts:
+        hi_sent = sum(a["score"] for a in high_impact_arts)
+        if hi_sent > 0:
+            signals.append(("⚡", "HIGH IMPACT BULLISH EVENT", f"{len(high_impact_arts)} major events — net bullish"))
+        elif hi_sent < 0:
+            signals.append(("⚡", "HIGH IMPACT BEARISH EVENT", f"{len(high_impact_arts)} major events — net bearish"))
+    if total_score > 0 and price_chg_pct > 0.3:
+        signals.append(("✅", "NEWS + PRICE CONFLUENCE",
+                         "Bullish news confirmed by upward price move — strong signal"))
+    if total_score < 0 and price_chg_pct < -0.3:
+        signals.append(("✅", "NEWS + PRICE BREAKDOWN CONFIRMED",
+                         "Bearish news confirmed by downward price move"))
+    if fii_net_today > 500 and total_score > 0:
+        signals.append(("💎", "INSTITUTIONAL + NEWS ALIGNED",
+                         "FII buying aligns with bullish news — high conviction"))
+    if fii_net_today < -500 and total_score < 0:
+        signals.append(("💎", "INSTITUTIONAL + NEWS ALIGNED BEARISH",
+                         "FII selling aligns with bearish news — high conviction sell"))
+
+    if signals:
+        for icon, title, desc in signals:
+            st.info(f"{icon} **{title}** — {desc}")
+    else:
+        st.success("✅ No extreme news signals — normal news flow")
+
+    # ── MODULE 12: Combined Intelligence Engine ───────────────────────
+    st.markdown("---")
+    st.markdown("#### 🧠 Combined Intelligence Engine — Final Market Prediction")
+
+    # Score each pillar 0-100
+    news_pillar = impact_score
+
+    # Price action pillar
+    pa_score = 50
+    if df is not None and not df.empty and len(df) > 5:
+        df3 = df.copy()
+        df3.columns = [c.lower() for c in df3.columns]
+        if "close" in df3.columns:
+            cl3 = df3["close"]
+            ema9  = cl3.ewm(span=9,  adjust=False).mean()
+            ema21 = cl3.ewm(span=21, adjust=False).mean()
+            ema50 = cl3.ewm(span=50, adjust=False).mean()
+            if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]:
+                pa_score = 75
+            elif ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1]:
+                pa_score = 25
+            elif ema9.iloc[-1] > ema21.iloc[-1]:
+                pa_score = 60
+            else:
+                pa_score = 40
+
+    # Options/OI pillar
+    oi_score = 50
+    if option_data:
+        pcr = option_data.get('pcr', 1.0) or 1.0
+        if pcr > 1.3:   oi_score = 70
+        elif pcr > 1.0: oi_score = 58
+        elif pcr < 0.7: oi_score = 30
+        elif pcr < 1.0: oi_score = 42
+
+    # FII pillar
+    fii_score = 50
+    if fii_net_today > 2000:   fii_score = 80
+    elif fii_net_today > 500:  fii_score = 65
+    elif fii_net_today < -2000: fii_score = 20
+    elif fii_net_today < -500:  fii_score = 35
+
+    # Sector pillar (from sector_scores)
+    pos_sectors = sum(1 for v in sector_scores.values() if v > 0)
+    neg_sectors = sum(1 for v in sector_scores.values() if v < 0)
+    total_sectors = len(sector_scores)
+    sect_score = int(50 + (pos_sectors - neg_sectors) / total_sectors * 30)
+
+    # Weighted composite
+    weights = {
+        "Price Action":  0.30,
+        "Options OI":    0.20,
+        "FII/DII Flow":  0.20,
+        "News Sentiment":0.20,
+        "Sector Pulse":  0.10,
+    }
+    scores = {
+        "Price Action":   pa_score,
+        "Options OI":     oi_score,
+        "FII/DII Flow":   fii_score,
+        "News Sentiment": news_pillar,
+        "Sector Pulse":   sect_score,
+    }
+    composite = int(sum(scores[k] * weights[k] for k in scores))
+
+    # Labels
+    def _score_label(s):
+        if s >= 70: return "BULLISH",  "#00e676"
+        if s >= 58: return "SLIGHTLY BULLISH", "#69f0ae"
+        if s <= 30: return "BEARISH",  "#ff5252"
+        if s <= 42: return "SLIGHTLY BEARISH", "#ff8a80"
+        return "NEUTRAL", "#ffeb3b"
+
+    # Display combined engine table
+    ci_rows = []
+    for pillar, score in scores.items():
+        lbl, clr = _score_label(score)
+        ci_rows.append({
+            "Pillar":  pillar,
+            "Score":   score,
+            "Weight":  f"{int(weights[pillar]*100)}%",
+            "Signal":  lbl,
+            "_clr":    clr,
+        })
+    ci_df = pd.DataFrame(ci_rows)
+
+    def _ci_style(row):
+        styles = [""] * len(row)
+        col_names = list(row.index)
+        for i, col in enumerate(col_names):
+            if col == "Signal":
+                lbl, clr = _score_label(int(row["Score"]))
+                styles[i] = f"color:{clr}; font-weight:bold"
+            elif col == "Score":
+                lbl, clr = _score_label(int(row["Score"]))
+                styles[i] = f"color:{clr}"
+        return styles
+
+    st.dataframe(
+        ci_df.drop(columns=["_clr"]).style.apply(_ci_style, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    # Final verdict
+    comp_lbl, comp_clr = _score_label(composite)
+    trend_prob   = composite
+    breakout_prob = min(100, max(0, composite + (10 if vol_ratio > 1.3 else -5)))
+    risk_level   = "HIGH" if abs(composite - 50) < 10 else ("LOW" if abs(composite - 50) > 25 else "MEDIUM")
+
+    vc1, vc2, vc3, vc4 = st.columns(4)
+    with vc1:
+        st.markdown(
+            f"<div style='text-align:center;padding:12px;"
+            f"background:#1e1e1e;border-radius:10px;border:1px solid {comp_clr}'>"
+            f"<span style='font-size:11px;color:#aaa'>Market Direction</span><br>"
+            f"<span style='font-size:22px;font-weight:bold;color:{comp_clr}'>{comp_lbl}</span>"
+            f"</div>", unsafe_allow_html=True
+        )
+    with vc2:
+        st.metric("Composite Score", f"{composite}/100")
+    with vc3:
+        st.metric("Trend Probability", f"{trend_prob}%")
+    with vc4:
+        st.metric("Breakout Probability", f"{breakout_prob}%",
+                  delta=f"Risk: {risk_level}")
+
+    # ── MODULE 10: News Backtest ───────────────────────────────────────
+    with st.expander("📊 News Signal Backtest Report", expanded=False):
+        st.markdown(
+            "**Methodology:** For each article in today's feed, we score its sentiment "
+            "and compare against the current session's price direction as a proxy for "
+            "news→price correlation."
+        )
+        bt_rows = []
+        for a in processed[:20]:
+            price_aligned = (
+                (a["score"] == 1  and price_chg_pct > 0) or
+                (a["score"] == -1 and price_chg_pct < 0) or
+                (a["score"] == 0)
+            )
+            outcome = "SIGNAL CONFIRMED" if price_aligned else "FALSE SIGNAL"
+            bt_rows.append({
+                "Headline":  a["title"][:70] + "…",
+                "Sentiment": a["sentiment"],
+                "Price Chg": f"{price_chg_pct:+.2f}%",
+                "Outcome":   outcome,
+            })
+        bt_df = pd.DataFrame(bt_rows)
+
+        def _bt_news_style(row):
+            c = ("background-color:#1a3a1a; color:#00e676"
+                 if row["Outcome"] == "SIGNAL CONFIRMED"
+                 else "background-color:#3a1a1a; color:#ff5252")
+            return [c] * len(row)
+
+        if bt_rows:
+            confirmed = sum(1 for r in bt_rows if r["Outcome"] == "SIGNAL CONFIRMED")
+            win_rate  = confirmed / len(bt_rows) * 100
+            st.markdown(
+                f"Articles analysed: **{len(bt_rows)}** | "
+                f"Confirmed: **{confirmed}** | "
+                f"Win Rate: **{win_rate:.0f}%**"
+            )
+            st.dataframe(bt_df.style.apply(_bt_news_style, axis=1),
+                         use_container_width=True, hide_index=True)
+
+    # ── MODULE 11: News event markers hint ───────────────────────────
+    with st.expander("📌 Chart Event Markers", expanded=False):
+        st.markdown(
+            "**News event markers** are overlaid on the main price chart below. "
+            "Green triangles = bullish news; Red triangles = bearish news; "
+            "Blue circles = high-impact events."
+        )
+        marker_rows = []
+        for a in high_impact_arts[:10]:
+            icon = "🔺" if a["score"] == 1 else ("🔻" if a["score"] == -1 else "🔵")
+            marker_rows.append({
+                "Icon": icon,
+                "Event": a["title"][:80],
+                "Category": a["category"],
+                "Sector Impact": a["sectors"],
+            })
+        if marker_rows:
+            st.dataframe(pd.DataFrame(marker_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No high-impact events to mark on chart in current feed.")
+
+
+# =====================================================================
 # SECTOR ROTATION ANALYSIS ENGINE
 # =====================================================================
 
@@ -15429,6 +16070,7 @@ def main():
             st.warning(f"Sector Rotation Engine error: {str(_sre_err)}")
 
     # ===== FII / DII ACTIVITY ANALYSIS ENGINE =====
+    _fii_net_today_for_news = 0.0
     with st.expander("🏦 FII & DII Activity Analysis Engine", expanded=False):
         try:
             show_fii_dii_analysis(
@@ -15436,8 +16078,26 @@ def main():
                 option_data=option_data,
                 current_price=current_price,
             )
+            # Try to surface today's FII net for Combined Intelligence
+            _fii_raw = _fii_fetch_cash_data()
+            if _fii_raw:
+                _fii_cd = _fii_parse_cash(_fii_raw)
+                if not _fii_cd.empty:
+                    _fii_net_today_for_news = float(_fii_cd["FII Net"].iloc[0])
         except Exception as _fii_err:
             st.warning(f"FII/DII Analysis Engine error: {str(_fii_err)}")
+
+    # ===== MARKET NEWS INTELLIGENCE ENGINE =====
+    with st.expander("📰 Market News Intelligence Engine", expanded=False):
+        try:
+            show_news_intelligence_engine(
+                df=df if not df.empty else None,
+                option_data=option_data,
+                current_price=current_price,
+                fii_net_today=_fii_net_today_for_news,
+            )
+        except Exception as _nws_err:
+            st.warning(f"News Intelligence Engine error: {str(_nws_err)}")
 
     # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
     if enable_signals and option_data and option_data.get('underlying') and not df.empty:
