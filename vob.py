@@ -626,6 +626,19 @@ class DhanAPI:
             st.error(f"Network error fetching LTP: {str(e)}")
             return None
 
+    def get_market_depth(self, security_id="13", exchange_segment="IDX_I"):
+        """Fetch market depth (top-5 bid/ask levels) from Dhan API v2."""
+        url = f"{self.base_url}/marketfeed/depth"
+        payload = {exchange_segment: [int(security_id)]}
+        try:
+            response = requests.post(url, headers=self.headers, json=payload, timeout=8)
+            if response.status_code == 200:
+                return response.json()
+            # Silently fail — depth is best-effort
+            return None
+        except Exception:
+            return None
+
 @st.cache_data(ttl=300)  # Cache expiry list for 5 minutes
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
     return get_dhan_expiry_list(underlying_scrip, underlying_seg)
@@ -7250,6 +7263,933 @@ def show_futures_analysis_engine(df: pd.DataFrame, option_data: dict, current_pr
             st.dataframe(bt_df.style.apply(_bt_style, axis=1), use_container_width=True, hide_index=True)
         else:
             st.info("No completed EMA crossover trades in the last 50 bars.")
+
+
+# =====================================================================
+# MARKET DEPTH ANALYSIS ENGINE
+# =====================================================================
+
+_MDA_STRENGTH_THRESHOLDS = {
+    # (ratio_vs_opposite_side, label, color)
+    "Institutional": (4.0, "🏛️ Institutional", "#7c4dff"),
+    "Strong":        (2.5, "🔵 Strong",         "#00e676"),
+    "Moderate":      (1.5, "🟡 Moderate",        "#ffeb3b"),
+    "Weak":          (0.0, "⚪ Weak",             "#757575"),
+}
+
+def _mda_classify_strength(ratio: float, side: str) -> tuple:
+    """Return (label, color) for a bid or ask wall strength ratio."""
+    for key, (thresh, label, color) in _MDA_STRENGTH_THRESHOLDS.items():
+        if ratio >= thresh:
+            side_label = label.replace("🔵 Strong", f"🔵 Strong {'Support' if side=='bid' else 'Resistance'}")
+            side_label = side_label if "Support" in side_label or "Resistance" in side_label \
+                         else label + (" Support" if side == "bid" else " Resistance")
+            return side_label, color
+    return "⚪ Weak", "#757575"
+
+def _mda_parse_dhan_depth(raw: dict, exchange_segment: str, security_id: str):
+    """Parse Dhan /marketfeed/depth response into bid/ask lists."""
+    if not raw or "data" not in raw:
+        return [], []
+    data = raw.get("data", {})
+    # Response format: {"data": {"IDX_I": {"13": {"depth": {"buy":[], "sell":[]}, ...}}}}
+    seg_data = data.get(exchange_segment, data.get(str(exchange_segment), {}))
+    if not seg_data:
+        # Try flat structure
+        for v in data.values():
+            if isinstance(v, dict):
+                seg_data = v
+                break
+    sec_data = seg_data.get(str(security_id), seg_data.get(security_id, {}))
+    if not sec_data:
+        # Try direct if only one entry
+        if len(seg_data) == 1:
+            sec_data = next(iter(seg_data.values()))
+    depth = sec_data.get("depth", sec_data)
+    bids = depth.get("buy", depth.get("bid", []))
+    asks = depth.get("sell", depth.get("ask", []))
+    result_bids, result_asks = [], []
+    for b in bids:
+        price = float(b.get("price", b.get("Price", 0)))
+        qty   = float(b.get("quantity", b.get("Quantity", b.get("qty", 0))))
+        if price > 0:
+            result_bids.append({"price": price, "qty": qty})
+    for a in asks:
+        price = float(a.get("price", a.get("Price", 0)))
+        qty   = float(a.get("quantity", a.get("Quantity", a.get("qty", 0))))
+        if price > 0:
+            result_asks.append({"price": price, "qty": qty})
+    return result_bids, result_asks
+
+def _mda_nse_depth(spot: float):
+    """Try NSE public quote API for NIFTY futures market depth."""
+    try:
+        import urllib.request, json
+        req = urllib.request.Request(
+            "https://www.nseindia.com/api/quote-derivative?symbol=NIFTY",
+            headers={"User-Agent": "Mozilla/5.0 (compatible; MarketBot/1.0)",
+                     "Referer": "https://www.nseindia.com/"}
+        )
+        with urllib.request.urlopen(req, timeout=7) as r:
+            raw = json.loads(r.read())
+        # NSE returns futures data with depth in stocks key
+        fut_data = raw.get("stocks", [{}])[0]
+        mkt = fut_data.get("metadata", {})
+        depth_raw = fut_data.get("marketDepthTradeInfo", {})
+        bids = depth_raw.get("bidDetails", [])
+        asks = depth_raw.get("askDetails", [])
+        result_bids = [{"price": float(b.get("bidPrice", 0)), "qty": float(b.get("bidQty", 0))}
+                       for b in bids if float(b.get("bidPrice", 0)) > 0]
+        result_asks = [{"price": float(a.get("askPrice", 0)), "qty": float(a.get("askQty", 0))}
+                       for a in asks if float(a.get("askPrice", 0)) > 0]
+        return result_bids, result_asks
+    except Exception:
+        return [], []
+
+def _mda_synthetic_depth(df_summary: pd.DataFrame, spot: float, levels: int = 10):
+    """
+    Build synthetic depth from option chain bid/ask quantities per strike.
+
+    Logic:
+      - Each strike = one price level
+      - Bid side: put_bidQty (put buyers defend this level as support)
+                + call_bidQty (call buyers willing to pay)
+      - Ask side: call_askQty (call sellers create ceiling resistance)
+                + put_askQty (put sellers add pressure)
+    Returns (bids, asks) sorted by distance from spot.
+    """
+    if df_summary is None or df_summary.empty:
+        return [], []
+
+    ds = df_summary.copy()
+    ds = ds.sort_values("Strike").reset_index(drop=True)
+
+    def _s(row, col):
+        try:
+            v = row.get(col, 0)
+            return float(v) if pd.notna(v) and v != "" else 0.0
+        except Exception:
+            return 0.0
+
+    below = ds[ds["Strike"] <= spot].tail(levels)
+    above = ds[ds["Strike"] >  spot].head(levels)
+
+    bids, asks = [], []
+    for _, row in below.iterrows():
+        bid_qty = _s(row, "bidQty_PE") + _s(row, "bidQty_CE")
+        ask_qty = _s(row, "askQty_PE") + _s(row, "askQty_CE")
+        oi_pe   = _s(row, "openInterest_PE")
+        # Weight by OI to make it more representative
+        effective_bid = bid_qty + oi_pe * 0.001
+        bids.append({"price": float(row["Strike"]), "qty": round(effective_bid, 0),
+                     "raw_bid": bid_qty, "raw_ask": ask_qty,
+                     "oi_pe": oi_pe, "oi_ce": _s(row, "openInterest_CE"),
+                     "source": "option_chain"})
+    for _, row in above.iterrows():
+        bid_qty = _s(row, "bidQty_PE") + _s(row, "bidQty_CE")
+        ask_qty = _s(row, "askQty_CE") + _s(row, "askQty_PE")
+        oi_ce   = _s(row, "openInterest_CE")
+        effective_ask = ask_qty + oi_ce * 0.001
+        asks.append({"price": float(row["Strike"]), "qty": round(effective_ask, 0),
+                     "raw_bid": bid_qty, "raw_ask": ask_qty,
+                     "oi_ce": oi_ce, "oi_pe": _s(row, "openInterest_PE"),
+                     "source": "option_chain"})
+    return bids, asks
+
+def _mda_demo_depth(spot: float):
+    """Generate realistic demo depth around spot for display when no API data."""
+    import random
+    random.seed(int(spot) % 1000)
+    step = 50  # NIFTY strikes at 50-pt intervals
+    bids, asks = [], []
+    for i in range(1, 11):
+        price = round(spot - i * step, 0)
+        # Occasionally create large walls
+        base = random.randint(5000, 30000)
+        multiplier = 4.0 if i in (2, 5) else (2.0 if i == 8 else 1.0)
+        bids.append({"price": price, "qty": int(base * multiplier)})
+    for i in range(1, 11):
+        price = round(spot + i * step, 0)
+        base = random.randint(5000, 30000)
+        multiplier = 4.0 if i in (3, 6) else (2.0 if i == 9 else 1.0)
+        asks.append({"price": price, "qty": int(base * multiplier)})
+    return bids, asks
+
+def _mda_find_clusters(levels: list, cluster_pct: float = 0.005):
+    """Group nearby levels into liquidity clusters."""
+    if not levels:
+        return []
+    sorted_lvls = sorted(levels, key=lambda x: x["price"])
+    clusters = []
+    current = [sorted_lvls[0]]
+    for lvl in sorted_lvls[1:]:
+        if abs(lvl["price"] - current[-1]["price"]) / max(current[-1]["price"], 1) <= cluster_pct:
+            current.append(lvl)
+        else:
+            clusters.append(current)
+            current = [lvl]
+    clusters.append(current)
+    result = []
+    for c in clusters:
+        total_qty = sum(x["qty"] for x in c)
+        avg_price = sum(x["price"] * x["qty"] for x in c) / total_qty if total_qty > 0 else c[0]["price"]
+        result.append({"price": round(avg_price, 1), "total_qty": total_qty,
+                        "levels_count": len(c), "price_range": (c[0]["price"], c[-1]["price"])})
+    return result
+
+def show_market_depth_engine(api=None, option_data: dict = None,
+                              current_price: float = None, df: pd.DataFrame = None):
+    """11-Module Market Depth Analysis Engine."""
+    st.markdown("### 📖 Market Depth Analysis Engine")
+
+    spot = current_price or 0.0
+    if spot <= 0:
+        if option_data and option_data.get("underlying"):
+            spot = float(option_data["underlying"])
+    if spot <= 0:
+        st.warning("No spot price available. Load NIFTY price data first.")
+        return
+
+    # ── MODULE 1+2: Data Collection ───────────────────────────────────
+    data_source = "none"
+    bids, asks = [], []
+
+    # Try 1 — Dhan market depth API
+    if api is not None:
+        raw_depth = api.get_market_depth(security_id="13", exchange_segment="IDX_I")
+        if raw_depth:
+            bids, asks = _mda_parse_dhan_depth(raw_depth, "IDX_I", "13")
+        if not bids and not asks:
+            # Try NSE_FO NIFTY futures (near-month security ID 35001 is a placeholder)
+            raw_depth2 = api.get_market_depth(security_id="13", exchange_segment="NSE_FO")
+            if raw_depth2:
+                bids, asks = _mda_parse_dhan_depth(raw_depth2, "NSE_FO", "13")
+        if bids or asks:
+            data_source = "dhan"
+
+    # Try 2 — Synthetic from option chain (most reliable in this app)
+    if not bids and not asks and option_data:
+        df_summary = option_data.get("df_summary")
+        if df_summary is not None and not df_summary.empty:
+            bids, asks = _mda_synthetic_depth(df_summary, spot, levels=10)
+            if bids or asks:
+                data_source = "option_chain"
+
+    # Try 3 — NSE public API
+    if not bids and not asks:
+        with st.spinner("Trying NSE depth API..."):
+            bids, asks = _mda_nse_depth(spot)
+        if bids or asks:
+            data_source = "nse"
+
+    # Fallback — demo
+    if not bids and not asks:
+        bids, asks = _mda_demo_depth(spot)
+        data_source = "demo"
+        st.info(
+            "ℹ️ **Demo Mode** — No live depth data available. "
+            "Dhan API market depth works locally. "
+            "Option chain data adds synthetic depth when loaded."
+        )
+
+    source_labels = {
+        "dhan":         "✅ Live — Dhan API",
+        "option_chain": "🔶 Synthetic — Option Chain Bid/Ask + OI",
+        "nse":          "✅ Live — NSE API",
+        "demo":         "🔵 Demo Data",
+    }
+    st.caption(f"Data source: **{source_labels.get(data_source, data_source)}** | Spot: ₹{spot:,.0f}")
+
+    # Sort and limit to 10 levels each side
+    bids = sorted(bids, key=lambda x: x["price"], reverse=True)[:10]
+    asks = sorted(asks, key=lambda x: x["price"])[:10]
+
+    total_bid_vol = sum(b["qty"] for b in bids)
+    total_ask_vol = sum(a["qty"] for a in asks)
+
+    # ── MODULE 6: Order Book Imbalance ────────────────────────────────
+    imbalance = total_bid_vol - total_ask_vol
+    imb_ratio = total_bid_vol / total_ask_vol if total_ask_vol > 0 else 1.0
+    if imbalance > 0:
+        imb_label, imb_color = f"BUYING PRESSURE (+{imbalance:,.0f})", "#00e676"
+    elif imbalance < 0:
+        imb_label, imb_color = f"SELLING PRESSURE ({imbalance:,.0f})", "#ff5252"
+    else:
+        imb_label, imb_color = "BALANCED", "#ffeb3b"
+
+    # ── MODULE 3+4: Support / Resistance Classification ───────────────
+    def _classify_levels(levels: list, side: str, opposite_total: float):
+        enriched = []
+        for lvl in levels:
+            qty = lvl["qty"]
+            opposite_avg = opposite_total / max(len(levels), 1)
+            ratio = qty / opposite_avg if opposite_avg > 0 else 1.0
+            label, color = _mda_classify_strength(ratio, side)
+            enriched.append({**lvl, "strength_label": label, "color": color,
+                              "ratio": round(ratio, 2), "side": side})
+        return enriched
+
+    bid_levels = _classify_levels(bids, "bid", total_ask_vol)
+    ask_levels = _classify_levels(asks, "ask", total_bid_vol)
+
+    # ── MODULE 8: Nearest S/R ─────────────────────────────────────────
+    nearest_support    = max((b for b in bid_levels if b["price"] < spot),
+                             key=lambda x: x["price"], default=None)
+    nearest_resistance = min((a for a in ask_levels if a["price"] > spot),
+                             key=lambda x: x["price"], default=None)
+    supp_dist = (spot - nearest_support["price"]) if nearest_support else None
+    res_dist  = (nearest_resistance["price"] - spot) if nearest_resistance else None
+
+    # ── MODULE 5: Liquidity Clusters ─────────────────────────────────
+    all_levels_for_cluster = bid_levels + ask_levels
+    clusters = _mda_find_clusters(all_levels_for_cluster, cluster_pct=0.004)
+    major_clusters = [c for c in clusters if c["levels_count"] >= 2 or c["total_qty"] > 0.7 * (total_bid_vol + total_ask_vol) / max(len(all_levels_for_cluster), 1)]
+
+    # ── KPI Row ───────────────────────────────────────────────────────
+    st.markdown("#### 📊 Order Book Overview")
+    kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+    with kc1: st.metric("Total Bid Volume", f"{total_bid_vol:,.0f}")
+    with kc2: st.metric("Total Ask Volume", f"{total_ask_vol:,.0f}")
+    with kc3: st.metric("Bid/Ask Ratio", f"{imb_ratio:.2f}x")
+    with kc4:
+        st.markdown(
+            f"<div style='text-align:center;padding:8px;background:#1e1e1e;"
+            f"border-radius:8px;border-left:4px solid {imb_color}'>"
+            f"<span style='font-size:10px;color:#aaa'>Order Imbalance</span><br>"
+            f"<span style='font-size:13px;font-weight:bold;color:{imb_color}'>{imb_label}</span>"
+            f"</div>", unsafe_allow_html=True
+        )
+    with kc5:
+        walls = sum(1 for b in bid_levels if "Institutional" in b["strength_label"] or "Strong" in b["strength_label"])
+        walls += sum(1 for a in ask_levels if "Institutional" in a["strength_label"] or "Strong" in a["strength_label"])
+        st.metric("Major Walls Detected", walls)
+
+    # ── MODULE 8: Near Spot Panel ─────────────────────────────────────
+    st.markdown("#### 🎯 Nearest Support & Resistance")
+    nc1, nc2 = st.columns(2)
+    with nc1:
+        if nearest_support:
+            st.markdown(
+                f"<div style='padding:12px;background:#1a3a1a;border-radius:8px;"
+                f"border-left:4px solid #00e676'>"
+                f"<span style='color:#aaa;font-size:11px'>NEAREST SUPPORT</span><br>"
+                f"<span style='font-size:24px;font-weight:bold;color:#00e676'>"
+                f"₹{nearest_support['price']:,.0f}</span><br>"
+                f"<span style='color:#69f0ae'>Vol: {nearest_support['qty']:,.0f} | "
+                f"{nearest_support['strength_label']} | "
+                f"Distance: {supp_dist:.0f} pts ({supp_dist/spot*100:.2f}%)</span>"
+                f"</div>", unsafe_allow_html=True
+            )
+        else:
+            st.info("No support levels detected below spot.")
+    with nc2:
+        if nearest_resistance:
+            st.markdown(
+                f"<div style='padding:12px;background:#3a1a1a;border-radius:8px;"
+                f"border-left:4px solid #ff5252'>"
+                f"<span style='color:#aaa;font-size:11px'>NEAREST RESISTANCE</span><br>"
+                f"<span style='font-size:24px;font-weight:bold;color:#ff5252'>"
+                f"₹{nearest_resistance['price']:,.0f}</span><br>"
+                f"<span style='color:#ff8a80'>Vol: {nearest_resistance['qty']:,.0f} | "
+                f"{nearest_resistance['strength_label']} | "
+                f"Distance: {res_dist:.0f} pts ({res_dist/spot*100:.2f}%)</span>"
+                f"</div>", unsafe_allow_html=True
+            )
+        else:
+            st.info("No resistance levels detected above spot.")
+
+    # ── MODULE 3+4+7: Full Depth Table ────────────────────────────────
+    st.markdown("#### 📋 Full Order Book — 10 Levels Each Side")
+
+    _SIDE_STYLES = {
+        "#7c4dff": "background-color:#1a0a3a; color:#ce93d8; font-weight:bold",
+        "#00e676": "background-color:#1a3a1a; color:#00e676; font-weight:bold",
+        "#ffeb3b": "background-color:#2a2a1a; color:#ffeb3b",
+        "#757575": "color:#757575",
+        "#ff5252": "background-color:#3a1a1a; color:#ff5252; font-weight:bold",
+        "#ff8a80": "background-color:#2a1a1a; color:#ff8a80",
+    }
+
+    dt1, dt2 = st.columns(2)
+
+    # Support (Bids) table
+    with dt1:
+        st.markdown("##### 🟢 Support Levels (Bids)")
+        bid_rows = []
+        for b in bid_levels:
+            pct_of_total = b["qty"] / total_bid_vol * 100 if total_bid_vol > 0 else 0
+            bid_rows.append({
+                "Price (₹)":   f"₹{b['price']:,.0f}",
+                "Bid Volume":  f"{b['qty']:,.0f}",
+                "% of Total":  f"{pct_of_total:.1f}%",
+                "Strength":    b["strength_label"],
+                "Dist (pts)":  f"{spot - b['price']:.0f}" if b['price'] < spot else "—",
+                "_color":      b["color"],
+            })
+        bid_df = pd.DataFrame(bid_rows)
+
+        def _bid_style(row):
+            clr = _SIDE_STYLES.get(str(row["_color"]), "")
+            styles = ["", "", "", clr, "", ""]
+            return styles
+
+        st.dataframe(
+            bid_df.drop(columns=["_color"]).style.apply(_bid_style, axis=1),
+            use_container_width=True, hide_index=True
+        )
+
+    # Resistance (Asks) table
+    with dt2:
+        st.markdown("##### 🔴 Resistance Levels (Asks)")
+        ask_rows = []
+        for a in ask_levels:
+            pct_of_total = a["qty"] / total_ask_vol * 100 if total_ask_vol > 0 else 0
+            ask_rows.append({
+                "Price (₹)":   f"₹{a['price']:,.0f}",
+                "Ask Volume":  f"{a['qty']:,.0f}",
+                "% of Total":  f"{pct_of_total:.1f}%",
+                "Strength":    a["strength_label"],
+                "Dist (pts)":  f"{a['price'] - spot:.0f}" if a['price'] > spot else "—",
+                "_color":      a["color"],
+            })
+        ask_df = pd.DataFrame(ask_rows)
+
+        def _ask_style(row):
+            clr_map = {
+                "#7c4dff": "background-color:#1a0a3a; color:#ce93d8; font-weight:bold",
+                "#00e676": "background-color:#1a3a1a; color:#ff5252; font-weight:bold",
+                "#ffeb3b": "background-color:#2a1a1a; color:#ff8a80",
+                "#757575": "color:#757575",
+            }
+            clr = clr_map.get(str(row["_color"]),
+                              "background-color:#3a1a1a; color:#ff5252; font-weight:bold"
+                              if "Institutional" in str(row["Strength"]) else "")
+            return ["", "", "", clr, "", ""]
+
+        st.dataframe(
+            ask_df.drop(columns=["_color"]).style.apply(_ask_style, axis=1),
+            use_container_width=True, hide_index=True
+        )
+
+    # ── MODULE 5: Liquidity Clusters ─────────────────────────────────
+    if major_clusters:
+        st.markdown("#### 💧 Major Liquidity Clusters")
+        cluster_rows = []
+        for c in sorted(major_clusters, key=lambda x: x["total_qty"], reverse=True)[:8]:
+            side = "SUPPORT" if c["price"] < spot else "RESISTANCE"
+            cluster_rows.append({
+                "Price Zone":    f"₹{c['price_range'][0]:,.0f} – ₹{c['price_range'][1]:,.0f}",
+                "Mid Price":     f"₹{c['price']:,.0f}",
+                "Total Volume":  f"{c['total_qty']:,.0f}",
+                "Levels Stacked":c["levels_count"],
+                "Type":          side,
+                "Dist (pts)":    f"{abs(c['price'] - spot):.0f}",
+            })
+        cl_df = pd.DataFrame(cluster_rows)
+
+        def _cl_style(row):
+            if row["Type"] == "SUPPORT":
+                return ["", "", "color:#00e676", "", "background-color:#1a3a1a;color:#00e676;font-weight:bold", ""]
+            return ["", "", "color:#ff5252", "", "background-color:#3a1a1a;color:#ff5252;font-weight:bold", ""]
+
+        st.dataframe(cl_df.style.apply(_cl_style, axis=1), use_container_width=True, hide_index=True)
+
+    # ── MODULE 9: Chart Visualization ────────────────────────────────
+    with st.expander("📈 Depth Chart — Liquidity Profile", expanded=False):
+        try:
+            import plotly.graph_objects as go
+            fig = go.Figure()
+
+            # Bid bars (horizontal depth chart)
+            bid_prices = [b["price"] for b in bid_levels]
+            bid_qtys   = [b["qty"]   for b in bid_levels]
+            bid_colors = [b["color"] for b in bid_levels]
+
+            fig.add_trace(go.Bar(
+                y=bid_prices, x=[-q for q in bid_qtys],
+                orientation="h", name="Bids (Support)",
+                marker_color=bid_colors,
+                customdata=[[b["strength_label"], b["qty"]] for b in bid_levels],
+                hovertemplate="₹%{y:,.0f}<br>Vol: %{customdata[1]:,.0f}<br>%{customdata[0]}<extra></extra>",
+            ))
+
+            ask_prices = [a["price"] for a in ask_levels]
+            ask_qtys   = [a["qty"]   for a in ask_levels]
+            ask_clrs   = [a["color"] for a in ask_levels]
+
+            fig.add_trace(go.Bar(
+                y=ask_prices, x=ask_qtys,
+                orientation="h", name="Asks (Resistance)",
+                marker_color=ask_clrs,
+                customdata=[[a["strength_label"], a["qty"]] for a in ask_levels],
+                hovertemplate="₹%{y:,.0f}<br>Vol: %{customdata[1]:,.0f}<br>%{customdata[0]}<extra></extra>",
+            ))
+
+            # Spot line
+            fig.add_hline(y=spot, line_dash="dash", line_color="#ffeb3b", line_width=2,
+                          annotation_text=f"SPOT ₹{spot:,.0f}", annotation_position="right")
+
+            fig.update_layout(
+                title="Market Depth — Liquidity Profile",
+                xaxis_title="Volume (←Bids | Asks→)",
+                yaxis_title="Price Level (₹)",
+                barmode="overlay",
+                paper_bgcolor="#0e1117", plot_bgcolor="#0e1117",
+                font=dict(color="#e0e0e0"),
+                legend=dict(bgcolor="#1e1e1e"),
+                height=500,
+                yaxis=dict(tickformat=","),
+            )
+            st.plotly_chart(fig, use_container_width=True)
+        except Exception as _chart_err:
+            st.info(f"Chart unavailable: {_chart_err}")
+
+    # ── MODULE 7: Dynamic Update Summary ─────────────────────────────
+    with st.expander("🔄 Dynamic Liquidity Change Tracker", expanded=False):
+        st.markdown(
+            "This tracker compares successive snapshots. "
+            "Open this expander and **refresh the page** to see changes."
+        )
+        snap_key = "mda_prev_snapshot"
+        curr_snap = {b["price"]: b["qty"] for b in bid_levels}
+        curr_snap.update({a["price"]: a["qty"] for a in ask_levels})
+
+        if snap_key in st.session_state:
+            prev_snap = st.session_state[snap_key]
+            changes = []
+            for price, qty in curr_snap.items():
+                prev_qty = prev_snap.get(price, 0)
+                if prev_qty == 0 and qty > 0:
+                    changes.append({"Price": f"₹{price:,.0f}", "Change": "NEW LIQUIDITY ENTERED", "Volume": f"{qty:,.0f}", "_bull": True})
+                elif qty == 0 and prev_qty > 0:
+                    changes.append({"Price": f"₹{price:,.0f}", "Change": "LIQUIDITY REMOVED", "Volume": f"−{prev_qty:,.0f}", "_bull": False})
+                elif prev_qty > 0 and qty / prev_qty > 1.5:
+                    changes.append({"Price": f"₹{price:,.0f}", "Change": f"VOLUME SURGE +{(qty/prev_qty-1)*100:.0f}%", "Volume": f"{qty:,.0f}", "_bull": True})
+                elif prev_qty > 0 and qty / prev_qty < 0.5:
+                    changes.append({"Price": f"₹{price:,.0f}", "Change": f"VOLUME DROP −{(1-qty/prev_qty)*100:.0f}%", "Volume": f"{qty:,.0f}", "_bull": False})
+
+            if changes:
+                chg_df = pd.DataFrame(changes)
+
+                def _chg_style(row):
+                    c = "color:#00e676" if row["_bull"] else "color:#ff5252"
+                    return ["", c, c, ""]
+
+                st.dataframe(
+                    chg_df.drop(columns=["_bull"]).style.apply(_chg_style, axis=1),
+                    use_container_width=True, hide_index=True
+                )
+            else:
+                st.success("✅ No significant liquidity changes since last snapshot.")
+        else:
+            st.info("First snapshot taken. Refresh to detect changes.")
+        st.session_state[snap_key] = curr_snap
+
+    # ── MODULE 10: Alerts ─────────────────────────────────────────────
+    st.markdown("#### 🚨 Market Depth Alerts")
+    depth_alerts = []
+
+    # Large buy/sell walls
+    max_bid = max(bid_levels, key=lambda x: x["qty"], default=None)
+    max_ask = max(ask_levels, key=lambda x: x["qty"], default=None)
+    if max_bid and max_bid["qty"] > total_bid_vol * 0.35:
+        depth_alerts.append(("🟢", "LARGE BUY WALL",
+                              f"₹{max_bid['price']:,.0f} — {max_bid['qty']:,.0f} lots "
+                              f"({max_bid['qty']/total_bid_vol*100:.0f}% of total bids) | "
+                              f"{max_bid['strength_label']}"))
+    if max_ask and max_ask["qty"] > total_ask_vol * 0.35:
+        depth_alerts.append(("🔴", "LARGE SELL WALL",
+                              f"₹{max_ask['price']:,.0f} — {max_ask['qty']:,.0f} lots "
+                              f"({max_ask['qty']/total_ask_vol*100:.0f}% of total asks) | "
+                              f"{max_ask['strength_label']}"))
+
+    # Imbalance alert
+    if imb_ratio > 2.0:
+        depth_alerts.append(("⚡", "STRONG BUYING PRESSURE",
+                              f"Bid volume {imb_ratio:.1f}× ask volume — institutional accumulation likely"))
+    elif imb_ratio < 0.5:
+        depth_alerts.append(("⚡", "STRONG SELLING PRESSURE",
+                              f"Ask volume {1/imb_ratio:.1f}× bid volume — distribution likely"))
+
+    # Near-spot wall
+    if nearest_support and supp_dist and supp_dist < 50:
+        depth_alerts.append(("🔵", "SUPPORT VERY CLOSE",
+                              f"₹{nearest_support['price']:,.0f} only {supp_dist:.0f} pts below spot"))
+    if nearest_resistance and res_dist and res_dist < 50:
+        depth_alerts.append(("🔵", "RESISTANCE VERY CLOSE",
+                              f"₹{nearest_resistance['price']:,.0f} only {res_dist:.0f} pts above spot"))
+
+    # Institutional walls near spot
+    for lvl in bid_levels[:3] + ask_levels[:3]:
+        if "Institutional" in lvl.get("strength_label", ""):
+            side_str = "SUPPORT" if lvl["side"] == "bid" else "RESISTANCE"
+            depth_alerts.append(("🏛️", f"INSTITUTIONAL {side_str} WALL",
+                                  f"₹{lvl['price']:,.0f} — {lvl['qty']:,.0f} lots near spot"))
+            break
+
+    if depth_alerts:
+        for icon, title, desc in depth_alerts:
+            st.info(f"{icon} **{title}** — {desc}")
+    else:
+        st.success("✅ No extreme depth signals — normal order book conditions")
+
+    # ── MODULE 11: Backtest ───────────────────────────────────────────
+    with st.expander("📊 Depth Signal Backtest — Historical S/R Win Rate", expanded=False):
+        if df is not None and not df.empty and len(df) >= 10:
+            df2 = df.copy()
+            df2.columns = [c.lower() for c in df2.columns]
+            close_col = "close" if "close" in df2.columns else df2.columns[3]
+            prices = df2[close_col].dropna()
+
+            bt_rows = []
+            for lvl in (bid_levels[:5] + ask_levels[:5]):
+                level_price = lvl["price"]
+                touches     = ((prices - level_price).abs() < level_price * 0.003).sum()
+                if touches == 0:
+                    continue
+                # Check if price bounced after touching (reversal)
+                bounces = 0
+                for i in range(len(prices) - 1):
+                    if abs(prices.iloc[i] - level_price) < level_price * 0.003:
+                        if lvl["side"] == "bid" and prices.iloc[i+1] > prices.iloc[i]:
+                            bounces += 1
+                        elif lvl["side"] == "ask" and prices.iloc[i+1] < prices.iloc[i]:
+                            bounces += 1
+                win_rate = bounces / touches * 100 if touches > 0 else 0
+                bt_rows.append({
+                    "Level":      f"₹{level_price:,.0f}",
+                    "Type":       "Support" if lvl["side"] == "bid" else "Resistance",
+                    "Strength":   lvl["strength_label"],
+                    "Touches":    touches,
+                    "Bounces":    bounces,
+                    "Win Rate %": f"{win_rate:.0f}%",
+                })
+
+            if bt_rows:
+                bt_df = pd.DataFrame(bt_rows).sort_values("Touches", ascending=False)
+                overall_touches = sum(r["Touches"] for r in bt_rows)
+                overall_bounces = sum(r["Bounces"] for r in bt_rows)
+                overall_wr = overall_bounces / overall_touches * 100 if overall_touches > 0 else 0
+                st.markdown(
+                    f"**Total touches:** {overall_touches} | "
+                    f"**Bounces:** {overall_bounces} | "
+                    f"**Overall Win Rate:** {overall_wr:.0f}%"
+                )
+
+                def _bt_style(row):
+                    try:
+                        wr = float(str(row["Win Rate %"]).replace("%", ""))
+                        c = "color:#00e676" if wr >= 60 else ("color:#ffeb3b" if wr >= 40 else "color:#ff5252")
+                    except Exception:
+                        c = ""
+                    return ["", "", "", "", "", c]
+
+                st.dataframe(bt_df.style.apply(_bt_style, axis=1),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.info("No price data overlaps with current depth levels for backtesting.")
+        else:
+            st.info("Load NIFTY price chart data to enable depth backtest.")
+
+
+# =====================================================================
+# MARKET SENTIMENT ENGINE — DEPTH-BASED
+# =====================================================================
+
+def _mse_sentiment_score(ba_ratio: float, imbalance: float,
+                          total_vol: float, near_spot_ratio: float,
+                          wall_score: float) -> int:
+    """
+    Composite Market Sentiment Score 0–100.
+      ba_ratio      : Total Bid Vol / Total Ask Vol
+      imbalance     : (Bid − Ask) / Total  [−1 to +1]
+      near_spot_ratio: bid/ask ratio for 5 levels around spot
+      wall_score    : 0–1, normalised strength of nearest buy wall vs sell wall
+    """
+    score = 50
+    # Bid/Ask Ratio contribution (±20)
+    if ba_ratio >= 2.0:   score += 20
+    elif ba_ratio >= 1.5: score += 12
+    elif ba_ratio >= 1.1: score += 6
+    elif ba_ratio <= 0.5: score -= 20
+    elif ba_ratio <= 0.7: score -= 12
+    elif ba_ratio <= 0.9: score -= 6
+    # Order imbalance contribution (±15)
+    score += int(imbalance * 15)
+    # Near-spot activity (±10)
+    if near_spot_ratio >= 1.5:   score += 10
+    elif near_spot_ratio >= 1.1: score += 5
+    elif near_spot_ratio <= 0.7: score -= 10
+    elif near_spot_ratio <= 0.9: score -= 5
+    # Wall strength (±5)
+    score += int((wall_score - 0.5) * 10)
+    return max(0, min(100, int(score)))
+
+def _mse_label(score: int) -> tuple:
+    if score >= 70: return "STRONG BULLISH",  "#00e676", "🟢"
+    if score >= 50: return "BULLISH",          "#69f0ae", "🟢"
+    if score >= 30: return "NEUTRAL",          "#ffeb3b", "🟡"
+    return "BEARISH", "#ff5252", "🔴"
+
+def _mse_absorption_detect(bid_levels: list, ask_levels: list) -> list:
+    """
+    Detect institutional absorption:
+    - Large bid refilling at same price repeatedly → Accumulation
+    - Large ask refilling at same price repeatedly → Distribution
+    Uses session_state history to track repeated appearance.
+    """
+    findings = []
+    hist_key = "mse_level_history"
+    if hist_key not in st.session_state:
+        st.session_state[hist_key] = {}
+    hist = st.session_state[hist_key]
+
+    for lvl in bid_levels:
+        p = lvl["price"]
+        prev = hist.get(p, {"count": 0, "avg_qty": 0})
+        if prev["count"] >= 2 and lvl["qty"] >= prev["avg_qty"] * 0.8:
+            findings.append({
+                "Price": f"₹{p:,.0f}", "Type": "BID",
+                "Pattern": "INSTITUTIONAL ACCUMULATION",
+                "Appearances": prev["count"] + 1,
+                "Avg Volume": f"{prev['avg_qty']:,.0f}",
+            })
+        hist[p] = {"count": prev["count"] + 1,
+                   "avg_qty": (prev["avg_qty"] * prev["count"] + lvl["qty"]) / (prev["count"] + 1)}
+
+    for lvl in ask_levels:
+        p = lvl["price"]
+        prev = hist.get(p, {"count": 0, "avg_qty": 0})
+        if prev["count"] >= 2 and lvl["qty"] >= prev["avg_qty"] * 0.8:
+            findings.append({
+                "Price": f"₹{p:,.0f}", "Type": "ASK",
+                "Pattern": "INSTITUTIONAL DISTRIBUTION",
+                "Appearances": prev["count"] + 1,
+                "Avg Volume": f"{prev['avg_qty']:,.0f}",
+            })
+        hist[p] = {"count": prev["count"] + 1,
+                   "avg_qty": (prev["avg_qty"] * prev["count"] + lvl["qty"]) / (prev["count"] + 1)}
+
+    st.session_state[hist_key] = hist
+    return findings
+
+def show_market_sentiment_engine(api=None, option_data: dict = None,
+                                  current_price: float = None):
+    """10-Module Market Sentiment Engine using Market Depth Data."""
+    st.markdown("### 🧭 Market Sentiment Engine — Real-Time Depth Analysis")
+
+    spot = current_price or 0.0
+    if spot <= 0 and option_data:
+        spot = float(option_data.get("underlying", 0) or 0)
+    if spot <= 0:
+        st.warning("No spot price available.")
+        return
+
+    # ── MODULE 1: Fetch depth (reuse same pipeline as Depth Engine) ───
+    bids, asks = [], []
+    data_source = "none"
+
+    if api is not None:
+        raw = api.get_market_depth(security_id="13", exchange_segment="IDX_I")
+        if raw:
+            bids, asks = _mda_parse_dhan_depth(raw, "IDX_I", "13")
+        if bids or asks:
+            data_source = "dhan"
+
+    if not bids and not asks and option_data:
+        df_summary = option_data.get("df_summary")
+        if df_summary is not None and not df_summary.empty:
+            bids, asks = _mda_synthetic_depth(df_summary, spot, levels=10)
+            data_source = "option_chain"
+
+    if not bids and not asks:
+        bids, asks = _mda_demo_depth(spot)
+        data_source = "demo"
+        st.info("ℹ️ Demo mode — live depth unavailable. Results are illustrative.")
+
+    bids = sorted(bids, key=lambda x: x["price"], reverse=True)[:10]
+    asks = sorted(asks, key=lambda x: x["price"])[:10]
+
+    total_bid = sum(b["qty"] for b in bids)
+    total_ask = sum(a["qty"] for a in asks)
+    total_vol = total_bid + total_ask
+
+    # ── MODULE 2: Bid/Ask Ratio ───────────────────────────────────────
+    ba_ratio = total_bid / total_ask if total_ask > 0 else 1.0
+
+    # ── MODULE 3: Order Imbalance ─────────────────────────────────────
+    imbalance_abs = total_bid - total_ask
+    imbalance_norm = imbalance_abs / total_vol if total_vol > 0 else 0.0  # −1 to +1
+
+    # ── MODULE 5: Near-Spot (5 levels each side) ──────────────────────
+    near_bids = [b for b in bids if b["price"] >= spot - 5 * 50][:5]
+    near_asks = [a for a in asks if a["price"] <= spot + 5 * 50][:5]
+    near_bid_vol = sum(b["qty"] for b in near_bids)
+    near_ask_vol = sum(a["qty"] for a in near_asks)
+    near_spot_ratio = near_bid_vol / near_ask_vol if near_ask_vol > 0 else 1.0
+
+    # ── MODULE 4: Wall Detection ──────────────────────────────────────
+    max_bid_wall = max(bids, key=lambda x: x["qty"], default=None)
+    max_ask_wall = max(asks, key=lambda x: x["qty"], default=None)
+    wall_score = 0.5
+    if max_bid_wall and max_ask_wall:
+        wall_score = max_bid_wall["qty"] / (max_bid_wall["qty"] + max_ask_wall["qty"])
+
+    # ── MODULE 8: Sentiment Score ─────────────────────────────────────
+    score = _mse_sentiment_score(ba_ratio, imbalance_norm,
+                                  total_vol, near_spot_ratio, wall_score)
+    label, color, icon = _mse_label(score)
+
+    # ── MODULE 6: Liquidity Shift Detection ──────────────────────────
+    shift_key = "mse_prev_snapshot"
+    curr_snap = {b["price"]: b["qty"] for b in bids}
+    curr_snap.update({-a["price"]: a["qty"] for a in asks})  # negative key for asks
+    shifts = []
+    if shift_key in st.session_state:
+        prev = st.session_state[shift_key]
+        prev_bid_vol = sum(v for k, v in prev.items() if k > 0)
+        prev_ask_vol = sum(v for k, v in prev.items() if k < 0)
+        prev_ratio = prev_bid_vol / prev_ask_vol if prev_ask_vol > 0 else 1.0
+        delta_ratio = ba_ratio - prev_ratio
+        if delta_ratio > 0.3:
+            shifts.append(("🟢", "SENTIMENT SHIFT BULLISH",
+                           f"Bid/Ask ratio rose from {prev_ratio:.2f} → {ba_ratio:.2f}"))
+        elif delta_ratio < -0.3:
+            shifts.append(("🔴", "SENTIMENT SHIFT BEARISH",
+                           f"Bid/Ask ratio fell from {prev_ratio:.2f} → {ba_ratio:.2f}"))
+        # Sudden large order appearance
+        for price, qty in curr_snap.items():
+            if price not in prev and qty > total_vol * 0.15:
+                side = "BUY WALL" if price > 0 else "SELL WALL"
+                shifts.append(("⚡", f"NEW LARGE {side}",
+                               f"₹{abs(price):,.0f} — {qty:,.0f} lots appeared"))
+        # Large order disappearance
+        for price, qty in prev.items():
+            if price not in curr_snap and qty > total_vol * 0.15:
+                side = "BUY" if price > 0 else "SELL"
+                shifts.append(("💨", f"LARGE {side} ORDER REMOVED",
+                               f"₹{abs(price):,.0f} — {qty:,.0f} lots withdrawn (fake wall?)"))
+    st.session_state[shift_key] = curr_snap
+
+    # ── MODULE 7: Smart Money / Absorption ───────────────────────────
+    absorptions = _mse_absorption_detect(bids, asks)
+
+    # ── MODULE 9: Dashboard ───────────────────────────────────────────
+    st.markdown("#### 🧭 Sentiment Dashboard")
+
+    # Sentiment gauge
+    gauge_col, metrics_col = st.columns([1, 2])
+    with gauge_col:
+        try:
+            import plotly.graph_objects as go
+            fig_gauge = go.Figure(go.Indicator(
+                mode="gauge+number+delta",
+                value=score,
+                title={"text": "Sentiment Score", "font": {"color": "#e0e0e0"}},
+                gauge={
+                    "axis": {"range": [0, 100], "tickcolor": "#e0e0e0"},
+                    "bar": {"color": color},
+                    "bgcolor": "#1e1e1e",
+                    "bordercolor": "#333",
+                    "steps": [
+                        {"range": [0,  30], "color": "#3a1a1a"},
+                        {"range": [30, 50], "color": "#2a2a1a"},
+                        {"range": [50, 70], "color": "#1a2a1a"},
+                        {"range": [70, 100],"color": "#1a3a1a"},
+                    ],
+                    "threshold": {"line": {"color": "#ffeb3b", "width": 3},
+                                  "thickness": 0.75, "value": score},
+                },
+                number={"font": {"color": color, "size": 36}},
+            ))
+            fig_gauge.update_layout(
+                paper_bgcolor="#0e1117", font={"color": "#e0e0e0"},
+                height=280, margin=dict(t=40, b=20, l=20, r=20)
+            )
+            st.plotly_chart(fig_gauge, use_container_width=True)
+        except Exception:
+            st.markdown(
+                f"<div style='text-align:center;padding:20px;background:#1e1e1e;"
+                f"border-radius:10px;border:2px solid {color}'>"
+                f"<span style='font-size:48px;font-weight:bold;color:{color}'>{score}</span><br>"
+                f"<span style='font-size:18px;color:{color}'>{icon} {label}</span>"
+                f"</div>", unsafe_allow_html=True
+            )
+
+    with metrics_col:
+        mc1, mc2 = st.columns(2)
+        with mc1:
+            st.metric("Bid/Ask Ratio", f"{ba_ratio:.2f}x",
+                      delta="Bullish" if ba_ratio > 1 else "Bearish")
+            st.metric("Total Bid Vol", f"{total_bid:,.0f}")
+            st.metric("Near-Spot B/A", f"{near_spot_ratio:.2f}x")
+        with mc2:
+            st.metric("Order Imbalance", f"{imbalance_abs:+,.0f}",
+                      delta="Buying Pressure" if imbalance_abs > 0 else "Selling Pressure")
+            st.metric("Total Ask Vol", f"{total_ask:,.0f}")
+            st.metric("Wall Score", f"{wall_score:.2f}")
+
+        st.markdown(
+            f"<div style='margin-top:8px;padding:10px;background:#1e1e1e;"
+            f"border-radius:8px;border-left:4px solid {color};'>"
+            f"<b style='color:{color}'>{icon} {label}</b> &nbsp;|&nbsp; "
+            f"Score: <b style='color:{color}'>{score}/100</b><br>"
+            f"<span style='font-size:11px;color:#aaa'>"
+            f"Data: {data_source} | Spot: ₹{spot:,.0f}"
+            f"</span></div>",
+            unsafe_allow_html=True
+        )
+
+    # Near-spot breakdown table
+    st.markdown("#### 📊 Near-Spot Order Distribution (±5 Levels)")
+    near_rows = []
+    for a in reversed(near_asks):
+        near_rows.append({"Side": "ASK 🔴", "Price (₹)": f"₹{a['price']:,.0f}",
+                          "Volume": f"{a['qty']:,.0f}",
+                          "% Near Total": f"{a['qty']/(near_bid_vol+near_ask_vol)*100:.1f}%" if (near_bid_vol+near_ask_vol)>0 else "—"})
+    near_rows.append({"Side": "── SPOT ──", "Price (₹)": f"₹{spot:,.0f}",
+                      "Volume": "—", "% Near Total": "—"})
+    for b in near_bids:
+        near_rows.append({"Side": "BID 🟢", "Price (₹)": f"₹{b['price']:,.0f}",
+                          "Volume": f"{b['qty']:,.0f}",
+                          "% Near Total": f"{b['qty']/(near_bid_vol+near_ask_vol)*100:.1f}%" if (near_bid_vol+near_ask_vol)>0 else "—"})
+
+    def _near_style(row):
+        if "ASK" in str(row["Side"]):  return ["background-color:#3a1a1a;color:#ff5252"] * len(row)
+        if "BID" in str(row["Side"]):  return ["background-color:#1a3a1a;color:#00e676"] * len(row)
+        if "SPOT" in str(row["Side"]): return ["background-color:#2a2a2a;color:#ffeb3b;font-weight:bold"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(pd.DataFrame(near_rows).style.apply(_near_style, axis=1),
+                 use_container_width=True, hide_index=True)
+
+    # ── MODULE 7: Smart Money Table ───────────────────────────────────
+    if absorptions:
+        st.markdown("#### 🏛️ Smart Money — Absorption Signals")
+        abs_df = pd.DataFrame(absorptions)
+
+        def _abs_style(row):
+            if "ACCUMULATION" in str(row["Pattern"]):
+                return ["background-color:#1a3a1a; color:#00e676"] * len(row)
+            return ["background-color:#3a1a1a; color:#ff5252"] * len(row)
+
+        st.dataframe(abs_df.style.apply(_abs_style, axis=1),
+                     use_container_width=True, hide_index=True)
+
+    # ── MODULE 6+10: Shift Alerts ─────────────────────────────────────
+    st.markdown("#### 🚨 Sentiment Alerts")
+    if shifts:
+        for icon_s, title, desc in shifts:
+            st.info(f"{icon_s} **{title}** — {desc}")
+    else:
+        st.success("✅ No significant sentiment shifts detected.")
+
+    # Score legend
+    st.markdown(
+        "<div style='font-size:11px;color:#888;margin-top:8px'>"
+        "Score: 0–30 🔴 Bearish | 30–50 🟡 Neutral | 50–70 🟢 Bullish | 70–100 💚 Strong Bullish"
+        "</div>", unsafe_allow_html=True
+    )
 
 
 # =====================================================================
@@ -16145,6 +17085,29 @@ def main():
             )
         except Exception as _nws_err:
             st.warning(f"News Intelligence Engine error: {str(_nws_err)}")
+
+    # ===== MARKET DEPTH ANALYSIS ENGINE =====
+    with st.expander("📖 Market Depth Analysis Engine", expanded=False):
+        try:
+            show_market_depth_engine(
+                api=api,
+                option_data=option_data,
+                current_price=current_price,
+                df=df if not df.empty else None,
+            )
+        except Exception as _mda_err:
+            st.warning(f"Market Depth Analysis Engine error: {str(_mda_err)}")
+
+    # ===== MARKET SENTIMENT ENGINE =====
+    with st.expander("🧭 Market Sentiment Engine — Depth-Based", expanded=False):
+        try:
+            show_market_sentiment_engine(
+                api=api,
+                option_data=option_data,
+                current_price=current_price,
+            )
+        except Exception as _mse_err:
+            st.warning(f"Market Sentiment Engine error: {str(_mse_err)}")
 
     # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
     if enable_signals and option_data and option_data.get('underlying') and not df.empty:
