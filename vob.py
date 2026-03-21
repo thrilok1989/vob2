@@ -400,51 +400,73 @@ CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
             }
     
     def save_market_analytics(self, symbol, analytics_data):
-        """Save daily market analytics"""
+        """Save daily market analytics — skips silently on schema mismatches."""
         try:
             today = datetime.now(pytz.timezone('Asia/Kolkata')).date()
-            
+            # Try with symbol column first; fall back to date-only if column missing
             data = {
-                'symbol': symbol,
                 'date': today.isoformat(),
-                'day_high': analytics_data['day_high'],
-                'day_low': analytics_data['day_low'],
-                'day_open': analytics_data['day_open'],
-                'day_close': analytics_data['day_close'],
-                'total_volume': analytics_data['total_volume'],
-                'avg_price': analytics_data['avg_price'],
-                'price_change': analytics_data['price_change'],
-                'price_change_pct': analytics_data['price_change_pct']
+                'day_high':        analytics_data.get('day_high'),
+                'day_low':         analytics_data.get('day_low'),
+                'day_open':        analytics_data.get('day_open'),
+                'day_close':       analytics_data.get('day_close'),
+                'total_volume':    analytics_data.get('total_volume'),
+                'avg_price':       analytics_data.get('avg_price'),
+                'price_change':    analytics_data.get('price_change'),
+                'price_change_pct':analytics_data.get('price_change_pct'),
             }
-            
-            self.client.table('market_analytics').upsert(
-                data, 
-                on_conflict="symbol,date"
-            ).execute()
-            
-        except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving analytics: {str(e)}")
-    
+            try:
+                # Attempt full upsert with symbol
+                self.client.table('market_analytics').upsert(
+                    {'symbol': symbol, **data},
+                    on_conflict="symbol,date"
+                ).execute()
+            except Exception as _e1:
+                err_str = str(_e1).lower()
+                if "symbol" in err_str or "42703" in err_str or "column" in err_str:
+                    # Table missing symbol column — upsert without it
+                    try:
+                        self.client.table('market_analytics').upsert(
+                            data, on_conflict="date"
+                        ).execute()
+                    except Exception:
+                        pass  # silently skip — analytics saving is non-critical
+                elif "23505" not in err_str and "duplicate key" not in err_str:
+                    pass  # suppress all other analytics errors
+
+        except Exception:
+            pass  # analytics saving is non-critical; never surface to user
+
     def get_market_analytics(self, symbol, days_back=30):
-        """Get historical market analytics"""
+        """Get historical market analytics — schema-resilient."""
         try:
             cutoff_date = datetime.now().date() - timedelta(days=days_back)
-            
-            result = self.client.table('market_analytics')\
-                .select('*')\
-                .eq('symbol', symbol)\
-                .gte('date', cutoff_date.isoformat())\
-                .order('date', desc=False)\
-                .execute()
-            
+            try:
+                # Try with symbol filter
+                result = self.client.table('market_analytics')\
+                    .select('*')\
+                    .eq('symbol', symbol)\
+                    .gte('date', cutoff_date.isoformat())\
+                    .order('date', desc=False)\
+                    .execute()
+            except Exception as _e1:
+                err_str = str(_e1).lower()
+                if "symbol" in err_str or "42703" in err_str or "column" in err_str:
+                    # Table has no symbol column — query without it
+                    result = self.client.table('market_analytics')\
+                        .select('*')\
+                        .gte('date', cutoff_date.isoformat())\
+                        .order('date', desc=False)\
+                        .execute()
+                else:
+                    return pd.DataFrame()
+
             if result.data:
                 return pd.DataFrame(result.data)
-            else:
-                return pd.DataFrame()
-                
-        except Exception as e:
-            st.error(f"Error retrieving analytics: {str(e)}")
+            return pd.DataFrame()
+
+        except Exception:
+            # Never surface DB schema errors to the dashboard
             return pd.DataFrame()
 
     def save_spike_history(self, record):
@@ -15600,29 +15622,54 @@ def main():
                         st.rerun()
 
             else:
-                st.info("Option chain data required for Market Acceleration Engine.")
+                st.markdown(
+                    "<div style='padding:18px;border-radius:8px;"
+                    "background:#1e2530;border-left:4px solid #f0a500;'>"
+                    "<b>⚠️ Option Chain Data Not Loaded</b><br>"
+                    "The Market Acceleration Engine requires live option chain data.<br>"
+                    "<ul style='margin:8px 0 0 16px;color:#ccc'>"
+                    "<li>Ensure your <b>Dhan API token</b> is valid and not expired</li>"
+                    "<li>Check that the <b>option chain loaded successfully</b> in the "
+                    "Options Analysis panel above</li>"
+                    "<li>If running on Streamlit Cloud, the Dhan CDN may block shared IPs — "
+                    "try <b>running locally</b></li>"
+                    "</ul></div>",
+                    unsafe_allow_html=True
+                )
         except Exception as _mae_e:
-            st.warning(f"Market Acceleration Engine unavailable: {str(_mae_e)}")
+            st.warning(f"Market Acceleration Engine error: {str(_mae_e)}")
 
     # ===== CANDLESTICK INTELLIGENCE ENGINE =====
     st.markdown("---")
     with st.expander("🕯️ Candlestick Intelligence Engine — Reversal & Continuation Signals", expanded=False):
         try:
-            if option_data and option_data.get('underlying') and not df.empty:
-                _cie_underlying = option_data['underlying']
-                _cie_df_summary = option_data.get('df_summary')
+            # CIE can run on price data alone; option_data augments S/R with OI levels
+            _cie_has_data = not df.empty and current_price
+            if _cie_has_data:
+                # Use option_data underlying if available, else fall back to current_price
+                _cie_underlying = (option_data.get('underlying')
+                                   if option_data and option_data.get('underlying')
+                                   else current_price)
                 _cie_straddle_hist = st.session_state.straddle_history
+
+                # Show a notice when running without option chain (price-only mode)
+                if not (option_data and option_data.get('underlying')):
+                    st.info(
+                        "ℹ️ **Running in Price-Only Mode** — Candlestick patterns, S/R levels, "
+                        "EMA and momentum signals are active. OI-based level augmentation requires "
+                        "a live option chain (Dhan API)."
+                    )
 
                 # Determine expiry day (DTE ≤ 2)
                 try:
-                    _cie_expiry_str = option_data.get('expiry', '')
+                    _cie_expiry_str = option_data.get('expiry', '') if option_data else ''
                     _cie_expiry_dt  = datetime.strptime(_cie_expiry_str, "%Y-%m-%d") if _cie_expiry_str else None
                     _cie_dte = (_cie_expiry_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days if _cie_expiry_dt else 999
                     _cie_is_expiry = _cie_dte <= 2
                 except Exception:
                     _cie_is_expiry = False
 
-                # Run engine
+                # Run engine — option_data=None is handled gracefully inside
                 _cie_signals = run_candlestick_intelligence_engine(
                     df, option_data, _cie_straddle_hist, _cie_underlying, is_expiry=_cie_is_expiry
                 )
@@ -16050,7 +16097,7 @@ def main():
                             st.rerun()
 
             else:
-                st.info("Option chain data required for Candlestick Intelligence Engine.")
+                st.warning("No price chart data available. Load NIFTY chart data to enable this engine.")
         except Exception as _cie_err:
             st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
 
