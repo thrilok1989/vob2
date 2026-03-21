@@ -7541,6 +7541,44 @@ def main():
                 *VOB zones show volume-backed order flow areas with % distribution*
                 """)
 
+            # ── Pre-compute HTF pivot + VOB levels for candle pattern enrichment ──
+            _cp_htf_supports    = []
+            _cp_htf_resistances = []
+            _cp_vob_supports    = []
+            _cp_vob_resistances = []
+            if len(df) > 50:
+                try:
+                    _cp_pivots_raw = cached_pivot_calculation(df.to_json(), pivot_settings or {})
+                    _cp_htf_supports    = sorted([p['value'] for p in _cp_pivots_raw if p['type'] == 'low'], reverse=True)
+                    _cp_htf_resistances = sorted([p['value'] for p in _cp_pivots_raw if p['type'] == 'high'])
+                except Exception:
+                    pass
+            if len(df) > 30:
+                try:
+                    _cp_vob_det = VolumeOrderBlocks(sensitivity=5)
+                    _cp_vob_sr, _cp_vob_blks = _cp_vob_det.get_sr_levels(df)
+                    _cp_vob_supports    = sorted(_cp_vob_sr.get('support', []), reverse=True)
+                    _cp_vob_resistances = sorted(_cp_vob_sr.get('resistance', []))
+                except Exception:
+                    pass
+
+            def _nearest_level(price, levels):
+                """Return (nearest_level, distance_pts, distance_pct) or (None,None,None)."""
+                if not levels:
+                    return None, None, None
+                closest = min(levels, key=lambda v: abs(v - price))
+                dist_pts = abs(price - closest)
+                dist_pct = dist_pts / price * 100 if price else 0
+                return closest, dist_pts, dist_pct
+
+            def _nearest_vob(price, vob_levels):
+                """Return nearest VOB level as string, or '—'."""
+                if not vob_levels:
+                    return '—'
+                closest = min(vob_levels, key=lambda v: abs(v - price))
+                dist_pct = abs(price - closest) / price * 100 if price else 0
+                return f"₹{closest:.0f} ({dist_pct:.2f}% away)"
+
             # ── Candle Types Table ────────────────────────────────────────
             if _chart_candle_markers:
                 st.markdown(f"### 🕯️ Candle Patterns Detected — {_date_label}")
@@ -7550,13 +7588,43 @@ def main():
                     _time_str = _ts.strftime('%H:%M') if hasattr(_ts, 'strftime') else str(_ts)
                     _dir = _cp['direction']
                     _dir_lbl = '🟢 BUY' if _dir == 'BUY' else ('🔴 SELL' if _dir == 'SELL' else '🟡 NEUTRAL')
+                    _price = _cp['price']
+
+                    # For BUY → show nearest HTF support + distance + VOB support
+                    # For SELL → show nearest HTF resistance + distance + VOB resistance
+                    if _dir == 'BUY':
+                        _htf_level, _dist_pts, _dist_pct = _nearest_level(_price, _cp_htf_supports)
+                        _htf_label = (f"₹{_htf_level:.0f} ({_dist_pct:.2f}% below)"
+                                      if _htf_level else '—')
+                        _vob_label = _nearest_vob(_price, _cp_vob_supports)
+                        _htf_col   = 'Nearest HTF Support'
+                        _vob_col   = 'Nearest VOB Support'
+                    elif _dir == 'SELL':
+                        _htf_level, _dist_pts, _dist_pct = _nearest_level(_price, _cp_htf_resistances)
+                        _htf_label = (f"₹{_htf_level:.0f} ({_dist_pct:.2f}% above)"
+                                      if _htf_level else '—')
+                        _vob_label = _nearest_vob(_price, _cp_vob_resistances)
+                        _htf_col   = 'Nearest HTF Resistance'
+                        _vob_col   = 'Nearest VOB Resistance'
+                    else:
+                        # NEUTRAL — show both nearest support and resistance
+                        _sup_lvl, _sup_pts, _sup_pct = _nearest_level(_price, _cp_htf_supports)
+                        _res_lvl, _res_pts, _res_pct = _nearest_level(_price, _cp_htf_resistances)
+                        _htf_label = (f"S ₹{_sup_lvl:.0f} / R ₹{_res_lvl:.0f}"
+                                      if (_sup_lvl and _res_lvl) else '—')
+                        _vob_label = '—'
+                        _htf_col   = 'HTF S/R Context'
+                        _vob_col   = 'VOB'
+
                     _ctype_rows.append({
                         'Time': _time_str,
                         'Pattern': _cp['pattern'],
                         'Signal': _dir_lbl,
-                        'Price (₹)': f"{_cp['price']:.1f}",
+                        'Price (₹)': f"{_price:.1f}",
                         'High (₹)': f"{_cp['high']:.1f}",
                         'Low (₹)': f"{_cp['low']:.1f}",
+                        'Nearest HTF Pivot': _htf_label,
+                        'Nearest VOB': _vob_label,
                     })
                 st.dataframe(pd.DataFrame(_ctype_rows), use_container_width=True, hide_index=True)
 
