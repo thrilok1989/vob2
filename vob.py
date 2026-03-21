@@ -10583,6 +10583,452 @@ def _amie_expected_move(pattern_type: str, oi_behavior: str, support_signal: str
     return direction, bo_prob, rv_prob, target_info
 
 
+def show_ml_market_report(option_data=None, df=None, current_price=None):
+    """
+    ML-style Market Intelligence Report.
+    Combines ALL available signals from session state + live option data
+    into a single weighted ensemble score and generates a plain-English
+    multi-section market narrative.
+    """
+    import numpy as np
+
+    # ── 1. FEATURE EXTRACTION ────────────────────────────────────────────────
+    def _latest(history, key, default=None):
+        """Get the latest value of a key from a history list."""
+        for entry in reversed(history):
+            v = entry.get(key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return v
+        return default
+
+    def _trend(history, key, window=5):
+        """Slope direction of last N values: +1 rising, -1 falling, 0 flat."""
+        vals = [entry.get(key) for entry in history[-window:] if entry.get(key) is not None]
+        if len(vals) < 2:
+            return 0
+        try:
+            vals = [float(v) for v in vals]
+            return 1 if vals[-1] > vals[0] * 1.005 else (-1 if vals[-1] < vals[0] * 0.995 else 0)
+        except Exception:
+            return 0
+
+    pro_h   = st.session_state.get('pro_trader_history', [])
+    iv_h    = st.session_state.get('iv_skew_history', [])
+    pres_h  = st.session_state.get('pressure_history', [])
+    sent_h  = st.session_state.get('sentiment_history', [])
+    comp_h  = st.session_state.get('composite_signal_history', [])
+    gex_h   = st.session_state.get('total_gex_history', [])
+    spike_h = st.session_state.get('spike_history', [])
+    amie_h  = st.session_state.get('amie_history', [])
+
+    # Live option chain scalars
+    spot      = (option_data.get('underlying') if option_data else None) or current_price or 0
+    df_sum    = option_data.get('df_summary') if option_data else None
+    atm_row   = df_sum[df_sum['Zone'] == 'ATM'].iloc[0] if (df_sum is not None and 'Zone' in df_sum.columns and len(df_sum[df_sum['Zone'] == 'ATM']) > 0) else None
+
+    def _safe(v, default=0.0):
+        try:
+            return float(v) if v is not None else default
+        except Exception:
+            return default
+
+    # ── 2. SIGNAL COMPONENTS (each normalised to -1…+1) ─────────────────────
+    signals = {}
+
+    # A. OPTIONS FLOW SIGNALS
+    pcr_oi   = _safe(_latest(pro_h, 'pcr_oi',   1.0), 1.0)
+    pcr_vol  = _safe(_latest(pro_h, 'pcr_vol',  1.0), 1.0)
+    pcr_chg  = _safe(_latest(pro_h, 'pcr_chgoi',1.0), 1.0)
+    # PCR > 1.2 = bullish (put writing), < 0.7 = bearish (call writing)
+    signals['PCR_OI']      = min(1, max(-1, (pcr_oi  - 1.0) / 0.5))
+    signals['PCR_VOL']     = min(1, max(-1, (pcr_vol - 1.0) / 0.5))
+    signals['PCR_CHGOI']   = min(1, max(-1, (pcr_chg - 1.0) / 0.5))
+
+    # B. IV SKEW SIGNAL
+    iv_skew = _safe(_latest(iv_h, 'iv_skew', 1.0), 1.0)
+    # <0.9 = CE cheap vs PE → bullish; >1.1 = PE expensive → bearish
+    if iv_skew < 0.85:   signals['IV_SKEW'] =  1.0
+    elif iv_skew < 0.95: signals['IV_SKEW'] =  0.5
+    elif iv_skew > 1.15: signals['IV_SKEW'] = -1.0
+    elif iv_skew > 1.05: signals['IV_SKEW'] = -0.5
+    else:                signals['IV_SKEW'] =  0.0
+    avg_iv_ce = _safe(_latest(iv_h, 'avg_iv_ce', 15), 15)
+    avg_iv_pe = _safe(_latest(iv_h, 'avg_iv_pe', 15), 15)
+
+    # C. PRESSURE SIGNALS
+    net_pres = _safe(_latest(pres_h, 'net_pressure', 0), 0)
+    signals['NET_PRESSURE'] = min(1, max(-1, net_pres * 4))
+    pres_trend = _trend(pres_h, 'net_pressure')
+    signals['PRESSURE_TREND'] = pres_trend * 0.5
+
+    # D. GAMMA EXPOSURE
+    net_gex = _safe(_latest(pro_h, 'net_gex', 0), 0)
+    # Negative GEX → trending/breakout; positive → pinned/range
+    signals['GEX_REGIME'] = min(1, max(-1, -net_gex / 50))  # inverted: neg GEX = +1 (trend)
+
+    # E. DELTA POSITIONING
+    net_delta = _safe(_latest(pro_h, 'net_delta', 0), 0)
+    signals['NET_DELTA'] = min(1, max(-1, net_delta / 5e7))
+
+    # F. SENTIMENT SCORE
+    sent_score = _safe(_latest(sent_h, 'sentiment_score', 50), 50)
+    signals['SENTIMENT'] = (sent_score - 50) / 50
+
+    # G. COMPOSITE DIRECTION
+    comp_score = _safe(_latest(comp_h, 'score', 0), 0)
+    signals['COMPOSITE'] = min(1, max(-1, comp_score / 100))
+
+    # H. STRADDLE MOMENTUM
+    straddle_trend = _trend(pro_h, 'straddle_atm', window=5)
+    signals['STRADDLE_EXPAND'] = straddle_trend * -0.3  # rising straddle = uncertainty
+
+    # I. BREAKOUT SCORE
+    bo_score = _safe(_latest(pro_h, 'breakout_score', 50), 50)
+    signals['BREAKOUT_SCORE'] = (bo_score - 50) / 50
+
+    # J. PRICE ACTION (from df candles)
+    pa_sig = 0.0
+    if df is not None and len(df) >= 50:
+        try:
+            close = df['close'].values
+            ema9  = float(pd.Series(close).ewm(span=9,  adjust=False).mean().iloc[-1])
+            ema21 = float(pd.Series(close).ewm(span=21, adjust=False).mean().iloc[-1])
+            ema50 = float(pd.Series(close).ewm(span=50, adjust=False).mean().iloc[-1])
+            last  = float(close[-1])
+            if last > ema9 > ema21 > ema50:   pa_sig =  1.0
+            elif last < ema9 < ema21 < ema50: pa_sig = -1.0
+            elif last > ema21:                pa_sig =  0.5
+            elif last < ema21:                pa_sig = -0.5
+        except Exception:
+            pass
+    signals['PRICE_ACTION'] = pa_sig
+
+    # K. NEWS SENTIMENT
+    news_score = _safe(st.session_state.get('_fid_news_score', 50), 50)
+    signals['NEWS'] = (news_score - 50) / 50
+
+    # L. SECTOR ROTATION
+    sect_score = _safe(st.session_state.get('_fid_sector_score', 50), 50)
+    signals['SECTOR'] = (sect_score - 50) / 50
+
+    # M. IV TREND
+    iv_trend = _trend(iv_h, 'avg_iv_ce', window=5)
+    signals['IV_TREND'] = iv_trend * -0.5  # rising CE IV = fear/uncertainty
+
+    # ── 3. WEIGHTED ENSEMBLE (ML-style Random Forest voting) ─────────────────
+    weights = {
+        'PCR_OI':         0.12,
+        'PCR_VOL':        0.08,
+        'PCR_CHGOI':      0.10,
+        'IV_SKEW':        0.10,
+        'NET_PRESSURE':   0.10,
+        'PRESSURE_TREND': 0.04,
+        'GEX_REGIME':     0.06,
+        'NET_DELTA':      0.06,
+        'SENTIMENT':      0.08,
+        'COMPOSITE':      0.06,
+        'STRADDLE_EXPAND':0.03,
+        'BREAKOUT_SCORE': 0.05,
+        'PRICE_ACTION':   0.08,
+        'NEWS':           0.05,
+        'SECTOR':         0.03,
+        'IV_TREND':       0.06,
+    }
+    # Normalise weights
+    w_total = sum(weights.values())
+    ensemble_score = sum(signals.get(k, 0) * weights[k] / w_total for k in weights)
+    # ensemble_score: -1 = strongly bearish, +1 = strongly bullish
+
+    # Confidence = agreement among signals
+    vals = [signals.get(k, 0) for k in weights]
+    bullish_votes = sum(1 for v in vals if v > 0.1)
+    bearish_votes = sum(1 for v in vals if v < -0.1)
+    neutral_votes = len(vals) - bullish_votes - bearish_votes
+    dominant = max(bullish_votes, bearish_votes)
+    confidence = round(dominant / len(vals) * 100) if vals else 50
+
+    # Map to readable label
+    if ensemble_score > 0.35:
+        ml_direction = "🟢 STRONGLY BULLISH"
+        ml_color = "#00C853"
+        ml_action = "Bias: BUY dips / hold longs"
+    elif ensemble_score > 0.12:
+        ml_direction = "🟢 MILDLY BULLISH"
+        ml_color = "#69F0AE"
+        ml_action = "Bias: Small longs, watch for breakout"
+    elif ensemble_score < -0.35:
+        ml_direction = "🔴 STRONGLY BEARISH"
+        ml_color = "#FF1744"
+        ml_action = "Bias: SELL rallies / hold shorts"
+    elif ensemble_score < -0.12:
+        ml_direction = "🔴 MILDLY BEARISH"
+        ml_color = "#FF5252"
+        ml_action = "Bias: Small shorts, watch for breakdown"
+    else:
+        ml_direction = "🟡 NEUTRAL / RANGE"
+        ml_color = "#FFD740"
+        ml_action = "Bias: Avoid naked directional trades; straddle or wait"
+
+    # GEX regime text
+    if net_gex > 50:
+        gex_text = "Strong PIN — dealers long gamma, price will revert to mean. Expect chop and range-bound action. Breakouts will be faded."
+    elif net_gex > 10:
+        gex_text = "Mild PIN — moderate dealer hedging caps sharp moves. Price likely oscillates around ATM."
+    elif net_gex < -50:
+        gex_text = "Strong TREND — dealers short gamma, forced to chase price. Moves can accelerate and extend beyond normal range."
+    elif net_gex < -10:
+        gex_text = "Mild TREND acceleration — gamma is not pinning price; directional moves have more room."
+    else:
+        gex_text = "Neutral GEX — no dominant dealer hedging pressure. Market direction will be driven by order flow."
+
+    # IV regime text
+    avg_iv = (avg_iv_ce + avg_iv_pe) / 2
+    if avg_iv > 20:
+        iv_regime = f"HIGH volatility (avg IV {avg_iv:.1f}%) — premiums are expensive. Prefer selling options or buying deep ITM. Expect large candles."
+    elif avg_iv > 12:
+        iv_regime = f"NORMAL volatility (avg IV {avg_iv:.1f}%) — fair premium environment. Both buyers and sellers have edge depending on direction."
+    else:
+        iv_regime = f"LOW volatility (avg IV {avg_iv:.1f}%) — premiums are cheap. Prefer buying options or straddles ahead of catalyst."
+
+    # IV skew interpretation
+    if iv_skew < 0.85:
+        skew_text = f"IV Skew {iv_skew:.3f} — CALL IV significantly cheaper than PUT IV. Market expects upside; smart money is buying calls or selling puts. Bullish."
+    elif iv_skew < 0.95:
+        skew_text = f"IV Skew {iv_skew:.3f} — Slight call discount. Mild bullish bias in options pricing."
+    elif iv_skew > 1.15:
+        skew_text = f"IV Skew {iv_skew:.3f} — PUT IV significantly more expensive than CALL IV. Market is paying up for downside protection. Bearish or hedging."
+    elif iv_skew > 1.05:
+        skew_text = f"IV Skew {iv_skew:.3f} — Mild put premium. Some downside protection being bought."
+    else:
+        skew_text = f"IV Skew {iv_skew:.3f} — Balanced. No directional bias in options pricing."
+
+    # PCR interpretation
+    if pcr_oi > 1.5:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Extremely high put writing. Dealers see strong support. Very bullish OI structure."
+    elif pcr_oi > 1.2:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Put writing dominant. Bullish OI structure — sellers expect floor holds."
+    elif pcr_oi < 0.7:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Extreme call writing. Strong resistance overhead. Bearish OI structure."
+    elif pcr_oi < 1.0:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Call writing slightly dominant. Mild resistance; market may struggle to push higher."
+    else:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Balanced OI. No clear directional bias from open interest."
+
+    # Pressure interpretation
+    if net_pres > 0.3:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Strong CALL-side aggression. Buyers actively hitting ask on calls. Momentum firmly up."
+    elif net_pres > 0.1:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Mild call bid pressure. Lean bullish flow."
+    elif net_pres < -0.3:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Strong PUT-side aggression. Sellers actively hitting bids on puts. Momentum firmly down."
+    elif net_pres < -0.1:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Mild put bid pressure. Lean bearish flow."
+    else:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Balanced. Neither calls nor puts dominating flow."
+
+    # Sentiment narrative
+    if sent_score >= 75:
+        sent_text = f"Sentiment {sent_score}/100 — STRONG BULLISH TREND. Multiple pillars aligned upward. High-probability long environment."
+    elif sent_score >= 60:
+        sent_text = f"Sentiment {sent_score}/100 — Bullish lean. Most signals support upside but not overwhelmingly."
+    elif sent_score <= 25:
+        sent_text = f"Sentiment {sent_score}/100 — STRONG BEARISH. Broad-based selling pressure across options and price action."
+    elif sent_score <= 40:
+        sent_text = f"Sentiment {sent_score}/100 — Bearish lean. Risk-off environment; rallies likely sold."
+    else:
+        sent_text = f"Sentiment {sent_score}/100 — Neutral / Indecisive. Mixed signals; range-bound conditions likely."
+
+    # Price action narrative
+    if pa_sig >= 1.0:
+        pa_text = "Price action: EMA9 > EMA21 > EMA50 — Perfect bull alignment. Trend is intact across all timeframes."
+    elif pa_sig == 0.5:
+        pa_text = "Price action: Price above EMA21 but not full bull stack — partial uptrend, watch for breakout or failure."
+    elif pa_sig <= -1.0:
+        pa_text = "Price action: EMA9 < EMA21 < EMA50 — Perfect bear alignment. Trend is clearly down across all timeframes."
+    elif pa_sig == -0.5:
+        pa_text = "Price action: Price below EMA21 — short-term bearish, watch for potential mean-reversion or continuation."
+    else:
+        pa_text = "Price action: Insufficient candle data for EMA analysis."
+
+    # Spike signal
+    spike_score = _safe(_latest(spike_h, 'spike_score', 0), 0)
+    if spike_score >= 60:
+        spike_text = f"⚡ VOLUME SPIKE DETECTED (score {spike_score:.0f}/100) — Unusual options activity. Could signal institutional entry or news catalyst."
+    elif spike_score >= 30:
+        spike_text = f"Moderate activity (spike score {spike_score:.0f}/100) — Slightly elevated options flow."
+    else:
+        spike_text = f"Normal options flow (spike score {spike_score:.0f}/100)."
+
+    # FII/DII
+    fii_net = 0
+    try:
+        _fr = _fii_fetch_cash_data()
+        if _fr:
+            _fd = _fii_parse_cash(_fr)
+            if not _fd.empty:
+                fii_net = float(_fd['FII Net'].iloc[0])
+    except Exception:
+        pass
+    if fii_net > 1000:
+        fii_text = f"FII net ₹{fii_net:+,.0f} Cr — Strong institutional buying. Smart money is accumulating."
+    elif fii_net > 0:
+        fii_text = f"FII net ₹{fii_net:+,.0f} Cr — Mild FII buying. Supportive but not conviction-level."
+    elif fii_net < -1000:
+        fii_text = f"FII net ₹{fii_net:+,.0f} Cr — Heavy FII selling. Institutional distribution underway."
+    elif fii_net < 0:
+        fii_text = f"FII net ₹{fii_net:+,.0f} Cr — Mild FII selling. Caution warranted."
+    else:
+        fii_text = "FII/DII cash data unavailable (weekend/holiday or NSE API blocked)."
+
+    # Risk assessment
+    signal_spread = max(vals) - min(vals) if vals else 0
+    if signal_spread > 1.5 and confidence < 55:
+        risk_text = "⚠️ HIGH CONFLICT — Signals are contradicting each other significantly. Avoid high-leverage trades. Wait for clarity."
+    elif confidence < 50:
+        risk_text = "⚠️ MODERATE UNCERTAINTY — Mixed signals. Reduce position size and use wider stops."
+    elif confidence >= 75:
+        risk_text = "✅ HIGH CONVICTION — Most signals aligned. Acceptable risk for directional trades with normal sizing."
+    else:
+        risk_text = "✅ MODERATE CONVICTION — Reasonable signal alignment. Normal position sizing with defined SL."
+
+    # ── 4. UI RENDERING ───────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,{ml_color}18,{ml_color}08);
+                border:2px solid {ml_color};border-radius:14px;padding:20px;margin-bottom:18px;">
+        <div style="font-size:13px;color:#aaa;letter-spacing:1px;">ML ENSEMBLE MARKET VERDICT</div>
+        <div style="font-size:28px;font-weight:bold;color:{ml_color};margin:6px 0;">{ml_direction}</div>
+        <div style="font-size:14px;color:#ccc;">{ml_action}</div>
+        <div style="margin-top:10px;display:flex;gap:30px;flex-wrap:wrap;">
+            <div><span style="color:#888;font-size:12px;">ENSEMBLE SCORE</span><br>
+                 <span style="font-size:20px;font-weight:bold;color:{ml_color};">{ensemble_score:+.3f}</span>
+                 <span style="font-size:11px;color:#888;"> / ±1.0</span></div>
+            <div><span style="color:#888;font-size:12px;">SIGNAL CONFIDENCE</span><br>
+                 <span style="font-size:20px;font-weight:bold;color:#FFD740;">{confidence}%</span>
+                 <span style="font-size:11px;color:#888;"> ({dominant}/{len(vals)} agree)</span></div>
+            <div><span style="color:#888;font-size:12px;">VOTE BREAKDOWN</span><br>
+                 <span style="color:#00C853;">🟢 {bullish_votes} bull</span> &nbsp;
+                 <span style="color:#FF5252;">🔴 {bearish_votes} bear</span> &nbsp;
+                 <span style="color:#888;">⚪ {neutral_votes} neutral</span></div>
+            <div><span style="color:#888;font-size:12px;">SPOT PRICE</span><br>
+                 <span style="font-size:20px;font-weight:bold;color:#ccc;">₹{spot:,.2f}</span></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Signal radar bar
+    st.markdown("#### 📊 Signal Radar — All 16 Inputs")
+    _sig_names  = list(weights.keys())
+    _sig_values = [signals.get(k, 0) for k in _sig_names]
+    _sig_colors = ['#00C853' if v > 0.05 else ('#FF5252' if v < -0.05 else '#FFD740') for v in _sig_values]
+    import plotly.graph_objects as go
+    _fig_radar = go.Figure(go.Bar(
+        x=_sig_names, y=_sig_values,
+        marker_color=_sig_colors,
+        text=[f"{v:+.2f}" for v in _sig_values],
+        textposition='outside',
+    ))
+    _fig_radar.update_layout(
+        height=260, margin=dict(l=10, r=10, t=30, b=60),
+        paper_bgcolor='#111', plot_bgcolor='#111',
+        font=dict(color='#ccc', size=10),
+        yaxis=dict(range=[-1.2, 1.2], zeroline=True, zerolinecolor='#555',
+                   gridcolor='#333', title='Signal Value (-1 bear … +1 bull)'),
+        xaxis=dict(tickangle=-35, gridcolor='#333'),
+        title=dict(text='ML Feature Vector (all signals normalised to -1…+1)', font=dict(size=12)),
+    )
+    _fig_radar.add_hline(y=0.12,  line_dash='dash', line_color='#00C853', line_width=1)
+    _fig_radar.add_hline(y=-0.12, line_dash='dash', line_color='#FF5252', line_width=1)
+    st.plotly_chart(_fig_radar, use_container_width=True)
+
+    # Narrative sections
+    st.markdown("#### 🗣️ Plain-English Market Narrative")
+    sections = [
+        ("🎯 Overall Direction",        ml_direction + f" (score {ensemble_score:+.3f})"),
+        ("⚡ Market Regime (GEX)",       gex_text),
+        ("📐 Options OI Structure",      pcr_text),
+        ("📡 IV Skew & Volatility",      f"{skew_text}\n\n{iv_regime}"),
+        ("🌊 Real-time Order Flow",      f"{pres_text}\n\n{spike_text}"),
+        ("😊 Unified Sentiment",         sent_text),
+        ("📈 Price Action (EMA)",        pa_text),
+        ("🏦 Institutional Flow (FII)",  fii_text),
+        ("🛡️ Risk & Conviction",         risk_text),
+    ]
+
+    for title, body in sections:
+        st.markdown(f"""
+        <div style="background:#1a1a2e;border-left:3px solid {ml_color};
+                    padding:12px 16px;border-radius:6px;margin-bottom:8px;">
+            <div style="font-size:13px;font-weight:bold;color:{ml_color};margin-bottom:4px;">{title}</div>
+            <div style="font-size:13px;color:#ddd;white-space:pre-line;">{body}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # Weighted contribution waterfall
+    st.markdown("#### ⚖️ Weighted Signal Contributions")
+    _contrib = {k: round(signals.get(k, 0) * weights[k] / w_total, 4) for k in weights}
+    _contrib_sorted = sorted(_contrib.items(), key=lambda x: abs(x[1]), reverse=True)
+    _cn, _cv = zip(*_contrib_sorted)
+    _cc = ['#00C853' if v > 0 else ('#FF5252' if v < 0 else '#888') for v in _cv]
+    _fig_c = go.Figure(go.Bar(
+        x=list(_cn), y=list(_cv),
+        marker_color=_cc,
+        text=[f"{v:+.4f}" for v in _cv],
+        textposition='outside',
+    ))
+    _fig_c.update_layout(
+        height=230, margin=dict(l=10, r=10, t=30, b=60),
+        paper_bgcolor='#111', plot_bgcolor='#111',
+        font=dict(color='#ccc', size=10),
+        yaxis=dict(zeroline=True, zerolinecolor='#555', gridcolor='#333',
+                   title='Contribution to ensemble score'),
+        xaxis=dict(tickangle=-35, gridcolor='#333'),
+        title=dict(text=f'Weighted Contributions → Final Score: {ensemble_score:+.3f}', font=dict(size=12)),
+    )
+    st.plotly_chart(_fig_c, use_container_width=True)
+
+    # Ensemble score history (store in session_state)
+    if 'ml_report_history' not in st.session_state:
+        st.session_state.ml_report_history = []
+    _now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+    if (not st.session_state.ml_report_history or
+            (_now_ist - st.session_state.ml_report_history[-1]['time']).total_seconds() >= 30):
+        st.session_state.ml_report_history.append({
+            'time': _now_ist, 'score': round(ensemble_score, 4),
+            'confidence': confidence, 'sent': sent_score,
+        })
+        if len(st.session_state.ml_report_history) > 200:
+            st.session_state.ml_report_history = st.session_state.ml_report_history[-200:]
+
+    if len(st.session_state.ml_report_history) >= 2:
+        _mh = pd.DataFrame(st.session_state.ml_report_history)
+        _fig_mh = go.Figure()
+        _fig_mh.add_trace(go.Scatter(
+            x=_mh['time'], y=_mh['score'],
+            mode='lines+markers', name='Ensemble Score',
+            line=dict(color=ml_color, width=2), marker=dict(size=4),
+            fill='tozeroy', fillcolor=f"{ml_color}22",
+        ))
+        _fig_mh.add_hline(y=0.12,  line_dash='dash', line_color='#00C853', line_width=1,
+                          annotation_text='Bull', annotation_position='right')
+        _fig_mh.add_hline(y=-0.12, line_dash='dash', line_color='#FF5252', line_width=1,
+                          annotation_text='Bear', annotation_position='right')
+        _fig_mh.update_layout(
+            title='ML Ensemble Score Over Time',
+            height=200, margin=dict(l=10, r=60, t=35, b=30),
+            paper_bgcolor='#111', plot_bgcolor='#111',
+            font=dict(color='#ccc'),
+            xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333', range=[-1.1, 1.1]),
+            showlegend=False,
+        )
+        st.plotly_chart(_fig_mh, use_container_width=True)
+
+    st.caption(f"🤖 ML Ensemble: 16 signals · {len(weights)} weighted features · Updates every ~30s · "
+               f"{len(st.session_state.ml_report_history)} data points")
+
+
 def show_advanced_market_intelligence_engine(
     df: pd.DataFrame = None,
     option_data: dict = None,
@@ -11808,6 +12254,8 @@ def main():
         st.session_state.pressure_last_valid = None
     if 'iv_skew_signal_last' not in st.session_state:
         st.session_state.iv_skew_signal_last = None  # (timestamp, signal_text)
+    if 'ml_report_history' not in st.session_state:
+        st.session_state.ml_report_history = []
 
     # Initialize session state for Pro Trader Dashboard
     if 'pro_trader_history' not in st.session_state:
@@ -18611,6 +19059,18 @@ def main():
             )
         except Exception as _mse_err:
             st.warning(f"Market Sentiment Engine error: {str(_mse_err)}")
+
+    # ===== ML MARKET INTELLIGENCE REPORT =====
+    st.markdown("---")
+    with st.expander("🤖 ML Market Intelligence Report — Unified Analysis of All Data", expanded=True):
+        try:
+            show_ml_market_report(
+                option_data=option_data,
+                df=df if not df.empty else None,
+                current_price=current_price,
+            )
+        except Exception as _ml_err:
+            st.warning(f"ML Market Report error: {str(_ml_err)}")
 
     # ===== ADVANCED MARKET INTELLIGENCE ENGINE =====
     st.markdown("---")
