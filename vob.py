@@ -12665,27 +12665,46 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         </div>
         """, unsafe_allow_html=True)
 
-        # ADV-3: Signal Clusters
-        _cluster_bar_html = ""
-        for _cname, _cval in [("OPTIONS", cluster_options), ("PRICE", cluster_price), ("MACRO", cluster_macro), ("FLOW", cluster_flow)]:
-            _cc = "#00C853" if _cval > 0.1 else ("#FF5252" if _cval < -0.1 else "#FFD740")
-            _cpct = int(abs(_cval) * 100)
-            _cdir = "▲ BULL" if _cval > 0.1 else ("▼ BEAR" if _cval < -0.1 else "◆ NEUTRAL")
-            _cluster_bar_html += f"""
-            <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;">
-                <div style="width:70px;font-size:11px;color:#888;">{_cname}</div>
-                <div style="flex:1;background:#222;border-radius:3px;height:8px;overflow:hidden;">
-                    <div style="width:{_cpct}%;background:{_cc};height:100%;border-radius:3px;"></div>
-                </div>
-                <div style="width:70px;font-size:11px;color:{_cc};text-align:right;">{_cval:+.2f} {_cdir}</div>
-            </div>"""
+        # ADV-3: Signal Clusters — Plotly horizontal bar (flexbox CSS unreliable in Streamlit)
         st.markdown(f"""
         <div style="background:#0d1117;border:1px solid {cluster_align_col}55;border-left:3px solid {cluster_align_col};
-                    border-radius:8px;padding:14px;margin-bottom:10px;">
+                    border-radius:8px 8px 0 0;padding:14px 14px 4px 14px;">
             <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 3 — SIGNAL CLUSTER ALIGNMENT</div>
-            <div style="font-size:15px;font-weight:bold;color:{cluster_align_col};margin:4px 0;">{cluster_alignment}</div>
-            {_cluster_bar_html}
-            <div style="font-size:12px;color:#aaa;margin-top:6px;">{cluster_desc}</div>
+            <div style="font-size:15px;font-weight:bold;color:{cluster_align_col};margin:4px 0 0 0;">{cluster_alignment}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        _clust_names  = ["FLOW", "MACRO", "PRICE", "OPTIONS"]  # bottom→top in horizontal chart
+        _clust_vals   = [cluster_flow, cluster_macro, cluster_price, cluster_options]
+        _clust_colors = ["#00C853" if v > 0.1 else ("#FF5252" if v < -0.1 else "#FFD740") for v in _clust_vals]
+        _clust_labels = [f"{v:+.2f}" for v in _clust_vals]
+        _fig_clust = go.Figure(go.Bar(
+            x=_clust_vals,
+            y=_clust_names,
+            orientation='h',
+            marker_color=_clust_colors,
+            text=_clust_labels,
+            textposition='outside',
+            textfont=dict(size=11),
+            cliponaxis=False,
+        ))
+        _fig_clust.update_layout(
+            height=155,
+            margin=dict(l=10, r=55, t=4, b=4),
+            paper_bgcolor='#0d1117',
+            plot_bgcolor='#0d1117',
+            font=dict(color='#ccc', size=11),
+            xaxis=dict(range=[-1.2, 1.2], zeroline=True, zerolinecolor='#555',
+                       gridcolor='#1e1e1e', showticklabels=False),
+            yaxis=dict(gridcolor='#1e1e1e'),
+            showlegend=False,
+        )
+        _fig_clust.add_vline(x=0.1,  line_dash='dot', line_color='#00C853', line_width=1)
+        _fig_clust.add_vline(x=-0.1, line_dash='dot', line_color='#FF5252', line_width=1)
+        st.plotly_chart(_fig_clust, use_container_width=True, config={'displayModeBar': False})
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {cluster_align_col}33;border-left:3px solid {cluster_align_col};
+                    border-radius:0 0 8px 8px;padding:6px 14px 12px 14px;margin-top:-24px;margin-bottom:10px;">
+            <div style="font-size:12px;color:#aaa;">{cluster_desc}</div>
         </div>
         """, unsafe_allow_html=True)
 
