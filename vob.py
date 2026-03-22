@@ -12236,6 +12236,295 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
     else:
         gcorr_text = "🌐 Global correlation data unavailable (yfinance not reachable or network issue). Signal defaulted to neutral."
 
+    # ── ADVANCED INTELLIGENCE MODULES (on top of ensemble) ───────────────────
+
+    # ── ADV-1: MARKET REGIME DETECTION ───────────────────────────────────────
+    _iv_trend_val      = _trend(iv_h, 'avg_iv_ce', window=5)
+    _straddle_trend_v  = _trend(pro_h, 'straddle_atm', window=5)
+    _bo_score_val      = bo_score
+
+    if net_gex > 20 and vix_pct < 0:
+        market_regime      = "🔒 LOW VOLATILITY RANGE"
+        regime_color       = "#FFD740"
+        regime_desc        = "GEX positive + VIX falling — dealers long gamma, price pinned. Expect chop and mean-reversion. Avoid naked directional trades."
+        regime_code        = "RANGE"
+    elif net_gex < -20 and _bo_score_val > 55:
+        market_regime      = "🚀 TRENDING MARKET"
+        regime_color       = "#00C853"
+        regime_desc        = "Negative GEX + rising breakout score — dealers short gamma, forced to chase price. Moves can extend and accelerate."
+        regime_code        = "TREND"
+    elif _iv_trend_val > 0 and _straddle_trend_v > 0:
+        market_regime      = "💥 HIGH VOLATILITY EXPANSION"
+        regime_color       = "#FF5252"
+        regime_desc        = "IV rising + straddle expanding — uncertainty spike incoming. Large candles expected. Favour debit spreads or long straddles."
+        regime_code        = "EXPANSION"
+    elif net_gex > 10 and abs(signals.get('BREAKOUT_SCORE', 0)) < 0.2:
+        market_regime      = "🗜️ GAMMA COMPRESSION"
+        regime_color       = "#FF9800"
+        regime_desc        = "GEX positive + low breakout score — price compressed near ATM. Explosive directional move building. Prepare for expansion."
+        regime_code        = "COMPRESSION"
+    elif _bo_score_val > 60 and net_gex < 5:
+        market_regime      = "⚡ PRE-BREAKOUT SETUP"
+        regime_color       = "#40C4FF"
+        regime_desc        = "High breakout score + low GEX resistance — conditions ripe for imminent directional breakout. Watch key levels closely."
+        regime_code        = "PRE_BREAKOUT"
+    else:
+        market_regime      = "🟡 NEUTRAL / TRANSITIONING"
+        regime_color       = "#888888"
+        regime_desc        = "Mixed regime signals. Market transitioning between states. Wait for one regime to dominate before committing capital."
+        regime_code        = "NEUTRAL"
+
+    # ── ADV-2: INSTITUTIONAL ACTIVITY DETECTION ───────────────────────────────
+    _pcr_trend_v   = _trend(pro_h, 'pcr_oi', window=5)
+    _delta_trend_v = _trend(pro_h, 'net_delta', window=5)
+    _price_rising  = pa_sig > 0
+    _price_falling = pa_sig < 0
+    _pres_positive = net_pres > 0.05
+    _pres_negative = net_pres < -0.05
+    _pcr_rising    = _pcr_trend_v > 0
+    _pcr_falling   = _pcr_trend_v < 0
+    _delta_positive = net_delta > 0
+
+    if _price_rising and _pcr_rising and _delta_positive and _pres_positive:
+        inst_activity  = "📈 LONG BUILD-UP"
+        inst_color     = "#00C853"
+        inst_desc      = ("Price rising + PCR rising + positive net delta + call-side pressure — "
+                          "institutions systematically building long positions. High-quality bullish signal.")
+        inst_code      = "LONG_BUILD"
+    elif _price_falling and _pcr_falling and _pres_negative:
+        inst_activity  = "📉 SHORT BUILD-UP"
+        inst_color     = "#FF5252"
+        inst_desc      = ("Price falling + PCR falling + put-side pressure — "
+                          "institutions accumulating short positions. Bearish distribution underway.")
+        inst_code      = "SHORT_BUILD"
+    elif _price_rising and _pcr_falling and not _delta_positive:
+        inst_activity  = "🔄 SHORT COVERING"
+        inst_color     = "#FFD740"
+        inst_desc      = ("Price rising + PCR falling + negative delta — shorts being covered, NOT fresh longs. "
+                          "Rally driven by forced buying. Watch for rally to fade once covering is exhausted.")
+        inst_code      = "SHORT_COVER"
+    elif _price_falling and _pcr_rising and _delta_positive:
+        inst_activity  = "🔄 LONG UNWINDING"
+        inst_color     = "#FF9800"
+        inst_desc      = ("Price falling + PCR rising + positive delta — existing longs being exited. "
+                          "Bearish distribution. Smart money reducing exposure into dips.")
+        inst_code      = "LONG_UNWIND"
+    else:
+        inst_activity  = "⚪ NEUTRAL / MIXED"
+        inst_color     = "#888888"
+        inst_desc      = ("No clear institutional directional bias detected from current PCR / delta / pressure combination. "
+                          "Positioning is mixed — wait for a cleaner signal.")
+        inst_code      = "NEUTRAL"
+
+    # ── ADV-3: SIGNAL CLUSTERING ───────────────────────────────────────────────
+    OPTIONS_CLUSTER = ['PCR_OI', 'PCR_VOL', 'PCR_CHGOI', 'IV_SKEW', 'NET_DELTA', 'STRADDLE_EXPAND', 'GEX_REGIME']
+    PRICE_CLUSTER   = ['PRICE_ACTION', 'BREAKOUT_SCORE', 'IND_VWAP_MULTI', 'IND_TREND_MULTI', 'CANDLE_PATTERN', 'GEO_PATTERN']
+    MACRO_CLUSTER   = ['MACRO_USDINR', 'MACRO_VIX', 'MACRO_CRUDE', 'GLOBAL_CORR']
+    FLOW_CLUSTER    = ['NET_PRESSURE', 'PRESSURE_TREND', 'SENTIMENT', 'COMPOSITE', 'SECTOR', 'NEWS', 'IV_TREND', 'IND_RSI_MULTI']
+
+    def _cluster_avg(keys):
+        _vs = [signals.get(k, 0) for k in keys]
+        return sum(_vs) / len(_vs) if _vs else 0.0
+
+    cluster_options = _cluster_avg(OPTIONS_CLUSTER)
+    cluster_price   = _cluster_avg(PRICE_CLUSTER)
+    cluster_macro   = _cluster_avg(MACRO_CLUSTER)
+    cluster_flow    = _cluster_avg(FLOW_CLUSTER)
+
+    clusters = {
+        'OPTIONS': cluster_options,
+        'PRICE':   cluster_price,
+        'MACRO':   cluster_macro,
+        'FLOW':    cluster_flow,
+    }
+
+    _bull_clusters    = sum(1 for v in clusters.values() if v > 0.1)
+    _bear_clusters    = sum(1 for v in clusters.values() if v < -0.1)
+    _dominant_clust   = max(_bull_clusters, _bear_clusters)
+    _cluster_dir      = "BULL" if _bull_clusters >= _bear_clusters else "BEAR"
+
+    if _dominant_clust >= 3:
+        cluster_alignment  = "💪 STRONG — 3+ Clusters Aligned"
+        cluster_align_col  = "#00C853" if _cluster_dir == "BULL" else "#FF5252"
+        cluster_desc       = (f"{_bull_clusters} bullish / {_bear_clusters} bearish clusters. "
+                              f"High-conviction move likely. {'Bullish' if _cluster_dir == 'BULL' else 'Bearish'} pressure dominant across multiple market dimensions.")
+        cluster_strength   = "STRONG"
+    elif _dominant_clust == 2:
+        cluster_alignment  = "🔶 MODERATE — 2 Clusters Aligned"
+        cluster_align_col  = "#FFD740"
+        cluster_desc       = (f"{_bull_clusters} bullish / {_bear_clusters} bearish clusters. "
+                              f"Moderate conviction. Await 3rd cluster confirmation for high-probability trade.")
+        cluster_strength   = "MODERATE"
+    else:
+        cluster_alignment  = "⚪ WEAK — Clusters Conflicting"
+        cluster_align_col  = "#888888"
+        cluster_desc       = "Clusters pulling in different directions. Low-confidence environment. Reduce size, use straddles, or stay flat."
+        cluster_strength   = "WEAK"
+
+    # ── ADV-4: TRAP DETECTION ─────────────────────────────────────────────────
+    _vwap_above  = ind_vwap_score > 0
+    _put_writing = pcr_oi > 1.2 and _pcr_rising
+
+    if signals.get('BREAKOUT_SCORE', 0) > 0.3 and net_gex > 15 and _pcr_falling:
+        trap_type  = "🪤 POSSIBLE BULL TRAP"
+        trap_color = "#FF9800"
+        trap_desc  = ("Breakout score high BUT GEX is pinning price AND PCR falling — "
+                      "breakout may be false. Institutions may be distributing into retail strength. "
+                      "Use tight stops on longs; watch for quick reversal below breakout level.")
+        trap_code  = "BULL_TRAP"
+    elif signals.get('BREAKOUT_SCORE', 0) < -0.3 and _put_writing and _vwap_above:
+        trap_type  = "🪤 POSSIBLE BEAR TRAP"
+        trap_color = "#FF9800"
+        trap_desc  = ("Breakdown signal BUT put writing is INCREASING and price holding VWAP — "
+                      "shorts may be trapped. A sharp short-squeeze reversal is possible. "
+                      "Avoid fresh shorts; wait for VWAP to break convincingly.")
+        trap_code  = "BEAR_TRAP"
+    elif abs(net_pres) > 0.25 and abs(pa_sig) < 0.3:
+        trap_type  = "💧 LIQUIDITY TRAP / ABSORPTION"
+        trap_color = "#FF9800"
+        trap_desc  = ("Strong order flow pressure but price barely moving — "
+                      "large institutional players are absorbing the flow silently. "
+                      "Direction will become clear once absorption completes. Wait for price to 'pop'.")
+        trap_code  = "LIQUIDITY_TRAP"
+    else:
+        trap_type  = "✅ NO TRAP DETECTED"
+        trap_color = "#00C853"
+        trap_desc  = "No classic bull/bear/liquidity trap patterns detected in current data. Signals appear genuine."
+        trap_code  = "NONE"
+
+    # ── ADV-5: MOMENTUM SHIFT DETECTOR ────────────────────────────────────────
+    _chgoi_trend_v  = _trend(pro_h, 'pcr_chgoi', window=5)
+    _sent_trend_v   = _trend(sent_h, 'sentiment_score', window=5)
+    _pres_trend_now = _trend(pres_h, 'net_pressure', window=3)
+
+    momentum_shift       = "⚪ NOT DETECTED"
+    momentum_shift_color = "#888888"
+    momentum_shift_desc  = "No significant momentum transition event detected. Current trend continuing without shift signals."
+    momentum_shift_code  = "NONE"
+
+    if _chgoi_trend_v > 0 and _delta_trend_v > 0 and _pres_trend_now > 0 and not _price_rising:
+        momentum_shift       = "🔄 SHORT COVERING → LONG BUILD-UP"
+        momentum_shift_color = "#00C853"
+        momentum_shift_desc  = ("PCR ChgOI rising + delta turning positive + improving order pressure — "
+                                "short positions being covered and fresh longs building simultaneously. "
+                                "High-probability trend reversal UP. Watch for breakout confirmation.")
+        momentum_shift_code  = "SHORT_COVER_TO_LONG"
+    elif _price_rising and _delta_trend_v < 0 and _pres_trend_now < 0 and _sent_trend_v < 0:
+        momentum_shift       = "🔄 LONG BUILD-UP → DISTRIBUTION"
+        momentum_shift_color = "#FF9800"
+        momentum_shift_desc  = ("Price rising but delta weakening + pressure falling + sentiment declining — "
+                                "smart money distributing into retail FOMO buying. Classic topping signal. "
+                                "Reduce longs, tighten stops.")
+        momentum_shift_code  = "LONG_TO_DISTRIBUTION"
+    elif _pcr_falling and _delta_trend_v < 0 and _pres_trend_now < 0:
+        momentum_shift       = "📉 SHORT BUILD-UP → BREAKDOWN"
+        momentum_shift_color = "#FF5252"
+        momentum_shift_desc  = ("PCR falling + delta turning negative + put pressure rising — "
+                                "fresh short positions accelerating. Breakdown momentum building. "
+                                "Avoid catching falling knife; trade only on bounces.")
+        momentum_shift_code  = "BUILD_TO_BREAKDOWN"
+
+    # ── ADV-6: NEXT MOVE PROBABILITY ──────────────────────────────────────────
+    base_bull  = max(0.0, ensemble_score)
+    base_bear  = max(0.0, -ensemble_score)
+    base_range = max(0.05, 1.0 - abs(ensemble_score))
+
+    _clu_avg           = sum(clusters.values()) / 4
+    cluster_bull_boost = max(0, _clu_avg) * 0.15
+    cluster_bear_boost = max(0, -_clu_avg) * 0.15
+
+    inst_bull_boost = 0.10 if inst_code == "LONG_BUILD"  else (0.05 if inst_code == "SHORT_COVER" else 0.0)
+    inst_bear_boost = 0.10 if inst_code == "SHORT_BUILD" else (0.05 if inst_code == "LONG_UNWIND" else 0.0)
+
+    regime_bull_boost  = 0.08 if (regime_code in ("TREND", "PRE_BREAKOUT") and ensemble_score > 0) else 0.0
+    regime_bear_boost  = 0.08 if (regime_code in ("TREND", "PRE_BREAKOUT") and ensemble_score < 0) else 0.0
+    regime_range_boost = 0.10 if regime_code in ("RANGE", "COMPRESSION") else 0.0
+
+    mom_bull_boost = 0.07 if momentum_shift_code == "SHORT_COVER_TO_LONG"  else 0.0
+    mom_bear_boost = 0.07 if momentum_shift_code == "BUILD_TO_BREAKDOWN"   else 0.0
+    mom_dist_boost = 0.05 if momentum_shift_code == "LONG_TO_DISTRIBUTION" else 0.0
+
+    trap_bull_penalty  = 0.10 if trap_code == "BULL_TRAP"  else 0.0
+    trap_bear_penalty  = 0.10 if trap_code == "BEAR_TRAP"  else 0.0
+
+    raw_bull  = max(0.0, base_bull  + cluster_bull_boost + inst_bull_boost  + regime_bull_boost + mom_bull_boost - trap_bull_penalty)
+    raw_bear  = max(0.0, base_bear  + cluster_bear_boost + inst_bear_boost  + regime_bear_boost + mom_bear_boost + mom_dist_boost - trap_bear_penalty)
+    raw_range = max(0.05, (base_range + regime_range_boost) * 0.5)
+
+    _total_raw = raw_bull + raw_bear + raw_range
+    prob_bull  = round((raw_bull  / _total_raw) * 100)
+    prob_bear  = round((raw_bear  / _total_raw) * 100)
+    prob_range = max(0, 100 - prob_bull - prob_bear)
+
+    _max_prob = max(prob_bull, prob_bear, prob_range)
+    if _max_prob >= 60:
+        prob_confidence   = "🟢 HIGH"
+        prob_conf_color   = "#00C853"
+    elif _max_prob >= 45:
+        prob_confidence   = "🟡 MEDIUM"
+        prob_conf_color   = "#FFD740"
+    else:
+        prob_confidence   = "🔴 LOW"
+        prob_conf_color   = "#FF5252"
+
+    # ── ADV-7: SMART MONEY CONFIRMATION ───────────────────────────────────────
+    _pcr_high            = pcr_oi > 1.2
+    _put_writing_active  = _pcr_high and _pcr_rising
+    _delta_bull          = net_delta > 0
+    _above_vwap          = ind_vwap_score > 0
+
+    sm_bull_score = sum([
+        1 if _put_writing_active else 0,
+        1 if _delta_bull else 0,
+        1 if _above_vwap else 0,
+        1 if net_pres > 0.1 else 0,
+        1 if pcr_vol > 1.1 else 0,
+    ])
+    sm_bear_score = sum([
+        1 if (pcr_oi < 0.8 and _pcr_falling) else 0,
+        1 if not _delta_bull else 0,
+        1 if not _above_vwap else 0,
+        1 if net_pres < -0.1 else 0,
+        1 if pcr_vol < 0.9 else 0,
+    ])
+
+    if sm_bull_score >= 4:
+        smart_money  = "🐋 SMART MONEY LONG"
+        sm_color     = "#00C853"
+        sm_desc      = (f"Score {sm_bull_score}/5 — "
+                        f"{'Put writing ✅ ' if _put_writing_active else ''}"
+                        f"{'Delta+ ✅ ' if _delta_bull else ''}"
+                        f"{'Above VWAP ✅ ' if _above_vwap else ''}"
+                        f"{'Call pressure ✅ ' if net_pres > 0.1 else ''}"
+                        f"Strong institutional long confirmation. High-quality entry zone for longs.")
+        sm_code      = "LONG"
+    elif sm_bull_score >= 3:
+        smart_money  = "🟢 SMART MONEY LEANING LONG"
+        sm_color     = "#69F0AE"
+        sm_desc      = f"Score {sm_bull_score}/5 — Moderate long bias. Not full conviction. Reduce size until 4th condition confirms."
+        sm_code      = "LEAN_LONG"
+    elif sm_bear_score >= 4:
+        smart_money  = "🐻 SMART MONEY SHORT"
+        sm_color     = "#FF5252"
+        sm_desc      = (f"Score {sm_bear_score}/5 — "
+                        f"{'Call writing ✅ ' if (pcr_oi < 0.8 and _pcr_falling) else ''}"
+                        f"{'Delta- ✅ ' if not _delta_bull else ''}"
+                        f"{'Below VWAP ✅ ' if not _above_vwap else ''}"
+                        f"{'Put pressure ✅ ' if net_pres < -0.1 else ''}"
+                        f"Strong institutional short confirmation. High-quality entry zone for shorts.")
+        sm_code      = "SHORT"
+    elif sm_bear_score >= 3:
+        smart_money  = "🔴 SMART MONEY LEANING SHORT"
+        sm_color     = "#FF5252"
+        sm_desc      = f"Score {sm_bear_score}/5 — Moderate short bias. Not full conviction. Await 4th condition."
+        sm_code      = "LEAN_SHORT"
+    else:
+        smart_money  = "⚪ SMART MONEY NEUTRAL"
+        sm_color     = "#888888"
+        sm_desc      = (f"Bull conditions: {sm_bull_score}/5 | Bear conditions: {sm_bear_score}/5 — "
+                        "No clear institutional directional bias. Institutions sitting on the fence.")
+        sm_code      = "NEUTRAL"
+
     # ── 4. UI RENDERING ───────────────────────────────────────────────────────
     st.markdown(f"""
     <div style="background:linear-gradient(135deg,{ml_color}18,{ml_color}08);
@@ -12312,6 +12601,242 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
             <div style="font-size:13px;color:#ddd;white-space:pre-line;">{body}</div>
         </div>
         """, unsafe_allow_html=True)
+
+    # ── ADVANCED INTELLIGENCE REPORT ─────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🧠 Advanced ML Market Intelligence Report")
+    st.caption("Regime Detection · Institutional Positioning · Cluster Alignment · Trap Detection · Smart Money · Probability Engine")
+
+    # ── SUMMARY HEADER CARD ───────────────────────────────────────────────────
+    _prob_lead = "BULLISH" if prob_bull >= prob_bear and prob_bull >= prob_range else ("BEARISH" if prob_bear >= prob_range else "RANGE")
+    _prob_lead_pct = prob_bull if _prob_lead == "BULLISH" else (prob_bear if _prob_lead == "BEARISH" else prob_range)
+    _prob_lead_col = "#00C853" if _prob_lead == "BULLISH" else ("#FF5252" if _prob_lead == "BEARISH" else "#FFD740")
+
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#1a1a2e,#0d0d1e);
+                border:1px solid #333;border-radius:14px;padding:18px;margin-bottom:16px;">
+        <div style="font-size:11px;color:#888;letter-spacing:2px;margin-bottom:8px;">ADVANCED ML INTELLIGENCE SUMMARY</div>
+        <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">MARKET REGIME</div>
+                <div style="font-size:14px;font-weight:bold;color:{regime_color};">{market_regime}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">INSTITUTIONAL ACTIVITY</div>
+                <div style="font-size:14px;font-weight:bold;color:{inst_color};">{inst_activity}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">CLUSTER ALIGNMENT</div>
+                <div style="font-size:14px;font-weight:bold;color:{cluster_align_col};">{cluster_alignment}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">TRAP RISK</div>
+                <div style="font-size:14px;font-weight:bold;color:{trap_color};">{trap_type}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">MOMENTUM SHIFT</div>
+                <div style="font-size:14px;font-weight:bold;color:{momentum_shift_color};">{momentum_shift}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">SMART MONEY</div>
+                <div style="font-size:14px;font-weight:bold;color:{sm_color};">{smart_money}</div>
+            </div>
+            <div style="text-align:center;background:#0d1117;border-radius:8px;padding:8px 14px;border:1px solid {_prob_lead_col}44;">
+                <div style="font-size:10px;color:#888;">NEXT MOVE PROBABILITY</div>
+                <div style="font-size:22px;font-weight:bold;color:{_prob_lead_col};">{_prob_lead_pct}%</div>
+                <div style="font-size:11px;color:{_prob_lead_col};">{_prob_lead}</div>
+                <div style="font-size:10px;color:{prob_conf_color};">{prob_confidence} CONFIDENCE</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── DETAILED MODULE CARDS (2-column layout) ────────────────────────────────
+    _adv_col1, _adv_col2 = st.columns(2)
+
+    with _adv_col1:
+        # ADV-1: Market Regime
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {regime_color}55;border-left:3px solid {regime_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 1 — MARKET REGIME</div>
+            <div style="font-size:16px;font-weight:bold;color:{regime_color};margin:4px 0;">{market_regime}</div>
+            <div style="font-size:12px;color:#ccc;">{regime_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-3: Signal Clusters
+        _cluster_bar_html = ""
+        for _cname, _cval in [("OPTIONS", cluster_options), ("PRICE", cluster_price), ("MACRO", cluster_macro), ("FLOW", cluster_flow)]:
+            _cc = "#00C853" if _cval > 0.1 else ("#FF5252" if _cval < -0.1 else "#FFD740")
+            _cpct = int(abs(_cval) * 100)
+            _cdir = "▲ BULL" if _cval > 0.1 else ("▼ BEAR" if _cval < -0.1 else "◆ NEUTRAL")
+            _cluster_bar_html += f"""
+            <div style="display:flex;align-items:center;gap:8px;margin-bottom:5px;">
+                <div style="width:70px;font-size:11px;color:#888;">{_cname}</div>
+                <div style="flex:1;background:#222;border-radius:3px;height:8px;overflow:hidden;">
+                    <div style="width:{_cpct}%;background:{_cc};height:100%;border-radius:3px;"></div>
+                </div>
+                <div style="width:70px;font-size:11px;color:{_cc};text-align:right;">{_cval:+.2f} {_cdir}</div>
+            </div>"""
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {cluster_align_col}55;border-left:3px solid {cluster_align_col};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 3 — SIGNAL CLUSTER ALIGNMENT</div>
+            <div style="font-size:15px;font-weight:bold;color:{cluster_align_col};margin:4px 0;">{cluster_alignment}</div>
+            {_cluster_bar_html}
+            <div style="font-size:12px;color:#aaa;margin-top:6px;">{cluster_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-5: Momentum Shift
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {momentum_shift_color}55;border-left:3px solid {momentum_shift_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 5 — MOMENTUM SHIFT DETECTOR</div>
+            <div style="font-size:15px;font-weight:bold;color:{momentum_shift_color};margin:4px 0;">{momentum_shift}</div>
+            <div style="font-size:12px;color:#ccc;">{momentum_shift_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-7: Smart Money
+        _sm_bars = [
+            ("Put Writing",   _put_writing_active,   sm_bull_score >= 1),
+            ("Net Delta +",   _delta_bull,            sm_bull_score >= 1),
+            ("Above VWAP",    _above_vwap,            True),
+            ("Call Pressure", net_pres > 0.1,         True),
+            ("PCR Vol >1.1",  pcr_vol > 1.1,          True),
+        ]
+        _sm_check_html = "".join([
+            f'<span style="color:{"#00C853" if cond else "#555"};font-size:12px;margin-right:8px;">{"✅" if cond else "⬜"} {lbl}</span>'
+            for lbl, cond, _ in _sm_bars
+        ])
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {sm_color}55;border-left:3px solid {sm_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 7 — SMART MONEY CONFIRMATION</div>
+            <div style="font-size:16px;font-weight:bold;color:{sm_color};margin:4px 0;">{smart_money}</div>
+            <div style="margin:6px 0;flex-wrap:wrap;">{_sm_check_html}</div>
+            <div style="font-size:12px;color:#aaa;margin-top:4px;">{sm_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with _adv_col2:
+        # ADV-2: Institutional Activity
+        _inst_indicators = [
+            ("Price Action", "Rising ▲" if _price_rising else ("Falling ▼" if _price_falling else "Flat"), "#00C853" if _price_rising else ("#FF5252" if _price_falling else "#888")),
+            ("PCR Trend",    "Rising ▲" if _pcr_rising else ("Falling ▼" if _pcr_falling else "Flat"),    "#00C853" if _pcr_rising else ("#FF5252" if _pcr_falling else "#888")),
+            ("Net Delta",    f"{net_delta:+.0f}",                                                           "#00C853" if _delta_positive else "#FF5252"),
+            ("Order Pressure", f"{net_pres:+.3f}",                                                          "#00C853" if _pres_positive else ("#FF5252" if _pres_negative else "#888")),
+        ]
+        _inst_html = "".join([
+            f'<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #1e1e1e;">'
+            f'<span style="font-size:11px;color:#888;">{lbl}</span>'
+            f'<span style="font-size:11px;font-weight:bold;color:{col};">{val}</span></div>'
+            for lbl, val, col in _inst_indicators
+        ])
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {inst_color}55;border-left:3px solid {inst_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 2 — INSTITUTIONAL ACTIVITY</div>
+            <div style="font-size:16px;font-weight:bold;color:{inst_color};margin:4px 0;">{inst_activity}</div>
+            {_inst_html}
+            <div style="font-size:12px;color:#aaa;margin-top:8px;">{inst_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-4: Trap Detection
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {trap_color}55;border-left:3px solid {trap_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 4 — TRAP DETECTION ENGINE</div>
+            <div style="font-size:15px;font-weight:bold;color:{trap_color};margin:4px 0;">{trap_type}</div>
+            <div style="font-size:12px;color:#ccc;">{trap_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-6: Next Move Probability
+        _pb_bar  = int(prob_bull)
+        _pbe_bar = int(prob_bear)
+        _pr_bar  = int(prob_range)
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {prob_conf_color}55;border-left:3px solid {prob_conf_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 6 — NEXT MOVE PROBABILITY</div>
+            <div style="margin:8px 0;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                    <span style="font-size:12px;color:#00C853;">🟢 Bullish</span>
+                    <span style="font-size:13px;font-weight:bold;color:#00C853;">{prob_bull}%</span>
+                </div>
+                <div style="background:#1a1a2e;border-radius:4px;height:10px;overflow:hidden;margin-bottom:6px;">
+                    <div style="width:{_pb_bar}%;background:#00C853;height:100%;border-radius:4px;"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                    <span style="font-size:12px;color:#FF5252;">🔴 Bearish</span>
+                    <span style="font-size:13px;font-weight:bold;color:#FF5252;">{prob_bear}%</span>
+                </div>
+                <div style="background:#1a1a2e;border-radius:4px;height:10px;overflow:hidden;margin-bottom:6px;">
+                    <div style="width:{_pbe_bar}%;background:#FF5252;height:100%;border-radius:4px;"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                    <span style="font-size:12px;color:#FFD740;">🟡 Range</span>
+                    <span style="font-size:13px;font-weight:bold;color:#FFD740;">{prob_range}%</span>
+                </div>
+                <div style="background:#1a1a2e;border-radius:4px;height:10px;overflow:hidden;margin-bottom:6px;">
+                    <div style="width:{_pr_bar}%;background:#FFD740;height:100%;border-radius:4px;"></div>
+                </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding-top:8px;border-top:1px solid #222;">
+                <span style="font-size:11px;color:#888;">Confidence Level</span>
+                <span style="font-size:13px;font-weight:bold;color:{prob_conf_color};">{prob_confidence}</span>
+            </div>
+            <div style="font-size:10px;color:#666;margin-top:4px;">Inputs: Ensemble · Clusters · Institutions · Regime · Traps · Momentum</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── FINAL INTELLIGENCE VERDICT ─────────────────────────────────────────────
+    _final_signals_aligned = (
+        (sm_code in ("LONG", "LEAN_LONG") and _prob_lead == "BULLISH" and inst_code in ("LONG_BUILD", "SHORT_COVER") and trap_code == "NONE") or
+        (sm_code in ("SHORT", "LEAN_SHORT") and _prob_lead == "BEARISH" and inst_code in ("SHORT_BUILD", "LONG_UNWIND") and trap_code == "NONE")
+    )
+    _final_dir_col  = "#00C853" if _prob_lead == "BULLISH" else ("#FF5252" if _prob_lead == "BEARISH" else "#FFD740")
+    _conviction_tag = "⚡ HIGH CONVICTION" if (_final_signals_aligned and cluster_strength == "STRONG" and _max_prob >= 55) else \
+                      ("🔶 MODERATE CONVICTION" if cluster_strength in ("STRONG", "MODERATE") and _max_prob >= 45 else "⚠️ LOW CONVICTION — WAIT")
+    _conv_col       = "#00C853" if "HIGH" in _conviction_tag else ("#FFD740" if "MODERATE" in _conviction_tag else "#FF5252")
+
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,{_final_dir_col}12,{_final_dir_col}05);
+                border:2px solid {_final_dir_col}66;border-radius:12px;padding:16px;margin-top:8px;">
+        <div style="font-size:11px;color:#888;letter-spacing:2px;">ADVANCED ML — FINAL VERDICT</div>
+        <div style="display:flex;flex-wrap:wrap;gap:20px;margin-top:10px;align-items:center;">
+            <div>
+                <div style="font-size:11px;color:#888;">REGIME</div>
+                <div style="font-size:13px;color:{regime_color};font-weight:bold;">{market_regime}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">INSTITUTIONS</div>
+                <div style="font-size:13px;color:{inst_color};font-weight:bold;">{inst_activity}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">CLUSTERS</div>
+                <div style="font-size:13px;color:{cluster_align_col};font-weight:bold;">{cluster_strength}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">TRAP</div>
+                <div style="font-size:13px;color:{trap_color};font-weight:bold;">{trap_code.replace('_',' ')}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">SMART MONEY</div>
+                <div style="font-size:13px;color:{sm_color};font-weight:bold;">{sm_code.replace('_',' ')}</div>
+            </div>
+            <div style="background:#0d1117;border-radius:8px;padding:8px 16px;border:1px solid {_final_dir_col}44;">
+                <div style="font-size:11px;color:#888;">NEXT MOVE</div>
+                <div style="font-size:20px;font-weight:bold;color:{_final_dir_col};">{_prob_lead} {_prob_lead_pct}%</div>
+                <div style="font-size:12px;color:{_conv_col};margin-top:2px;">{_conviction_tag}</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
     # Weighted contribution waterfall
     st.markdown("#### ⚖️ Weighted Signal Contributions")
