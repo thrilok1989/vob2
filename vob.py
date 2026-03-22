@@ -6330,6 +6330,549 @@ def render_smart_money_master_analysis(option_data, current_price):
         )
 
 
+def render_pre_market_intelligence_report(option_data, current_price):
+    """
+    VOB2 Institutional Pre-Market Intelligence Report.
+
+    Uses ONLY existing formulas already present in the codebase:
+    - PCR: PE_OI / CE_OI  (from render_smart_money_master_analysis)
+    - GEX: calculate_dealer_gex  (Call_GEX + Put_GEX)
+    - Gamma Flip: sign-change strike from Net_GEX profile
+    - Max Pain: strike with minimum total options pain to writers
+    - OI Activity: price vs OI change direction logic
+    - Trap Detection: Bull/Bear/Gamma trap conditions
+    - Smart Money: OI spike > 3× average at strike
+    - Confidence: PCR(25%) + OI Shift(25%) + Gamma Regime(20%) +
+                  Chart Structure(15%) + Breakout Signals(15%)
+    - Volatility: ATM IV average
+    """
+    if option_data is None:
+        return
+    df_summary = option_data.get('df_summary')
+    if df_summary is None or df_summary.empty:
+        return
+
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+
+    underlying   = option_data.get('underlying', current_price or 0)
+    atm_strike   = option_data.get('atm_strike')
+    max_pain     = option_data.get('max_pain_strike')
+    total_ce_chg = option_data.get('total_ce_change', 0)
+    total_pe_chg = option_data.get('total_pe_change', 0)
+    expiry       = option_data.get('expiry', '')
+
+    if atm_strike is None:
+        return
+
+    LOT = 100000
+
+    def _gv(row, col, default=0.0):
+        try:
+            v = row[col] if hasattr(row, '__getitem__') else getattr(row, col, default)
+            return float(v) if pd.notna(v) else default
+        except Exception:
+            return default
+
+    ds = df_summary.sort_values('Strike').reset_index(drop=True)
+    atm_matches = ds[ds['Strike'] == atm_strike].index.tolist()
+    ai = atm_matches[0] if atm_matches else int((ds['Strike'] - atm_strike).abs().idxmin())
+
+    def _safe_row(i):
+        return ds.iloc[i] if 0 <= i < len(ds) else None
+
+    r_m2 = _safe_row(ai - 2); r_m1 = _safe_row(ai - 1)
+    r_0  = ds.iloc[ai]
+    r_p1 = _safe_row(ai + 1); r_p2 = _safe_row(ai + 2)
+
+    # ── 1. PCR ─────────────────────────────────────────────────────────────
+    total_ce_oi = ds['openInterest_CE'].sum() if 'openInterest_CE' in ds.columns else 0
+    total_pe_oi = ds['openInterest_PE'].sum() if 'openInterest_PE' in ds.columns else 0
+    pcr = (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else 1.0
+    if pcr > 1.2:
+        pcr_label, pcr_pts = "Bullish (Put-heavy)", 1
+    elif pcr < 0.7:
+        pcr_label, pcr_pts = "Bearish (Call-heavy)", -1
+    else:
+        pcr_label, pcr_pts = "Neutral", 0
+
+    # ── 2. GEX (Net Gamma Exposure) ────────────────────────────────────────
+    gex_data = calculate_dealer_gex(ds, underlying, 25)
+    net_gex       = gex_data.get('total_gex', 0.0) if gex_data else 0.0
+    gamma_flip    = gex_data.get('gamma_flip_level') if gex_data else None
+    gex_signal    = gex_data.get('gex_signal', 'N/A') if gex_data else 'N/A'
+    gex_interp    = gex_data.get('gex_interpretation', 'N/A') if gex_data else 'N/A'
+    gex_magnet    = gex_data.get('gex_magnet') if gex_data else None
+
+    if net_gex > 50:
+        gex_regime, gex_pts = "Strong PIN (Range/Chop)", 1
+    elif net_gex > 0:
+        gex_regime, gex_pts = "Mild PIN (Mean Reversion)", 1
+    elif net_gex > -50:
+        gex_regime, gex_pts = "Mild TREND (Directional Bias)", -1
+    else:
+        gex_regime, gex_pts = "Strong TREND (Breakout/Violent Move)", -2
+
+    # ── 3. OI Activity (same logic as render_smart_money_master_analysis) ──
+    _price_up = underlying >= float(st.session_state.get('_oi_prev_underlying', underlying))
+    if _price_up and total_pe_chg > 0 and total_pe_chg >= abs(total_ce_chg):
+        oi_activity  = "Long Build-up"
+        oi_detail    = "Price ↑ + Put OI ↑ — bulls adding floor"
+        market_phase = "Long Build-up Day"
+        oi_pts       = 2
+    elif not _price_up and total_ce_chg > 0 and total_ce_chg >= abs(total_pe_chg):
+        oi_activity  = "Short Build-up"
+        oi_detail    = "Price ↓ + Call OI ↑ — bears adding resistance"
+        market_phase = "Short Build-up Day"
+        oi_pts       = -2
+    elif _price_up and total_ce_chg < 0:
+        oi_activity  = "Short Covering Rally"
+        oi_detail    = "Price ↑ + Call OI ↓ — shorts being covered"
+        market_phase = "Short Covering Rally"
+        oi_pts       = 1
+    elif not _price_up and total_pe_chg < 0:
+        oi_activity  = "Long Unwinding"
+        oi_detail    = "Price ↓ + Put OI ↓ — longs being unwound"
+        market_phase = "Long Unwinding Day"
+        oi_pts       = -1
+    else:
+        oi_activity  = "Mixed / Neutral"
+        oi_detail    = "No clear directional OI bias"
+        market_phase = "Range / Gamma Pin Day"
+        oi_pts       = 0
+
+    # Override market phase to Breakout Trend Day when GEX is strong negative
+    if net_gex < -50 and abs(total_ce_chg - total_pe_chg) > 0:
+        market_phase = "Breakout Trend Day"
+
+    # ── 4. Support & Resistance Strength ───────────────────────────────────
+    pe_chg_atm = _gv(r_0,  'changeinOpenInterest_PE')
+    ce_chg_atm = _gv(r_0,  'changeinOpenInterest_CE')
+    pe_chg_m1  = _gv(r_m1, 'changeinOpenInterest_PE') if r_m1 is not None else 0
+    pe_chg_m2  = _gv(r_m2, 'changeinOpenInterest_PE') if r_m2 is not None else 0
+    ce_chg_p1  = _gv(r_p1, 'changeinOpenInterest_CE') if r_p1 is not None else 0
+    ce_chg_p2  = _gv(r_p2, 'changeinOpenInterest_CE') if r_p2 is not None else 0
+    pe_oi_atm  = _gv(r_0,  'openInterest_PE')
+    ce_oi_atm  = _gv(r_0,  'openInterest_CE')
+    pe_oi_m1   = _gv(r_m1, 'openInterest_PE') if r_m1 is not None else 0
+    ce_oi_p1   = _gv(r_p1, 'openInterest_CE') if r_p1 is not None else 0
+
+    sup_score = sum([total_pe_chg > 0, total_pe_chg > abs(total_ce_chg),
+                     pe_chg_atm > 0, pe_chg_m1 > 0, pe_chg_m2 > 0, pe_oi_atm > pe_oi_m1])
+    res_score = sum([total_ce_chg > 0, total_ce_chg > abs(total_pe_chg),
+                     ce_chg_atm > 0, ce_chg_p1 > 0, ce_chg_p2 > 0, ce_oi_atm > ce_oi_p1])
+
+    _sup_labels = ["Very Weak", "Weak", "Moderate", "Strong", "Very Strong", "Dominant"]
+    _res_labels = ["Very Weak", "Weak", "Moderate", "Strong", "Very Strong", "Dominant"]
+    support_strength    = _sup_labels[min(sup_score, 5)]
+    resistance_strength = _res_labels[min(res_score, 5)]
+
+    # Key S/R strikes from max OI concentration
+    max_pe_strike = float(ds.loc[ds['openInterest_PE'].idxmax(), 'Strike']) if 'openInterest_PE' in ds.columns else None
+    max_ce_strike = float(ds.loc[ds['openInterest_CE'].idxmax(), 'Strike']) if 'openInterest_CE' in ds.columns else None
+
+    # ── 5. Strike Migration ────────────────────────────────────────────────
+    if ce_chg_atm < 0 and (ce_chg_p1 > 0 or ce_chg_p2 > 0):
+        resist_migration = "Shifting Higher (Bullish)"
+    elif ce_chg_atm > 0 and ce_chg_p1 < 0:
+        resist_migration = "Shifting Lower (Bearish)"
+    else:
+        resist_migration = "Stable"
+
+    if pe_chg_atm < 0 and (pe_chg_m1 > 0 or pe_chg_m2 > 0):
+        support_migration = "Shifting Lower (Bearish)"
+    elif pe_chg_atm > 0 and pe_chg_m1 < 0:
+        support_migration = "Shifting Higher (Bullish)"
+    else:
+        support_migration = "Stable"
+
+    # ── 6. Smart Money / Institutional Activity ────────────────────────────
+    smart_signals = []
+    inst_activity_parts = []
+    for side, pos_lbl, neg_lbl in [
+        ('CE', 'Institutional Call Writing', 'Institutional Call Unwinding'),
+        ('PE', 'Institutional Put Writing',  'Institutional Put Unwinding'),
+    ]:
+        col = f'changeinOpenInterest_{side}'
+        if col in ds.columns:
+            avg_abs = ds[col].abs().mean()
+            spikes  = ds[ds[col].abs() > avg_abs * 3]
+            for _, srow in spikes.head(2).iterrows():
+                lbl = pos_lbl if srow[col] > 0 else neg_lbl
+                smart_signals.append(f"{lbl} @ ₹{int(srow['Strike'])}")
+                inst_activity_parts.append(lbl)
+
+    # Classify institutional activity
+    if any('Call Writing' in s for s in smart_signals) and any('Put Writing' in s for s in smart_signals):
+        inst_call_put = "Call Writing + Put Writing (Both sides — Pinning expected)"
+    elif any('Call Writing' in s for s in smart_signals):
+        inst_call_put = "Call Writing (Resistance building)"
+    elif any('Put Writing' in s for s in smart_signals):
+        inst_call_put = "Put Writing (Support building)"
+    elif any('Unwinding' in s for s in smart_signals):
+        inst_call_put = "Unwinding (De-risking / Exits)"
+    else:
+        inst_call_put = "No major spikes — Normal flow"
+
+    # Smart money shift detection (institutional positioning)
+    if total_ce_chg < 0 and total_pe_chg > 0:
+        smart_money_direction = "Institutional Bullish Positioning (CE ↓ + PE ↑)"
+    elif total_pe_chg < 0 and total_ce_chg > 0:
+        smart_money_direction = "Institutional Bearish Positioning (PE ↓ + CE ↑)"
+    elif total_pe_chg > 0 and pcr > 1.2:
+        smart_money_direction = "Bullish Bias (Rising PCR + Put Writing)"
+    elif total_ce_chg > 0 and pcr < 0.7:
+        smart_money_direction = "Bearish Bias (Falling PCR + Call Writing)"
+    else:
+        smart_money_direction = "Mixed / Wait for confirmation"
+
+    # ── 7. Trap Detection ──────────────────────────────────────────────────
+    trap_signals, trap_pts = [], 0
+    trap_type = "None"
+
+    if total_pe_chg > 0 and total_ce_chg > total_pe_chg:
+        trap_signals.append("Bull Trap: PUT OI building but CALL OI growth stronger")
+        trap_pts += 2
+        trap_type = "Bull Trap"
+
+    if total_ce_chg > 0 and total_pe_chg > total_ce_chg:
+        trap_signals.append("Bear Trap: CALL OI building but PUT OI growth stronger")
+        trap_pts += 2
+        trap_type = "Bear Trap"
+
+    avg_oi = (total_ce_oi + total_pe_oi) / max(len(ds), 1)
+    if (ce_oi_atm + pe_oi_atm) > avg_oi * 2:
+        trap_signals.append("Gamma Trap: High OI concentration at ATM — price likely pinned")
+        trap_pts += 2
+        if trap_type == "None":
+            trap_type = "Gamma Trap"
+
+    if ce_chg_atm < 0 and pe_chg_atm < 0:
+        trap_signals.append("Fake Breakout Risk: Both CE & PE OI unwinding at ATM")
+        trap_pts += 1
+
+    # Gamma-based trap signals (from analyze_gamma_sequence_mae logic)
+    if net_gex > 0 and ce_chg_atm > 0 and resist_migration != "Shifting Higher (Bullish)":
+        trap_signals.append("Call Trap: Positive GEX + CE OI rising but no upward ramp")
+        trap_pts += 1
+        if trap_type == "None":
+            trap_type = "Bull Trap"
+
+    if net_gex < 0 and pe_chg_atm > 0 and support_migration != "Shifting Higher (Bullish)":
+        trap_signals.append("Put Trap: Negative GEX + PE OI rising but no downward ramp")
+        trap_pts += 1
+        if trap_type == "None":
+            trap_type = "Bear Trap"
+
+    # Expiry trap (from calculate_expiry_day_intelligence logic)
+    if expiry:
+        try:
+            expiry_dt  = datetime.strptime(expiry, "%Y-%m-%d")
+            dte        = (expiry_dt.date() - now.date()).days
+            straddle   = _gv(r_0, 'lastPrice_CE') + _gv(r_0, 'lastPrice_PE')
+            max_pain_v = max_pain or atm_strike
+            in_expiry_zone = (abs(underlying - max_pain_v) <= 50) if max_pain_v else False
+            if dte <= 2 and in_expiry_zone:
+                trap_signals.append(f"Expiry Manipulation Likely: DTE={dte}, Spot near Max Pain ₹{int(max_pain_v)}")
+                trap_pts += 2
+                market_phase = "Expiry Manipulation Day"
+                if trap_type == "None":
+                    trap_type = "Gamma Trap"
+        except Exception:
+            pass
+
+    trap_prob = "High" if trap_pts >= 4 else ("Medium" if trap_pts >= 2 else "Low")
+
+    # ── 8. Breakout Signals ────────────────────────────────────────────────
+    bo_pts = 0
+    if ce_chg_atm < 0: bo_pts += 1
+    if pe_chg_atm < 0: bo_pts += 1
+    if "Higher" in resist_migration: bo_pts += 2
+    if "Lower"  in support_migration: bo_pts += 2
+    raw_total_oi = (total_ce_oi + total_pe_oi) / LOT
+    if raw_total_oi > 0 and abs(total_ce_chg + total_pe_chg) / LOT / raw_total_oi > 0.05:
+        bo_pts += 1
+    if net_gex < -50: bo_pts += 1
+    bo_prob = "High" if bo_pts >= 4 else ("Medium" if bo_pts >= 2 else "Low")
+
+    # ── 9. Expected First Move ─────────────────────────────────────────────
+    if market_phase in ("Long Build-up Day", "Short Covering Rally"):
+        first_move = "Up"
+        first_move_color = "#00ff88"
+    elif market_phase in ("Short Build-up Day", "Long Unwinding Day"):
+        first_move = "Down"
+        first_move_color = "#ff4444"
+    elif "Higher" in resist_migration and sup_score >= 4:
+        first_move = "Up"
+        first_move_color = "#00ff88"
+    elif "Lower" in support_migration and res_score >= 4:
+        first_move = "Down"
+        first_move_color = "#ff4444"
+    elif trap_type in ("Bull Trap", "Bear Trap"):
+        first_move = "Range (Trap Reversal)"
+        first_move_color = "#FFD700"
+    else:
+        first_move = "Range"
+        first_move_color = "#aaaaaa"
+
+    # ── 10. Volatility Expectation ─────────────────────────────────────────
+    iv_ce_atm = _gv(r_0, 'impliedVolatility_CE', 15.0)
+    iv_pe_atm = _gv(r_0, 'impliedVolatility_PE', 15.0)
+    avg_iv = (iv_ce_atm + iv_pe_atm) / 2.0
+    iv_skew = iv_pe_atm - iv_ce_atm
+
+    if avg_iv >= 18 or abs(iv_skew) > 3:
+        vol_exp       = "High"
+        vol_detail    = f"ATM IV={avg_iv:.1f}% | Skew={iv_skew:+.1f}% — elevated uncertainty"
+        vol_color     = "#ff4444"
+    elif avg_iv >= 12:
+        vol_exp       = "Medium"
+        vol_detail    = f"ATM IV={avg_iv:.1f}% | Skew={iv_skew:+.1f}% — moderate swings expected"
+        vol_color     = "#FFD700"
+    else:
+        vol_exp       = "Low"
+        vol_detail    = f"ATM IV={avg_iv:.1f}% | Skew={iv_skew:+.1f}% — range / pin day likely"
+        vol_color     = "#00cc66"
+
+    # ── 11. Market Confidence Score ────────────────────────────────────────
+    # PCR Trend = 25%
+    pcr_conf = 75 if pcr_pts == 1 else (25 if pcr_pts == -1 else 50)
+    # OI Shift = 25%
+    oi_conf  = 80 if oi_pts == 2 else (65 if oi_pts == 1 else (35 if oi_pts == -1 else (20 if oi_pts == -2 else 50)))
+    # Gamma Regime = 20%
+    gex_conf = 70 if gex_pts == 1 else (40 if gex_pts == -1 else (30 if gex_pts == -2 else 50))
+    # Chart Structure (S/R alignment) = 15%
+    chart_conf = min(50 + (sup_score - res_score) * 5, 90)
+    chart_conf = max(chart_conf, 10)
+    # Breakout/Trap signals = 15%
+    bo_trap_conf = (85 if bo_prob == "High" else (60 if bo_prob == "Medium" else 40))
+    if trap_prob == "High": bo_trap_conf = max(bo_trap_conf - 20, 10)
+
+    confidence_raw = (
+        pcr_conf   * 0.25 +
+        oi_conf    * 0.25 +
+        gex_conf   * 0.20 +
+        chart_conf * 0.15 +
+        bo_trap_conf * 0.15
+    )
+    confidence = round(confidence_raw, 1)
+    if confidence >= 70:
+        conf_label = "HIGH"
+        conf_color = "#00ff88"
+    elif confidence >= 50:
+        conf_label = "MEDIUM"
+        conf_color = "#FFD700"
+    else:
+        conf_label = "LOW"
+        conf_color = "#ff4444"
+
+    # ── 12. Overall Market Sentiment ───────────────────────────────────────
+    ss = 0
+    ss += 2 if pcr > 1.2 else (1 if pcr > 0.9 else (-2 if pcr < 0.7 else -1))
+    ss += min(sup_score - 2, 2) - min(res_score - 2, 2)
+    if "Long Build"  in oi_activity: ss += 1
+    if "Short Build" in oi_activity: ss -= 1
+    if "Short Cover" in oi_activity: ss += 1
+    if "Long Unwind" in oi_activity: ss -= 1
+    if "Higher" in resist_migration: ss += 1
+    if "Lower"  in support_migration: ss -= 1
+
+    if   ss >= 6:   mkt_sentiment, s_clr = "Strong Bullish", "#00ff88"
+    elif ss >= 4:   mkt_sentiment, s_clr = "Bullish",        "#00cc66"
+    elif ss >= 2:   mkt_sentiment, s_clr = "Mildly Bullish", "#aacc00"
+    elif ss == 1:   mkt_sentiment, s_clr = "Slight Bullish", "#cccc00"
+    elif ss == 0:   mkt_sentiment, s_clr = "Neutral / Range","#aaaaaa"
+    elif ss == -1:  mkt_sentiment, s_clr = "Slight Bearish", "#cc9900"
+    elif ss >= -3:  mkt_sentiment, s_clr = "Mildly Bearish", "#cc6600"
+    elif ss >= -5:  mkt_sentiment, s_clr = "Bearish",        "#cc3333"
+    else:           mkt_sentiment, s_clr = "Strong Bearish", "#ff2222"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # DISPLAY — PRE-MARKET INTELLIGENCE REPORT
+    # ══════════════════════════════════════════════════════════════════════
+
+    st.markdown("---")
+    st.markdown(
+        f"<div style='background:linear-gradient(135deg,#0a0f1e,#111827);border:1px solid #1e3a5f;"
+        f"border-radius:12px;padding:20px 24px;margin-bottom:16px'>"
+        f"<div style='display:flex;align-items:center;gap:12px'>"
+        f"<span style='font-size:1.8em'>🧠</span>"
+        f"<div>"
+        f"<div style='font-size:1.4em;font-weight:800;color:#e2e8f0;letter-spacing:0.05em'>"
+        f"VOB2 PRE-MARKET INTELLIGENCE REPORT</div>"
+        f"<div style='font-size:0.85em;color:#64748b'>Institutional Market Intelligence Engine &nbsp;·&nbsp; "
+        f"NIFTY 50 &nbsp;·&nbsp; {now.strftime('%d %b %Y %H:%M IST')} &nbsp;·&nbsp; "
+        f"Spot ₹{underlying:,.2f}</div>"
+        f"</div></div></div>",
+        unsafe_allow_html=True
+    )
+
+    # ── ROW 1: Phase · Sentiment · Confidence ──────────────────────────────
+    r1c1, r1c2, r1c3 = st.columns(3)
+
+    def _rpt_card(col_w, label, value, detail, color, icon=""):
+        with col_w:
+            st.markdown(
+                f"<div style='background:#0d1117;border-radius:10px;border-left:4px solid {color};"
+                f"padding:14px 16px;height:100%'>"
+                f"<div style='font-size:0.7em;color:#64748b;text-transform:uppercase;letter-spacing:0.08em'>{label}</div>"
+                f"<div style='font-size:1.05em;font-weight:700;color:{color};margin:4px 0'>{icon}{value}</div>"
+                f"<div style='font-size:0.78em;color:#94a3b8'>{detail}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+    phase_color = ("#00ff88" if "Long" in market_phase or "Covering" in market_phase
+                   else "#ff4444" if "Short Build" in market_phase or "Unwinding" in market_phase
+                   else "#FFD700")
+    _rpt_card(r1c1, "Expected Market Phase", market_phase, oi_detail, phase_color)
+    _rpt_card(r1c2, "Market Sentiment", mkt_sentiment, f"Sentiment Score: {ss:+d}", s_clr)
+    _rpt_card(r1c3, "Confidence Score", f"{confidence}%  [{conf_label}]",
+              f"PCR×25% · OI×25% · GEX×20% · Chart×15% · BO×15%", conf_color)
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── ROW 2: PCR · GEX · Volatility ──────────────────────────────────────
+    r2c1, r2c2, r2c3 = st.columns(3)
+    pcr_color = "#00cc66" if pcr > 1.1 else ("#ff4444" if pcr < 0.8 else "#FFD700")
+    gex_color = "#00cc66" if net_gex > 50 else ("#FFD700" if net_gex > 0 else ("#ff8800" if net_gex > -50 else "#ff4444"))
+    _rpt_card(r2c1, "PCR (Overall)", f"{pcr:.3f} — {pcr_label}", f"Total CE OI: {total_ce_oi/LOT:.1f}L | PE OI: {total_pe_oi/LOT:.1f}L", pcr_color)
+    _rpt_card(r2c2, "Gamma Regime (GEX)", f"{net_gex:+.2f}L — {gex_regime}", gex_interp, gex_color)
+    _rpt_card(r2c3, "Volatility Expectation", vol_exp, vol_detail, vol_color)
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── ROW 3: Key Levels ──────────────────────────────────────────────────
+    r3c1, r3c2, r3c3, r3c4 = st.columns(4)
+    _rpt_card(r3c1, "Key Support",
+              f"₹{int(max_pe_strike)}" if max_pe_strike else "N/A",
+              f"Strength: {support_strength} | Migration: {support_migration}",
+              "#00cc66")
+    _rpt_card(r3c2, "Key Resistance",
+              f"₹{int(max_ce_strike)}" if max_ce_strike else "N/A",
+              f"Strength: {resistance_strength} | Migration: {resist_migration}",
+              "#ff4444")
+    _rpt_card(r3c3, "Gamma Flip Level",
+              f"₹{gamma_flip:,.2f}" if gamma_flip else "Not Found",
+              f"GEX Magnet: {'₹' + str(int(gex_magnet)) if gex_magnet else 'N/A'} | {gex_data.get('spot_vs_flip','N/A') if gex_data else 'N/A'}",
+              "#9b59b6")
+    _rpt_card(r3c4, "Max Pain",
+              f"₹{int(max_pain)}" if max_pain else "N/A",
+              ("Pull-Down likely" if max_pain and underlying > max_pain else
+               "Pull-Up likely" if max_pain and underlying < max_pain else "At Max Pain"),
+              "#3498db")
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── ROW 4: Smart Money · First Move · Trap ─────────────────────────────
+    r4c1, r4c2, r4c3 = st.columns(3)
+
+    trap_color = "#ff4444" if trap_prob == "High" else ("#FFD700" if trap_prob == "Medium" else "#00cc66")
+    _rpt_card(r4c1, "Institutional Activity",
+              inst_call_put,
+              smart_money_direction,
+              "#e67e22")
+    _rpt_card(r4c2, "Expected First Move",
+              first_move,
+              (f"BO Probability: {bo_prob} | S/R Score: {sup_score}/{res_score}"),
+              first_move_color)
+    _rpt_card(r4c3, "Trap Detected",
+              trap_type,
+              f"Trap Probability: {trap_prob}",
+              trap_color)
+
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+    # ── ATM ±2 OI Snapshot ─────────────────────────────────────────────────
+    with st.expander("📊 ATM ±2 Strike Detail & OI Snapshot", expanded=False):
+        snap_rows = []
+        for lbl, row in [("ATM-2", r_m2), ("ATM-1", r_m1), ("ATM ★", r_0), ("ATM+1", r_p1), ("ATM+2", r_p2)]:
+            if row is None:
+                continue
+            snap_rows.append({
+                "Zone":           lbl,
+                "Strike":         int(_gv(row, 'Strike')),
+                "CE OI (L)":      f"{_gv(row,'openInterest_CE')/LOT:.2f}",
+                "CE ΔOI (L)":     f"{_gv(row,'changeinOpenInterest_CE')/LOT:+.2f}",
+                "PE OI (L)":      f"{_gv(row,'openInterest_PE')/LOT:.2f}",
+                "PE ΔOI (L)":     f"{_gv(row,'changeinOpenInterest_PE')/LOT:+.2f}",
+                "IV CE %":        f"{_gv(row,'impliedVolatility_CE',15):.1f}",
+                "IV PE %":        f"{_gv(row,'impliedVolatility_PE',15):.1f}",
+                "PCR":            f"{_gv(row,'PCR',1.0):.2f}" if 'PCR' in ds.columns else "—",
+            })
+        if snap_rows:
+            st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+
+    # ── Trap Signals Detail ────────────────────────────────────────────────
+    with st.expander("🪤 Trap Detection Detail", expanded=trap_prob == "High"):
+        if trap_signals:
+            for sig in trap_signals:
+                color_sig = "#ff4444" if "Trap" in sig or "Fake" in sig else "#FFD700"
+                st.markdown(
+                    f"<div style='background:#1a0a0a;border-left:3px solid {color_sig};"
+                    f"padding:6px 10px;margin:4px 0;border-radius:4px;font-size:0.9em;color:#e2e8f0'>"
+                    f"⚠️ {sig}</div>",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.success("✅ No trap patterns detected — market flow appears clean")
+
+    # ── Smart Money Signals Detail ─────────────────────────────────────────
+    with st.expander("🏦 Smart Money Signal Detail", expanded=False):
+        if smart_signals:
+            for sig in smart_signals:
+                color_sig = "#e67e22" if "Writing" in sig else "#3498db"
+                st.markdown(
+                    f"<div style='background:#0d1117;border-left:3px solid {color_sig};"
+                    f"padding:6px 10px;margin:4px 0;border-radius:4px;font-size:0.9em;color:#e2e8f0'>"
+                    f"🏦 {sig}</div>",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.info("✅ No major institutional spikes detected — normal flow")
+
+    # ── Final Summary Table ────────────────────────────────────────────────
+    st.markdown("#### 📋 Intelligence Summary")
+    sum_c1, sum_c2 = st.columns(2)
+    with sum_c1:
+        st.markdown(f"""
+| Field | Reading |
+|---|---|
+| **Market Phase** | {market_phase} |
+| **Market Sentiment** | {mkt_sentiment} (Score: {ss:+d}) |
+| **PCR** | {pcr:.3f} — {pcr_label} |
+| **Net GEX** | {net_gex:+.2f}L — {gex_regime} |
+| **OI Activity** | {oi_activity} |
+| **Volatility** | {vol_exp} (IV {avg_iv:.1f}%) |
+""")
+    with sum_c2:
+        st.markdown(f"""
+| Field | Reading |
+|---|---|
+| **Key Support** | {'₹'+str(int(max_pe_strike)) if max_pe_strike else 'N/A'} ({support_strength}) |
+| **Key Resistance** | {'₹'+str(int(max_ce_strike)) if max_ce_strike else 'N/A'} ({resistance_strength}) |
+| **Gamma Flip** | {'₹'+f'{gamma_flip:,.2f}' if gamma_flip else 'N/A'} |
+| **Max Pain** | {'₹'+str(int(max_pain)) if max_pain else 'N/A'} |
+| **Trap Detected** | {trap_type} ({trap_prob} probability) |
+| **Expected First Move** | {first_move} | Confidence: {confidence}% [{conf_label}] |
+""")
+
+    if trap_prob == "High":
+        st.warning(
+            "⚠️ **HIGH TRAP PROBABILITY** — Smart money may be setting a trap. "
+            "Avoid chasing the first move. Wait for confirmation before entry."
+        )
+    elif bo_prob == "High":
+        st.info(
+            "🚀 **HIGH BREAKOUT ENERGY** — OI unwinding + large total movement detected. "
+            "Use strict stop-losses. Breakout direction: " + (
+                "UPSIDE" if "Higher" in resist_migration and total_pe_chg > total_ce_chg else
+                "DOWNSIDE" if "Lower" in support_migration and total_ce_chg > total_pe_chg else
+                "UNCLEAR — wait for price confirmation"
+            )
+        )
+
+
 def display_analytics_dashboard(db, symbol="NIFTY50"):
     """Display analytics dashboard"""
     st.subheader("Market Analytics Dashboard")
@@ -13473,6 +14016,9 @@ def main():
 
         # ── 🧠 SMART MONEY PANEL — shown first so it's always visible ────────
         render_smart_money_master_analysis(option_data, current_price)
+
+        # ── 🧠 VOB2 PRE-MARKET INTELLIGENCE REPORT ──────────────────────────
+        render_pre_market_intelligence_report(option_data, current_price)
 
         # OI Change metrics
         st.markdown("## Open Interest Change (in Lakhs)")
