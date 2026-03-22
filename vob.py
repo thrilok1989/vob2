@@ -7212,6 +7212,363 @@ def _bn_trend_label(pct: float, inverse: bool = False) -> str:
     return ("🔴" if inverse else "🟢") if pct > 0 else ("🟢" if inverse else "🔴")
 
 
+def show_global_correlation_intelligence():
+    """VOB2 Global Correlation Intelligence Engine.
+
+    Fetches live global market data, applies direct/reverse correlation scoring,
+    detects traps and special conditions, and outputs the full pre-market report.
+    """
+    import yfinance as yf
+
+    st.markdown(
+        """
+        <div style='background: linear-gradient(135deg,#0a0a1a 0%,#0d1b2a 50%,#0a0a1a 100%);
+                    border:1px solid #00d4ff; border-radius:12px; padding:20px; margin-bottom:18px;'>
+            <h2 style='color:#00d4ff; margin:0; text-align:center; letter-spacing:2px;'>
+                🌐 VOB2 GLOBAL CORRELATION INTELLIGENCE ENGINE
+            </h2>
+            <p style='color:#7ec8e3; margin:6px 0 0; text-align:center; font-size:13px;'>
+                Live Global Market Scoring — Direct &amp; Reverse Correlation Analysis
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Ticker map ─────────────────────────────────────────────────────────────
+    DIRECT_TICKERS = {
+        "Gift Nifty":   "^NSEI",       # proxy — NSE Nifty 50
+        "S&P 500":      "^GSPC",
+        "NASDAQ":       "^IXIC",
+        "Dow Jones":    "^DJI",
+        "Nikkei 225":   "^N225",
+        "Shanghai":     "000001.SS",
+        "Hang Seng":    "^HSI",
+        "KOSPI":        "^KS11",
+        "DAX":          "^GDAXI",
+        "FTSE 100":     "^FTSE",
+        "CAC 40":       "^FCHI",
+    }
+    REVERSE_TICKERS = {
+        "USD/INR":      "USDINR=X",
+        "DXY":          "DX-Y.NYB",
+        "Crude Oil":    "CL=F",
+        "India VIX":    "^INDIAVIX",
+        "US VIX":       "^VIX",
+        "US 10Y Yield": "^TNX",
+        "Gold":         "GC=F",
+    }
+
+    def _score_direct(pct: float) -> int:
+        if pct >= 1.0:   return 10
+        if pct >= 0.3:   return 5
+        if pct > -0.3:   return 0
+        if pct > -1.0:   return -5
+        return -10
+
+    def _score_reverse(pct: float) -> int:
+        if pct >= 1.0:   return -10
+        if pct >= 0.3:   return -5
+        if pct > -0.3:   return 0
+        if pct > -1.0:   return 5
+        return 10
+
+    def _fetch_pct(ticker: str) -> float | None:
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="2d", interval="1d")
+            if hist.empty or len(hist) < 2:
+                hist = t.history(period="5d", interval="1d").dropna()
+            if len(hist) < 2:
+                return None
+            prev, last = float(hist["Close"].iloc[-2]), float(hist["Close"].iloc[-1])
+            return ((last - prev) / prev) * 100 if prev else None
+        except Exception:
+            return None
+
+    with st.spinner("Fetching live global market data…"):
+        direct_data, reverse_data = {}, {}
+        for name, sym in DIRECT_TICKERS.items():
+            direct_data[name] = _fetch_pct(sym)
+        for name, sym in REVERSE_TICKERS.items():
+            reverse_data[name] = _fetch_pct(sym)
+
+    # ── Score calculation ───────────────────────────────────────────────────────
+    direct_scores, reverse_scores = {}, {}
+    for name, pct in direct_data.items():
+        direct_scores[name] = _score_direct(pct) if pct is not None else 0
+    for name, pct in reverse_data.items():
+        # Gold is partial reverse — half weight
+        score = _score_reverse(pct) if pct is not None else 0
+        reverse_scores[name] = score // 2 if name == "Gold" else score
+
+    raw_total   = sum(direct_scores.values()) + sum(reverse_scores.values())
+    max_abs     = max(abs(raw_total), 1)
+    # Normalise to ±100 scale keeping sign
+    norm_score  = int(round((raw_total / max(len(direct_scores) + len(reverse_scores), 1)) * 5.5))
+    # Clamp to meaningful display range
+    norm_score  = max(-100, min(100, norm_score))
+
+    # Sentiment label
+    if   norm_score >  40: sentiment, s_color = "STRONG BULLISH",  "#00ff88"
+    elif norm_score >  15: sentiment, s_color = "BULLISH BIAS",    "#7fff00"
+    elif norm_score >= -15: sentiment, s_color = "NEUTRAL / MIXED", "#ffd700"
+    elif norm_score >= -40: sentiment, s_color = "BEARISH BIAS",   "#ff8c00"
+    else:                   sentiment, s_color = "STRONG BEARISH",  "#ff2244"
+
+    # ── Special conditions ──────────────────────────────────────────────────────
+    usdinr_pct  = reverse_data.get("USD/INR")   or 0.0
+    dxy_pct     = reverse_data.get("DXY")        or 0.0
+    india_vix_p = reverse_data.get("India VIX") or 0.0
+    us_vix_p    = reverse_data.get("US VIX")    or 0.0
+    crude_pct   = reverse_data.get("Crude Oil") or 0.0
+    yield_pct   = reverse_data.get("US 10Y Yield") or 0.0
+
+    currency_pressure = usdinr_pct > 0.3 and dxy_pct > 0.1
+    volatility_shock  = india_vix_p > 3.0 or us_vix_p > 5.0
+    energy_shock      = crude_pct > 1.5
+    liquidity_stress  = dxy_pct > 0.1 and yield_pct > 0.1 and crude_pct > 0.5 and us_vix_p > 3.0
+    risk_mode         = "Risk-Off" if liquidity_stress or (norm_score < -15) else "Risk-On"
+
+    # ── Trap detection ──────────────────────────────────────────────────────────
+    gift_pct   = direct_data.get("Gift Nifty") or 0.0
+    us_avg     = sum(direct_data.get(x, 0) or 0 for x in ["S&P 500", "NASDAQ", "Dow Jones"]) / 3
+    asia_avg   = sum(direct_data.get(x, 0) or 0
+                     for x in ["Nikkei 225", "Hang Seng", "KOSPI", "Shanghai"]) / 4
+    global_avg = (us_avg + asia_avg) / 2
+
+    if global_avg > 0.5 and gift_pct < -0.3:
+        trap = "Bull Trap Risk"
+        trap_color = "#ff8c00"
+    elif global_avg < -0.5 and gift_pct > 0.3:
+        trap = "Bear Trap Risk"
+        trap_color = "#ffd700"
+    else:
+        trap = "None"
+        trap_color = "#00ff88"
+
+    # ── Gap prediction ──────────────────────────────────────────────────────────
+    if gift_pct >= 0.4:   gap_pred, gap_color = "Gap Up",   "#00ff88"
+    elif gift_pct <= -0.4: gap_pred, gap_color = "Gap Down", "#ff2244"
+    else:                  gap_pred, gap_color = "Flat",      "#ffd700"
+
+    # ── Volatility expectation ──────────────────────────────────────────────────
+    vix_avg = (abs(india_vix_p) + abs(us_vix_p)) / 2
+    if vix_avg > 5 or volatility_shock:
+        vol_exp, vol_color = "High",   "#ff2244"
+    elif vix_avg > 2:
+        vol_exp, vol_color = "Medium", "#ffd700"
+    else:
+        vol_exp, vol_color = "Low",    "#00ff88"
+
+    # ── Most influential indicator ──────────────────────────────────────────────
+    all_impacts = {**{k: abs(v) for k, v in direct_scores.items()},
+                   **{k: abs(v) for k, v in reverse_scores.items()}}
+    top_indicator = max(all_impacts, key=all_impacts.get)
+
+    # ══════════════════════════════ DISPLAY ════════════════════════════════════
+
+    # Row 1 — Summary headline cards
+    c1, c2, c3, c4 = st.columns(4)
+    def _card(col, label, value, color, sub=""):
+        col.markdown(
+            f"""<div style='background:#0d1b2a;border:1px solid {color};border-radius:10px;
+                            padding:14px;text-align:center;'>
+                    <div style='color:#aaa;font-size:11px;letter-spacing:1px;'>{label}</div>
+                    <div style='color:{color};font-size:20px;font-weight:700;margin:4px 0;'>{value}</div>
+                    <div style='color:#888;font-size:11px;'>{sub}</div>
+                </div>""",
+            unsafe_allow_html=True,
+        )
+
+    _card(c1, "GLOBAL SENTIMENT", sentiment, s_color)
+    _card(c2, "GLOBAL SCORE",     f"{norm_score:+d}",   s_color, "Scale: ±100")
+    _card(c3, "GAP PROBABILITY",  gap_pred,   gap_color, f"Gift Nifty {gift_pct:+.2f}%")
+    _card(c4, "VOLATILITY",       vol_exp,    vol_color, f"VIX Avg {vix_avg:.1f}%")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Row 2 — Risk / Trap / Energy
+    r1, r2, r3, r4 = st.columns(4)
+    risk_color = "#ff2244" if risk_mode == "Risk-Off" else "#00ff88"
+    _card(r1, "RISK MODE",              risk_mode,      risk_color)
+    _card(r2, "TRAP RISK",              trap,           trap_color)
+    _card(r3, "MOST INFLUENTIAL",       top_indicator,  "#00d4ff")
+    _card(r4, "ENERGY SHOCK",
+          "ACTIVE" if energy_shock else "CLEAR",
+          "#ff2244" if energy_shock else "#00ff88",
+          f"Crude {crude_pct:+.2f}%")
+
+    st.markdown("---")
+
+    # ── Direct Correlation Table ────────────────────────────────────────────────
+    st.markdown(
+        "<h4 style='color:#00ff88;'>📈 Direct Correlation Indicators</h4>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Rise → Bullish  |  Fall → Bearish")
+
+    d_rows = []
+    for name in DIRECT_TICKERS:
+        pct   = direct_data.get(name)
+        score = direct_scores.get(name, 0)
+        pct_s = f"{pct:+.2f}%" if pct is not None else "N/A"
+        if score > 0:   arrow, clr = "▲", "#00ff88"
+        elif score < 0: arrow, clr = "▼", "#ff2244"
+        else:           arrow, clr = "—", "#ffd700"
+        d_rows.append((name, pct_s, arrow, score, clr))
+
+    cols = st.columns([3, 2, 1, 1, 3])
+    for hdr, w in zip(["Indicator", "Change %", "Dir", "Score", "Signal"], cols):
+        w.markdown(f"**{hdr}**")
+    for name, pct_s, arrow, score, clr in d_rows:
+        if   score >= 5:  label = "Bullish"
+        elif score <= -5: label = "Bearish"
+        else:             label = "Neutral"
+        c1, c2, c3, c4, c5 = st.columns([3, 2, 1, 1, 3])
+        c1.write(name)
+        c2.write(pct_s)
+        c3.markdown(f"<span style='color:{clr}'>{arrow}</span>", unsafe_allow_html=True)
+        c4.markdown(f"<span style='color:{clr}'>{score:+d}</span>", unsafe_allow_html=True)
+        c5.markdown(f"<span style='color:{clr}'>{label}</span>", unsafe_allow_html=True)
+
+    direct_total = sum(direct_scores.values())
+    st.markdown(
+        f"<div style='text-align:right;color:#00ff88;font-weight:700;'>"
+        f"Direct Sub-Total: {direct_total:+d}</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # ── Reverse Correlation Table ───────────────────────────────────────────────
+    st.markdown(
+        "<h4 style='color:#ff8c00;'>📉 Reverse Correlation Indicators</h4>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Rise → Bearish  |  Fall → Bullish")
+
+    r_rows = []
+    for name in REVERSE_TICKERS:
+        pct   = reverse_data.get(name)
+        score = reverse_scores.get(name, 0)
+        pct_s = f"{pct:+.2f}%" if pct is not None else "N/A"
+        if score > 0:   arrow, clr = "▲", "#00ff88"
+        elif score < 0: arrow, clr = "▼", "#ff2244"
+        else:           arrow, clr = "—", "#ffd700"
+        r_rows.append((name, pct_s, arrow, score, clr))
+
+    cols2 = st.columns([3, 2, 1, 1, 3])
+    for hdr, w in zip(["Indicator", "Change %", "Dir", "Score", "Impact"], cols2):
+        w.markdown(f"**{hdr}**")
+    for name, pct_s, arrow, score, clr in r_rows:
+        if   score >= 5:  label = "Bullish Impact"
+        elif score <= -5: label = "Bearish Impact"
+        else:             label = "Neutral"
+        suffix = " (partial)" if name == "Gold" else ""
+        c1, c2, c3, c4, c5 = st.columns([3, 2, 1, 1, 3])
+        c1.write(f"{name}{suffix}")
+        c2.write(pct_s)
+        c3.markdown(f"<span style='color:{clr}'>{arrow}</span>", unsafe_allow_html=True)
+        c4.markdown(f"<span style='color:{clr}'>{score:+d}</span>", unsafe_allow_html=True)
+        c5.markdown(f"<span style='color:{clr}'>{label}</span>", unsafe_allow_html=True)
+
+    reverse_total = sum(reverse_scores.values())
+    st.markdown(
+        f"<div style='text-align:right;color:#ff8c00;font-weight:700;'>"
+        f"Reverse Sub-Total: {reverse_total:+d}</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # ── Special Conditions ──────────────────────────────────────────────────────
+    st.markdown("<h4 style='color:#00d4ff;'>⚠️ Special Conditions</h4>", unsafe_allow_html=True)
+    cond_cols = st.columns(4)
+    def _cond(col, title, active, detail=""):
+        clr = "#ff2244" if active else "#00ff88"
+        badge = "🔴 ACTIVE" if active else "🟢 CLEAR"
+        col.markdown(
+            f"""<div style='background:#0d1b2a;border:1px solid {clr};border-radius:8px;
+                            padding:12px;text-align:center;'>
+                    <div style='color:#aaa;font-size:11px;'>{title}</div>
+                    <div style='color:{clr};font-weight:700;margin:4px 0;'>{badge}</div>
+                    <div style='color:#888;font-size:11px;'>{detail}</div>
+                </div>""",
+            unsafe_allow_html=True,
+        )
+    _cond(cond_cols[0], "Currency Pressure",
+          currency_pressure, f"USDINR {usdinr_pct:+.2f}% | DXY {dxy_pct:+.2f}%")
+    _cond(cond_cols[1], "Volatility Shock",
+          volatility_shock,  f"India VIX {india_vix_p:+.2f}% | US VIX {us_vix_p:+.2f}%")
+    _cond(cond_cols[2], "Energy Shock",
+          energy_shock,      f"Crude {crude_pct:+.2f}%")
+    _cond(cond_cols[3], "Liquidity Stress",
+          liquidity_stress,  "DXY+Yield+Crude+VIX all rising")
+
+    st.markdown("---")
+
+    # ── Impact Summary ──────────────────────────────────────────────────────────
+    st.markdown("<h4 style='color:#00d4ff;'>📊 Impact Summary</h4>", unsafe_allow_html=True)
+    imp1, imp2, imp3 = st.columns(3)
+
+    # Currency
+    cur_impact = "NEGATIVE" if (usdinr_pct > 0.3 or dxy_pct > 0.3) else \
+                 "POSITIVE" if (usdinr_pct < -0.3 or dxy_pct < -0.3) else "NEUTRAL"
+    cur_clr    = "#ff2244" if cur_impact == "NEGATIVE" else \
+                 "#00ff88" if cur_impact == "POSITIVE" else "#ffd700"
+
+    # Commodity
+    com_impact = "NEGATIVE" if crude_pct > 1.0 else \
+                 "POSITIVE" if crude_pct < -1.0 else "NEUTRAL"
+    com_clr    = "#ff2244" if com_impact == "NEGATIVE" else \
+                 "#00ff88" if com_impact == "POSITIVE" else "#ffd700"
+
+    # Volatility
+    vol_impact = "HIGH RISK" if volatility_shock else \
+                 "ELEVATED"  if vix_avg > 2 else "LOW"
+    vol_imp_clr= "#ff2244" if vol_impact == "HIGH RISK" else \
+                 "#ffd700"  if vol_impact == "ELEVATED"  else "#00ff88"
+
+    imp1.markdown(
+        f"""<div style='background:#0d1b2a;border:1px solid {cur_clr};border-radius:8px;padding:14px;'>
+            <div style='color:#aaa;font-size:11px;'>Currency Impact</div>
+            <div style='color:{cur_clr};font-weight:700;font-size:18px;'>{cur_impact}</div>
+            <div style='color:#888;font-size:11px;'>USDINR {usdinr_pct:+.2f}% | DXY {dxy_pct:+.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+    imp2.markdown(
+        f"""<div style='background:#0d1b2a;border:1px solid {com_clr};border-radius:8px;padding:14px;'>
+            <div style='color:#aaa;font-size:11px;'>Commodity Impact</div>
+            <div style='color:{com_clr};font-weight:700;font-size:18px;'>{com_impact}</div>
+            <div style='color:#888;font-size:11px;'>Crude {crude_pct:+.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+    imp3.markdown(
+        f"""<div style='background:#0d1b2a;border:1px solid {vol_imp_clr};border-radius:8px;padding:14px;'>
+            <div style='color:#aaa;font-size:11px;'>Volatility Impact</div>
+            <div style='color:{vol_imp_clr};font-weight:700;font-size:18px;'>{vol_impact}</div>
+            <div style='color:#888;font-size:11px;'>India VIX {india_vix_p:+.2f}% | US {us_vix_p:+.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Final Score Banner ──────────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div style='background:linear-gradient(90deg,#0d1b2a,#0a0a1a);
+                    border:2px solid {s_color};border-radius:12px;padding:22px;text-align:center;margin-top:10px;'>
+            <div style='color:#aaa;font-size:13px;letter-spacing:2px;'>GLOBAL SENTIMENT SCORE</div>
+            <div style='color:{s_color};font-size:48px;font-weight:900;margin:8px 0;'>{norm_score:+d}</div>
+            <div style='color:{s_color};font-size:20px;font-weight:700;letter-spacing:3px;'>{sentiment}</div>
+            <div style='color:#888;font-size:12px;margin-top:8px;'>
+                Direct: {direct_total:+d} &nbsp;|&nbsp; Reverse: {reverse_total:+d} &nbsp;|&nbsp;
+                Gap: {gap_pred} &nbsp;|&nbsp; Risk: {risk_mode} &nbsp;|&nbsp; Trap: {trap}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def show_bn_dashboard(nifty_df: pd.DataFrame = None, interval: str = "1"):
     """Full Bank Nifty Dashboard — Pine Script converted to Python/Streamlit."""
     st.markdown("### 📊 Bank Nifty Multi-Ticker Dashboard")
@@ -19798,6 +20155,14 @@ def main():
             )
         except Exception as _mse_err:
             st.warning(f"Market Sentiment Engine error: {str(_mse_err)}")
+
+    # ===== GLOBAL CORRELATION INTELLIGENCE ENGINE =====
+    st.markdown("---")
+    with st.expander("🌐 Global Correlation Intelligence Engine — Pre-Market NIFTY Direction", expanded=True):
+        try:
+            show_global_correlation_intelligence()
+        except Exception as _gci_err:
+            st.warning(f"Global Correlation Intelligence Engine error: {str(_gci_err)}")
 
     # ===== ML MARKET INTELLIGENCE REPORT =====
     st.markdown("---")
