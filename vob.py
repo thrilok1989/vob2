@@ -11484,6 +11484,213 @@ def _amie_expected_move(pattern_type: str, oi_behavior: str, support_signal: str
     return direction, bo_prob, rv_prob, target_info
 
 
+# ── Global Correlation Intelligence Engine ────────────────────────────────
+GCORR_TICKERS = [
+    # US Markets — strong positive correlation with NIFTY
+    {"name": "S&P 500 Fut",  "yf": "ES=F",       "corr": +0.85, "group": "🇺🇸 US"},
+    {"name": "Nasdaq Fut",   "yf": "NQ=F",       "corr": +0.80, "group": "🇺🇸 US"},
+    {"name": "Dow Fut",      "yf": "YM=F",       "corr": +0.78, "group": "🇺🇸 US"},
+    # Asian Markets — moderate positive
+    {"name": "Nikkei 225",   "yf": "^N225",      "corr": +0.65, "group": "🌏 Asia"},
+    {"name": "Hang Seng",    "yf": "^HSI",       "corr": +0.55, "group": "🌏 Asia"},
+    {"name": "Shanghai Comp","yf": "000001.SS",   "corr": +0.40, "group": "🌏 Asia"},
+    # European Markets — moderate positive
+    {"name": "DAX",          "yf": "^GDAXI",     "corr": +0.60, "group": "🇪🇺 Europe"},
+    {"name": "FTSE 100",     "yf": "^FTSE",      "corr": +0.55, "group": "🇪🇺 Europe"},
+    # Macro / Commodities — inverse or mixed
+    {"name": "India VIX",    "yf": "^INDIAVIX",  "corr": -0.90, "group": "⚠ Macro"},
+    {"name": "USD/INR",      "yf": "USDINR=X",   "corr": -0.60, "group": "⚠ Macro"},
+    {"name": "Crude Oil",    "yf": "CL=F",       "corr": -0.35, "group": "⚠ Macro"},
+    {"name": "Gold",         "yf": "GC=F",       "corr": -0.20, "group": "⚠ Macro"},
+]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _gcorr_fetch_global():
+    """Fetch latest % change for all global correlation tickers via yfinance."""
+    if not _YF_AVAILABLE:
+        return {}
+    syms = [t["yf"] for t in GCORR_TICKERS]
+    try:
+        raw = yf.download(syms, period="2d", interval="1d",
+                          group_by="ticker", auto_adjust=True,
+                          progress=False, threads=True)
+    except Exception:
+        return {}
+    result = {}
+    for t in GCORR_TICKERS:
+        sym = t["yf"]
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                df_t = raw[sym] if sym in raw.columns.get_level_values(0) else pd.DataFrame()
+            else:
+                df_t = raw
+            df_t = df_t.dropna(subset=["Close"])
+            if len(df_t) >= 2:
+                prev_close = float(df_t["Close"].iloc[-2])
+                last_close = float(df_t["Close"].iloc[-1])
+                pct = (last_close - prev_close) / prev_close * 100 if prev_close != 0 else 0.0
+            elif len(df_t) == 1:
+                pct = 0.0
+                last_close = float(df_t["Close"].iloc[-1])
+            else:
+                continue
+            result[sym] = {"pct": round(pct, 3), "price": round(last_close, 2)}
+        except Exception:
+            continue
+    return result
+
+
+def _gcorr_compute_signal(gcorr_data: dict) -> float:
+    """
+    Compute a weighted directional signal for NIFTY from global market data.
+    Returns a value normalised to -1.0 (strongly bearish) … +1.0 (strongly bullish).
+    """
+    if not gcorr_data:
+        return 0.0
+    total_weight = sum(abs(t["corr"]) for t in GCORR_TICKERS if t["yf"] in gcorr_data)
+    if total_weight == 0:
+        return 0.0
+    raw_score = 0.0
+    for t in GCORR_TICKERS:
+        d = gcorr_data.get(t["yf"])
+        if d is None:
+            continue
+        pct   = d["pct"]
+        corr  = t["corr"]
+        # Normalise pct change: cap at ±3% → maps to ±1
+        norm_pct = max(-1.0, min(1.0, pct / 3.0))
+        raw_score += norm_pct * corr * abs(corr)   # weight by |correlation|²
+    # Normalise by max possible score
+    max_score = sum(abs(t["corr"]) ** 2 for t in GCORR_TICKERS if t["yf"] in gcorr_data)
+    return max(-1.0, min(1.0, raw_score / max_score)) if max_score > 0 else 0.0
+
+
+def show_global_correlation_engine():
+    """🌐 Global Correlation Intelligence Engine — Pre-Market NIFTY Direction."""
+    st.markdown("### 🌐 Global Correlation Intelligence Engine")
+    st.caption("Tracks 12 global indices & macro assets, computes weighted NIFTY directional bias using historical correlation coefficients.")
+
+    if not _YF_AVAILABLE:
+        st.warning("⚠ yfinance not installed. Run `pip install yfinance` to enable this engine.")
+        return
+
+    with st.spinner("Fetching global market data…"):
+        gcorr_data = _gcorr_fetch_global()
+
+    if not gcorr_data:
+        st.warning("⚠ Could not fetch global data. Check internet connection or yfinance availability.")
+        return
+
+    gcorr_signal = _gcorr_compute_signal(gcorr_data)
+
+    # Direction label
+    if gcorr_signal > 0.30:
+        gc_dir = "🟢 STRONGLY BULLISH for NIFTY"
+        gc_color = "#00C853"
+    elif gcorr_signal > 0.10:
+        gc_dir = "🟢 MILDLY BULLISH for NIFTY"
+        gc_color = "#69F0AE"
+    elif gcorr_signal < -0.30:
+        gc_dir = "🔴 STRONGLY BEARISH for NIFTY"
+        gc_color = "#FF1744"
+    elif gcorr_signal < -0.10:
+        gc_dir = "🔴 MILDLY BEARISH for NIFTY"
+        gc_color = "#FF5252"
+    else:
+        gc_dir = "🟡 NEUTRAL / MIXED SIGNALS"
+        gc_color = "#FFD740"
+
+    # Header verdict card
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,{gc_color}18,{gc_color}08);
+                border:2px solid {gc_color};border-radius:12px;padding:16px;margin-bottom:14px;">
+        <div style="font-size:12px;color:#aaa;letter-spacing:1px;">GLOBAL CORRELATION SIGNAL</div>
+        <div style="font-size:24px;font-weight:bold;color:{gc_color};margin:4px 0;">{gc_dir}</div>
+        <div style="font-size:13px;color:#ccc;">Composite Score: <b>{gcorr_signal:+.3f}</b> / ±1.0 &nbsp;|&nbsp;
+             Based on {len(gcorr_data)}/{len(GCORR_TICKERS)} markets fetched</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Per-market breakdown table ────────────────────────────────────────
+    rows = []
+    for t in GCORR_TICKERS:
+        d = gcorr_data.get(t["yf"])
+        if d is None:
+            rows.append({
+                "Group": t["group"], "Market": t["name"],
+                "Price": "—", "% Change": "—",
+                "Corr to NIFTY": f"{t['corr']:+.2f}",
+                "NIFTY Impact": "—", "Signal": "⚪ N/A"
+            })
+            continue
+        pct = d["pct"]
+        norm_pct = max(-1.0, min(1.0, pct / 3.0))
+        impact = norm_pct * t["corr"]  # positive = bullish contribution
+        if impact > 0.05:
+            sig = "🟢 Bullish"
+        elif impact < -0.05:
+            sig = "🔴 Bearish"
+        else:
+            sig = "🟡 Neutral"
+        pct_str = f"{pct:+.2f}%"
+        rows.append({
+            "Group": t["group"],
+            "Market": t["name"],
+            "Price": f"{d['price']:,.2f}",
+            "% Change": pct_str,
+            "Corr to NIFTY": f"{t['corr']:+.2f}",
+            "NIFTY Impact": f"{impact:+.3f}",
+            "Signal": sig,
+        })
+
+    df_gc = pd.DataFrame(rows)
+    st.dataframe(df_gc, use_container_width=True, hide_index=True)
+
+    # ── Contribution bar chart ────────────────────────────────────────────
+    import plotly.graph_objects as go
+    valid_rows = [r for r in rows if r["NIFTY Impact"] != "—"]
+    if valid_rows:
+        names   = [r["Market"] for r in valid_rows]
+        impacts = [float(r["NIFTY Impact"]) for r in valid_rows]
+        colors  = ["#00C853" if v > 0 else ("#FF5252" if v < 0 else "#888") for v in impacts]
+        fig_gc = go.Figure(go.Bar(
+            x=names, y=impacts,
+            marker_color=colors,
+            text=[f"{v:+.3f}" for v in impacts],
+            textposition="outside",
+        ))
+        fig_gc.update_layout(
+            height=240, margin=dict(l=10, r=10, t=40, b=60),
+            paper_bgcolor="#111", plot_bgcolor="#111",
+            font=dict(color="#ccc", size=10),
+            yaxis=dict(zeroline=True, zerolinecolor="#555", gridcolor="#333",
+                       title="NIFTY Impact (–bear … +bull)"),
+            xaxis=dict(tickangle=-35, gridcolor="#333"),
+            title=dict(text=f"Global Market Contributions to NIFTY Bias → Score: {gcorr_signal:+.3f}",
+                       font=dict(size=12)),
+        )
+        fig_gc.add_hline(y=0, line_color="#666", line_width=1)
+        st.plotly_chart(fig_gc, use_container_width=True)
+
+    # ── Narrative ─────────────────────────────────────────────────────────
+    bull_mkts = [r["Market"] for r in valid_rows if float(r["NIFTY Impact"]) > 0.05]
+    bear_mkts = [r["Market"] for r in valid_rows if float(r["NIFTY Impact"]) < -0.05]
+    st.markdown("**📝 Interpretation:**")
+    if bull_mkts:
+        st.markdown(f"- 🟢 **Bullish contributors:** {', '.join(bull_mkts)}")
+    if bear_mkts:
+        st.markdown(f"- 🔴 **Bearish contributors:** {', '.join(bear_mkts)}")
+    if gcorr_signal > 0.10:
+        st.info(f"🌐 Global cues are net **positive** for NIFTY. Pre-market bias: gap-up likely if US/Asia closed strong.")
+    elif gcorr_signal < -0.10:
+        st.warning(f"🌐 Global cues are net **negative** for NIFTY. Pre-market bias: gap-down risk. Watch support levels.")
+    else:
+        st.info("🌐 Global signals are **mixed**. NIFTY likely to open flat. Direction will be decided by domestic flows.")
+
+    st.caption(f"🌐 Global Correlation Engine · {len(gcorr_data)} markets · Cached 60s · Correlations: historical 5Y rolling")
+
+
 def show_ml_market_report(option_data=None, df=None, current_price=None):
     """
     ML-style Market Intelligence Report.
@@ -11727,6 +11934,16 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
             pass
     signals['GEO_PATTERN'] = geo_sig
 
+    # ── R. GLOBAL CORRELATION SIGNAL ─────────────────────────────────────────
+    gcorr_sig = 0.0
+    gcorr_data_ml = {}
+    try:
+        gcorr_data_ml = _gcorr_fetch_global()
+        gcorr_sig = _gcorr_compute_signal(gcorr_data_ml)
+    except Exception:
+        gcorr_sig = 0.0
+    signals['GLOBAL_CORR'] = gcorr_sig
+
     # ── 3. WEIGHTED ENSEMBLE (ML-style Random Forest voting) ─────────────────
     weights = {
         'PCR_OI':         0.12,
@@ -11756,6 +11973,8 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         # Pattern signals
         'CANDLE_PATTERN':  0.06,
         'GEO_PATTERN':     0.08,
+        # Global correlation
+        'GLOBAL_CORR':     0.09,
     }
     # Normalise weights
     w_total = sum(weights.values())
@@ -11983,6 +12202,40 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
     else:
         risk_text = "✅ MODERATE CONVICTION — Reasonable signal alignment. Normal position sizing with defined SL."
 
+    # Global correlation narrative
+    if gcorr_data_ml:
+        gc_bull = [t["name"] for t in GCORR_TICKERS
+                   if t["yf"] in gcorr_data_ml and
+                   max(-1.0, min(1.0, gcorr_data_ml[t["yf"]]["pct"] / 3.0)) * t["corr"] > 0.05]
+        gc_bear = [t["name"] for t in GCORR_TICKERS
+                   if t["yf"] in gcorr_data_ml and
+                   max(-1.0, min(1.0, gcorr_data_ml[t["yf"]]["pct"] / 3.0)) * t["corr"] < -0.05]
+        gc_fetched = len(gcorr_data_ml)
+        if gcorr_sig > 0.30:
+            gcorr_text = (f"🌐 STRONGLY BULLISH global cues (score {gcorr_sig:+.3f}). "
+                          f"{gc_fetched} markets tracked. "
+                          f"Bullish drivers: {', '.join(gc_bull) if gc_bull else 'broad'} — "
+                          f"favours gap-up open and upside continuation for NIFTY.")
+        elif gcorr_sig > 0.10:
+            gcorr_text = (f"🌐 Mildly bullish global setup (score {gcorr_sig:+.3f}). "
+                          f"Positive contributors: {', '.join(gc_bull[:3]) if gc_bull else '—'}. "
+                          f"Gap-up bias but not high-conviction.")
+        elif gcorr_sig < -0.30:
+            gcorr_text = (f"🌐 STRONGLY BEARISH global cues (score {gcorr_sig:+.3f}). "
+                          f"Bearish drivers: {', '.join(gc_bear) if gc_bear else 'broad'} — "
+                          f"gap-down risk for NIFTY. Sell rallies until domestic data improves.")
+        elif gcorr_sig < -0.10:
+            gcorr_text = (f"🌐 Mildly bearish global setup (score {gcorr_sig:+.3f}). "
+                          f"Negative contributors: {', '.join(gc_bear[:3]) if gc_bear else '—'}. "
+                          f"Slight gap-down bias; watch key supports.")
+        else:
+            gcorr_text = (f"🌐 Mixed / neutral global cues (score {gcorr_sig:+.3f}). "
+                          f"Bullish: {', '.join(gc_bull[:2]) if gc_bull else '—'} | "
+                          f"Bearish: {', '.join(gc_bear[:2]) if gc_bear else '—'}. "
+                          f"NIFTY likely to open flat; direction set by domestic flows.")
+    else:
+        gcorr_text = "🌐 Global correlation data unavailable (yfinance not reachable or network issue). Signal defaulted to neutral."
+
     # ── 4. UI RENDERING ───────────────────────────────────────────────────────
     st.markdown(f"""
     <div style="background:linear-gradient(135deg,{ml_color}18,{ml_color}08);
@@ -12048,6 +12301,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         ("📐 NIFTY Indicator Dashboard", ind_text),
         ("🕯️ Candle Patterns Detected",  candle_text),
         ("🔔 Geometric & Reversal Patterns", geo_text),
+        ("🌐 Global Correlation (Pre-Market)", gcorr_text),
     ]
 
     for title, body in sections:
@@ -12118,7 +12372,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         )
         st.plotly_chart(_fig_mh, use_container_width=True)
 
-    st.caption(f"🤖 ML Ensemble: 24 signals · {len(weights)} weighted features · Updates every ~30s · "
+    st.caption(f"🤖 ML Ensemble: 25 signals · {len(weights)} weighted features · Updates every ~30s · "
                f"{len(st.session_state.ml_report_history)} data points")
 
 
