@@ -266,7 +266,8 @@ CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
                     'exchange': exchange,
                     'timeframe': timeframe,
                     'timestamp': int(row['timestamp']),
-                    'datetime': row['datetime'].isoformat(),
+                    # Always store UTC so Supabase timestamptz column is correct
+                    'datetime': pd.to_datetime(int(row['timestamp']), unit='s', utc=True).isoformat(),
                     'open': float(row['open']),
                     'high': float(row['high']),
                     'low': float(row['low']),
@@ -295,13 +296,14 @@ CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
     def get_candle_data(self, symbol, exchange, timeframe, hours_back=24):
         """Retrieve candle data from Supabase — returns empty df on schema errors."""
         try:
-            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours_back)
+            # Use Unix timestamp for cutoff — avoids any timestamptz TZ mismatch
+            cutoff_ts = int((datetime.now(pytz.UTC) - timedelta(hours=hours_back)).timestamp())
             result = self.client.table('candle_data')\
                 .select('*')\
                 .eq('symbol', symbol)\
                 .eq('exchange', exchange)\
                 .eq('timeframe', timeframe)\
-                .gte('datetime', cutoff_time.isoformat())\
+                .gte('timestamp', cutoff_ts)\
                 .order('timestamp', desc=False)\
                 .execute()
             if result.data:
@@ -326,11 +328,10 @@ CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
     def clear_old_candle_data(self, days_old=7):
         """Clear candle data older than specified days"""
         try:
-            cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days_old)
-            
+            cutoff_ts = int((datetime.now(pytz.UTC) - timedelta(days=days_old)).timestamp())
             result = self.client.table('candle_data')\
                 .delete()\
-                .lt('datetime', cutoff_date.isoformat())\
+                .lt('timestamp', cutoff_ts)\
                 .execute()
             
             return len(result.data) if result.data else 0
@@ -14482,10 +14483,14 @@ def main():
                 st.session_state['nifty_chart_df'] = df
 
             _max_dt = df['datetime'].max() if not df.empty else None
-            _max_utc = (_max_dt.tz_convert(pytz.UTC) if _max_dt is not None and _max_dt.tzinfo else _max_dt.tz_localize(pytz.timezone('Asia/Kolkata')).tz_convert(pytz.UTC)) if _max_dt is not None else None
+            # Use Unix timestamp for staleness — avoids timestamptz TZ mismatch where
+            # IST naive times stored without TZ get treated as UTC by Supabase,
+            # making (now_UTC - stored_UTC) appear negative and skipping the API call.
+            _max_ts = int(df['timestamp'].max()) if not df.empty and 'timestamp' in df.columns else None
             # Stale threshold = candle interval in seconds (no point fetching more often)
             _interval_secs = int(interval) * 60
-            if df.empty or _max_utc is None or (datetime.now(pytz.UTC) - _max_utc).total_seconds() > _interval_secs:
+            import time as _time
+            if df.empty or _max_ts is None or (_time.time() - _max_ts) > _interval_secs:
                 with st.spinner("Fetching latest data from API..."):
                     data = api.get_intraday_data(
                         security_id="13",
