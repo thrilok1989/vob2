@@ -20954,6 +20954,7 @@ def main():
                 underlying_price=_iofce_price,
                 cie_signals=_iofce_cie_sigs,
                 send_telegram=_iofce_tg,
+                ultimate_rsi_data=ultimate_rsi_data_for_chart if 'ultimate_rsi_data_for_chart' in dir() else None,
             )
         except Exception as _iofce_err:
             st.warning(f"Institutional Order Flow Engine error: {str(_iofce_err)}")
@@ -22027,7 +22028,8 @@ def run_iofce(option_data: dict, df, underlying_price: float,
 
 
 def _iofce_build_telegram_message(res: dict, underlying_price: float,
-                                   dominant_signal: dict) -> str:
+                                   dominant_signal: dict,
+                                   ultimate_rsi_data: dict = None) -> str:
     """Format Telegram alert message for IOFCE result."""
     inst_score  = res["institutional_score"]
     classif     = res["classification"]
@@ -22086,6 +22088,33 @@ def _iofce_build_telegram_message(res: dict, underlying_price: float,
                 f"Conf:{s.get('confidence',0)}%  Adj:{s.get('iofce_adjustment','-')}"
             )
 
+    # RSI section
+    if ultimate_rsi_data:
+        ursi_val      = ultimate_rsi_data.get('latest_arsi', 50)
+        ursi_sig      = ultimate_rsi_data.get('latest_signal', 50)
+        ursi_zone     = ultimate_rsi_data.get('zone', 'Neutral')
+        ursi_cross    = ultimate_rsi_data.get('cross_signal', 'None')
+        ursi_momentum = ultimate_rsi_data.get('momentum', 'Neutral')
+
+        if ursi_zone == 'Overbought':
+            rsi_zone_icon = "🔴"
+            rsi_note      = "Overbought — watch for bearish reversal"
+        elif ursi_zone == 'Oversold':
+            rsi_zone_icon = "🟢"
+            rsi_note      = "Oversold — watch for bullish bounce"
+        else:
+            rsi_zone_icon = "⚪"
+            rsi_note      = "Neutral zone"
+
+        cross_icon = "🔼" if 'Bullish' in ursi_cross else ("🔽" if 'Bearish' in ursi_cross else "➖")
+        lines += [
+            "",
+            f"<b>📈 Ultimate RSI (LuxAlgo):</b>",
+            f"  Value: {ursi_val:.1f}  |  Signal: {ursi_sig:.1f}",
+            f"  Zone: {rsi_zone_icon} <b>{ursi_zone}</b> — {rsi_note}",
+            f"  Momentum: {ursi_momentum}  |  Cross: {cross_icon} {ursi_cross}",
+        ]
+
     lines += ["", f"<b>Guidance:</b> {sig_adj}"]
     if underlying_price:
         lines.append(f"<b>NIFTY Spot:</b> ₹{underlying_price:,.0f}")
@@ -22094,7 +22123,7 @@ def _iofce_build_telegram_message(res: dict, underlying_price: float,
 
 
 def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list,
-               send_telegram: bool = False):
+               send_telegram: bool = False, ultimate_rsi_data: dict = None):
     """UI panel for the Institutional Order Flow Confirmation Engine."""
     st.markdown("#### 🏦 Institutional Order Flow Confirmation Engine")
     st.caption(
@@ -22247,7 +22276,8 @@ def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list
                 _buy  = [s for s in cie_signals if s.get('direction') == 'BUY']
                 _dom_sig = (_sell[0] if len(_sell) >= len(_buy) and _sell
                             else (_buy[0] if _buy else cie_signals[0]))
-            msg = _iofce_build_telegram_message(res, underlying_price, _dom_sig)
+            msg = _iofce_build_telegram_message(res, underlying_price, _dom_sig,
+                                                ultimate_rsi_data=ultimate_rsi_data)
             try:
                 send_telegram_message_sync(msg)
                 st.session_state.iofce_last_alert = _now
