@@ -14202,6 +14202,8 @@ def main():
     # Cross-Market Confirmation Engine
     if 'cmce_last_alert' not in st.session_state:
         st.session_state.cmce_last_alert = None     # datetime of last CMCE Telegram alert
+    if 'iofce_last_alert' not in st.session_state:
+        st.session_state.iofce_last_alert = None    # datetime of last IOFCE Telegram alert
 
     # Initialize Supabase
     try:
@@ -20943,11 +20945,15 @@ def main():
             _iofce_cie_sigs = _cie_signals if '_cie_signals' in dir() and not df.empty else []
             _iofce_price    = current_price if current_price else (
                 option_data.get('underlying') if option_data else None)
+            _iofce_tg = enable_signals and bool(
+                option_data and option_data.get('underlying')
+            )
             show_iofce(
                 option_data=option_data if option_data else {},
                 df=df if not df.empty else None,
                 underlying_price=_iofce_price,
                 cie_signals=_iofce_cie_sigs,
+                send_telegram=_iofce_tg,
             )
         except Exception as _iofce_err:
             st.warning(f"Institutional Order Flow Engine error: {str(_iofce_err)}")
@@ -22020,7 +22026,75 @@ def run_iofce(option_data: dict, df, underlying_price: float,
     return result
 
 
-def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list):
+def _iofce_build_telegram_message(res: dict, underlying_price: float,
+                                   dominant_signal: dict) -> str:
+    """Format Telegram alert message for IOFCE result."""
+    inst_score  = res["institutional_score"]
+    classif     = res["classification"]
+    trap_risk   = res["trap_risk"]
+    sig_adj     = res["signal_adjustment"]
+    zones       = res.get("zones", {})
+
+    score_emoji = "🔥" if inst_score >= 6 else ("📊" if inst_score >= 3 else "⚠️")
+    trap_emoji  = "🟢" if trap_risk == "Low" else ("🟡" if trap_risk == "Medium" else "🔴")
+    dir_arrow   = ""
+    if dominant_signal:
+        d = dominant_signal.get("direction", "")
+        dir_arrow = "🟢 BUY" if d == "BUY" else ("🔴 SELL" if d == "SELL" else "")
+
+    lines = [
+        f"<b>🏦 Institutional Order Flow Confirmation</b>",
+        "",
+    ]
+    if dir_arrow:
+        lines.append(f"<b>Signal:</b> {dir_arrow}  |  {dominant_signal.get('pattern', '')}")
+    lines += [
+        f"<b>Inst. Score:</b> {score_emoji} {inst_score} / 8",
+        f"<b>Classification:</b> {classif}",
+        f"<b>Trap Risk:</b> {trap_emoji} {trap_risk}",
+        "",
+        "<b>Component Breakdown:</b>",
+        f"  OI Activity:        {res['oi_label']} ({res['oi_score']}/2)",
+        f"  Futures Pos:        {res['futures_label']} ({res['futures_score']}/2)",
+        f"  Depth Absorption:   {res['depth_label']} ({res['depth_score']}/2)",
+        f"  Gamma Reaction:     {res['gamma_label']} ({res['gamma_score']}/2)",
+    ]
+
+    # Zones
+    zone_label_map = {
+        "max_pain":            "Max Pain",
+        "oi_resistance":       "OI Resistance",
+        "oi_support":          "OI Support",
+        "gamma_flip":          "Gamma Flip",
+    }
+    zone_parts = [
+        f"{zone_label_map[k]}: ₹{v:,.0f}"
+        for k, v in zones.items()
+        if v is not None and k in zone_label_map
+    ]
+    if zone_parts:
+        lines += ["", "<b>Key Levels:</b>  " + "  |  ".join(zone_parts)]
+
+    # Adjusted signals summary
+    adj_sigs = res.get("adjusted_signals", [])
+    if adj_sigs:
+        lines.append("")
+        lines.append("<b>IOFCE-Adjusted Signals:</b>")
+        for s in adj_sigs[:3]:  # cap at 3 to keep message concise
+            lines.append(
+                f"  {s.get('direction','')} {s.get('pattern','')} → "
+                f"Conf:{s.get('confidence',0)}%  Adj:{s.get('iofce_adjustment','-')}"
+            )
+
+    lines += ["", f"<b>Guidance:</b> {sig_adj}"]
+    if underlying_price:
+        lines.append(f"<b>NIFTY Spot:</b> ₹{underlying_price:,.0f}")
+
+    return "\n".join(lines)
+
+
+def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list,
+               send_telegram: bool = False):
     """UI panel for the Institutional Order Flow Confirmation Engine."""
     st.markdown("#### 🏦 Institutional Order Flow Confirmation Engine")
     st.caption(
@@ -22160,6 +22234,26 @@ def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list
     <span style='color:#ff4444'>≤2 Retail / Trap Risk</span>
     </div>
     """, unsafe_allow_html=True)
+
+    # ── Telegram Alert (rate-limited to 5 min) ────────────────────────
+    if send_telegram:
+        _now  = datetime.now(pytz.timezone('Asia/Kolkata'))
+        _last = st.session_state.get('iofce_last_alert')
+        if _last is None or (_now - _last).total_seconds() > 300:
+            # Derive dominant signal for the message
+            _dom_sig = None
+            if cie_signals:
+                _sell = [s for s in cie_signals if s.get('direction') == 'SELL']
+                _buy  = [s for s in cie_signals if s.get('direction') == 'BUY']
+                _dom_sig = (_sell[0] if len(_sell) >= len(_buy) and _sell
+                            else (_buy[0] if _buy else cie_signals[0]))
+            msg = _iofce_build_telegram_message(res, underlying_price, _dom_sig)
+            try:
+                send_telegram_message_sync(msg)
+                st.session_state.iofce_last_alert = _now
+                st.success("📨 Telegram IOFCE alert sent!")
+            except Exception as _tg_e:
+                st.warning(f"Telegram send failed: {_tg_e}")
 
 
 if __name__ == "__main__":
