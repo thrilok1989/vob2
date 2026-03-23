@@ -14199,6 +14199,9 @@ def main():
         st.session_state.cie_signal_history = []   # list of signal dicts with timestamp
     if 'cie_last_alert' not in st.session_state:
         st.session_state.cie_last_alert = {}        # pattern -> last alert datetime
+    # Cross-Market Confirmation Engine
+    if 'cmce_last_alert' not in st.session_state:
+        st.session_state.cmce_last_alert = None     # datetime of last CMCE Telegram alert
 
     # Initialize Supabase
     try:
@@ -20918,6 +20921,21 @@ def main():
         except Exception as _cie_err:
             st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
 
+    # ===== CROSS-MARKET REVERSAL CONFIRMATION ENGINE =====
+    st.markdown("---")
+    with st.expander("🔗 Cross-Market Reversal Confirmation Engine — Signal Validation", expanded=False):
+        try:
+            _cmce_cie_sigs = _cie_signals if '_cie_signals' in dir() and not df.empty else []
+            _cmce_tg = enable_signals and bool(
+                option_data and option_data.get('underlying')
+            )
+            show_cross_market_confirmation_engine(
+                cie_signals=_cmce_cie_sigs,
+                send_telegram=_cmce_tg,
+            )
+        except Exception as _cmce_err:
+            st.warning(f"Cross-Market Confirmation Engine error: {str(_cmce_err)}")
+
     # ===== FUTURES MARKET ANALYSIS ENGINE =====
     with st.expander("🔮 Futures Market Analysis Engine", expanded=False):
         try:
@@ -21061,6 +21079,350 @@ def main():
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S IST")
     st.sidebar.info(f"Last Updated: {current_time}")
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CROSS-MARKET REVERSAL CONFIRMATION ENGINE (CMCE)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cmce_fetch_candles(ticker: str, interval: str = "15m", period: str = "5d") -> pd.DataFrame:
+    """Fetch OHLCV candles for a ticker via yfinance. Returns empty DataFrame on failure."""
+    try:
+        import yfinance as yf
+        raw = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        # Flatten MultiIndex columns (yfinance ≥ 0.2)
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [str(col[0]).lower() for col in raw.columns]
+        else:
+            raw.columns = [str(col).lower() for col in raw.columns]
+        raw = raw.rename(columns={"adj close": "close"})
+        raw = raw.dropna()
+        return raw
+    except Exception:
+        return pd.DataFrame()
+
+
+def _cmce_detect_reversal(df: pd.DataFrame, signal_direction: str) -> dict:
+    """Detect reversal candle on the most recent candles of df.
+
+    signal_direction: 'BUY' or 'SELL'
+    Returns dict with keys: pattern (str), confirmed (bool)
+    """
+    if df.empty or len(df) < 3:
+        return {"pattern": "No Data", "confirmed": False}
+
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
+    o,  h,  l,  c  = float(last['open']),  float(last['high']),  float(last['low']),  float(last['close'])
+    po, ph, pl, pc = float(prev['open']),  float(prev['high']),  float(prev['low']),  float(prev['close'])
+    p2o, _,  _,  p2c = float(prev2['open']), float(prev2['high']), float(prev2['low']), float(prev2['close'])
+
+    body        = abs(c - o)
+    candle_range = h - l if h != l else 0.001
+    upper_wick  = h - max(o, c)
+    lower_wick  = min(o, c) - l
+    is_bull = c > o
+    is_bear = c < o
+
+    recent   = df.tail(10)
+    avg_body  = (recent['close'] - recent['open']).abs().mean() or 1.0
+    avg_range = (recent['high'] - recent['low']).mean() or 1.0
+
+    detected  = "Neutral"
+    confirmed = False
+
+    if signal_direction == 'SELL':
+        if pc < po and is_bear and c < po and o > pc and body > avg_body * 0.8:
+            detected, confirmed = "Bearish Engulfing", True
+        elif upper_wick > body * 2 and upper_wick > avg_range * 0.4 and upper_wick > candle_range * 0.45:
+            detected, confirmed = "Shooting Star", True
+        elif p2c > p2o and abs(pc - po) < avg_body * 0.5 and is_bear and c < p2c * 0.998:
+            detected, confirmed = "Evening Star", True
+        elif pc > po and is_bear and c < (po + pc) / 2 and o > pc:
+            detected, confirmed = "Dark Cloud Cover", True
+        elif is_bear and body > avg_body * 1.4 and upper_wick < body * 0.2:
+            detected, confirmed = "Bearish Marubozu", True
+        elif upper_wick > candle_range * 0.55 and upper_wick > body * 1.3:
+            detected, confirmed = "Upper Wick Rej", True
+    elif signal_direction == 'BUY':
+        if pc > po and is_bull and c > po and o < pc and body > avg_body * 0.8:
+            detected, confirmed = "Bull Engulfing", True
+        elif lower_wick > body * 2 and lower_wick > avg_range * 0.4 and lower_wick > candle_range * 0.45:
+            detected, confirmed = "Hammer", True
+        elif p2c < p2o and abs(pc - po) < avg_body * 0.5 and is_bull and c > p2c * 1.002:
+            detected, confirmed = "Morning Star", True
+        elif pc < po and is_bull and c > (po + pc) / 2 and o < pc:
+            detected, confirmed = "Piercing Pattern", True
+        elif is_bull and body > avg_body * 1.4 and lower_wick < body * 0.2:
+            detected, confirmed = "Bull Marubozu", True
+        elif lower_wick > candle_range * 0.55 and lower_wick > body * 1.3:
+            detected, confirmed = "Lower Wick Rej", True
+
+    return {"pattern": detected, "confirmed": confirmed}
+
+
+def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m") -> dict:
+    """Run Cross-Market Reversal Confirmation Engine.
+
+    Returns analysis dict with scores, classification, trap risk, and divergence flag.
+    """
+    INDIAN_MARKETS = [
+        {"name": "Bank Nifty", "ticker": "^NSEBANK", "weight": 2},
+        {"name": "Sensex",     "ticker": "^BSESN",   "weight": 1},
+        {"name": "Gift Nifty", "ticker": "^NSEI",    "weight": 2},
+    ]
+    REVERSE_INDICATORS = [
+        {"name": "India VIX",  "ticker": "^INDIAVIX", "weight": 2},
+        {"name": "Dollar/INR", "ticker": "USDINR=X",  "weight": 2},
+        {"name": "Crude Oil",  "ticker": "CL=F",      "weight": 1},
+    ]
+
+    period = "5d" if timeframe in ("5m", "15m") else "30d"
+    results = {
+        "signal_direction": signal_direction,
+        "timeframe": timeframe,
+        "indian_markets": [],
+        "reverse_indicators": [],
+        "index_score": 0,
+        "reverse_score": 0,
+        "total_score": 0,
+        "classification": "",
+        "trap_risk": "",
+        "divergence_detected": False,
+        "divergence_note": "",
+    }
+
+    for mkt in INDIAN_MARKETS:
+        df_m = _cmce_fetch_candles(mkt["ticker"], interval=timeframe, period=period)
+        res  = _cmce_detect_reversal(df_m, signal_direction)
+        score = mkt["weight"] if res["confirmed"] else 0
+        results["index_score"] += score
+        results["indian_markets"].append({
+            "name": mkt["name"], "ticker": mkt["ticker"],
+            "pattern": res["pattern"], "confirmed": res["confirmed"], "score": score,
+        })
+
+    # Reverse indicators: opposite candle confirms bearish/bullish macro alignment
+    opposite_dir = "BUY" if signal_direction == "SELL" else "SELL"
+    for ind in REVERSE_INDICATORS:
+        df_r = _cmce_fetch_candles(ind["ticker"], interval=timeframe, period=period)
+        res  = _cmce_detect_reversal(df_r, opposite_dir)
+        score = ind["weight"] if res["confirmed"] else 0
+        results["reverse_score"] += score
+        results["reverse_indicators"].append({
+            "name": ind["name"], "ticker": ind["ticker"],
+            "pattern": res["pattern"], "confirmed": res["confirmed"], "score": score,
+        })
+
+    # Divergence: Bank Nifty and Sensex confirming opposite directions
+    bn_conf = next((m["confirmed"] for m in results["indian_markets"] if m["name"] == "Bank Nifty"), False)
+    sx_conf = next((m["confirmed"] for m in results["indian_markets"] if m["name"] == "Sensex"), False)
+    if bn_conf != sx_conf:
+        results["divergence_detected"] = True
+        results["divergence_note"] = "Bank Nifty & Sensex diverging — possible sector rotation or fake breakdown"
+
+    total = results["index_score"] + results["reverse_score"]
+    results["total_score"] = total
+
+    if total >= 7:
+        results["classification"] = "Institutional Move Likely"
+        results["trap_risk"] = "Low"
+    elif total >= 4:
+        results["classification"] = "Valid Signal"
+        results["trap_risk"] = "Low-Medium"
+    elif total >= 2:
+        results["classification"] = "Weak Signal"
+        results["trap_risk"] = "Medium-High"
+    else:
+        results["classification"] = "Trap Probability High"
+        results["trap_risk"] = "High"
+
+    return results
+
+
+def _cmce_build_telegram_message(nifty_pattern: str, analysis: dict) -> str:
+    """Format Telegram alert message for CMCE."""
+    sig   = analysis["signal_direction"]
+    arrow = "🔴 SELL" if sig == "SELL" else "🟢 BUY"
+    trap_emoji = "🔴" if analysis["trap_risk"] == "High" else ("🟡" if "Medium" in analysis["trap_risk"] else "🟢")
+    weak  = "⚠️ Weak " if analysis["total_score"] <= 1 else "✅ "
+
+    lines = [
+        f"<b>{weak}{arrow} SIGNAL — Cross-Market Confirmation</b>",
+        "",
+        f"<b>NIFTY:</b> {nifty_pattern}",
+    ]
+    for m in analysis["indian_markets"]:
+        status = "✅ Confirmed" if m["confirmed"] else "➖ Neutral"
+        lines.append(f"<b>{m['name']}:</b> {m['pattern']} — {status}")
+
+    lines.append("")
+    for r in analysis["reverse_indicators"]:
+        status = "✅ Confirmed" if r["confirmed"] else "➖ No Reversal"
+        lines.append(f"<b>{r['name']}:</b> {r['pattern']} — {status}")
+
+    lines += [
+        "",
+        f"<b>Signal Strength:</b> {analysis['total_score']} / 10",
+        f"<b>Index Conf:</b> {analysis['index_score']}/5  |  <b>Risk Conf:</b> {analysis['reverse_score']}/5",
+        f"<b>Market Status:</b> {analysis['classification']}",
+        f"<b>Trap Risk:</b> {trap_emoji} {analysis['trap_risk']}",
+    ]
+    if analysis["divergence_detected"]:
+        lines += ["", f"⚠️ <b>Divergence Detected:</b> {analysis['divergence_note']}"]
+    return "\n".join(lines)
+
+
+def show_cross_market_confirmation_engine(
+    cie_signals: list,
+    send_telegram: bool = False,
+):
+    """UI for Cross-Market Reversal Confirmation Engine.
+
+    Accepts live CIE signals list, derives dominant direction, fetches cross-market
+    candles and scores confirmation against Indian indices and reverse macro indicators.
+    """
+    st.markdown("#### 🔗 Cross-Market Reversal Confirmation Engine")
+    st.caption(
+        "Validates NIFTY signals by checking Bank Nifty, Sensex & Gift Nifty candles + "
+        "inverse macro indicators (VIX, USD/INR, Crude Oil). Scores 0–10."
+    )
+
+    if not cie_signals:
+        st.info(
+            "No active CIE signals found. This engine activates when the Candlestick "
+            "Intelligence Engine detects a BUY or SELL pattern."
+        )
+        return
+
+    buy_signals  = [s for s in cie_signals if s.get('direction') == 'BUY']
+    sell_signals = [s for s in cie_signals if s.get('direction') == 'SELL']
+
+    # Dominant direction = whichever side has more signals; SELL wins ties
+    if len(sell_signals) >= len(buy_signals) and sell_signals:
+        dom_sig, signal_direction = sell_signals[0], 'SELL'
+    elif buy_signals:
+        dom_sig, signal_direction = buy_signals[0], 'BUY'
+    else:
+        dom_sig, signal_direction = cie_signals[0], cie_signals[0].get('direction', 'BUY')
+
+    nifty_pattern = dom_sig.get('pattern', 'Pattern')
+    confidence    = dom_sig.get('confidence', 0)
+
+    tf_map = {"5m": "5m", "15m": "15m", "1H": "60m"}
+    sel_tf = st.selectbox("Confirmation Timeframe", list(tf_map.keys()), index=1, key="cmce_tf_sel")
+    yf_interval = tf_map[sel_tf]
+
+    with st.spinner("Scanning cross-market candles…"):
+        analysis = run_cross_market_confirmation(signal_direction, timeframe=yf_interval)
+
+    total = analysis["total_score"]
+    trap  = analysis["trap_risk"]
+
+    dir_color   = "#ff4444" if signal_direction == "SELL" else "#00ff88"
+    score_color = "#00ff88" if total >= 7 else ("#ffaa00" if total >= 4 else "#ff4444")
+    trap_color  = "#ff4444" if trap == "High" else ("#ffaa00" if "Medium" in trap else "#00ff88")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {dir_color}'>
+        <div style='color:#aaa;font-size:11px'>CIE SIGNAL</div>
+        <div style='font-size:20px;font-weight:bold;color:{dir_color}'>{'🔴 SELL' if signal_direction=='SELL' else '🟢 BUY'}</div>
+        <div style='color:#ccc;font-size:11px'>{nifty_pattern}</div>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {score_color}'>
+        <div style='color:#aaa;font-size:11px'>TOTAL SCORE</div>
+        <div style='font-size:28px;font-weight:bold;color:{score_color}'>{total} / 10</div>
+        <div style='color:#ccc;font-size:11px'>Idx:{analysis['index_score']}/5  Risk:{analysis['reverse_score']}/5</div>
+        </div>""", unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00aaff'>
+        <div style='color:#aaa;font-size:11px'>CLASSIFICATION</div>
+        <div style='font-size:13px;font-weight:bold;color:#00aaff'>{analysis['classification']}</div>
+        <div style='color:#ccc;font-size:11px'>CIE Confidence: {confidence}%</div>
+        </div>""", unsafe_allow_html=True)
+    with c4:
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {trap_color}'>
+        <div style='color:#aaa;font-size:11px'>TRAP RISK</div>
+        <div style='font-size:20px;font-weight:bold;color:{trap_color}'>{trap}</div>
+        <div style='color:#ccc;font-size:11px'>{'⚠️ Divergence!' if analysis['divergence_detected'] else 'No Divergence'}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    tab_idx, tab_rev = st.tabs(["📊 Index Confirmation", "⚡ Risk Indicators"])
+
+    with tab_idx:
+        idx_rows = [
+            {
+                "Market":  m["name"],
+                "Candle":  m["pattern"],
+                "Signal":  "✅ Confirm" if m["confirmed"] else "➖ Neutral",
+                "Score":   f"+{m['score']}" if m["score"] > 0 else "0",
+            }
+            for m in analysis["indian_markets"]
+        ]
+        st.dataframe(pd.DataFrame(idx_rows), use_container_width=True, hide_index=True)
+        st.caption(f"Index Sub-Score: **{analysis['index_score']} / 5**  (≥3 = strong cross-index confirmation)")
+
+    with tab_rev:
+        rev_rows = [
+            {
+                "Indicator":    r["name"],
+                "Candle":       r["pattern"],
+                "Confirmation": "✅ Confirmed" if r["confirmed"] else "➖ No Reversal",
+                "Score":        f"+{r['score']}" if r["score"] > 0 else "0",
+            }
+            for r in analysis["reverse_indicators"]
+        ]
+        st.dataframe(pd.DataFrame(rev_rows), use_container_width=True, hide_index=True)
+        st.caption(f"Risk Sub-Score: **{analysis['reverse_score']} / 5**  (≥3 = macro alignment confirmed)")
+
+    if analysis["divergence_detected"]:
+        st.warning(f"⚠️ **Market Divergence Detected** — {analysis['divergence_note']}")
+
+    # Signal strength progress bar
+    bar_pct = int(total / 10 * 100)
+    st.markdown(f"""
+    <div style='margin-top:10px'>
+      <div style='color:#aaa;font-size:12px;margin-bottom:4px'>Signal Strength: {total}/10
+        {'— Institutional Move Likely 🔥' if total>=7 else ('— Valid Signal ✅' if total>=4 else ('— Weak Signal ⚠️' if total>=2 else '— Trap Risk 🚨'))}
+      </div>
+      <div style='background:#333;border-radius:6px;height:14px;width:100%'>
+        <div style='background:{score_color};width:{bar_pct}%;height:14px;border-radius:6px;transition:width 0.3s'></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Score classification legend
+    st.markdown("""
+    <div style='margin-top:8px;font-size:11px;color:#888'>
+    Score Guide: &nbsp;
+    <span style='color:#00ff88'>≥7 Institutional</span> &nbsp;|&nbsp;
+    <span style='color:#ffaa00'>4–6 Valid</span> &nbsp;|&nbsp;
+    <span style='color:#ff8800'>2–3 Weak</span> &nbsp;|&nbsp;
+    <span style='color:#ff4444'>≤1 Trap Risk</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Telegram alert (rate-limited to 5 min)
+    if send_telegram and total >= 2:
+        _now  = datetime.now(pytz.timezone('Asia/Kolkata'))
+        _last = st.session_state.get('cmce_last_alert')
+        if _last is None or (_now - _last).total_seconds() > 300:
+            msg = _cmce_build_telegram_message(nifty_pattern, analysis)
+            try:
+                send_telegram_message_sync(msg)
+                st.session_state.cmce_last_alert = _now
+                st.success("📨 Telegram cross-market alert sent!")
+            except Exception as _tg_e:
+                st.warning(f"Telegram send failed: {_tg_e}")
+
 
 if __name__ == "__main__":
     main()
