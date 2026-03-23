@@ -14465,7 +14465,9 @@ def main():
         elif use_cache:
             df = db.get_candle_data("NIFTY50", "IDX_I", interval, hours_back=days_back*24)
 
-            if df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_localize(pytz.timezone('Asia/Kolkata')).tz_convert(pytz.UTC)).total_seconds() > 300:
+            _max_dt = df['datetime'].max() if not df.empty else None
+            _max_utc = (_max_dt.tz_convert(pytz.UTC) if _max_dt is not None and _max_dt.tzinfo else _max_dt.tz_localize(pytz.timezone('Asia/Kolkata')).tz_convert(pytz.UTC)) if _max_dt is not None else None
+            if df.empty or _max_utc is None or (datetime.now(pytz.UTC) - _max_utc).total_seconds() > 300:
                 with st.spinner("Fetching latest data from API..."):
                     data = api.get_intraday_data(
                         security_id="13",
