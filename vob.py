@@ -542,8 +542,12 @@ class DhanAPI:
         elif status_code == 401:
             st.error("🔐 **Dhan API — Unauthorised (401):** Invalid client ID or token. Check your credentials.")
         elif status_code == 429:
-            st.session_state['_api_cooldown_until'] = datetime.now(pytz.UTC) + timedelta(seconds=90)
-            st.warning("⏳ **Dhan API — Rate Limited (429):** Too many requests. Auto-fetch paused for 90 seconds.")
+            # Exponential backoff: double cooldown each consecutive 429, max 10 min
+            prev = st.session_state.get('_api_cooldown_secs', 60)
+            next_wait = min(prev * 2, 600)
+            st.session_state['_api_cooldown_secs'] = next_wait
+            st.session_state['_api_cooldown_until'] = datetime.now(pytz.UTC) + timedelta(seconds=next_wait)
+            st.warning(f"⏳ **Dhan API — Rate Limited (429):** Auto-fetch paused for {next_wait}s.")
         elif status_code >= 500:
             st.warning(f"🌐 **Dhan API — Server Error ({status_code}):** Dhan servers are temporarily unavailable. Try again shortly.")
         else:
@@ -14479,7 +14483,9 @@ def main():
 
             _max_dt = df['datetime'].max() if not df.empty else None
             _max_utc = (_max_dt.tz_convert(pytz.UTC) if _max_dt is not None and _max_dt.tzinfo else _max_dt.tz_localize(pytz.timezone('Asia/Kolkata')).tz_convert(pytz.UTC)) if _max_dt is not None else None
-            if df.empty or _max_utc is None or (datetime.now(pytz.UTC) - _max_utc).total_seconds() > 300:
+            # Stale threshold = candle interval in seconds (no point fetching more often)
+            _interval_secs = int(interval) * 60
+            if df.empty or _max_utc is None or (datetime.now(pytz.UTC) - _max_utc).total_seconds() > _interval_secs:
                 with st.spinner("Fetching latest data from API..."):
                     data = api.get_intraday_data(
                         security_id="13",
@@ -14492,6 +14498,9 @@ def main():
                     if data:
                         df = process_candle_data(data, interval)
                         db.save_candle_data("NIFTY50", "IDX_I", interval, df)
+                        # Reset backoff on success
+                        st.session_state.pop('_api_cooldown_secs', None)
+                        st.session_state.pop('_api_cooldown_until', None)
                     elif not df.empty and _max_utc is not None:
                         stale_mins = int((datetime.now(pytz.UTC) - _max_utc).total_seconds() / 60)
                         st.warning(f"⚠️ **API fetch failed** — showing cached data from {stale_mins} min ago ({_max_dt.strftime('%H:%M')} IST). Check your Dhan token or network.")
