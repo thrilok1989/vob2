@@ -308,8 +308,12 @@ CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
                 .execute()
             if result.data:
                 df = pd.DataFrame(result.data)
-                ist = pytz.timezone('Asia/Kolkata')
-                df['datetime'] = pd.to_datetime(df['datetime'])
+                # Stored as UTC; convert to IST naive to match process_candle_data output
+                df['datetime'] = (
+                    pd.to_datetime(df['datetime'], utc=True)
+                    .dt.tz_convert('Asia/Kolkata')
+                    .dt.tz_localize(None)
+                )
                 return df
             return pd.DataFrame()
         except Exception as e:
