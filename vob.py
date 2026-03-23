@@ -6984,8 +6984,8 @@ def show_market_overview(api, interval="1", days_back=1):
     # Reuse chart df from session state — populated after first chart fetch
     df = st.session_state.get('nifty_chart_df', pd.DataFrame())
 
-    # LTP for live current price
-    ltp_resp = api.get_ltp_data("13", "IDX_I")
+    # Reuse LTP cached by main() — no extra API call
+    ltp_resp = st.session_state.get('nifty_ltp_data')
     current = None
     if ltp_resp and 'data' in ltp_resp:
         for _exc, _d in ltp_resp['data'].items():
@@ -8370,10 +8370,11 @@ def show_market_depth_engine(api=None, option_data: dict = None,
     data_source = "none"
     bids, asks = [], []
 
-    # Try 1 — Dhan market depth API
+    # Try 1 — Dhan market depth API (cache result for reuse by other engines)
     if api is not None:
-        raw_depth = api.get_market_depth(security_id="13", exchange_segment="IDX_I")
+        raw_depth = st.session_state.get('nifty_depth_cache') or api.get_market_depth(security_id="13", exchange_segment="IDX_I")
         if raw_depth:
+            st.session_state['nifty_depth_cache'] = raw_depth
             bids, asks = _mda_parse_dhan_depth(raw_depth, "IDX_I", "13")
         if not bids and not asks:
             # Try NSE_FO NIFTY futures (near-month security ID 35001 is a placeholder)
@@ -9001,8 +9002,9 @@ def show_market_sentiment_engine(api=None, option_data: dict = None,
     data_source = "none"
 
     if api is not None:
-        raw = api.get_market_depth(security_id="13", exchange_segment="IDX_I")
+        raw = st.session_state.get('nifty_depth_cache') or api.get_market_depth(security_id="13", exchange_segment="IDX_I")
         if raw:
+            st.session_state['nifty_depth_cache'] = raw
             bids, asks = _mda_parse_dhan_depth(raw, "IDX_I", "13")
         if bids or asks:
             data_source = "dhan"
@@ -14050,6 +14052,10 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
+    # Clear per-refresh caches so each run fetches fresh data once
+    st.session_state.pop('nifty_depth_cache', None)
+    st.session_state.pop('nifty_ltp_data', None)
+
     # Check if within market hours (8:30 AM to 3:45 PM IST)
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
@@ -14506,8 +14512,10 @@ def main():
         if not df.empty:
             st.session_state['nifty_chart_df'] = df
 
-        # Get LTP data and current price
+        # Get LTP data and current price (cache in session state for reuse)
         ltp_data = api.get_ltp_data("13", "IDX_I")
+        if ltp_data:
+            st.session_state['nifty_ltp_data'] = ltp_data
         if ltp_data and 'data' in ltp_data:
             for exchange, data in ltp_data['data'].items():
                 for security_id, price_data in data.items():
