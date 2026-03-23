@@ -306,7 +306,8 @@ CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
                 .execute()
             if result.data:
                 df = pd.DataFrame(result.data)
-                df['datetime'] = pd.to_datetime(df['datetime'])
+                ist = pytz.timezone('Asia/Kolkata')
+                df['datetime'] = pd.to_datetime(df['datetime'], utc=True).dt.tz_convert(ist).dt.tz_localize(None)
                 return df
             return pd.DataFrame()
         except Exception as e:
@@ -3117,7 +3118,7 @@ def process_candle_data(data, interval):
     })
     
     ist = pytz.timezone('Asia/Kolkata')
-    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s').dt.tz_localize('UTC').dt.tz_convert(ist)
+    df['datetime'] = pd.to_datetime(df['timestamp'], unit='s').dt.tz_localize('UTC').dt.tz_convert(ist).dt.tz_localize(None)
     
     return df
 
