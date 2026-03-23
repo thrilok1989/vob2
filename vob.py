@@ -14465,7 +14465,7 @@ def main():
         elif use_cache:
             df = db.get_candle_data("NIFTY50", "IDX_I", interval, hours_back=days_back*24)
 
-            if df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_convert(pytz.UTC)).total_seconds() > 300:
+            if df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_localize(pytz.timezone('Asia/Kolkata')).tz_convert(pytz.UTC)).total_seconds() > 300:
                 with st.spinner("Fetching latest data from API..."):
                     data = api.get_intraday_data(
                         security_id="13",
@@ -14536,7 +14536,7 @@ def main():
             # ── Filter df to the target date ──────────────────────────────
             _df_today = df.copy()
             try:
-                _df_today = df[pd.to_datetime(df['datetime']).dt.tz_convert('Asia/Kolkata').dt.date == _target_date].copy()
+                _df_today = df[pd.to_datetime(df['datetime']).dt.date == _target_date].copy()
             except Exception:
                 _df_today = df[df['datetime'].apply(
                     lambda x: x.date() if hasattr(x, 'date') else x
