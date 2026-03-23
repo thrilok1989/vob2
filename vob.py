@@ -14204,6 +14204,8 @@ def main():
         st.session_state.cmce_last_alert = None     # datetime of last CMCE Telegram alert
     if 'iofce_last_alert' not in st.session_state:
         st.session_state.iofce_last_alert = None    # datetime of last IOFCE Telegram alert
+    if 'delta_gamma_last_alert' not in st.session_state:
+        st.session_state.delta_gamma_last_alert = None  # datetime of last Delta & Gamma Telegram alert
 
     # Initialize Supabase
     try:
@@ -19821,6 +19823,56 @@ def main():
                     else:
                         _dg_entry = "WAIT ⏳"
                         _dg_entry_color = "#888888"
+
+                    # ======== TELEGRAM ALERT (rate-limited to 5 min) ========
+                    if enable_signals:
+                        _dg_tg_now  = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        _dg_tg_last = st.session_state.get('delta_gamma_last_alert')
+                        if _dg_tg_last is None or (_dg_tg_now - _dg_tg_last).total_seconds() > 300:
+                            # Build ATM ±2 strike comparison table rows
+                            _dg_tg_strike_lines = []
+                            for _dg_tg_lk in ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']:
+                                _dg_tg_d = _dg_delta_per.get(_dg_tg_lk)
+                                _dg_tg_g = _dg_gamma_per.get(_dg_tg_lk)
+                                if _dg_tg_d is None and _dg_tg_g is None:
+                                    continue
+                                _dg_tg_hot = " 🔥" if _dg_tg_lk == _hot_lbl else ""
+                                _dg_tg_d_str = f"{_dg_tg_d:+.4f}" if _dg_tg_d is not None else "—"
+                                _dg_tg_g_str = f"{_dg_tg_g:+.2f}L" if _dg_tg_g is not None else "—"
+                                _dg_tg_strike_lines.append(
+                                    f"  <b>{_dg_tg_lk}</b>{_dg_tg_hot}  Δ:{_dg_tg_d_str}  Γ:{_dg_tg_g_str}"
+                                )
+                            _dg_gamma_dir = "⬆️ Gamma expanding" if _gamma_change > 0 else "⬇️ Gamma contracting"
+                            _dg_tg_msg = "\n".join([
+                                "<b>⚡ Delta &amp; Gamma Engine — ATM ± 2</b>",
+                                "",
+                                "<b>NET DELTA</b>",
+                                f"  Value: <b>{_net_delta:+.4f}</b>  |  Δ change: {_delta_change:+.4f}",
+                                f"  avg CE Δ: {_avg_d_ce:+.3f}   PE Δ: {_avg_d_pe:+.3f}",
+                                "",
+                                "<b>NET GAMMA (Lakhs)</b>",
+                                f"  Value: <b>{_net_gamma:+.2f}L</b>  |  Δ change: {_gamma_change:+.2f}L",
+                                f"  {_dg_gamma_dir}",
+                                "",
+                                "<b>HOT STRIKE</b>",
+                                f"  Strike: <b>{_hot_lbl}</b>  {_hot_signal}",
+                                f"  Gamma: {_hot_val:+.2f}L",
+                                "",
+                                "<b>SIGNAL &amp; ENTRY</b>",
+                                f"  {_dg_main_signal}",
+                                f"  {_dg_entry}",
+                                "",
+                                "<b>📊 ATM ±2 Strike Comparison</b>",
+                            ] + _dg_tg_strike_lines + [
+                                "",
+                                f"NIFTY Spot: ₹{int(_dg_underlying):,}",
+                            ])
+                            try:
+                                send_telegram_message_sync(_dg_tg_msg)
+                                st.session_state.delta_gamma_last_alert = _dg_tg_now
+                                st.success("📨 Telegram Delta & Gamma alert sent!")
+                            except Exception as _dg_tg_e:
+                                st.warning(f"Telegram send failed: {_dg_tg_e}")
 
                     # ======== UI OUTPUT ========
                     _dg_c1, _dg_c2, _dg_c3, _dg_c4 = st.columns(4)
