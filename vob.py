@@ -6978,36 +6978,38 @@ def fetch_index_metrics(api, security_id, exchange_segment, interval="1", days_b
 
 
 def show_market_overview(api, interval="1", days_back=1):
-    """Render NIFTY 50 and SENSEX metrics in a tabbed table at the top of the page."""
+    """Render NIFTY 50 metrics using cached chart df + LTP (no extra intraday API call)."""
     st.markdown("### Market Overview")
 
-    tab_nifty, tab_sensex = st.tabs(["📈 NIFTY 50", "📊 SENSEX"])
+    # Reuse chart df from session state — populated after first chart fetch
+    df = st.session_state.get('nifty_chart_df', pd.DataFrame())
 
-    def _render_metrics(m, label):
-        if m is None:
-            st.warning(f"Could not fetch {label} data.")
-            return
-        sign = "+" if m['change'] >= 0 else ""
-        arrow = "▲" if m['change'] >= 0 else "▼"
-        chg_color = "#00cc66" if m['change'] >= 0 else "#ff4444"
+    # LTP for live current price
+    ltp_resp = api.get_ltp_data("13", "IDX_I")
+    current = None
+    if ltp_resp and 'data' in ltp_resp:
+        for _exc, _d in ltp_resp['data'].items():
+            for _sid, _pd in _d.items():
+                current = _pd.get('last_price')
+                break
+
+    st.markdown("#### 📈 NIFTY 50")
+    if df.empty or current is None:
+        st.info("Fetching NIFTY data...")
+    else:
+        _today = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+        _df_today = df[pd.to_datetime(df['datetime']).dt.date == _today]
+        if _df_today.empty:
+            _df_today = df
+        prev_close = float(_df_today['close'].iloc[-2]) if len(_df_today) > 1 else float(_df_today['close'].iloc[0])
+        change = current - prev_close
+        sign = "+" if change >= 0 else ""
         cols = st.columns(5)
-        cols[0].metric("Current Price", f"₹{m['current']:,.2f}")
-        cols[1].metric(
-            "Change",
-            f"{sign}{m['change']:,.2f}",
-            delta=f"{sign}{m['change_pct']:.2f}%"
-        )
-        cols[2].metric("Day High", f"₹{m['day_high']:,.2f}")
-        cols[3].metric("Day Low",  f"₹{m['day_low']:,.2f}")
-        cols[4].metric("Day Open", f"₹{m['day_open']:,.2f}")
-
-    with tab_nifty:
-        nifty_m = fetch_index_metrics(api, "13", "IDX_I", interval, days_back)
-        _render_metrics(nifty_m, "NIFTY 50")
-
-    with tab_sensex:
-        sensex_m = fetch_index_metrics(api, SENSEX_SCRIP_ID, SENSEX_EXCHANGE_SEG, interval, days_back)
-        _render_metrics(sensex_m, "SENSEX")
+        cols[0].metric("Current Price", f"₹{current:,.2f}")
+        cols[1].metric("Change", f"{sign}{change:,.2f}", delta=f"{sign}{(change/prev_close*100):.2f}%" if prev_close else "0%")
+        cols[2].metric("Day High", f"₹{float(_df_today['high'].max()):,.2f}")
+        cols[3].metric("Day Low",  f"₹{float(_df_today['low'].min()):,.2f}")
+        cols[4].metric("Day Open", f"₹{float(_df_today['open'].iloc[0]):,.2f}")
 
     st.markdown("---")
 
@@ -14466,6 +14468,8 @@ def main():
                     df = process_candle_data(_bt_raw, interval)
         elif use_cache:
             df = db.get_candle_data("NIFTY50", "IDX_I", interval, hours_back=days_back*24)
+            if not df.empty:
+                st.session_state['nifty_chart_df'] = df
 
             _max_dt = df['datetime'].max() if not df.empty else None
             _max_utc = (_max_dt.tz_convert(pytz.UTC) if _max_dt is not None and _max_dt.tzinfo else _max_dt.tz_localize(pytz.timezone('Asia/Kolkata')).tz_convert(pytz.UTC)) if _max_dt is not None else None
@@ -14498,7 +14502,10 @@ def main():
                 if data:
                     df = process_candle_data(data, interval)
                     db.save_candle_data("NIFTY50", "IDX_I", interval, df)
-        
+
+        if not df.empty:
+            st.session_state['nifty_chart_df'] = df
+
         # Get LTP data and current price
         ltp_data = api.get_ltp_data("13", "IDX_I")
         if ltp_data and 'data' in ltp_data:
