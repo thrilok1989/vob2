@@ -551,6 +551,9 @@ class DhanAPI:
         
     def get_intraday_data(self, security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval="1", days_back=1):
         """Get intraday historical data"""
+        _cooldown_until = st.session_state.get('_api_cooldown_until')
+        if _cooldown_until is not None and datetime.now(pytz.UTC) < _cooldown_until:
+            return None
         url = f"{self.base_url}/charts/intraday"
         
         ist = pytz.timezone('Asia/Kolkata')
@@ -14466,9 +14469,7 @@ def main():
 
             _max_dt = df['datetime'].max() if not df.empty else None
             _max_utc = (_max_dt.tz_convert(pytz.UTC) if _max_dt is not None and _max_dt.tzinfo else _max_dt.tz_localize(pytz.timezone('Asia/Kolkata')).tz_convert(pytz.UTC)) if _max_dt is not None else None
-            _cooldown_until = st.session_state.get('_api_cooldown_until')
-            _in_cooldown = _cooldown_until is not None and datetime.now(pytz.UTC) < _cooldown_until
-            if not _in_cooldown and (df.empty or _max_utc is None or (datetime.now(pytz.UTC) - _max_utc).total_seconds() > 300):
+            if df.empty or _max_utc is None or (datetime.now(pytz.UTC) - _max_utc).total_seconds() > 300:
                 with st.spinner("Fetching latest data from API..."):
                     data = api.get_intraday_data(
                         security_id="13",
