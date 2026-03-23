@@ -530,17 +530,15 @@ class DhanAPI:
     def _handle_api_error(self, status_code, body=""):
         """Show a clean, actionable error for known Dhan API status codes."""
         if status_code == 403:
-            if not st.session_state.get('_dhan_403_shown'):
-                st.session_state['_dhan_403_shown'] = True
-                st.error(
-                    "🔐 **Dhan API — Access Denied (403)**\n\n"
-                    "Your access token has **expired or is invalid**.\n\n"
-                    "**Fix:**\n"
-                    "1. Log in to [Dhan Developer Console](https://developer.dhan.co)\n"
-                    "2. Generate a new Access Token\n"
-                    "3. Update `DHAN_ACCESS_TOKEN` in your Streamlit secrets (`.streamlit/secrets.toml`)\n"
-                    "4. Reload the app"
-                )
+            st.error(
+                "🔐 **Dhan API — Access Denied (403)**\n\n"
+                "Your access token has **expired or is invalid**.\n\n"
+                "**Fix:**\n"
+                "1. Log in to [Dhan Developer Console](https://developer.dhan.co)\n"
+                "2. Generate a new Access Token\n"
+                "3. Update `DHAN_ACCESS_TOKEN` in your Streamlit secrets (`.streamlit/secrets.toml`)\n"
+                "4. Reload the app"
+            )
         elif status_code == 401:
             st.error("🔐 **Dhan API — Unauthorised (401):** Invalid client ID or token. Check your credentials.")
         elif status_code == 429:
@@ -14480,6 +14478,9 @@ def main():
                     if data:
                         df = process_candle_data(data, interval)
                         db.save_candle_data("NIFTY50", "IDX_I", interval, df)
+                    elif not df.empty and _max_utc is not None:
+                        stale_mins = int((datetime.now(pytz.UTC) - _max_utc).total_seconds() / 60)
+                        st.warning(f"⚠️ **API fetch failed** — showing cached data from {stale_mins} min ago ({_max_dt.strftime('%H:%M')} IST). Check your Dhan token or network.")
         else:
             with st.spinner("Fetching fresh data from API..."):
                 data = api.get_intraday_data(
