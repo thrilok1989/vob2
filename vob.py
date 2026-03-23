@@ -20921,9 +20921,9 @@ def main():
         except Exception as _cie_err:
             st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
 
-    # ===== CROSS-MARKET REVERSAL CONFIRMATION ENGINE =====
+    # ===== CROSS-MARKET CONFIRMATION ENGINE =====
     st.markdown("---")
-    with st.expander("🔗 Cross-Market Reversal Confirmation Engine — Signal Validation", expanded=False):
+    with st.expander("🔗 Cross-Market Confirmation Engine — Reversal / Continuation / Trap", expanded=False):
         try:
             _cmce_cie_sigs = _cie_signals if '_cie_signals' in dir() and not df.empty else []
             _cmce_tg = enable_signals and bool(
@@ -20935,6 +20935,22 @@ def main():
             )
         except Exception as _cmce_err:
             st.warning(f"Cross-Market Confirmation Engine error: {str(_cmce_err)}")
+
+    # ===== INSTITUTIONAL ORDER FLOW CONFIRMATION ENGINE =====
+    st.markdown("---")
+    with st.expander("🏦 Institutional Order Flow Confirmation Engine (IOFCE)", expanded=False):
+        try:
+            _iofce_cie_sigs = _cie_signals if '_cie_signals' in dir() and not df.empty else []
+            _iofce_price    = current_price if current_price else (
+                option_data.get('underlying') if option_data else None)
+            show_iofce(
+                option_data=option_data if option_data else {},
+                df=df if not df.empty else None,
+                underlying_price=_iofce_price,
+                cie_signals=_iofce_cie_sigs,
+            )
+        except Exception as _iofce_err:
+            st.warning(f"Institutional Order Flow Engine error: {str(_iofce_err)}")
 
     # ===== FUTURES MARKET ANALYSIS ENGINE =====
     with st.expander("🔮 Futures Market Analysis Engine", expanded=False):
@@ -21165,8 +21181,180 @@ def _cmce_detect_reversal(df: pd.DataFrame, signal_direction: str) -> dict:
     return {"pattern": detected, "confirmed": confirmed}
 
 
-def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m") -> dict:
-    """Run Cross-Market Reversal Confirmation Engine.
+def _cmce_detect_continuation(df: pd.DataFrame, signal_direction: str) -> dict:
+    """Detect trend continuation candle patterns on the most recent candles of df.
+
+    Looks for patterns that confirm the trend is CONTINUING (not reversing).
+    signal_direction: 'BUY' (uptrend continuing) or 'SELL' (downtrend continuing)
+    Returns dict with keys: pattern (str), confirmed (bool)
+    """
+    if df.empty or len(df) < 4:
+        return {"pattern": "No Data", "confirmed": False}
+
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    prev3 = df.iloc[-4]
+
+    o,  h,  l,  c  = float(last['open']),  float(last['high']),  float(last['low']),  float(last['close'])
+    po, ph, pl, pc = float(prev['open']),  float(prev['high']),  float(prev['low']),  float(prev['close'])
+    p2o, p2h, p2l, p2c = float(prev2['open']), float(prev2['high']), float(prev2['low']), float(prev2['close'])
+    p3o, _,   _,   p3c = float(prev3['open']), float(prev3['high']), float(prev3['low']), float(prev3['close'])
+
+    body        = abs(c - o)
+    candle_range = h - l if h != l else 0.001
+    upper_wick  = h - max(o, c)
+    lower_wick  = min(o, c) - l
+    is_bull = c > o
+    is_bear = c < o
+
+    recent   = df.tail(10)
+    avg_body  = (recent['close'] - recent['open']).abs().mean() or 1.0
+    avg_range = (recent['high'] - recent['low']).mean() or 1.0
+
+    detected  = "Neutral"
+    confirmed = False
+
+    if signal_direction == 'BUY':
+        # Three White Soldiers: three consecutive bullish candles, each higher close
+        if (p3c < p2c < pc < c and
+                p3c > p3o and p2c > p2o and pc > po and is_bull and
+                body > avg_body * 0.7 and lower_wick < body * 0.4):
+            detected, confirmed = "Three White Soldiers", True
+        # Bull Marubozu Continuation: strong bull body, minimal wicks, higher high
+        elif (is_bull and body > avg_body * 1.3 and
+              upper_wick < body * 0.15 and lower_wick < body * 0.15 and
+              c > pc and h > ph):
+            detected, confirmed = "Bull Marubozu Cont.", True
+        # Rising Window (gap up continuation)
+        elif l > ph and is_bull:
+            detected, confirmed = "Rising Window (Gap Up)", True
+        # Inside Bar Breakout Up: prev was inside bar, current breaks out upward
+        elif (ph <= p2h and pl >= p2l and  # prev is inside bar
+              c > p2h and is_bull):         # current breaks above prior high
+            detected, confirmed = "Inside Bar Breakout Up", True
+        # Bullish Flag: 2 small-body candles followed by a strong bull continuation
+        elif (abs(pc - po) < avg_body * 0.6 and abs(p2c - p2o) < avg_body * 0.6 and
+              p3c > p3o and is_bull and body > avg_body * 1.0 and c > pc):
+            detected, confirmed = "Bullish Flag Cont.", True
+        # Two Crows Inverse (bullish): two doji/small bars then strong continuation bull
+        elif (abs(pc - po) < avg_body * 0.5 and abs(p2c - p2o) < avg_body * 0.5 and
+              is_bull and body > avg_body * 1.2 and c > p2h):
+            detected, confirmed = "Consolidation Breakout Up", True
+
+    elif signal_direction == 'SELL':
+        # Three Black Crows: three consecutive bearish candles, each lower close
+        if (p3c > p2c > pc > c and
+                p3c < p3o and p2c < p2o and pc < po and is_bear and
+                body > avg_body * 0.7 and upper_wick < body * 0.4):
+            detected, confirmed = "Three Black Crows", True
+        # Bear Marubozu Continuation
+        elif (is_bear and body > avg_body * 1.3 and
+              upper_wick < body * 0.15 and lower_wick < body * 0.15 and
+              c < pc and l < pl):
+            detected, confirmed = "Bear Marubozu Cont.", True
+        # Falling Window (gap down continuation)
+        elif h < pl and is_bear:
+            detected, confirmed = "Falling Window (Gap Dn)", True
+        # Inside Bar Breakout Down
+        elif (ph <= p2h and pl >= p2l and
+              c < p2l and is_bear):
+            detected, confirmed = "Inside Bar Breakout Dn", True
+        # Bearish Flag: 2 small-body candles followed by strong bear continuation
+        elif (abs(pc - po) < avg_body * 0.6 and abs(p2c - p2o) < avg_body * 0.6 and
+              p3c < p3o and is_bear and body > avg_body * 1.0 and c < pc):
+            detected, confirmed = "Bearish Flag Cont.", True
+        # Consolidation Breakout Down
+        elif (abs(pc - po) < avg_body * 0.5 and abs(p2c - p2o) < avg_body * 0.5 and
+              is_bear and body > avg_body * 1.2 and c < p2l):
+            detected, confirmed = "Consolidation Breakout Dn", True
+
+    return {"pattern": detected, "confirmed": confirmed}
+
+
+def _cmce_detect_trap(df: pd.DataFrame, signal_direction: str) -> dict:
+    """Detect potential trap / fakeout candle patterns.
+
+    A trap is when price moves in signal_direction but then quickly reverses,
+    trapping breakout traders on the wrong side.
+    signal_direction: 'BUY' (bull trap — price fakes up then reverses down)
+                   or 'SELL' (bear trap — price fakes down then reverses up)
+    Returns dict with keys: pattern (str), confirmed (bool), trap_type (str)
+    """
+    if df.empty or len(df) < 3:
+        return {"pattern": "No Data", "confirmed": False, "trap_type": "Unknown"}
+
+    last  = df.iloc[-1]
+    prev  = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
+    o,  h,  l,  c  = float(last['open']),  float(last['high']),  float(last['low']),  float(last['close'])
+    po, ph, pl, pc = float(prev['open']),  float(prev['high']),  float(prev['low']),  float(prev['close'])
+    p2o, p2h, p2l, p2c = float(prev2['open']), float(prev2['high']), float(prev2['low']), float(prev2['close'])
+
+    body        = abs(c - o)
+    candle_range = h - l if h != l else 0.001
+    upper_wick  = h - max(o, c)
+    lower_wick  = min(o, c) - l
+    is_bull = c > o
+    is_bear = c < o
+
+    recent   = df.tail(10)
+    avg_body  = (recent['close'] - recent['open']).abs().mean() or 1.0
+    avg_range = (recent['high'] - recent['low']).mean() or 1.0
+
+    detected  = "Neutral"
+    confirmed = False
+    trap_type = "None"
+
+    if signal_direction == 'BUY':
+        # Bull Trap patterns (price appears bullish but is likely reversing down)
+        # Shooting Star after gap-up: previous gap up, current has large upper wick
+        if pc > p2c * 1.001 and upper_wick > body * 2.0 and upper_wick > avg_range * 0.4:
+            detected, confirmed, trap_type = "Shooting Star Trap", True, "Bull Trap"
+        # Fake Breakout: prev broke above resistance (high > p2h), current closes back inside
+        elif ph > p2h and is_bear and c < p2h and upper_wick > body:
+            detected, confirmed, trap_type = "Fake Breakout Up", True, "Bull Trap"
+        # Bearish Engulfing after run-up
+        elif pc > po and is_bear and c < po and o > pc and body > avg_body * 0.9:
+            detected, confirmed, trap_type = "Engulfing Reversal", True, "Bull Trap"
+        # Gravestone Doji: opens low, runs up, closes near open
+        elif (abs(c - o) < avg_body * 0.2 and upper_wick > avg_range * 0.5 and
+              lower_wick < avg_range * 0.1):
+            detected, confirmed, trap_type = "Gravestone Doji", True, "Bull Trap"
+        # Tweezer Top: two candles with same high, second bearish
+        elif (abs(h - ph) / (avg_range + 1e-6) < 0.05 and is_bear and pc > po):
+            detected, confirmed, trap_type = "Tweezer Top", True, "Bull Trap"
+
+    elif signal_direction == 'SELL':
+        # Bear Trap patterns (price appears bearish but is likely reversing up)
+        # Hammer after gap-down
+        if pc < p2c * 0.999 and lower_wick > body * 2.0 and lower_wick > avg_range * 0.4:
+            detected, confirmed, trap_type = "Hammer Trap", True, "Bear Trap"
+        # Fake Breakdown: prev broke below support, current closes back above
+        elif pl < p2l and is_bull and c > p2l and lower_wick > body:
+            detected, confirmed, trap_type = "Fake Breakdown", True, "Bear Trap"
+        # Bullish Engulfing after sell-off
+        elif pc < po and is_bull and c > po and o < pc and body > avg_body * 0.9:
+            detected, confirmed, trap_type = "Engulfing Reversal Up", True, "Bear Trap"
+        # Dragonfly Doji: opens high, drops, closes near open
+        elif (abs(c - o) < avg_body * 0.2 and lower_wick > avg_range * 0.5 and
+              upper_wick < avg_range * 0.1):
+            detected, confirmed, trap_type = "Dragonfly Doji", True, "Bear Trap"
+        # Tweezer Bottom: two candles with same low, second bullish
+        elif (abs(l - pl) / (avg_range + 1e-6) < 0.05 and is_bull and pc < po):
+            detected, confirmed, trap_type = "Tweezer Bottom", True, "Bear Trap"
+
+    return {"pattern": detected, "confirmed": confirmed, "trap_type": trap_type}
+
+
+def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m",
+                                   mode: str = "reversal") -> dict:
+    """Run Cross-Market Confirmation Engine.
+
+    mode: 'reversal'     — detect reversal candles confirming direction change
+          'continuation' — detect continuation candles confirming trend is intact
+          'trap'         — detect trap/fakeout candles raising trap probability
 
     Returns analysis dict with scores, classification, trap risk, and divergence flag.
     """
@@ -21185,6 +21373,7 @@ def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m")
     results = {
         "signal_direction": signal_direction,
         "timeframe": timeframe,
+        "mode": mode,
         "indian_markets": [],
         "reverse_indicators": [],
         "index_score": 0,
@@ -21196,21 +21385,42 @@ def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m")
         "divergence_note": "",
     }
 
+    # Select detector based on mode
+    if mode == "continuation":
+        _detect_fn = _cmce_detect_continuation
+    elif mode == "trap":
+        _detect_fn = _cmce_detect_trap
+    else:
+        _detect_fn = _cmce_detect_reversal
+
     for mkt in INDIAN_MARKETS:
-        df_m = _cmce_fetch_candles(mkt["ticker"], interval=timeframe, period=period)
-        res  = _cmce_detect_reversal(df_m, signal_direction)
+        df_m  = _cmce_fetch_candles(mkt["ticker"], interval=timeframe, period=period)
+        res   = _detect_fn(df_m, signal_direction)
         score = mkt["weight"] if res["confirmed"] else 0
         results["index_score"] += score
-        results["indian_markets"].append({
+        entry = {
             "name": mkt["name"], "ticker": mkt["ticker"],
             "pattern": res["pattern"], "confirmed": res["confirmed"], "score": score,
-        })
+        }
+        if mode == "trap":
+            entry["trap_type"] = res.get("trap_type", "None")
+        results["indian_markets"].append(entry)
 
-    # Reverse indicators: opposite candle confirms bearish/bullish macro alignment
+    # Reverse indicators logic varies by mode:
+    #   reversal/continuation: opposite candle on macro confirms macro alignment
+    #   trap: same-direction trap on macro amplifies trap probability
     opposite_dir = "BUY" if signal_direction == "SELL" else "SELL"
+    macro_dir    = opposite_dir if mode in ("reversal", "continuation") else signal_direction
+
     for ind in REVERSE_INDICATORS:
-        df_r = _cmce_fetch_candles(ind["ticker"], interval=timeframe, period=period)
-        res  = _cmce_detect_reversal(df_r, opposite_dir)
+        df_r  = _cmce_fetch_candles(ind["ticker"], interval=timeframe, period=period)
+        if mode == "trap":
+            res = _cmce_detect_trap(df_r, macro_dir)
+        elif mode == "continuation":
+            # For continuation: macro reverse confirms (VIX falling = trend safe)
+            res = _cmce_detect_reversal(df_r, macro_dir)
+        else:
+            res = _cmce_detect_reversal(df_r, macro_dir)
         score = ind["weight"] if res["confirmed"] else 0
         results["reverse_score"] += score
         results["reverse_indicators"].append({
@@ -21228,18 +21438,46 @@ def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m")
     total = results["index_score"] + results["reverse_score"]
     results["total_score"] = total
 
-    if total >= 7:
-        results["classification"] = "Institutional Move Likely"
-        results["trap_risk"] = "Low"
-    elif total >= 4:
-        results["classification"] = "Valid Signal"
-        results["trap_risk"] = "Low-Medium"
-    elif total >= 2:
-        results["classification"] = "Weak Signal"
-        results["trap_risk"] = "Medium-High"
-    else:
-        results["classification"] = "Trap Probability High"
-        results["trap_risk"] = "High"
+    # Classification changes slightly per mode
+    if mode == "continuation":
+        if total >= 7:
+            results["classification"] = "Trend Continuation Confirmed"
+            results["trap_risk"] = "Low"
+        elif total >= 4:
+            results["classification"] = "Trend Likely Continuing"
+            results["trap_risk"] = "Low-Medium"
+        elif total >= 2:
+            results["classification"] = "Trend Weakening"
+            results["trap_risk"] = "Medium-High"
+        else:
+            results["classification"] = "Trend Reversal Risk"
+            results["trap_risk"] = "High"
+    elif mode == "trap":
+        if total >= 7:
+            results["classification"] = "High Trap Probability"
+            results["trap_risk"] = "Very High"
+        elif total >= 4:
+            results["classification"] = "Possible Trap Setup"
+            results["trap_risk"] = "High"
+        elif total >= 2:
+            results["classification"] = "Mild Trap Risk"
+            results["trap_risk"] = "Medium"
+        else:
+            results["classification"] = "Low Trap Risk"
+            results["trap_risk"] = "Low"
+    else:  # reversal
+        if total >= 7:
+            results["classification"] = "Institutional Move Likely"
+            results["trap_risk"] = "Low"
+        elif total >= 4:
+            results["classification"] = "Valid Signal"
+            results["trap_risk"] = "Low-Medium"
+        elif total >= 2:
+            results["classification"] = "Weak Signal"
+            results["trap_risk"] = "Medium-High"
+        else:
+            results["classification"] = "Trap Probability High"
+            results["trap_risk"] = "High"
 
     return results
 
@@ -21247,22 +21485,27 @@ def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m")
 def _cmce_build_telegram_message(nifty_pattern: str, analysis: dict) -> str:
     """Format Telegram alert message for CMCE."""
     sig   = analysis["signal_direction"]
+    mode  = analysis.get("mode", "reversal")
     arrow = "🔴 SELL" if sig == "SELL" else "🟢 BUY"
-    trap_emoji = "🔴" if analysis["trap_risk"] == "High" else ("🟡" if "Medium" in analysis["trap_risk"] else "🟢")
+    trap_risk = analysis["trap_risk"]
+    trap_emoji = ("🔴" if trap_risk in ("High", "Very High")
+                  else ("🟡" if "Medium" in trap_risk else "🟢"))
     weak  = "⚠️ Weak " if analysis["total_score"] <= 1 else "✅ "
 
+    mode_label = {"reversal": "Reversal", "continuation": "Continuation", "trap": "Trap Detection"}.get(mode, "")
     lines = [
-        f"<b>{weak}{arrow} SIGNAL — Cross-Market Confirmation</b>",
+        f"<b>{weak}{arrow} SIGNAL — Cross-Market {mode_label} Confirmation</b>",
         "",
         f"<b>NIFTY:</b> {nifty_pattern}",
     ]
     for m in analysis["indian_markets"]:
         status = "✅ Confirmed" if m["confirmed"] else "➖ Neutral"
-        lines.append(f"<b>{m['name']}:</b> {m['pattern']} — {status}")
+        trap_note = f" [{m['trap_type']}]" if mode == "trap" and m.get("trap_type", "None") != "None" else ""
+        lines.append(f"<b>{m['name']}:</b> {m['pattern']}{trap_note} — {status}")
 
     lines.append("")
     for r in analysis["reverse_indicators"]:
-        status = "✅ Confirmed" if r["confirmed"] else "➖ No Reversal"
+        status = "✅ Confirmed" if r["confirmed"] else "➖ No Signal"
         lines.append(f"<b>{r['name']}:</b> {r['pattern']} — {status}")
 
     lines += [
@@ -21270,7 +21513,7 @@ def _cmce_build_telegram_message(nifty_pattern: str, analysis: dict) -> str:
         f"<b>Signal Strength:</b> {analysis['total_score']} / 10",
         f"<b>Index Conf:</b> {analysis['index_score']}/5  |  <b>Risk Conf:</b> {analysis['reverse_score']}/5",
         f"<b>Market Status:</b> {analysis['classification']}",
-        f"<b>Trap Risk:</b> {trap_emoji} {analysis['trap_risk']}",
+        f"<b>Trap Risk:</b> {trap_emoji} {trap_risk}",
     ]
     if analysis["divergence_detected"]:
         lines += ["", f"⚠️ <b>Divergence Detected:</b> {analysis['divergence_note']}"]
@@ -21281,15 +21524,15 @@ def show_cross_market_confirmation_engine(
     cie_signals: list,
     send_telegram: bool = False,
 ):
-    """UI for Cross-Market Reversal Confirmation Engine.
+    """UI for Cross-Market Confirmation Engine (Reversal / Continuation / Trap modes).
 
     Accepts live CIE signals list, derives dominant direction, fetches cross-market
     candles and scores confirmation against Indian indices and reverse macro indicators.
     """
-    st.markdown("#### 🔗 Cross-Market Reversal Confirmation Engine")
+    st.markdown("#### 🔗 Cross-Market Confirmation Engine")
     st.caption(
         "Validates NIFTY signals by checking Bank Nifty, Sensex & Gift Nifty candles + "
-        "inverse macro indicators (VIX, USD/INR, Crude Oil). Scores 0–10."
+        "inverse macro indicators (VIX, USD/INR, Crude Oil). Supports Reversal, Continuation & Trap modes. Scores 0–10."
     )
 
     if not cie_signals:
@@ -21313,19 +21556,42 @@ def show_cross_market_confirmation_engine(
     nifty_pattern = dom_sig.get('pattern', 'Pattern')
     confidence    = dom_sig.get('confidence', 0)
 
+    col_tf, col_mode = st.columns(2)
     tf_map = {"5m": "5m", "15m": "15m", "1H": "60m"}
-    sel_tf = st.selectbox("Confirmation Timeframe", list(tf_map.keys()), index=1, key="cmce_tf_sel")
+    with col_tf:
+        sel_tf = st.selectbox("Confirmation Timeframe", list(tf_map.keys()), index=1, key="cmce_tf_sel")
+    with col_mode:
+        mode_map = {
+            "Reversal": "reversal",
+            "Continuation": "continuation",
+            "Trap Detection": "trap",
+        }
+        sel_mode_label = st.selectbox(
+            "Analysis Mode",
+            list(mode_map.keys()),
+            index=0,
+            key="cmce_mode_sel",
+            help=(
+                "Reversal: detect reversal candles confirming direction change | "
+                "Continuation: detect trend-continuation candles | "
+                "Trap Detection: detect fakeout / trap patterns"
+            ),
+        )
     yf_interval = tf_map[sel_tf]
+    sel_mode    = mode_map[sel_mode_label]
 
-    with st.spinner("Scanning cross-market candles…"):
-        analysis = run_cross_market_confirmation(signal_direction, timeframe=yf_interval)
+    with st.spinner(f"Scanning cross-market candles ({sel_mode_label} mode)…"):
+        analysis = run_cross_market_confirmation(signal_direction, timeframe=yf_interval, mode=sel_mode)
 
     total = analysis["total_score"]
     trap  = analysis["trap_risk"]
 
     dir_color   = "#ff4444" if signal_direction == "SELL" else "#00ff88"
     score_color = "#00ff88" if total >= 7 else ("#ffaa00" if total >= 4 else "#ff4444")
-    trap_color  = "#ff4444" if trap == "High" else ("#ffaa00" if "Medium" in trap else "#00ff88")
+    trap_color  = ("#ff4444" if trap in ("High", "Very High")
+                   else ("#ffaa00" if "Medium" in trap else "#00ff88"))
+
+    mode_icon = {"reversal": "🔄", "continuation": "➡️", "trap": "🪤"}.get(sel_mode, "🔗")
 
     c1, c2, c3, c4 = st.columns(4)
     with c1:
@@ -21342,7 +21608,7 @@ def show_cross_market_confirmation_engine(
         </div>""", unsafe_allow_html=True)
     with c3:
         st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00aaff'>
-        <div style='color:#aaa;font-size:11px'>CLASSIFICATION</div>
+        <div style='color:#aaa;font-size:11px'>{mode_icon} {sel_mode_label.upper()}</div>
         <div style='font-size:13px;font-weight:bold;color:#00aaff'>{analysis['classification']}</div>
         <div style='color:#ccc;font-size:11px'>CIE Confidence: {confidence}%</div>
         </div>""", unsafe_allow_html=True)
@@ -21358,15 +21624,17 @@ def show_cross_market_confirmation_engine(
     tab_idx, tab_rev = st.tabs(["📊 Index Confirmation", "⚡ Risk Indicators"])
 
     with tab_idx:
-        idx_rows = [
-            {
+        idx_rows = []
+        for m in analysis["indian_markets"]:
+            row = {
                 "Market":  m["name"],
                 "Candle":  m["pattern"],
                 "Signal":  "✅ Confirm" if m["confirmed"] else "➖ Neutral",
                 "Score":   f"+{m['score']}" if m["score"] > 0 else "0",
             }
-            for m in analysis["indian_markets"]
-        ]
+            if sel_mode == "trap" and m.get("trap_type", "None") != "None":
+                row["Trap Type"] = m.get("trap_type", "-")
+            idx_rows.append(row)
         st.dataframe(pd.DataFrame(idx_rows), use_container_width=True, hide_index=True)
         st.caption(f"Index Sub-Score: **{analysis['index_score']} / 5**  (≥3 = strong cross-index confirmation)")
 
@@ -21375,7 +21643,7 @@ def show_cross_market_confirmation_engine(
             {
                 "Indicator":    r["name"],
                 "Candle":       r["pattern"],
-                "Confirmation": "✅ Confirmed" if r["confirmed"] else "➖ No Reversal",
+                "Confirmation": "✅ Confirmed" if r["confirmed"] else "➖ No Signal",
                 "Score":        f"+{r['score']}" if r["score"] > 0 else "0",
             }
             for r in analysis["reverse_indicators"]
@@ -21386,13 +21654,18 @@ def show_cross_market_confirmation_engine(
     if analysis["divergence_detected"]:
         st.warning(f"⚠️ **Market Divergence Detected** — {analysis['divergence_note']}")
 
-    # Signal strength progress bar
-    bar_pct = int(total / 10 * 100)
+    # Mode-aware signal strength bar
+    if sel_mode == "trap":
+        strength_labels = {7: "High Trap Probability 🪤", 4: "Possible Trap ⚠️", 2: "Mild Risk", 0: "Safe Signal 🟢"}
+    elif sel_mode == "continuation":
+        strength_labels = {7: "Trend Confirmed 🔥", 4: "Trend Likely ✅", 2: "Weakening ⚠️", 0: "Reversal Risk 🚨"}
+    else:
+        strength_labels = {7: "Institutional Move 🔥", 4: "Valid Signal ✅", 2: "Weak Signal ⚠️", 0: "Trap Risk 🚨"}
+    bar_label = next(v for k, v in sorted(strength_labels.items(), reverse=True) if total >= k)
+    bar_pct   = int(total / 10 * 100)
     st.markdown(f"""
     <div style='margin-top:10px'>
-      <div style='color:#aaa;font-size:12px;margin-bottom:4px'>Signal Strength: {total}/10
-        {'— Institutional Move Likely 🔥' if total>=7 else ('— Valid Signal ✅' if total>=4 else ('— Weak Signal ⚠️' if total>=2 else '— Trap Risk 🚨'))}
-      </div>
+      <div style='color:#aaa;font-size:12px;margin-bottom:4px'>Signal Strength: {total}/10 — {bar_label}</div>
       <div style='background:#333;border-radius:6px;height:14px;width:100%'>
         <div style='background:{score_color};width:{bar_pct}%;height:14px;border-radius:6px;transition:width 0.3s'></div>
       </div>
@@ -21400,15 +21673,13 @@ def show_cross_market_confirmation_engine(
     """, unsafe_allow_html=True)
 
     # Score classification legend
-    st.markdown("""
-    <div style='margin-top:8px;font-size:11px;color:#888'>
-    Score Guide: &nbsp;
-    <span style='color:#00ff88'>≥7 Institutional</span> &nbsp;|&nbsp;
-    <span style='color:#ffaa00'>4–6 Valid</span> &nbsp;|&nbsp;
-    <span style='color:#ff8800'>2–3 Weak</span> &nbsp;|&nbsp;
-    <span style='color:#ff4444'>≤1 Trap Risk</span>
-    </div>
-    """, unsafe_allow_html=True)
+    if sel_mode == "trap":
+        legend = "<span style='color:#ff4444'>≥7 High Trap</span> &nbsp;|&nbsp; <span style='color:#ffaa00'>4–6 Possible</span> &nbsp;|&nbsp; <span style='color:#ff8800'>2–3 Mild</span> &nbsp;|&nbsp; <span style='color:#00ff88'>≤1 Safe</span>"
+    elif sel_mode == "continuation":
+        legend = "<span style='color:#00ff88'>≥7 Trend Confirmed</span> &nbsp;|&nbsp; <span style='color:#ffaa00'>4–6 Likely</span> &nbsp;|&nbsp; <span style='color:#ff8800'>2–3 Weakening</span> &nbsp;|&nbsp; <span style='color:#ff4444'>≤1 Reversal Risk</span>"
+    else:
+        legend = "<span style='color:#00ff88'>≥7 Institutional</span> &nbsp;|&nbsp; <span style='color:#ffaa00'>4–6 Valid</span> &nbsp;|&nbsp; <span style='color:#ff8800'>2–3 Weak</span> &nbsp;|&nbsp; <span style='color:#ff4444'>≤1 Trap Risk</span>"
+    st.markdown(f"<div style='margin-top:8px;font-size:11px;color:#888'>Score Guide: &nbsp;{legend}</div>", unsafe_allow_html=True)
 
     # Telegram alert (rate-limited to 5 min)
     if send_telegram and total >= 2:
@@ -21422,6 +21693,473 @@ def show_cross_market_confirmation_engine(
                 st.success("📨 Telegram cross-market alert sent!")
             except Exception as _tg_e:
                 st.warning(f"Telegram send failed: {_tg_e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# INSTITUTIONAL ORDER FLOW CONFIRMATION ENGINE (IOFCE)
+# Uses only existing VOB2 data: options chain, OI, GEX, depth, candles
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _iofce_identify_zones(df_summary, underlying_price: float) -> dict:
+    """Step 1: Identify Key Institutional Zones from existing options chain data.
+
+    Returns dict with: max_pain, oi_resistance, oi_support, gamma_flip,
+    gamma_support, gamma_resistance, depth_cluster_above, depth_cluster_below
+    """
+    zones = {
+        "max_pain": None,
+        "oi_resistance": None,      # highest CE OI strike
+        "oi_support": None,         # highest PE OI strike
+        "gamma_flip": None,
+        "gamma_resistance": None,   # highest CE gamma × OI strike
+        "gamma_support": None,      # highest PE gamma × OI strike
+        "depth_cluster_above": None,
+        "depth_cluster_below": None,
+    }
+    if df_summary is None or df_summary.empty or underlying_price is None:
+        return zones
+
+    try:
+        # OI walls
+        if 'openInterest_CE' in df_summary.columns:
+            idx = df_summary['openInterest_CE'].idxmax()
+            zones["oi_resistance"] = float(df_summary.loc[idx, 'Strike'])
+        if 'openInterest_PE' in df_summary.columns:
+            idx = df_summary['openInterest_PE'].idxmax()
+            zones["oi_support"] = float(df_summary.loc[idx, 'Strike'])
+
+        # Max pain: strike where total pain (sum of OI × |price-strike|) is maximum
+        try:
+            mp, _ = calculate_max_pain(df_summary, underlying_price)
+            zones["max_pain"] = float(mp) if mp else None
+        except Exception:
+            pass
+
+        # Gamma exposure zones
+        gex_result = calculate_dealer_gex(df_summary, underlying_price)
+        if gex_result:
+            zones["gamma_flip"]       = gex_result.get("gamma_flip_level")
+            zones["gamma_resistance"] = gex_result.get("gex_repeller")
+            zones["gamma_support"]    = gex_result.get("gex_magnet")
+
+        # Depth cluster using bid/ask columns as proxy for liquidity
+        ask_cols = [c for c in df_summary.columns if 'askQty' in c]
+        bid_cols = [c for c in df_summary.columns if 'bidQty' in c]
+        if ask_cols and bid_cols:
+            df_above = df_summary[df_summary['Strike'] > underlying_price].copy()
+            df_below = df_summary[df_summary['Strike'] < underlying_price].copy()
+            if not df_above.empty:
+                ask_sum = df_above[ask_cols].sum(axis=1)
+                zones["depth_cluster_above"] = float(df_above.loc[ask_sum.idxmax(), 'Strike'])
+            if not df_below.empty:
+                bid_sum = df_below[bid_cols].sum(axis=1)
+                zones["depth_cluster_below"] = float(df_below.loc[bid_sum.idxmax(), 'Strike'])
+    except Exception:
+        pass
+
+    return zones
+
+
+def _iofce_oi_score(df_summary, underlying_price: float,
+                    total_ce_chg: float, total_pe_chg: float) -> tuple:
+    """Step 2: OI Expansion Detection — score 0-2, direction, label.
+
+    Returns (score 0-2, activity_label str, detail str)
+    """
+    if df_summary is None or df_summary.empty:
+        return 0, "No OI Data", "Options chain unavailable"
+
+    try:
+        # Determine ATM
+        atm_strike = float(min(df_summary['Strike'].tolist(),
+                               key=lambda x: abs(x - underlying_price)))
+        atm_row = df_summary[df_summary['Strike'] == atm_strike]
+
+        ce_atm_chg = float(atm_row['changeinOpenInterest_CE'].iloc[0]) if (
+            not atm_row.empty and 'changeinOpenInterest_CE' in atm_row.columns) else 0
+        pe_atm_chg = float(atm_row['changeinOpenInterest_PE'].iloc[0]) if (
+            not atm_row.empty and 'changeinOpenInterest_PE' in atm_row.columns) else 0
+
+        score = 0
+        label = "Neutral OI"
+        detail = ""
+
+        # Strong call writing near resistance → institutional defense
+        if total_ce_chg > 0 and total_ce_chg > abs(total_pe_chg) * 1.2:
+            score += 1
+            label  = "Institutional Defense (CE Writing)"
+            detail = f"Call OI +{total_ce_chg:.1f}L vs Put OI {total_pe_chg:+.1f}L"
+
+        # Strong put writing near support → institutional accumulation
+        elif total_pe_chg > 0 and total_pe_chg > abs(total_ce_chg) * 1.2:
+            score += 1
+            label  = "Institutional Accumulation (PE Writing)"
+            detail = f"Put OI +{total_pe_chg:.1f}L vs Call OI {total_ce_chg:+.1f}L"
+
+        # Large OI change at ATM confirms smart money positioning
+        if abs(ce_atm_chg) + abs(pe_atm_chg) > 50000:   # significant ATM activity
+            score += 1
+            detail += f" | ATM activity CE:{ce_atm_chg:+.0f} PE:{pe_atm_chg:+.0f}"
+
+        if score == 0:
+            label  = "Weak / Mixed OI"
+            detail = f"CE chg:{total_ce_chg:+.1f}L  PE chg:{total_pe_chg:+.1f}L"
+
+        return min(2, score), label, detail.strip(" |")
+    except Exception:
+        return 0, "OI Error", "Calculation failed"
+
+
+def _iofce_futures_score(df, option_data: dict) -> tuple:
+    """Step 3: Futures Positioning Confirmation — score 0-2.
+
+    Uses existing _amie_oi_behavior which classifies Long/Short Build-up etc.
+    Returns (score 0-2, positioning_label str, detail str)
+    """
+    oi_behavior, support_sig, resistance_sig, oi_score = _amie_oi_behavior(option_data, df)
+
+    # Map AMIE OI behavior to institutional futures score
+    score_map = {
+        "Long Build-up":   2,   # price up + OI up → institutional longs building
+        "Short Build-up":  2,   # price down + OI up → institutional shorts building
+        "Short Covering":  1,   # price up + OI down → short covering (less definitive)
+        "Long Unwinding":  1,   # price down + OI down → longs exiting
+        "Mixed / Neutral": 0,
+    }
+    score = score_map.get(oi_behavior, 0)
+
+    # Determine direction context
+    if oi_behavior in ("Long Build-up", "Short Covering"):
+        detail = f"Bullish positioning — {support_sig} support | {resistance_sig} resistance"
+    elif oi_behavior in ("Short Build-up", "Long Unwinding"):
+        detail = f"Bearish positioning — {resistance_sig} resistance | {support_sig} support"
+    else:
+        detail = f"Mixed positioning — support:{support_sig} | resistance:{resistance_sig}"
+
+    return score, oi_behavior, detail
+
+
+def _iofce_depth_score(option_data: dict) -> tuple:
+    """Step 4: Market Depth Absorption Detection — score 0-2.
+
+    Uses existing _amie_depth_signal which reads bid/ask OI proxy.
+    Returns (score 0-2, depth_label str, detail str)
+    """
+    depth_signal, depth_score_raw, depth_detail = _amie_depth_signal(option_data)
+
+    # Map 0-100 score to 0-2 bands
+    if depth_score_raw >= 68:        # strong buying pressure (ratio > 1.5)
+        score = 2
+    elif depth_score_raw >= 58:      # mild buying
+        score = 1
+    elif depth_score_raw <= 32:      # strong selling
+        score = 2
+    elif depth_score_raw <= 42:      # mild selling
+        score = 1
+    else:                            # balanced (no clear absorption)
+        score = 0
+
+    return score, depth_signal, depth_detail
+
+
+def _iofce_gamma_score(df_summary, underlying_price: float) -> tuple:
+    """Step 5: Gamma Reaction Confirmation — score 0-2.
+
+    Uses existing GEX calculation to check if price is reacting at gamma levels.
+    Returns (score 0-2, gamma_label str, detail str)
+    """
+    if df_summary is None or df_summary.empty or underlying_price is None:
+        return 0, "No Gamma Data", "GEX calculation unavailable"
+
+    try:
+        gex = calculate_dealer_gex(df_summary, underlying_price)
+        if not gex:
+            return 0, "GEX Error", "Could not compute GEX"
+
+        total_gex     = gex.get("total_gex", 0)
+        flip_level    = gex.get("gamma_flip_level")
+        gex_signal    = gex.get("gex_signal", "")
+        gex_interp    = gex.get("gex_interpretation", "")
+        spot_vs_flip  = gex.get("spot_vs_flip", "N/A")
+        gex_magnet    = gex.get("gex_magnet")
+        gex_repeller  = gex.get("gex_repeller")
+
+        score = 0
+        label = "Neutral Gamma"
+        detail = f"GEX={total_gex:.0f}  Flip={flip_level or 'N/A'}  {spot_vs_flip}"
+
+        # Strong GEX signal
+        if gex_signal in ("Breakout", "Trending"):
+            # Negative GEX: dealers short gamma → directional moves amplified
+            score += 1
+            label  = f"Gamma Breakout Zone ({gex_signal})"
+        elif gex_signal in ("Pin/Chop", "Range"):
+            # Positive GEX: dealers long gamma → price pinning / mean reversion
+            score += 1
+            label  = f"Gamma Pinning ({gex_signal})"
+
+        # Price near gamma flip → high dealer hedging activity → institutional reaction
+        if flip_level and abs(underlying_price - flip_level) / (flip_level + 1e-6) < 0.005:
+            score += 1
+            label += " + Near Gamma Flip"
+            detail += f"  |  Price {underlying_price:.0f} near Flip {flip_level:.0f}"
+        elif gex_repeller and abs(underlying_price - gex_repeller) / (gex_repeller + 1e-6) < 0.004:
+            score += 1
+            label += " + At Gamma Repeller (Resistance)"
+        elif gex_magnet and abs(underlying_price - gex_magnet) / (gex_magnet + 1e-6) < 0.004:
+            score += 1
+            label += " + At Gamma Magnet (Support)"
+
+        return min(2, score), label, detail
+    except Exception:
+        return 0, "Gamma Error", "Calculation failed"
+
+
+def run_iofce(option_data: dict, df, underlying_price: float,
+              cie_signals: list) -> dict:
+    """Run Institutional Order Flow Confirmation Engine (IOFCE).
+
+    Steps: Zones → OI Expansion → Futures Positioning → Depth Absorption → Gamma Reaction
+    Produces institutional_score 0-8, classification, trap_risk, and adjusts CIE signal confidence.
+
+    Returns enriched result dict.
+    """
+    result = {
+        "zones":                  {},
+        "oi_score":               0,  "oi_label":    "",  "oi_detail":    "",
+        "futures_score":          0,  "futures_label": "", "futures_detail": "",
+        "depth_score":            0,  "depth_label": "",  "depth_detail":  "",
+        "gamma_score":            0,  "gamma_label": "",  "gamma_detail":  "",
+        "institutional_score":    0,
+        "classification":         "",
+        "trap_risk":              "",
+        "signal_adjustment":      "",
+        "adjusted_signals":       [],
+    }
+
+    if option_data is None:
+        option_data = {}
+
+    df_summary      = option_data.get("df_summary")
+    total_ce_chg    = option_data.get("total_ce_change", 0) or 0
+    total_pe_chg    = option_data.get("total_pe_change", 0) or 0
+    underlying      = underlying_price or option_data.get("underlying", 0) or 0
+
+    # Step 1 — Zones
+    result["zones"] = _iofce_identify_zones(df_summary, underlying)
+
+    # Step 2 — OI Expansion
+    result["oi_score"], result["oi_label"], result["oi_detail"] = _iofce_oi_score(
+        df_summary, underlying, total_ce_chg, total_pe_chg)
+
+    # Step 3 — Futures Positioning
+    result["futures_score"], result["futures_label"], result["futures_detail"] = _iofce_futures_score(
+        df, option_data)
+
+    # Step 4 — Depth Absorption
+    result["depth_score"], result["depth_label"], result["depth_detail"] = _iofce_depth_score(option_data)
+
+    # Step 5 — Gamma Reaction
+    result["gamma_score"], result["gamma_label"], result["gamma_detail"] = _iofce_gamma_score(
+        df_summary, underlying)
+
+    # Step 6 — Institutional Score (max = 8)
+    inst_score = (result["oi_score"] + result["futures_score"] +
+                  result["depth_score"] + result["gamma_score"])
+    result["institutional_score"] = inst_score
+
+    # Step 7 — Classification
+    if inst_score >= 6:
+        result["classification"] = "Institutional Move Confirmed"
+        result["trap_risk"]      = "Low"
+    elif inst_score >= 3:
+        result["classification"] = "Possible Institutional Activity"
+        result["trap_risk"]      = "Medium"
+    else:
+        result["classification"] = "Weak / Retail Driven Move"
+        result["trap_risk"]      = "High"
+
+    # Step 8 — Signal Adjustment on CIE signals
+    adjusted = []
+    for sig in (cie_signals or []):
+        sig = dict(sig)  # copy
+        original_conf = sig.get("confidence", 50)
+        if inst_score >= 6:
+            new_conf = min(100, original_conf + 8)
+            sig["iofce_adjustment"] = f"+8 (Institutional Confirmed)"
+        elif inst_score >= 3:
+            new_conf = original_conf          # no change
+            sig["iofce_adjustment"] = "0 (Possible Activity)"
+        else:
+            new_conf = max(30, original_conf - 8)
+            sig["iofce_adjustment"] = f"-8 (Retail/Weak)"
+        sig["confidence"]        = new_conf
+        sig["iofce_trap_risk"]   = result["trap_risk"]
+        sig["iofce_score"]       = inst_score
+        # Re-classify signal_strength after adjustment
+        if new_conf >= 85:
+            sig["signal_strength"] = "INSTITUTIONAL"
+            sig["strength_color"]  = "#ff6600"
+        elif new_conf >= 70:
+            sig["signal_strength"] = "STRONG"
+            sig["strength_color"]  = "#ffaa00"
+        else:
+            sig["signal_strength"] = "NORMAL"
+            sig["strength_color"]  = "#00aaff"
+        adjusted.append(sig)
+    result["adjusted_signals"] = adjusted
+
+    # Step 9 — Trap Enhancement note
+    if inst_score <= 2:
+        result["signal_adjustment"] = "High Trap Probability — reduce position size or wait for confirmation"
+    elif inst_score >= 6:
+        result["signal_adjustment"] = "Low Trap Risk — signal backed by institutional order flow"
+    else:
+        result["signal_adjustment"] = "Moderate — confirm with price action before entry"
+
+    return result
+
+
+def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list):
+    """UI panel for the Institutional Order Flow Confirmation Engine."""
+    st.markdown("#### 🏦 Institutional Order Flow Confirmation Engine")
+    st.caption(
+        "Confirms whether smart money is active behind the signal. "
+        "Uses only live VOB2 data: Options OI, GEX, Market Depth, Futures Positioning. Score: 0–8."
+    )
+
+    with st.spinner("Analysing institutional order flow…"):
+        res = run_iofce(option_data, df, underlying_price, cie_signals)
+
+    inst_score = res["institutional_score"]
+    classif    = res["classification"]
+    trap_risk  = res["trap_risk"]
+
+    score_color = ("#00ff88" if inst_score >= 6
+                   else ("#ffaa00" if inst_score >= 3 else "#ff4444"))
+    trap_color  = ("#00ff88" if trap_risk == "Low"
+                   else ("#ffaa00" if trap_risk == "Medium" else "#ff4444"))
+
+    # ── Summary KPIs ──────────────────────────────────────────────────
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {score_color}'>
+        <div style='color:#aaa;font-size:11px'>INST. SCORE</div>
+        <div style='font-size:28px;font-weight:bold;color:{score_color}'>{inst_score} / 8</div>
+        <div style='color:#ccc;font-size:11px'>{classif}</div>
+        </div>""", unsafe_allow_html=True)
+    with k2:
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {trap_color}'>
+        <div style='color:#aaa;font-size:11px'>TRAP RISK</div>
+        <div style='font-size:20px;font-weight:bold;color:{trap_color}'>{trap_risk}</div>
+        <div style='color:#ccc;font-size:11px'>{'Institutional Confirmed 🔥' if inst_score>=6 else ('Active 📊' if inst_score>=3 else 'Retail / Weak ⚠️')}</div>
+        </div>""", unsafe_allow_html=True)
+    with k3:
+        sub_label = f"OI:{res['oi_score']}  Fut:{res['futures_score']}  Depth:{res['depth_score']}  GEX:{res['gamma_score']}"
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00aaff'>
+        <div style='color:#aaa;font-size:11px'>COMPONENT BREAKDOWN</div>
+        <div style='font-size:13px;font-weight:bold;color:#00aaff'>{sub_label}</div>
+        <div style='color:#ccc;font-size:11px'>Each component max 2</div>
+        </div>""", unsafe_allow_html=True)
+    with k4:
+        adj_color = "#00ff88" if "Low" in res["signal_adjustment"] else ("#ffaa00" if "Moderate" in res["signal_adjustment"] else "#ff4444")
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {adj_color}'>
+        <div style='color:#aaa;font-size:11px'>SIGNAL GUIDANCE</div>
+        <div style='font-size:11px;font-weight:bold;color:{adj_color}'>{res['signal_adjustment']}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Component Detail Table ─────────────────────────────────────────
+    st.markdown("##### Component Analysis")
+    comp_rows = [
+        {
+            "Component":    "OI Expansion",
+            "Score":        f"{res['oi_score']} / 2",
+            "Activity":     res["oi_label"],
+            "Detail":       res["oi_detail"],
+        },
+        {
+            "Component":    "Futures Positioning",
+            "Score":        f"{res['futures_score']} / 2",
+            "Activity":     res["futures_label"],
+            "Detail":       res["futures_detail"],
+        },
+        {
+            "Component":    "Depth Absorption",
+            "Score":        f"{res['depth_score']} / 2",
+            "Activity":     res["depth_label"],
+            "Detail":       res["depth_detail"],
+        },
+        {
+            "Component":    "Gamma Reaction",
+            "Score":        f"{res['gamma_score']} / 2",
+            "Activity":     res["gamma_label"],
+            "Detail":       res["gamma_detail"],
+        },
+    ]
+    st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+
+    # ── Institutional Zones ────────────────────────────────────────────
+    zones = res["zones"]
+    non_null_zones = {k: v for k, v in zones.items() if v is not None}
+    if non_null_zones:
+        st.markdown("##### Key Institutional Zones")
+        zone_labels = {
+            "max_pain":            "Max Pain (Price Magnet)",
+            "oi_resistance":       "OI Wall Resistance (Max CE OI)",
+            "oi_support":          "OI Wall Support (Max PE OI)",
+            "gamma_flip":          "Gamma Flip Level",
+            "gamma_resistance":    "Gamma Repeller (Resistance)",
+            "gamma_support":       "Gamma Magnet (Support)",
+            "depth_cluster_above": "Depth Cluster Above",
+            "depth_cluster_below": "Depth Cluster Below",
+        }
+        zone_rows = [
+            {"Zone": zone_labels.get(k, k), "Level (₹)": f"₹{v:,.0f}"}
+            for k, v in non_null_zones.items()
+        ]
+        st.dataframe(pd.DataFrame(zone_rows), use_container_width=True, hide_index=True)
+
+    # ── Adjusted CIE Signals ───────────────────────────────────────────
+    if res["adjusted_signals"]:
+        st.markdown("##### IOFCE-Adjusted CIE Signals")
+        sig_rows = []
+        for s in res["adjusted_signals"]:
+            sig_rows.append({
+                "Pattern":      s.get("pattern", "-"),
+                "Direction":    s.get("direction", "-"),
+                "Confidence":   f"{s.get('confidence', 0)}%",
+                "IOFCE Adj":    s.get("iofce_adjustment", "-"),
+                "Trap Risk":    s.get("iofce_trap_risk", "-"),
+                "Strength":     s.get("signal_strength", "-"),
+            })
+        st.dataframe(pd.DataFrame(sig_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No CIE signals available for IOFCE adjustment.")
+
+    # ── Institutional Score Gauge ─────────────────────────────────────
+    bar_pct = int(inst_score / 8 * 100)
+    gauge_label = ("Institutional Move Confirmed 🔥" if inst_score >= 6
+                   else ("Possible Institutional Activity 📊" if inst_score >= 3
+                         else "Retail / Weak Move ⚠️"))
+    st.markdown(f"""
+    <div style='margin-top:10px'>
+      <div style='color:#aaa;font-size:12px;margin-bottom:4px'>Institutional Score: {inst_score}/8 — {gauge_label}</div>
+      <div style='background:#333;border-radius:6px;height:16px;width:100%'>
+        <div style='background:{score_color};width:{bar_pct}%;height:16px;border-radius:6px;transition:width 0.4s'></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style='margin-top:8px;font-size:11px;color:#888'>
+    Score Guide: &nbsp;
+    <span style='color:#00ff88'>≥6 Institutional Confirmed</span> &nbsp;|&nbsp;
+    <span style='color:#ffaa00'>3–5 Possible Activity</span> &nbsp;|&nbsp;
+    <span style='color:#ff4444'>≤2 Retail / Trap Risk</span>
+    </div>
+    """, unsafe_allow_html=True)
 
 
 if __name__ == "__main__":
