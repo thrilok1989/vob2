@@ -37,7 +37,7 @@ _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
 _mkt_open  = _ist_now.replace(hour=8,  minute=30, second=0, microsecond=0)
 _mkt_close = _ist_now.replace(hour=16, minute=0,  second=0, microsecond=0)
 if _ist_now.weekday() < 5 and _mkt_open <= _ist_now <= _mkt_close:
-    st_autorefresh(interval=30000, key="datarefresh")
+    st_autorefresh(interval=60000, key="datarefresh")
 
 # Custom CSS for TradingView-like appearance + ATM highlighting
 st.markdown("""
