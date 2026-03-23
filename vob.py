@@ -14512,6 +14512,10 @@ def main():
 
         # Calculate Volume Order Blocks (VOB) from full df (HTF context)
         vob_blocks_for_chart = None
+        poc_data_for_chart = None
+        swing_data_for_chart = None
+        rsi_sz_data_for_chart = None
+        ultimate_rsi_data_for_chart = None
         if not df.empty and len(df) > 30:
             try:
                 vob_detector = VolumeOrderBlocks(sensitivity=5)
