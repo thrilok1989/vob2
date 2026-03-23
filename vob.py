@@ -14423,10 +14423,6 @@ def main():
     # ===== MARKET OVERVIEW (NIFTY + SENSEX) =====
     show_market_overview(api, interval=timeframes.get(selected_timeframe, "1"), days_back=days_back)
 
-    # ===== BANK NIFTY MULTI-TICKER DASHBOARD =====
-    with st.expander("📊 Bank Nifty Dashboard — Multi-Ticker & Indicator Table", expanded=False):
-        show_bn_dashboard(interval=timeframes.get(selected_timeframe, "1"))
-
     # Main layout - Trading chart and Options analysis side by side
     col1, col2 = st.columns([2, 1])
 
@@ -21014,7 +21010,12 @@ def main():
     if show_analytics:
         st.markdown("---")
         display_analytics_dashboard(db)
-    
+
+    # ===== BANK NIFTY MULTI-TICKER DASHBOARD =====
+    st.markdown("---")
+    with st.expander("📊 Bank Nifty Dashboard — Multi-Ticker & Indicator Table", expanded=False):
+        show_bn_dashboard(interval=timeframes.get(selected_timeframe, "1"))
+
     # Show current time
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S IST")
