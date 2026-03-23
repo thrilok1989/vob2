@@ -13306,15 +13306,36 @@ def show_final_intelligence_dashboard(df: pd.DataFrame = None,
     except Exception:
         pass
 
-    # News (20%) — use cached value from session if available
+    # News (15%) — use cached value from session if available
     news_score = st.session_state.get("_fid_news_score", 50)
 
-    # Sector (10%)
+    # Sector (5%)
     sect_score = st.session_state.get("_fid_sector_score", 50)
 
-    # Combined composite
-    weights = {"PA": 0.30, "OI": 0.20, "FII": 0.20, "News": 0.20, "Sector": 0.10}
-    scores  = {"PA": pa_score, "OI": oi_score, "FII": fii_score, "News": news_score, "Sector": sect_score}
+    # Greeks / Delta & Gamma (15%) — from Delta & Gamma Engine session state
+    dg_score = 50
+    dg_detail = "N/A — DG Engine not run"
+    _dg_hist = st.session_state.get('delta_gamma_history', [])
+    if _dg_hist:
+        _dg_latest = _dg_hist[-1]
+        _dg_nd = _dg_latest.get('net_delta', 0)
+        _dg_ng = _dg_latest.get('net_gamma', 0)
+        _dg_gc = (_dg_hist[-1]['net_gamma'] - _dg_hist[-2]['net_gamma']) if len(_dg_hist) >= 2 else 0
+        # Base score from net_delta
+        if _dg_nd > 0.15:    dg_score = 78
+        elif _dg_nd > 0.05:  dg_score = 62
+        elif _dg_nd < -0.15: dg_score = 22
+        elif _dg_nd < -0.05: dg_score = 38
+        else:                 dg_score = 50
+        # Gamma expansion/contraction modifier
+        if _dg_gc > 0:   dg_score = min(dg_score + 5, 100)
+        elif _dg_gc < 0: dg_score = max(dg_score - 5, 0)
+        _dg_dir = "⬆️" if _dg_gc > 0 else "⬇️"
+        dg_detail = f"Δ:{_dg_nd:+.4f}  Γ:{_dg_ng:+.2f}L {_dg_dir}"
+
+    # Combined composite (weights adjusted to include Greeks pillar)
+    weights = {"PA": 0.25, "OI": 0.20, "FII": 0.20, "News": 0.15, "Sector": 0.05, "Greeks": 0.15}
+    scores  = {"PA": pa_score, "OI": oi_score, "FII": fii_score, "News": news_score, "Sector": sect_score, "Greeks": dg_score}
     composite = int(sum(scores[k] * weights[k] for k in scores))
 
     # Trend probability
@@ -13380,11 +13401,12 @@ def show_final_intelligence_dashboard(df: pd.DataFrame = None,
 
     pillar_rows = []
     pillar_info = [
-        ("Price Action (EMA+ADX)",  pa_score,   "30%", ema_trend),
-        ("Options / OI (PCR+GEX)",  oi_score,   "20%", f"PCR={pcr:.2f} GEX={gex_signal}"),
-        ("FII / DII Flow",          fii_score,  "20%", fii_net_str),
-        ("News Sentiment",          news_score, "20%", "Keyword-scored RSS"),
-        ("Sector Rotation",         sect_score, "10%", "RS-Ratio vs NIFTY"),
+        ("Price Action (EMA+ADX)",      pa_score,   "25%", ema_trend),
+        ("Options / OI (PCR+GEX)",      oi_score,   "20%", f"PCR={pcr:.2f} GEX={gex_signal}"),
+        ("FII / DII Flow",              fii_score,  "20%", fii_net_str),
+        ("News Sentiment",              news_score, "15%", "Keyword-scored RSS"),
+        ("Greeks (Delta+Gamma Engine)", dg_score,   "15%", dg_detail),
+        ("Sector Rotation",             sect_score,  "5%", "RS-Ratio vs NIFTY"),
     ]
     for name, sc, wt, detail in pillar_info:
         clr, lbl = _score_style(sc)
