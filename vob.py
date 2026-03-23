@@ -37,7 +37,7 @@ _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
 _mkt_open  = _ist_now.replace(hour=8,  minute=30, second=0, microsecond=0)
 _mkt_close = _ist_now.replace(hour=16, minute=0,  second=0, microsecond=0)
 if _ist_now.weekday() < 5 and _mkt_open <= _ist_now <= _mkt_close:
-    st_autorefresh(interval=30000, key="datarefresh")
+    st_autorefresh(interval=60000, key="datarefresh")
 
 # Custom CSS for TradingView-like appearance + ATM highlighting
 st.markdown("""
@@ -542,7 +542,8 @@ class DhanAPI:
         elif status_code == 401:
             st.error("🔐 **Dhan API — Unauthorised (401):** Invalid client ID or token. Check your credentials.")
         elif status_code == 429:
-            st.warning("⏳ **Dhan API — Rate Limited (429):** Too many requests. Please wait a moment and refresh.")
+            st.session_state['_api_cooldown_until'] = datetime.now(pytz.UTC) + timedelta(seconds=90)
+            st.warning("⏳ **Dhan API — Rate Limited (429):** Too many requests. Auto-fetch paused for 90 seconds.")
         elif status_code >= 500:
             st.warning(f"🌐 **Dhan API — Server Error ({status_code}):** Dhan servers are temporarily unavailable. Try again shortly.")
         else:
@@ -14465,7 +14466,9 @@ def main():
 
             _max_dt = df['datetime'].max() if not df.empty else None
             _max_utc = (_max_dt.tz_convert(pytz.UTC) if _max_dt is not None and _max_dt.tzinfo else _max_dt.tz_localize(pytz.timezone('Asia/Kolkata')).tz_convert(pytz.UTC)) if _max_dt is not None else None
-            if df.empty or _max_utc is None or (datetime.now(pytz.UTC) - _max_utc).total_seconds() > 300:
+            _cooldown_until = st.session_state.get('_api_cooldown_until')
+            _in_cooldown = _cooldown_until is not None and datetime.now(pytz.UTC) < _cooldown_until
+            if not _in_cooldown and (df.empty or _max_utc is None or (datetime.now(pytz.UTC) - _max_utc).total_seconds() > 300):
                 with st.spinner("Fetching latest data from API..."):
                     data = api.get_intraday_data(
                         security_id="13",
