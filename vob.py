@@ -12900,7 +12900,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
             x=_mh['time'], y=_mh['score'],
             mode='lines+markers', name='Ensemble Score',
             line=dict(color=ml_color, width=2), marker=dict(size=4),
-            fill='tozeroy', fillcolor=f"{ml_color}22",
+            fill='tozeroy', fillcolor='rgba({},{},{},0.13)'.format(int(ml_color[1:3],16),int(ml_color[3:5],16),int(ml_color[5:7],16)),
         ))
         _fig_mh.add_hline(y=0.12,  line_dash='dash', line_color='#00C853', line_width=1,
                           annotation_text='Bull', annotation_position='right')
