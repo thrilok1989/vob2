@@ -337,12 +337,79 @@ CREATE INDEX IF NOT EXISTS idx_candle_data_lookup
                 .delete()\
                 .lt('timestamp', cutoff_ts)\
                 .execute()
-            
+
             return len(result.data) if result.data else 0
         except Exception as e:
             st.error(f"Error clearing old data: {str(e)}")
             return 0
-    
+
+    # ── Signals table SQL ────────────────────────────────────────────────────
+    SIGNALS_SCHEMA_SQL = """
+-- Run this once in Supabase SQL Editor:
+CREATE TABLE IF NOT EXISTS signals (
+    id          bigserial PRIMARY KEY,
+    created_at  timestamptz DEFAULT now(),
+    signal_time timestamptz NOT NULL,
+    signal_type text        NOT NULL,   -- CONFLUENCE | ITM | CIE | CMCE | IOFCE
+    direction   text,                   -- BUY | SELL
+    source      text        NOT NULL,   -- human-readable analysis source name
+    symbol      text        NOT NULL DEFAULT 'NIFTY',
+    spot_price  double precision,
+    confidence  text,
+    entry       double precision,
+    target      double precision,
+    stop_loss   double precision,
+    details     jsonb       DEFAULT '{}'::jsonb
+);
+CREATE INDEX IF NOT EXISTS idx_signals_time ON signals (signal_time DESC);
+"""
+
+    def save_signal(self, signal_type: str, direction: str, source: str,
+                    spot_price=None, confidence=None,
+                    entry=None, target=None, stop_loss=None,
+                    details: dict = None):
+        """Persist a trading signal to Supabase. Silently skips on any error."""
+        try:
+            now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+            record = {
+                'signal_time': now_ist.isoformat(),
+                'signal_type': signal_type,
+                'direction': direction or '',
+                'source': source,
+                'symbol': 'NIFTY',
+                'spot_price': float(spot_price) if spot_price is not None else None,
+                'confidence': str(confidence) if confidence is not None else None,
+                'entry': float(entry) if entry is not None else None,
+                'target': float(target) if target is not None else None,
+                'stop_loss': float(stop_loss) if stop_loss is not None else None,
+                'details': details or {},
+            }
+            self.client.table('signals').insert(record).execute()
+        except Exception:
+            pass  # never block the main app
+
+    def get_signals(self, limit: int = 200):
+        """Return recent signals as a DataFrame. Returns empty df on error."""
+        try:
+            result = (
+                self.client.table('signals')
+                .select('signal_time,signal_type,direction,source,symbol,spot_price,confidence,entry,target,stop_loss,details')
+                .order('signal_time', desc=True)
+                .limit(limit)
+                .execute()
+            )
+            if result.data:
+                df = pd.DataFrame(result.data)
+                df['signal_time'] = (
+                    pd.to_datetime(df['signal_time'], utc=True)
+                    .dt.tz_convert('Asia/Kolkata')
+                    .dt.strftime('%Y-%m-%d %H:%M:%S')
+                )
+                return df
+            return pd.DataFrame()
+        except Exception:
+            return pd.DataFrame()
+
     def save_user_preferences(self, user_id, timeframe, auto_refresh, days_back, pivot_settings, pivot_proximity=5):
         """Save user preferences"""
         try:
@@ -2442,7 +2509,8 @@ def calculate_max_pain(df_options, spot_price):
 
 
 def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price, pivot_proximity,
-                                   poc_data=None, rsi_sz_data=None, gex_data=None, ultimate_rsi_data=None):
+                                   poc_data=None, rsi_sz_data=None, gex_data=None, ultimate_rsi_data=None,
+                                   db=None):
     """
     Unified Confluence Entry Signal — sends ONE Telegram alert only when ALL conditions align:
 
@@ -2651,6 +2719,18 @@ def check_confluence_entry_signal(df, pivot_settings, df_summary, current_price,
 """
         send_telegram_message_sync(message)
         st.session_state.last_confluence_alert = alert_key
+        _conf_dir = 'BUY' if direction == 'bullish' else 'SELL'
+        if db:
+            db.save_signal(
+                signal_type='CONFLUENCE',
+                direction=_conf_dir,
+                source='ATM Confluence (6-condition)',
+                spot_price=current_price,
+                confidence='HIGH',
+                entry=float(atm_strike),
+                details={'verdict': verdict, 'bias_score': int(bias_score),
+                         'pcr': float(atm_pcr), 'confluence_strength': int(confluence_strength)},
+            )
         if direction == 'bullish':
             st.success(f"🟢🔥 Confluence BULLISH entry alert sent! Strike {atm_strike} CE")
         else:
@@ -16965,6 +17045,18 @@ def main():
                                 f"Confidence: {_confidence} | Sentiment: {_itm_sent_score}/100\n"
                                 f"Flow: {_itm_final_signal}"
                             )
+                            db.save_signal(
+                                signal_type='ITM',
+                                direction='BUY' if _itm_market_bias == 'BULLISH' else 'SELL',
+                                source='Institutional Trade Map',
+                                spot_price=_itm_spot,
+                                confidence=_confidence,
+                                entry=_itm_entry,
+                                target=_itm_target,
+                                stop_loss=_itm_sl,
+                                details={'sentiment': _itm_sent_score, 'flow': _itm_final_signal,
+                                         'support': _true_support, 'resistance': _true_resist},
+                            )
                             st.session_state.itm_last_alert = (_itm_key, _itm_now2)
 
                     # ── STEP 9 Display: Trade Map Panel ────────────────────────
@@ -20630,6 +20722,16 @@ def main():
                                     )
                                     send_telegram_message_sync(_cie_tg_msg)
                                     st.session_state.cie_last_alert[_pat] = _cie_now_ist
+                                    db.save_signal(
+                                        signal_type='CIE',
+                                        direction=_dir,
+                                        source=f'Candlestick Intelligence Engine — {_pat}',
+                                        spot_price=_cie_underlying,
+                                        confidence=str(_conf),
+                                        entry=_price,
+                                        details={'pattern': _pat, 'category': _cat,
+                                                 'level_type': _lvl_type, 'strength': _strength},
+                                    )
                                     # Store in history
                                     st.session_state.cie_signal_history.append({
                                         'time': _cie_now_ist,
@@ -20917,6 +21019,7 @@ def main():
             show_cross_market_confirmation_engine(
                 cie_signals=_cmce_cie_sigs,
                 send_telegram=_cmce_tg,
+                db=db,
             )
         except Exception as _cmce_err:
             st.warning(f"Cross-Market Confirmation Engine error: {str(_cmce_err)}")
@@ -20938,9 +21041,51 @@ def main():
                 cie_signals=_iofce_cie_sigs,
                 send_telegram=_iofce_tg,
                 ultimate_rsi_data=ultimate_rsi_data_for_chart if 'ultimate_rsi_data_for_chart' in dir() else None,
+                db=db,
             )
         except Exception as _iofce_err:
             st.warning(f"Institutional Order Flow Engine error: {str(_iofce_err)}")
+
+    # ===== SIGNAL HISTORY (Supabase) =====
+    st.markdown("---")
+    with st.expander("📋 Signal History — All Stored Signals", expanded=False):
+        try:
+            _sig_df = db.get_signals(limit=200)
+            if _sig_df.empty:
+                st.info("No signals stored yet. Signals are saved automatically when BUY/SELL alerts fire.")
+                st.code(SupabaseDB.SIGNALS_SCHEMA_SQL, language="sql")
+            else:
+                _col_order = ['signal_time', 'signal_type', 'direction', 'source',
+                              'spot_price', 'confidence', 'entry', 'target', 'stop_loss']
+                _display_cols = [c for c in _col_order if c in _sig_df.columns]
+                _sig_display = _sig_df[_display_cols].copy()
+                _sig_display.columns = ['Time (IST)', 'Type', 'Direction', 'Source',
+                                        'Spot', 'Confidence', 'Entry', 'Target', 'SL'][:len(_display_cols)]
+
+                def _dir_color(val):
+                    if val == 'BUY':
+                        return 'color: #00ff88; font-weight: bold'
+                    elif val == 'SELL':
+                        return 'color: #ff4444; font-weight: bold'
+                    return ''
+
+                _styled = _sig_display.style.applymap(_dir_color, subset=['Direction'] if 'Direction' in _sig_display.columns else [])
+                st.dataframe(_styled, use_container_width=True, hide_index=True)
+
+                # Download button
+                _csv_data = _sig_df[_display_cols].to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="⬇️ Download Signals CSV",
+                    data=_csv_data,
+                    file_name=f"signals_{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y%m%d_%H%M')}.csv",
+                    mime='text/csv',
+                )
+
+                # Show SQL for reference
+                with st.expander("SQL — Create signals table in Supabase", expanded=False):
+                    st.code(SupabaseDB.SIGNALS_SCHEMA_SQL, language="sql")
+        except Exception as _sh_err:
+            st.warning(f"Signal History error: {str(_sh_err)}")
 
     # ===== FUTURES MARKET ANALYSIS ENGINE =====
     with st.expander("🔮 Futures Market Analysis Engine", expanded=False):
@@ -21072,6 +21217,7 @@ def main():
                     rsi_sz_data=rsi_sz_data_for_chart,
                     gex_data=gex_data,
                     ultimate_rsi_data=ultimate_rsi_data_for_chart,
+                    db=db,
                 )
         except Exception:
             pass
@@ -21513,6 +21659,7 @@ def _cmce_build_telegram_message(nifty_pattern: str, analysis: dict) -> str:
 def show_cross_market_confirmation_engine(
     cie_signals: list,
     send_telegram: bool = False,
+    db=None,
 ):
     """UI for Cross-Market Confirmation Engine (Reversal / Continuation / Trap modes).
 
@@ -21680,6 +21827,15 @@ def show_cross_market_confirmation_engine(
             try:
                 send_telegram_message_sync(msg)
                 st.session_state.cmce_last_alert = _now
+                if db:
+                    db.save_signal(
+                        signal_type='CMCE',
+                        direction=signal_direction,
+                        source=f'Cross-Market Confirmation Engine ({sel_mode_label})',
+                        confidence=str(total),
+                        details={'score': total, 'trap_risk': trap,
+                                 'mode': sel_mode_label, 'pattern': nifty_pattern},
+                    )
                 st.success("📨 Telegram cross-market alert sent!")
             except Exception as _tg_e:
                 st.warning(f"Telegram send failed: {_tg_e}")
@@ -22106,7 +22262,7 @@ def _iofce_build_telegram_message(res: dict, underlying_price: float,
 
 
 def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list,
-               send_telegram: bool = False, ultimate_rsi_data: dict = None):
+               send_telegram: bool = False, ultimate_rsi_data: dict = None, db=None):
     """UI panel for the Institutional Order Flow Confirmation Engine."""
     st.markdown("#### 🏦 Institutional Order Flow Confirmation Engine")
     st.caption(
@@ -22265,6 +22421,16 @@ def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list
                 try:
                     send_telegram_message_sync(msg)
                     st.session_state.iofce_last_alert = _now
+                    if db:
+                        db.save_signal(
+                            signal_type='IOFCE',
+                            direction=_dom_sig.get('direction'),
+                            source='Institutional Order Flow Confirmation Engine',
+                            spot_price=underlying_price,
+                            confidence=str(inst_score),
+                            details={'inst_score': inst_score, 'classification': classif,
+                                     'trap_risk': trap_risk, 'pattern': _dom_sig.get('pattern', '')},
+                        )
                     st.success("📨 Telegram IOFCE alert sent!")
                 except Exception as _tg_e:
                     st.warning(f"Telegram send failed: {_tg_e}")
