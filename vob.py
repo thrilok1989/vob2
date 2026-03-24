@@ -22226,26 +22226,27 @@ def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list
     </div>
     """, unsafe_allow_html=True)
 
-    # ── Telegram Alert (rate-limited to 5 min) ────────────────────────
+    # ── Telegram Alert (rate-limited to 5 min, only when BUY/SELL signal present) ──
     if send_telegram:
         _now  = datetime.now(pytz.timezone('Asia/Kolkata'))
         _last = st.session_state.get('iofce_last_alert')
         if _last is None or (_now - _last).total_seconds() > 300:
-            # Derive dominant signal for the message
+            # Derive dominant signal — only send if explicit BUY or SELL direction
             _dom_sig = None
             if cie_signals:
                 _sell = [s for s in cie_signals if s.get('direction') == 'SELL']
                 _buy  = [s for s in cie_signals if s.get('direction') == 'BUY']
                 _dom_sig = (_sell[0] if len(_sell) >= len(_buy) and _sell
-                            else (_buy[0] if _buy else cie_signals[0]))
-            msg = _iofce_build_telegram_message(res, underlying_price, _dom_sig,
-                                                ultimate_rsi_data=ultimate_rsi_data)
-            try:
-                send_telegram_message_sync(msg)
-                st.session_state.iofce_last_alert = _now
-                st.success("📨 Telegram IOFCE alert sent!")
-            except Exception as _tg_e:
-                st.warning(f"Telegram send failed: {_tg_e}")
+                            else (_buy[0] if _buy else None))
+            if _dom_sig and _dom_sig.get('direction') in ('BUY', 'SELL'):
+                msg = _iofce_build_telegram_message(res, underlying_price, _dom_sig,
+                                                    ultimate_rsi_data=ultimate_rsi_data)
+                try:
+                    send_telegram_message_sync(msg)
+                    st.session_state.iofce_last_alert = _now
+                    st.success("📨 Telegram IOFCE alert sent!")
+                except Exception as _tg_e:
+                    st.warning(f"Telegram send failed: {_tg_e}")
 
 
 if __name__ == "__main__":
