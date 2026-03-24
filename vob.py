@@ -14025,6 +14025,54 @@ def run_candlestick_intelligence_engine(df, option_data, straddle_history, under
 
         final_signals.append(sig)
 
+    # ── Volume spike & institutional activity detection ──────────────
+    if df is not None and len(df) >= 10 and 'volume' in df.columns:
+        avg_vol = df['volume'].rolling(20).mean()
+        for _vi in range(max(0, len(df) - 5), len(df)):
+            _v = df['volume'].iloc[_vi]
+            _avg = avg_vol.iloc[_vi] if _vi < len(avg_vol) else df['volume'].mean()
+            if pd.isna(_avg) or _avg <= 0:
+                continue
+            _vol_ratio = _v / _avg
+            if _vol_ratio >= 1.5:
+                _v_close = df['close'].iloc[_vi]
+                _v_open = df['open'].iloc[_vi]
+                _v_dir = 'BUY' if _v_close > _v_open else 'SELL'
+                _v_time = df['datetime'].iloc[_vi] if 'datetime' in df.columns else None
+
+                # Volume strength classification
+                if _vol_ratio >= 3.0:
+                    _vol_strength = 'INSTITUTIONAL'
+                    _vol_color = '#ff6600'
+                    _vol_conf = 90
+                elif _vol_ratio >= 2.0:
+                    _vol_strength = 'HIGH'
+                    _vol_color = '#ffaa00'
+                    _vol_conf = 75
+                else:
+                    _vol_strength = 'ELEVATED'
+                    _vol_color = '#00aaff'
+                    _vol_conf = 60
+
+                _vol_sig = {
+                    'pattern': f'Volume Spike ({_vol_ratio:.1f}x)',
+                    'direction': _v_dir,
+                    'category': 'Volume Analysis',
+                    'price': _v_close,
+                    'level': _v_close,
+                    'level_type': 'Volume Spike',
+                    'confidence': _vol_conf,
+                    'signal_strength': _vol_strength,
+                    'strength_color': _vol_color,
+                    'options_confirmed': False,
+                    'options_details': {
+                        'volume_ratio': _vol_ratio,
+                        'volume_strength': _vol_strength,
+                    },
+                    'time': _v_time,
+                }
+                final_signals.append(_vol_sig)
+
     # Deduplicate by (pattern, direction), keep highest confidence
     seen, deduped = set(), []
     for s in sorted(final_signals, key=lambda x: -x['confidence']):
@@ -14181,6 +14229,413 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
         st.info("Load more data (increase 'Days Back') to enable backtest scan.")
 
 
+# =====================================================================
+# MASTER DATA ENGINE — Passive cache populated by main() flow
+# Eliminates duplicate calculations; all engines read from here.
+# =====================================================================
+
+class MasterDataEngine:
+    """Passive data cache. main() populates via store(). All engines read via val()."""
+
+    _KEY = '_master_data_engine'
+    _MAX_HISTORY = 200
+    _DEDUP_SECS = 30
+
+    @classmethod
+    def get_instance(cls):
+        if cls._KEY not in st.session_state:
+            st.session_state[cls._KEY] = cls()
+        return st.session_state[cls._KEY]
+
+    def __init__(self):
+        self._data = {}
+        self._price_history = []
+
+    def store(self, key, value):
+        self._data[key] = value
+
+    def store_many(self, **kv):
+        self._data.update(kv)
+
+    def val(self, key, default=None):
+        return self._data.get(key, default)
+
+    def populate_from_main(self, *, candle_df=None, df_today=None, current_price=None,
+                           ltp_data=None, option_data=None, pivots_raw=None,
+                           vob_sr=None, vob_blocks=None, gex_data=None,
+                           df_summary=None, underlying_price=None):
+        """Called once in main() after all data is fetched. Computes derived values."""
+        ist = pytz.timezone('Asia/Kolkata')
+        now_ist = datetime.now(ist)
+
+        if candle_df is not None:
+            self._data['candle_df'] = candle_df
+        if df_today is not None:
+            self._data['df_today'] = df_today
+        if current_price is not None:
+            self._data['spot_price'] = current_price
+        if ltp_data is not None:
+            self._data['ltp_data'] = ltp_data
+
+        # Option chain data
+        if option_data is not None:
+            self._data['option_data'] = option_data
+            self._data['df_summary'] = option_data.get('df_summary')
+            self._data['underlying_price'] = option_data.get('underlying', 0)
+            self._data['atm_strike'] = option_data.get('atm_strike')
+            self._data['total_ce_change'] = option_data.get('total_ce_change', 0)
+            self._data['total_pe_change'] = option_data.get('total_pe_change', 0)
+            self._data['expiry'] = option_data.get('expiry', '')
+            self._data['max_pain_strike'] = option_data.get('max_pain_strike')
+            self._data['sr_data'] = option_data.get('sr_data', [])
+            self._compute_atm_slices(option_data.get('df_summary'))
+        elif df_summary is not None:
+            self._data['df_summary'] = df_summary
+        if underlying_price is not None:
+            self._data['underlying_price'] = underlying_price
+
+        # Pivots
+        if pivots_raw is not None:
+            self._data['pivots_raw'] = pivots_raw
+            self._data['htf_supports'] = sorted([p['value'] for p in pivots_raw if p['type'] == 'low'], reverse=True)
+            self._data['htf_resistances'] = sorted([p['value'] for p in pivots_raw if p['type'] == 'high'])
+
+        # VOB
+        if vob_sr is not None:
+            self._data['vob_sr'] = vob_sr
+            self._data['vob_supports'] = sorted(vob_sr.get('support', []), reverse=True)
+            self._data['vob_resistances'] = sorted(vob_sr.get('resistance', []))
+        if vob_blocks is not None:
+            self._data['vob_blocks'] = vob_blocks
+
+        # GEX
+        if gex_data is not None:
+            self._data['gex_data'] = gex_data
+
+        # Day open, high, low, VWAP, price change %
+        _df_t = self._data.get('df_today')
+        if _df_t is not None and not _df_t.empty:
+            self._data['day_open'] = float(_df_t['open'].iloc[0])
+            self._data['day_high'] = float(_df_t['high'].max())
+            self._data['day_low'] = float(_df_t['low'].min())
+            spot = self._data.get('spot_price') or self._data.get('underlying_price', 0)
+            day_open = self._data['day_open']
+            if day_open and day_open > 0 and spot:
+                self._data['price_change_pct'] = ((spot - day_open) / day_open) * 100
+            else:
+                self._data['price_change_pct'] = 0.0
+            try:
+                tp = (_df_t['high'] + _df_t['low'] + _df_t['close']) / 3
+                vol = _df_t['volume'].replace(0, np.nan)
+                self._data['vwap'] = float((tp * vol).cumsum().iloc[-1] / vol.cumsum().iloc[-1])
+            except Exception:
+                self._data['vwap'] = self._data.get('spot_price', 0)
+
+        # Price history (rolling window with 30-sec dedup)
+        spot = self._data.get('spot_price')
+        if spot is not None:
+            should_add = True
+            if self._price_history:
+                last = self._price_history[-1]
+                try:
+                    elapsed = (now_ist.replace(tzinfo=None) - last['time']).total_seconds()
+                    if elapsed < self._DEDUP_SECS:
+                        should_add = False
+                except Exception:
+                    pass
+            if should_add:
+                self._price_history.append({
+                    'time': now_ist.replace(tzinfo=None),
+                    'price': float(spot),
+                    'change_pct': self._data.get('price_change_pct', 0.0),
+                })
+                if len(self._price_history) > self._MAX_HISTORY:
+                    self._price_history = self._price_history[-self._MAX_HISTORY:]
+        self._data['price_history'] = self._price_history
+
+    def _compute_atm_slices(self, df_summary):
+        if df_summary is None or 'Zone' not in df_summary.columns:
+            return
+        try:
+            atm_idx = df_summary[df_summary['Zone'] == 'ATM'].index
+            if len(atm_idx) == 0:
+                return
+            atm_pos = df_summary.index.get_loc(atm_idx[0])
+            s2, e2 = max(0, atm_pos - 2), min(len(df_summary), atm_pos + 3)
+            self._data['atm_pm2_df'] = df_summary.iloc[s2:e2].copy()
+            self._data['current_strikes_5'] = [int(s) for s in self._data['atm_pm2_df']['Strike'].tolist()]
+            s3, e3 = max(0, atm_pos - 3), min(len(df_summary), atm_pos + 4)
+            self._data['atm_pm3_df'] = df_summary.iloc[s3:e3].copy()
+            self._data['current_strikes_7'] = [int(s) for s in self._data['atm_pm3_df']['Strike'].tolist()]
+            self._data['atm_pos'] = atm_pos
+        except Exception:
+            pass
+
+
+def get_master_data():
+    """Return MasterDataEngine singleton."""
+    return MasterDataEngine.get_instance()
+
+
+# ── OI Build-up classifier ──────────────────────────────────────────
+def classify_oi_buildup(price_up, oi_change):
+    """Price ↑ + OI ↑ → Long Build-up, Price ↓ + OI ↑ → Short Build-up, etc."""
+    oi_up = (oi_change or 0) > 0
+    if price_up and oi_up:     return "🟢 Long Build-up"
+    if not price_up and oi_up: return "🔴 Short Build-up"
+    if price_up and not oi_up: return "🟡 Short Covering"
+    return "🟠 Long Unwinding"
+
+
+# ── Smart Money Trap Detection Engine ────────────────────────────────
+def run_smart_money_trap_detection(mde):
+    """Detect bull trap, bear trap, liquidity sweep, gamma trap, fake breakout."""
+    traps = []
+    spot = mde.val('spot_price', 0)
+    df_today = mde.val('df_today')
+    gex_data = mde.val('gex_data')
+    htf_res = mde.val('htf_resistances', [])
+    htf_sup = mde.val('htf_supports', [])
+    vob_res = mde.val('vob_resistances', [])
+    vob_sup = mde.val('vob_supports', [])
+    total_ce_chg = mde.val('total_ce_change', 0) or 0
+    total_pe_chg = mde.val('total_pe_change', 0) or 0
+    price_chg = mde.val('price_change_pct', 0)
+    day_open = mde.val('day_open', spot)
+    if not spot or df_today is None or df_today.empty:
+        return traps
+
+    all_res = sorted(set((htf_res or []) + (vob_res or [])))
+    all_sup = sorted(set((htf_sup or []) + (vob_sup or [])), reverse=True)
+
+    # Bull Trap: price barely above resistance + call OI building + pullback
+    for lvl in all_res[:5]:
+        if spot > lvl > 0:
+            dist = (spot - lvl) / lvl * 100
+            if dist < 0.3 and total_ce_chg > 0:
+                prob = min(85, 50 + int(dist * 100) + min(20, int(total_ce_chg)))
+                if len(df_today) >= 3 and df_today['close'].iloc[-1] < df_today['close'].iloc[-2]:
+                    prob = min(90, prob + 15)
+                traps.append({'type': '🐂 Bull Trap', 'probability': prob,
+                    'detail': f"Price above ₹{lvl:.0f} ({dist:.2f}%) + CE OI +{total_ce_chg:.1f}L losing momentum", 'level': lvl})
+                break
+
+    # Bear Trap: price below support + put OI building + recovering
+    for lvl in all_sup[:5]:
+        if spot < lvl and lvl > 0:
+            dist = (lvl - spot) / lvl * 100
+            if dist < 0.3 and total_pe_chg > 0:
+                prob = min(85, 50 + int(dist * 100) + min(20, int(total_pe_chg)))
+                if len(df_today) >= 3 and df_today['close'].iloc[-1] > df_today['close'].iloc[-2]:
+                    prob = min(90, prob + 15)
+                traps.append({'type': '🐻 Bear Trap', 'probability': prob,
+                    'detail': f"Price below ₹{lvl:.0f} ({dist:.2f}%) + PE OI +{total_pe_chg:.1f}L recovering", 'level': lvl})
+                break
+
+    # Liquidity Sweep: wick beyond level then close back
+    if len(df_today) >= 5:
+        rh = df_today['high'].iloc[-5:].max()
+        rl = df_today['low'].iloc[-5:].min()
+        cc = df_today['close'].iloc[-1]
+        for lvl in all_res[:3]:
+            if rh > lvl > cc and lvl > 0:
+                traps.append({'type': '💧 Liquidity Sweep (High)', 'probability': min(80, 60 + int((rh - lvl) / lvl * 10000)),
+                    'detail': f"Wick above ₹{lvl:.0f} (high {rh:.0f}) closed back ₹{cc:.0f}", 'level': lvl})
+                break
+        for lvl in all_sup[:3]:
+            if rl < lvl < cc and lvl > 0:
+                traps.append({'type': '💧 Liquidity Sweep (Low)', 'probability': min(80, 60 + int((lvl - rl) / lvl * 10000)),
+                    'detail': f"Wick below ₹{lvl:.0f} (low {rl:.0f}) closed back ₹{cc:.0f}", 'level': lvl})
+                break
+
+    # Gamma Trap: spot near gamma flip with high OI
+    if gex_data and isinstance(gex_data, dict):
+        gf = gex_data.get('gamma_flip_level', 0)
+        if gf and gf > 0:
+            dist = abs(spot - gf) / spot * 100
+            if dist < 0.2:
+                traps.append({'type': '⚡ Gamma Trap', 'probability': min(85, 65 + int(dist * 200)),
+                    'detail': f"Spot ₹{spot:.0f} near gamma flip ₹{gf:.0f} ({dist:.2f}%)", 'level': gf})
+
+    # Fake Breakout: moved but reverting
+    if abs(price_chg) > 0.3 and len(df_today) >= 5:
+        pk = (df_today['high'].max() - day_open) / day_open * 100
+        tr = (df_today['low'].min() - day_open) / day_open * 100
+        if pk > 0.5 and price_chg < 0.1:
+            traps.append({'type': '❌ Fake Breakout (Up)', 'probability': min(80, 55 + int(pk * 20)),
+                'detail': f"Rallied {pk:.2f}% but now {price_chg:+.2f}%", 'level': mde.val('day_high', spot)})
+        elif tr < -0.5 and price_chg > -0.1:
+            traps.append({'type': '❌ Fake Breakout (Down)', 'probability': min(80, 55 + int(abs(tr) * 20)),
+                'detail': f"Dropped {tr:.2f}% but now {price_chg:+.2f}%", 'level': mde.val('day_low', spot)})
+    return traps
+
+
+# ── Market Regime Detection Engine ───────────────────────────────────
+def detect_market_regime(mde):
+    """Classify market: Trending / Range / Breakout / Vol Expansion / Compression / Trap."""
+    df_today = mde.val('df_today')
+    spot = mde.val('spot_price', 0)
+    gex_data = mde.val('gex_data')
+    price_chg = mde.val('price_change_pct', 0)
+    result = {'regime': 'Unknown', 'confidence': 0, 'details': [], 'color': '#888', 'scores': {}}
+    if df_today is None or df_today.empty or len(df_today) < 10:
+        return result
+
+    closes = df_today['close']
+    highs, lows = df_today['high'], df_today['low']
+    tr = pd.concat([highs - lows, abs(highs - closes.shift(1)), abs(lows - closes.shift(1))], axis=1).max(axis=1)
+    atr_14 = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else tr.mean()
+    atr_pct = (atr_14 / spot * 100) if spot else 0
+    ema9 = closes.ewm(span=9, adjust=False).mean()
+    ema21 = closes.ewm(span=21, adjust=False).mean()
+    trend_up = ema9.iloc[-1] > ema21.iloc[-1] and closes.iloc[-1] > ema9.iloc[-1]
+    trend_dn = ema9.iloc[-1] < ema21.iloc[-1] and closes.iloc[-1] < ema9.iloc[-1]
+    range_pct = ((highs.max() - lows.min()) / spot * 100) if spot else 0
+    total_gex = gex_data.get('total_gex', 0) if gex_data and isinstance(gex_data, dict) else 0
+
+    details = []
+    sc = {'trend': 0, 'range': 0, 'breakout': 0, 'vol_expand': 0, 'vol_compress': 0, 'trap': 0}
+
+    if trend_up or trend_dn:
+        sc['trend'] += 30; details.append(f"EMA trend {'Up' if trend_up else 'Down'}")
+    if abs(price_chg) > 0.5:
+        sc['trend'] += 20; details.append(f"Price {price_chg:+.2f}% from open")
+    if range_pct < 0.6:
+        sc['range'] += 40; details.append(f"Tight range {range_pct:.2f}%")
+    if atr_pct < 0.08:
+        sc['range'] += 20; sc['vol_compress'] += 30; details.append(f"Low ATR {atr_pct:.3f}%")
+    if range_pct > 1.0 and abs(price_chg) > 0.6:
+        sc['breakout'] += 40; details.append(f"Wide range {range_pct:.2f}% + directional")
+    if atr_pct > 0.15:
+        sc['vol_expand'] += 20; details.append(f"High ATR {atr_pct:.3f}%")
+    if total_gex > 50:
+        sc['trap'] += 25; details.append(f"+GEX {total_gex:.0f}L pins price")
+    elif total_gex < -50:
+        sc['vol_expand'] += 15; details.append(f"-GEX {total_gex:.0f}L accelerates")
+
+    rmap = {'trend': ('Trending', '#00e676'), 'range': ('Range-Bound', '#ffeb3b'),
+            'breakout': ('Breakout Setup', '#ff6600'), 'vol_expand': ('Volatility Expansion', '#ff4444'),
+            'vol_compress': ('Volatility Compression', '#00aaff'), 'trap': ('Trap Zone / Pinned', '#ff44ff')}
+    best = max(sc, key=sc.get)
+    label, color = rmap[best]
+    conf = min(95, sc[best])
+    if conf < 25: label, color, conf = 'Indeterminate', '#888', 20
+    return {'regime': label, 'confidence': conf, 'details': details, 'color': color, 'scores': sc}
+
+
+# ── Price Target Projection Engine ───────────────────────────────────
+def project_price_targets(mde):
+    """Calculate magnet, upside/downside targets, acceleration zones."""
+    spot = mde.val('spot_price', 0)
+    gex_data = mde.val('gex_data')
+    htf_res = mde.val('htf_resistances', [])
+    htf_sup = mde.val('htf_supports', [])
+    vob_res = mde.val('vob_resistances', [])
+    vob_sup = mde.val('vob_supports', [])
+    max_pain = mde.val('max_pain_strike', 0) or 0
+    vwap = mde.val('vwap', 0)
+    targets = {'magnet': None, 'upside_t1': None, 'upside_t2': None,
+               'downside_t1': None, 'downside_t2': None,
+               'acceleration_up': None, 'acceleration_down': None, 'details': []}
+    if not spot: return targets
+
+    magnets = []
+    if max_pain and max_pain > 0: magnets.append(('MaxPain', max_pain, 0.4))
+    if gex_data and isinstance(gex_data, dict):
+        gm = gex_data.get('gex_magnet', 0)
+        if gm and gm > 0: magnets.append(('GEX', gm, 0.3))
+    if vwap and vwap > 0: magnets.append(('VWAP', vwap, 0.3))
+    if magnets:
+        tw = sum(w for _, _, w in magnets)
+        targets['magnet'] = round(sum(v * w for _, v, w in magnets) / tw, 1)
+        targets['details'].append(f"Magnet ₹{targets['magnet']:.0f}")
+
+    above = sorted([r for r in set((htf_res or []) + (vob_res or [])) if r > spot])
+    if len(above) >= 1: targets['upside_t1'] = round(above[0], 1)
+    if len(above) >= 2: targets['upside_t2'] = round(above[1], 1)
+    below = sorted([s for s in set((htf_sup or []) + (vob_sup or [])) if s < spot], reverse=True)
+    if len(below) >= 1: targets['downside_t1'] = round(below[0], 1)
+    if len(below) >= 2: targets['downside_t2'] = round(below[1], 1)
+
+    if gex_data and isinstance(gex_data, dict):
+        gf = gex_data.get('gamma_flip_level', 0)
+        if gf and gf > 0:
+            if gf > spot:
+                targets['acceleration_up'] = round(gf, 1)
+                targets['details'].append(f"Accel up above ₹{gf:.0f}")
+            else:
+                targets['acceleration_down'] = round(gf, 1)
+                targets['details'].append(f"Accel down below ₹{gf:.0f}")
+    return targets
+
+
+# ── Support/Resistance Reaction Engine ───────────────────────────────
+def detect_sr_reactions(mde):
+    """Detect bounce/breakdown probability at key S/R levels near spot."""
+    reactions = []
+    spot = mde.val('spot_price', 0)
+    df_today = mde.val('df_today')
+    gex_data = mde.val('gex_data')
+    total_ce_chg = mde.val('total_ce_change', 0) or 0
+    total_pe_chg = mde.val('total_pe_change', 0) or 0
+    if not spot or df_today is None or df_today.empty:
+        return reactions
+
+    all_levels = []
+    for lvl in mde.val('htf_supports', []): all_levels.append({'price': lvl, 'type': 'Support', 'source': 'HTF'})
+    for lvl in mde.val('htf_resistances', []): all_levels.append({'price': lvl, 'type': 'Resistance', 'source': 'HTF'})
+    for lvl in mde.val('vob_supports', []): all_levels.append({'price': lvl, 'type': 'Support', 'source': 'VOB'})
+    for lvl in mde.val('vob_resistances', []): all_levels.append({'price': lvl, 'type': 'Resistance', 'source': 'VOB'})
+    if gex_data and isinstance(gex_data, dict):
+        gm = gex_data.get('gex_magnet', 0)
+        gf = gex_data.get('gamma_flip_level', 0)
+        if gm and gm > 0: all_levels.append({'price': gm, 'type': 'Support' if gm < spot else 'Resistance', 'source': 'GEX'})
+        if gf and gf > 0: all_levels.append({'price': gf, 'type': 'Support' if gf < spot else 'Resistance', 'source': 'Gamma'})
+
+    for li in all_levels:
+        lvl = li['price']
+        if lvl <= 0: continue
+        dist_pct = (spot - lvl) / lvl * 100
+        if abs(dist_pct) > 0.3: continue
+
+        bp, dp = 50, 50
+        if li['type'] == 'Support':
+            if total_pe_chg > 0: bp += 15
+            if total_ce_chg > total_pe_chg: dp += 10
+        else:
+            if total_ce_chg > 0: bp += 15
+            if total_pe_chg > total_ce_chg: dp += 10
+        if len(df_today) >= 5:
+            rv = df_today['volume'].iloc[-3:].mean()
+            av = df_today['volume'].mean()
+            if rv > av * 1.5: dp += 10
+        total = bp + dp
+        bp, dp = int(bp / total * 100), int(dp / total * 100)
+        reactions.append({'level': round(lvl, 1), 'type': li['type'], 'source': li['source'],
+            'distance_pct': round(dist_pct, 3), 'bounce_prob': bp, 'breakdown_prob': dp,
+            'reaction': 'Bounce' if bp > dp else 'Breakdown'})
+    reactions.sort(key=lambda r: abs(r['distance_pct']))
+    return reactions[:10]
+
+
+# ── Dealer Hedging Pressure Map ──────────────────────────────────────
+def compute_dealer_hedging_map(mde):
+    """Classify strikes into Pin / Control / Acceleration zones from GEX."""
+    df_summary = mde.val('df_summary')
+    gex_data = mde.val('gex_data')
+    zones = {'pin_zone': None, 'control_zone': [], 'acceleration_zone': [], 'gamma_flip': None}
+    if df_summary is None: return zones
+    if gex_data and isinstance(gex_data, dict):
+        zones['gamma_flip'] = gex_data.get('gamma_flip_level')
+        zones['pin_zone'] = gex_data.get('gex_magnet')
+    if 'GammaExp_Net' in df_summary.columns:
+        for _, row in df_summary.iterrows():
+            s, g = int(row['Strike']), row.get('GammaExp_Net', 0) or 0
+            if g > 0: zones['control_zone'].append({'strike': s, 'gex': g})
+            elif g < 0: zones['acceleration_zone'].append({'strike': s, 'gex': g})
+    return zones
+
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -14244,6 +14699,10 @@ def main():
         st.session_state.pcr_chgoi_strike_current_strikes = []
     if 'pcr_telegram_last_sent' not in st.session_state:
         st.session_state.pcr_telegram_last_sent = None
+
+    # Initialize session state for OI Positioning Tracker (ATM ±2)
+    if 'oi_positioning_history' not in st.session_state:
+        st.session_state.oi_positioning_history = []
 
     # Initialize session state for Call vs Put OI comparison (ATM ±2)
     if 'call_put_oi_ce_history' not in st.session_state:
@@ -14581,6 +15040,9 @@ def main():
     # Initialize API
     api = DhanAPI(access_token, client_id)
 
+    # ===== MASTER DATA ENGINE INIT =====
+    mde = MasterDataEngine.get_instance()
+
     # ===== MARKET OVERVIEW (NIFTY + SENSEX) =====
     show_market_overview(api, interval=timeframes.get(selected_timeframe, "1"), days_back=days_back)
 
@@ -14694,10 +15156,14 @@ def main():
         swing_data_for_chart = None
         rsi_sz_data_for_chart = None
         ultimate_rsi_data_for_chart = None
+        # Compute VOB once and cache for reuse across all sections
+        _cached_vob_sr = None
+        _cached_vob_blks = None
         if not df.empty and len(df) > 30:
             try:
                 vob_detector = VolumeOrderBlocks(sensitivity=5)
-                _, vob_blocks_for_chart = vob_detector.get_sr_levels(df)
+                _cached_vob_sr, _cached_vob_blks = vob_detector.get_sr_levels(df)
+                vob_blocks_for_chart = _cached_vob_blks
             except Exception:
                 vob_blocks_for_chart = None
 
@@ -14785,6 +15251,59 @@ def main():
                 candle_patterns=_chart_candle_markers,
                 geo_patterns=_geo_patterns_live
             )
+
+            # ── Visual Overlay: Target levels, Trap zones, Gamma flip, S/R ──
+            try:
+                _ov_mde = get_master_data()
+                _ov_tgt = project_price_targets(_ov_mde)
+                _ov_gex = _ov_mde.val('gex_data')
+                _ov_last_t = _df_today['datetime'].iloc[-1] if not _df_today.empty else None
+                if _ov_last_t:
+                    # Target levels
+                    if _ov_tgt.get('magnet'):
+                        fig.add_hline(y=_ov_tgt['magnet'], line_dash="dot", line_color="rgba(255,235,59,0.5)",
+                                      line_width=1, row=1, col=1,
+                                      annotation_text=f"🧲 Magnet ₹{_ov_tgt['magnet']:.0f}",
+                                      annotation_position="left", annotation_font_size=9,
+                                      annotation_font_color="#ffeb3b")
+                    if _ov_tgt.get('upside_t1'):
+                        fig.add_hline(y=_ov_tgt['upside_t1'], line_dash="dot", line_color="rgba(0,230,118,0.4)",
+                                      line_width=1, row=1, col=1,
+                                      annotation_text=f"🎯 T1 ₹{_ov_tgt['upside_t1']:.0f}",
+                                      annotation_position="right", annotation_font_size=8,
+                                      annotation_font_color="#00e676")
+                    if _ov_tgt.get('downside_t1'):
+                        fig.add_hline(y=_ov_tgt['downside_t1'], line_dash="dot", line_color="rgba(255,82,82,0.4)",
+                                      line_width=1, row=1, col=1,
+                                      annotation_text=f"🎯 T1 ₹{_ov_tgt['downside_t1']:.0f}",
+                                      annotation_position="right", annotation_font_size=8,
+                                      annotation_font_color="#ff5252")
+                    # Gamma flip level
+                    if _ov_gex and isinstance(_ov_gex, dict):
+                        _gf_lvl = _ov_gex.get('gamma_flip_level', 0)
+                        if _gf_lvl and _gf_lvl > 0:
+                            fig.add_hline(y=_gf_lvl, line_dash="dashdot", line_color="rgba(255,68,255,0.5)",
+                                          line_width=1, row=1, col=1,
+                                          annotation_text=f"⚡ γ-Flip ₹{_gf_lvl:.0f}",
+                                          annotation_position="left", annotation_font_size=8,
+                                          annotation_font_color="#ff44ff")
+                    # Trap zone markers
+                    _ov_traps = run_smart_money_trap_detection(_ov_mde)
+                    for _ov_trap in _ov_traps[:3]:
+                        _ov_trap_lvl = _ov_trap.get('level', 0)
+                        if _ov_trap_lvl and _ov_trap_lvl > 0:
+                            fig.add_annotation(
+                                x=_ov_last_t, y=_ov_trap_lvl,
+                                text=f"⚠️ {_ov_trap['type'].split(' ')[1] if len(_ov_trap['type'].split(' ')) > 1 else 'Trap'}",
+                                showarrow=True, arrowhead=2, arrowcolor="#ff6600",
+                                font=dict(size=9, color="#ff6600"),
+                                bgcolor="rgba(30,30,30,0.8)",
+                                bordercolor="#ff6600", borderwidth=1,
+                                row=1, col=1,
+                            )
+            except Exception:
+                pass  # visual overlays are optional — don't break the chart
+
             st.plotly_chart(fig, use_container_width=True)
             
             # Show data info
@@ -14821,19 +15340,19 @@ def main():
             _cp_htf_resistances = []
             _cp_vob_supports    = []
             _cp_vob_resistances = []
+            # Cache df.to_json() for reuse across pivot calls
+            _cached_df_json = df.to_json() if not df.empty else '{}'
             if len(df) > 50:
                 try:
-                    _cp_pivots_raw = cached_pivot_calculation(df.to_json(), pivot_settings or {})
+                    _cp_pivots_raw = cached_pivot_calculation(_cached_df_json, pivot_settings or {})
                     _cp_htf_supports    = sorted([p['value'] for p in _cp_pivots_raw if p['type'] == 'low'], reverse=True)
                     _cp_htf_resistances = sorted([p['value'] for p in _cp_pivots_raw if p['type'] == 'high'])
                 except Exception:
                     pass
-            if len(df) > 30:
+            if _cached_vob_sr is not None:
                 try:
-                    _cp_vob_det = VolumeOrderBlocks(sensitivity=5)
-                    _cp_vob_sr, _cp_vob_blks = _cp_vob_det.get_sr_levels(df)
-                    _cp_vob_supports    = sorted(_cp_vob_sr.get('support', []), reverse=True)
-                    _cp_vob_resistances = sorted(_cp_vob_sr.get('resistance', []))
+                    _cp_vob_supports    = sorted(_cached_vob_sr.get('support', []), reverse=True)
+                    _cp_vob_resistances = sorted(_cached_vob_sr.get('resistance', []))
                 except Exception:
                     pass
 
@@ -14914,8 +15433,7 @@ def main():
             _htf_pivots_raw = []
             if show_pivots and len(df) > 50:
                 try:
-                    _htf_df_json = df.to_json()
-                    _htf_pivots_raw = cached_pivot_calculation(_htf_df_json, pivot_settings or {})
+                    _htf_pivots_raw = cached_pivot_calculation(_cached_df_json, pivot_settings or {})
                 except Exception:
                     _htf_pivots_raw = []
 
@@ -14924,12 +15442,10 @@ def main():
 
             _vob_supports = []
             _vob_resistances = []
-            if len(df) > 30:
+            if _cached_vob_sr is not None:
                 try:
-                    _vob_det = VolumeOrderBlocks(sensitivity=5)
-                    _vob_sr, _ = _vob_det.get_sr_levels(df)
-                    _vob_supports = sorted([v for v in _vob_sr.get('support', [])], reverse=True)
-                    _vob_resistances = sorted([v for v in _vob_sr.get('resistance', [])])
+                    _vob_supports = sorted([v for v in _cached_vob_sr.get('support', [])], reverse=True)
+                    _vob_resistances = sorted([v for v in _cached_vob_sr.get('resistance', [])])
                 except Exception:
                     pass
 
@@ -14967,13 +15483,17 @@ def main():
                 pivot_lows = []
                 pivot_highs = []
                 if show_pivots and len(df) > 50:
-                    df_json = df.to_json()
-                    pivots = cached_pivot_calculation(df_json, pivot_settings or {})
+                    pivots = cached_pivot_calculation(_cached_df_json, pivot_settings or {})
                     pivot_lows = [p['value'] for p in pivots if p['type'] == 'low']
                     pivot_highs = [p['value'] for p in pivots if p['type'] == 'high']
 
-                # Calculate Volume Order Blocks (VOB) for S/R integration
-                if len(df) > 30:
+                # Reuse cached VOB for S/R integration
+                if _cached_vob_sr is not None:
+                    vob_data = {
+                        'sr_levels': _cached_vob_sr,
+                        'blocks': _cached_vob_blks
+                    }
+                elif vob_data is None and len(df) > 30:
                     try:
                         vob_detector = VolumeOrderBlocks(sensitivity=5)
                         vob_sr_levels, vob_blocks = vob_detector.get_sr_levels(df)
@@ -15339,6 +15859,34 @@ def main():
 
         else:
             option_data = None
+
+    # ===== POPULATE MASTER DATA ENGINE (single source of truth) =====
+    # Gather pivots and VOB from col1 scope (already computed above)
+    _mde_pivots = None
+    _mde_vob_sr = None
+    _mde_vob_blks = None
+    try:
+        _mde_pivots = _htf_pivots_raw if '_htf_pivots_raw' in dir() else None
+    except Exception:
+        pass
+    try:
+        if vob_data and isinstance(vob_data, dict):
+            _mde_vob_sr = vob_data.get('sr_levels', {})
+            _mde_vob_blks = vob_data.get('blocks')
+    except Exception:
+        pass
+
+    mde.populate_from_main(
+        candle_df=df if 'df' in dir() and not df.empty else None,
+        df_today=_df_today if '_df_today' in dir() else None,
+        current_price=current_price if 'current_price' in dir() else None,
+        ltp_data=ltp_data if 'ltp_data' in dir() else None,
+        option_data=option_data,
+        pivots_raw=_mde_pivots,
+        vob_sr=_mde_vob_sr,
+        vob_blocks=_mde_vob_blks,
+        underlying_price=underlying_price if 'underlying_price' in dir() else None,
+    )
 
     # ===== OPTIONS CHAIN AND HTF S/R TABLES BELOW CHART =====
     if option_data and option_data.get('underlying'):
@@ -17681,6 +18229,10 @@ def main():
                         st.session_state.call_put_oi_pe_history = []
                         st.session_state.call_put_chgoi_ce_history = []
                         st.session_state.call_put_chgoi_pe_history = []
+                        st.session_state.oi_positioning_history = []
+                        # Reset MDE price history
+                        _mde_inst = get_master_data()
+                        _mde_inst._price_history = []
                         st.rerun()
 
             except Exception as e:
@@ -17981,6 +18533,322 @@ def main():
                 st.warning(f"Error displaying Call/Put OI charts: {str(_cp_err)}")
         else:
             st.info("📊 Call/Put OI history will build up as the app refreshes. Please wait for data collection…")
+
+        # ===== NIFTY PRICE CHANGE % — INTRADAY TRACKER =====
+        st.markdown("---")
+        st.markdown("## 📈 NIFTY Price Change % — Intraday Tracker")
+        _ph = mde.val('price_history', [])
+        if _ph and len(_ph) > 0:
+            try:
+                _ph_df = pd.DataFrame(_ph)
+                _ph_fig = go.Figure()
+
+                # Price Change % line
+                _ph_fig.add_trace(go.Scatter(
+                    x=_ph_df['time'], y=_ph_df['change_pct'],
+                    mode='lines+markers', name='Price Chg %',
+                    line=dict(color='#00e676', width=2),
+                    marker=dict(size=3),
+                    fill='tozeroy',
+                    fillcolor='rgba(0,230,118,0.1)',
+                ))
+
+                # Zero line
+                _ph_fig.add_hline(y=0, line_dash="solid", line_color="white", line_width=1)
+
+                # Day High / Day Low markers
+                _ph_day_high = mde.val('day_high')
+                _ph_day_low = mde.val('day_low')
+                _ph_day_open = mde.val('day_open', 0)
+                _ph_vwap = mde.val('vwap', 0)
+                if _ph_day_open and _ph_day_open > 0:
+                    if _ph_day_high:
+                        _ph_high_pct = ((_ph_day_high - _ph_day_open) / _ph_day_open) * 100
+                        _ph_fig.add_hline(y=_ph_high_pct, line_dash="dot", line_color="#ff6600", line_width=1,
+                                          annotation_text=f"Day High {_ph_high_pct:+.2f}%", annotation_position="right",
+                                          annotation_font_size=9, annotation_font_color="#ff6600")
+                    if _ph_day_low:
+                        _ph_low_pct = ((_ph_day_low - _ph_day_open) / _ph_day_open) * 100
+                        _ph_fig.add_hline(y=_ph_low_pct, line_dash="dot", line_color="#ff4444", line_width=1,
+                                          annotation_text=f"Day Low {_ph_low_pct:+.2f}%", annotation_position="right",
+                                          annotation_font_size=9, annotation_font_color="#ff4444")
+                    if _ph_vwap and _ph_vwap > 0:
+                        _ph_vwap_pct = ((_ph_vwap - _ph_day_open) / _ph_day_open) * 100
+                        _ph_fig.add_hline(y=_ph_vwap_pct, line_dash="dash", line_color="#ffeb3b", line_width=1,
+                                          annotation_text=f"VWAP {_ph_vwap_pct:+.2f}%", annotation_position="left",
+                                          annotation_font_size=9, annotation_font_color="#ffeb3b")
+
+                # Current value marker
+                _ph_cur = _ph_df['change_pct'].iloc[-1]
+                _ph_fig.add_trace(go.Scatter(
+                    x=[_ph_df['time'].iloc[-1]], y=[_ph_cur],
+                    mode='markers+text', text=[f'{_ph_cur:+.2f}%'],
+                    textposition='top right', textfont=dict(size=12, color='#00e676'),
+                    marker=dict(size=12, color='#00e676', symbol='circle'),
+                    showlegend=False, hoverinfo='skip',
+                ))
+
+                _ph_vals = _ph_df['change_pct'].dropna().tolist()
+                _ph_extras = [0]
+                if _ph_day_open and _ph_day_open > 0:
+                    if _ph_day_high: _ph_extras.append((_ph_day_high - _ph_day_open) / _ph_day_open * 100)
+                    if _ph_day_low: _ph_extras.append((_ph_day_low - _ph_day_open) / _ph_day_open * 100)
+                _ph_all = _ph_vals + _ph_extras
+                _ph_max_abs = max(abs(min(_ph_all)), abs(max(_ph_all)), 0.1)
+
+                _ph_fig.update_layout(
+                    title=dict(text=f"Price Change: {_ph_cur:+.2f}% | Open: ₹{_ph_day_open:,.0f} | "
+                               f"Spot: ₹{mde.val('spot_price', 0):,.0f}",
+                               font=dict(size=13)),
+                    template='plotly_dark', height=350,
+                    showlegend=False,
+                    margin=dict(l=10, r=10, t=60, b=30),
+                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                    yaxis=dict(title='Price Change %',
+                               range=[-_ph_max_abs * 1.2, _ph_max_abs * 1.2],
+                               zeroline=True, zerolinecolor='white', zerolinewidth=1),
+                    plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                )
+                st.plotly_chart(_ph_fig, use_container_width=True)
+
+                # Summary metrics
+                _ph_c1, _ph_c2, _ph_c3, _ph_c4 = st.columns(4)
+                _ph_c1.metric("Price Chg %", f"{_ph_cur:+.2f}%")
+                _ph_c2.metric("Day Open", f"₹{_ph_day_open:,.0f}" if _ph_day_open else "—")
+                _ph_c3.metric("Day Range", f"{(_ph_day_high or 0) - (_ph_day_low or 0):.0f} pts")
+                _ph_c4.metric("Data Points", f"{len(_ph)}")
+            except Exception as _ph_err:
+                st.warning(f"Price Change % error: {str(_ph_err)[:80]}")
+        else:
+            st.info("📈 Price history building up. Will show after first data point.")
+
+        # ===== OI POSITIONING TRACKER (ATM ±2) =====
+        st.markdown("---")
+        st.markdown("## 📊 OI Positioning Tracker — ATM ±2")
+        try:
+            _oi_df_summary = option_data.get('df_summary') if option_data else None
+            _oi_spot = underlying_price if 'underlying_price' in dir() and underlying_price else mde.val('spot_price', 0)
+            if _oi_df_summary is not None and 'Zone' in _oi_df_summary.columns and _oi_spot:
+                _oi_atm_idx = _oi_df_summary[_oi_df_summary['Zone'] == 'ATM'].index
+                if len(_oi_atm_idx) > 0:
+                    _oi_atm_pos = _oi_df_summary.index.get_loc(_oi_atm_idx[0])
+                    _oi_s = max(0, _oi_atm_pos - 2)
+                    _oi_e = min(len(_oi_df_summary), _oi_atm_pos + 3)
+                    _oi_slice = _oi_df_summary.iloc[_oi_s:_oi_e].copy()
+
+                    # Price direction
+                    _oi_prev_price = st.session_state.get('_oi_tracker_prev_price', _oi_spot)
+                    _oi_price_up = _oi_spot >= _oi_prev_price
+                    st.session_state['_oi_tracker_prev_price'] = _oi_spot
+
+                    # Collect positioning data
+                    ist = pytz.timezone('Asia/Kolkata')
+                    _oi_now = datetime.now(ist)
+                    _oi_entry = {'time': _oi_now, 'price': _oi_spot, 'price_up': _oi_price_up}
+                    _oi_pos_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+
+                    _oi_rows = []
+                    for _oi_i, (_, _oi_row) in enumerate(_oi_slice.iterrows()):
+                        strike = int(_oi_row['Strike'])
+                        ce_chg = _oi_row.get('changeinOpenInterest_CE', 0) or 0
+                        pe_chg = _oi_row.get('changeinOpenInterest_PE', 0) or 0
+                        ce_oi = _oi_row.get('openInterest_CE', 0) or 0
+                        pe_oi = _oi_row.get('openInterest_PE', 0) or 0
+
+                        ce_buildup = classify_oi_buildup(_oi_price_up, ce_chg)
+                        pe_buildup = classify_oi_buildup(_oi_price_up, pe_chg)
+
+                        zone = _oi_pos_labels[_oi_i] if _oi_i < len(_oi_pos_labels) else f"Strike"
+                        _oi_rows.append({
+                            'Strike': f"₹{strike}",
+                            'Zone': zone,
+                            'CE OI': f"{ce_oi:,.0f}",
+                            'CE ΔOI': f"{ce_chg:+,.0f}",
+                            'CE Build-up': ce_buildup,
+                            'PE OI': f"{pe_oi:,.0f}",
+                            'PE ΔOI': f"{pe_chg:+,.0f}",
+                            'PE Build-up': pe_buildup,
+                        })
+                        _oi_entry[f'ce_chg_{strike}'] = ce_chg
+                        _oi_entry[f'pe_chg_{strike}'] = pe_chg
+
+                    # Add to history
+                    _oi_should_add = True
+                    if st.session_state.oi_positioning_history:
+                        _oi_last = st.session_state.oi_positioning_history[-1]
+                        if (_oi_now - _oi_last['time']).total_seconds() < 30:
+                            _oi_should_add = False
+                    if _oi_should_add:
+                        st.session_state.oi_positioning_history.append(_oi_entry)
+                        if len(st.session_state.oi_positioning_history) > 200:
+                            st.session_state.oi_positioning_history = st.session_state.oi_positioning_history[-200:]
+
+                    # Display table
+                    _oi_tbl = pd.DataFrame(_oi_rows)
+                    st.dataframe(_oi_tbl, use_container_width=True, hide_index=True)
+
+                    _oi_dir = "↑" if _oi_price_up else "↓"
+                    st.caption(f"Price {_oi_dir} ₹{_oi_spot:.0f} | "
+                               f"🟢 Long Build-up  🔴 Short Build-up  🟡 Short Covering  🟠 Long Unwinding")
+                else:
+                    st.info("ATM strike not found in current data.")
+            else:
+                st.info("Option data not available for OI positioning.")
+        except Exception as _oi_err:
+            st.warning(f"OI Positioning error: {str(_oi_err)[:80]}")
+
+        # ===== SMART MONEY TRAP DETECTION ENGINE =====
+        st.markdown("---")
+        st.markdown("## 🚨 Smart Money Trap Detection Engine")
+        try:
+            _traps = run_smart_money_trap_detection(mde)
+            if _traps:
+                for _trap in _traps:
+                    _trap_clr = '#ff4444' if _trap['probability'] > 70 else ('#ffaa00' if _trap['probability'] > 50 else '#00aaff')
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {_trap_clr};margin-bottom:8px'>
+                    <div style='font-size:16px;font-weight:bold;color:{_trap_clr}'>{_trap['type']} — {_trap['probability']}% probability</div>
+                    <div style='color:#ccc;font-size:13px;margin-top:4px'>{_trap['detail']}</div>
+                    <div style='color:#888;font-size:11px;margin-top:2px'>Level: ₹{_trap['level']:,.0f}</div>
+                    </div>""", unsafe_allow_html=True)
+            else:
+                st.success("No active traps detected. Market appears clean.")
+        except Exception as _trap_err:
+            st.warning(f"Trap Detection error: {str(_trap_err)[:80]}")
+
+        # ===== MARKET REGIME DETECTION ENGINE =====
+        st.markdown("---")
+        st.markdown("## 📊 Market Regime Detection Engine")
+        try:
+            _regime = detect_market_regime(mde)
+            _reg_c1, _reg_c2, _reg_c3 = st.columns([2, 1, 1])
+            with _reg_c1:
+                st.markdown(f"""<div style='background:#1e1e1e;padding:16px;border-radius:8px;border-left:5px solid {_regime['color']}'>
+                <div style='color:#aaa;font-size:11px'>CURRENT REGIME</div>
+                <div style='font-size:26px;font-weight:bold;color:{_regime['color']}'>{_regime['regime']}</div>
+                <div style='color:#ccc;font-size:13px'>Confidence: {_regime['confidence']}%</div>
+                </div>""", unsafe_allow_html=True)
+            with _reg_c2:
+                st.markdown("**Factors:**")
+                for _rd in _regime.get('details', [])[:5]:
+                    st.caption(f"• {_rd}")
+            with _reg_c3:
+                _rsc = _regime.get('scores', {})
+                if _rsc:
+                    _rsc_sorted = sorted(_rsc.items(), key=lambda x: x[1], reverse=True)[:3]
+                    st.markdown("**Top Scores:**")
+                    for _rn, _rv in _rsc_sorted:
+                        st.caption(f"{_rn}: {_rv}")
+        except Exception as _reg_err:
+            st.warning(f"Regime Detection error: {str(_reg_err)[:80]}")
+
+        # ===== PRICE TARGET PROJECTION ENGINE =====
+        st.markdown("---")
+        st.markdown("## 🎯 Price Target Projection Engine — Intraday")
+        try:
+            _tgt = project_price_targets(mde)
+            _tgt_spot = mde.val('spot_price', 0) or 0
+            _tgt_cols = st.columns(5)
+            _tgt_items = [
+                ("🧲 Magnet", _tgt.get('magnet'), '#ffeb3b'),
+                ("🟢 Upside T1", _tgt.get('upside_t1'), '#00e676'),
+                ("🟢 Upside T2", _tgt.get('upside_t2'), '#00cc66'),
+                ("🔴 Downside T1", _tgt.get('downside_t1'), '#ff4444'),
+                ("🔴 Downside T2", _tgt.get('downside_t2'), '#ff6666'),
+            ]
+            for _tc, (_tl, _tv, _tclr) in zip(_tgt_cols, _tgt_items):
+                with _tc:
+                    if _tv:
+                        _tdist = ((_tv - _tgt_spot) / _tgt_spot * 100) if _tgt_spot else 0
+                        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {_tclr};text-align:center'>
+                        <div style='color:#aaa;font-size:10px'>{_tl}</div>
+                        <div style='font-size:22px;font-weight:bold;color:{_tclr}'>₹{_tv:,.0f}</div>
+                        <div style='color:#ccc;font-size:11px'>{_tdist:+.2f}%</div>
+                        </div>""", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;text-align:center'>
+                        <div style='color:#aaa;font-size:10px'>{_tl}</div>
+                        <div style='font-size:22px;color:#555'>—</div>
+                        </div>""", unsafe_allow_html=True)
+            # Acceleration zones
+            _acc_up = _tgt.get('acceleration_up')
+            _acc_dn = _tgt.get('acceleration_down')
+            if _acc_up or _acc_dn:
+                _acc_parts = []
+                if _acc_up: _acc_parts.append(f"⚡ Acceleration UP above ₹{_acc_up:,.0f}")
+                if _acc_dn: _acc_parts.append(f"⚡ Acceleration DOWN below ₹{_acc_dn:,.0f}")
+                st.caption(" | ".join(_acc_parts))
+            for _td in _tgt.get('details', []):
+                st.caption(f"• {_td}")
+        except Exception as _tgt_err:
+            st.warning(f"Price Target error: {str(_tgt_err)[:80]}")
+
+        # ===== SUPPORT/RESISTANCE REACTION ENGINE =====
+        st.markdown("---")
+        st.markdown("## ⚡ Support / Resistance Reaction Engine")
+        try:
+            _sr_reactions = detect_sr_reactions(mde)
+            if _sr_reactions:
+                _sr_rows = []
+                for _sr in _sr_reactions:
+                    _sr_emoji = "🟢" if _sr['reaction'] == 'Bounce' else "🔴"
+                    _sr_rows.append({
+                        'Level': f"₹{_sr['level']:,.0f}",
+                        'Type': _sr['type'],
+                        'Source': _sr['source'],
+                        'Distance': f"{_sr['distance_pct']:+.3f}%",
+                        'Bounce %': f"{_sr['bounce_prob']}%",
+                        'Breakdown %': f"{_sr['breakdown_prob']}%",
+                        'Reaction': f"{_sr_emoji} {_sr['reaction']}",
+                    })
+                st.dataframe(pd.DataFrame(_sr_rows), use_container_width=True, hide_index=True)
+            else:
+                st.info("No S/R levels within proximity (0.3%). Price is in open space.")
+        except Exception as _sr_err:
+            st.warning(f"S/R Reaction error: {str(_sr_err)[:80]}")
+
+        # ===== DEALER HEDGING PRESSURE MAP =====
+        st.markdown("---")
+        st.markdown("## 📊 Dealer Hedging Pressure Map")
+        try:
+            _dhm = compute_dealer_hedging_map(mde)
+            _dhm_c1, _dhm_c2, _dhm_c3 = st.columns(3)
+            with _dhm_c1:
+                _pin = _dhm.get('pin_zone')
+                st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #ffeb3b;text-align:center'>
+                <div style='color:#aaa;font-size:10px'>📍 PIN ZONE (Max GEX Magnet)</div>
+                <div style='font-size:22px;font-weight:bold;color:#ffeb3b'>{"₹" + f"{_pin:,.0f}" if _pin else "—"}</div>
+                </div>""", unsafe_allow_html=True)
+            with _dhm_c2:
+                _gf = _dhm.get('gamma_flip')
+                st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #ff44ff;text-align:center'>
+                <div style='color:#aaa;font-size:10px'>⚡ GAMMA FLIP LEVEL</div>
+                <div style='font-size:22px;font-weight:bold;color:#ff44ff'>{"₹" + f"{_gf:,.0f}" if _gf else "—"}</div>
+                </div>""", unsafe_allow_html=True)
+            with _dhm_c3:
+                _ctrl_count = len(_dhm.get('control_zone', []))
+                _accel_count = len(_dhm.get('acceleration_zone', []))
+                st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00aaff;text-align:center'>
+                <div style='color:#aaa;font-size:10px'>ZONE COUNT</div>
+                <div style='font-size:16px;color:#00aaff'>🟢 Control: {_ctrl_count} strikes</div>
+                <div style='font-size:16px;color:#ff6600'>🔴 Accel: {_accel_count} strikes</div>
+                </div>""", unsafe_allow_html=True)
+
+            # Show top control and acceleration zones
+            _dhm_c4, _dhm_c5 = st.columns(2)
+            with _dhm_c4:
+                _ctrl = sorted(_dhm.get('control_zone', []), key=lambda x: x['gex'], reverse=True)[:5]
+                if _ctrl:
+                    st.markdown("**🟢 Dealer Control Zones (Price Pin)**")
+                    for _z in _ctrl:
+                        st.caption(f"₹{_z['strike']:,} — GEX: {_z['gex']:+,.0f}")
+            with _dhm_c5:
+                _accel = sorted(_dhm.get('acceleration_zone', []), key=lambda x: x['gex'])[:5]
+                if _accel:
+                    st.markdown("**🔴 Acceleration Zones (Volatile)**")
+                    for _z in _accel:
+                        st.caption(f"₹{_z['strike']:,} — GEX: {_z['gex']:+,.0f}")
+        except Exception as _dhm_err:
+            st.warning(f"Dealer Hedging Map error: {str(_dhm_err)[:80]}")
 
         # ===== VOLUME PCR + STRADDLE + COMBINED SIGNAL (ATM ± 2) =====
         st.markdown("---")
@@ -21387,6 +22255,153 @@ def main():
             )
         except Exception as _iofce_err:
             st.warning(f"Institutional Order Flow Engine error: {str(_iofce_err)}")
+
+    # ===== MASTER MARKET DECISION ENGINE =====
+    st.markdown("---")
+    with st.expander("🧠 Master Market Decision Engine — Final Analysis", expanded=True):
+        try:
+            _mde_spot = mde.val('spot_price', 0) or (current_price if 'current_price' in dir() else 0)
+            _mde_price_chg = mde.val('price_change_pct', 0)
+
+            # ── Collect scores from all engines ──
+            _md_scores = {}
+
+            # 1. Market Regime
+            _md_regime = detect_market_regime(mde)
+            _md_scores['Market Regime'] = {'score': _md_regime['confidence'],
+                'signal': _md_regime['regime'], 'color': _md_regime['color']}
+
+            # 2. Price Action (EMA-based)
+            _md_pa = 50
+            _md_df_today = mde.val('df_today')
+            if _md_df_today is not None and not _md_df_today.empty and len(_md_df_today) > 20:
+                _md_cl = _md_df_today['close']
+                _md_e9 = _md_cl.ewm(span=9, adjust=False).mean().iloc[-1]
+                _md_e21 = _md_cl.ewm(span=21, adjust=False).mean().iloc[-1]
+                if _md_e9 > _md_e21 and _md_cl.iloc[-1] > _md_e9: _md_pa = 75
+                elif _md_e9 < _md_e21 and _md_cl.iloc[-1] < _md_e9: _md_pa = 25
+                elif _md_e9 > _md_e21: _md_pa = 60
+                else: _md_pa = 40
+            _md_scores['Price Action'] = {'score': _md_pa,
+                'signal': 'Bullish' if _md_pa > 60 else ('Bearish' if _md_pa < 40 else 'Neutral'),
+                'color': '#00e676' if _md_pa > 60 else ('#ff4444' if _md_pa < 40 else '#ffeb3b')}
+
+            # 3. Options OI
+            _md_oi = 50
+            _md_tce = mde.val('total_ce_change', 0) or 0
+            _md_tpe = mde.val('total_pe_change', 0) or 0
+            if _md_tpe > _md_tce * 1.5: _md_oi = 70
+            elif _md_tce > _md_tpe * 1.5: _md_oi = 30
+            elif _md_tpe > _md_tce: _md_oi = 58
+            elif _md_tce > _md_tpe: _md_oi = 42
+            _md_scores['OI Positioning'] = {'score': _md_oi,
+                'signal': 'Bullish (PE Dominant)' if _md_oi > 60 else ('Bearish (CE Dominant)' if _md_oi < 40 else 'Neutral'),
+                'color': '#00e676' if _md_oi > 60 else ('#ff4444' if _md_oi < 40 else '#ffeb3b')}
+
+            # 4. GEX
+            _md_gex = 50
+            _md_gex_data = mde.val('gex_data')
+            if _md_gex_data and isinstance(_md_gex_data, dict):
+                _tgex = _md_gex_data.get('total_gex', 0)
+                if _tgex > 50: _md_gex = 60  # Pinned = neutral to slightly bullish
+                elif _tgex < -50: _md_gex = 55 if _md_pa > 50 else 35  # Acceleration in price direction
+            _md_scores['GEX Flow'] = {'score': _md_gex,
+                'signal': 'Pin/Stable' if _md_gex > 55 else ('Acceleration' if _md_gex < 40 else 'Neutral'),
+                'color': '#00aaff' if _md_gex > 55 else ('#ff6600' if _md_gex < 40 else '#ffeb3b')}
+
+            # 5. Trap Detection
+            _md_traps = run_smart_money_trap_detection(mde)
+            _md_trap_score = 50
+            if _md_traps:
+                max_trap_prob = max(t['probability'] for t in _md_traps)
+                _md_trap_score = max(20, 50 - int(max_trap_prob * 0.3))
+            _md_scores['Trap Safety'] = {'score': _md_trap_score,
+                'signal': f"{len(_md_traps)} traps" if _md_traps else 'Clean',
+                'color': '#ff4444' if _md_trap_score < 35 else ('#ffeb3b' if _md_trap_score < 50 else '#00e676')}
+
+            # 6. S/R Reaction
+            _md_sr = detect_sr_reactions(mde)
+            _md_sr_score = 50
+            if _md_sr:
+                _md_bounces = sum(1 for r in _md_sr if r['reaction'] == 'Bounce')
+                _md_breakdowns = sum(1 for r in _md_sr if r['reaction'] == 'Breakdown')
+                _md_sr_score = 55 + _md_bounces * 5 - _md_breakdowns * 5
+                _md_sr_score = max(20, min(80, _md_sr_score))
+            _md_scores['S/R Reaction'] = {'score': _md_sr_score,
+                'signal': f"{len(_md_sr)} levels",
+                'color': '#00e676' if _md_sr_score > 60 else ('#ff4444' if _md_sr_score < 40 else '#ffeb3b')}
+
+            # 7. Price Targets
+            _md_tgt = project_price_targets(mde)
+            _md_tgt_score = 50
+            if _md_tgt.get('magnet') and _mde_spot:
+                _mg_dist = (_md_tgt['magnet'] - _mde_spot) / _mde_spot * 100
+                if _mg_dist > 0.1: _md_tgt_score = 60  # Magnet above = bullish pull
+                elif _mg_dist < -0.1: _md_tgt_score = 40  # Magnet below = bearish pull
+            _md_scores['Target Bias'] = {'score': _md_tgt_score,
+                'signal': f"Magnet ₹{_md_tgt['magnet']:,.0f}" if _md_tgt.get('magnet') else 'N/A',
+                'color': '#00e676' if _md_tgt_score > 55 else ('#ff4444' if _md_tgt_score < 45 else '#ffeb3b')}
+
+            # ── Weighted composite ──
+            _md_weights = {
+                'Price Action': 0.25, 'OI Positioning': 0.20, 'GEX Flow': 0.15,
+                'Market Regime': 0.10, 'Trap Safety': 0.10, 'S/R Reaction': 0.10,
+                'Target Bias': 0.10,
+            }
+            _md_composite = int(sum(_md_scores[k]['score'] * _md_weights.get(k, 0.1) for k in _md_scores))
+
+            # Direction
+            if _md_composite >= 65: _md_dir, _md_dir_clr = "BULLISH", "#00e676"
+            elif _md_composite >= 55: _md_dir, _md_dir_clr = "SLIGHTLY BULLISH", "#69f0ae"
+            elif _md_composite <= 35: _md_dir, _md_dir_clr = "BEARISH", "#ff5252"
+            elif _md_composite <= 45: _md_dir, _md_dir_clr = "SLIGHTLY BEARISH", "#ff8a80"
+            else: _md_dir, _md_dir_clr = "NEUTRAL", "#ffeb3b"
+
+            # ── Display ──
+            _md_hc1, _md_hc2, _md_hc3, _md_hc4 = st.columns(4)
+            with _md_hc1:
+                st.markdown(f"""<div style='background:#1e1e1e;padding:16px;border-radius:8px;border-left:5px solid {_md_dir_clr};text-align:center'>
+                <div style='color:#aaa;font-size:10px'>MARKET DIRECTION</div>
+                <div style='font-size:24px;font-weight:bold;color:{_md_dir_clr}'>{_md_dir}</div>
+                </div>""", unsafe_allow_html=True)
+            with _md_hc2:
+                st.metric("Composite Score", f"{_md_composite}/100")
+            with _md_hc3:
+                _md_bp = min(100, max(0, _md_composite + 10 if _md_regime['regime'] == 'Breakout Setup' else _md_composite))
+                st.metric("Breakout Prob", f"{_md_bp}%")
+            with _md_hc4:
+                _md_risk = "LOW" if abs(_md_composite - 50) > 20 else ("HIGH" if abs(_md_composite - 50) < 8 else "MEDIUM")
+                st.metric("Risk Level", _md_risk)
+
+            # Pillar table
+            _md_rows = []
+            for _mk, _mv in _md_scores.items():
+                _md_rows.append({'Engine': _mk, 'Score': _mv['score'],
+                    'Weight': f"{int(_md_weights.get(_mk, 0.1) * 100)}%",
+                    'Signal': _mv['signal']})
+            st.dataframe(pd.DataFrame(_md_rows), use_container_width=True, hide_index=True)
+
+            # Intraday targets summary
+            st.markdown("**Intraday Targets:**")
+            _md_tgt_parts = []
+            if _md_tgt.get('upside_t1'): _md_tgt_parts.append(f"🟢 T1: ₹{_md_tgt['upside_t1']:,.0f}")
+            if _md_tgt.get('upside_t2'): _md_tgt_parts.append(f"🟢 T2: ₹{_md_tgt['upside_t2']:,.0f}")
+            if _md_tgt.get('magnet'): _md_tgt_parts.append(f"🧲 Magnet: ₹{_md_tgt['magnet']:,.0f}")
+            if _md_tgt.get('downside_t1'): _md_tgt_parts.append(f"🔴 T1: ₹{_md_tgt['downside_t1']:,.0f}")
+            if _md_tgt.get('downside_t2'): _md_tgt_parts.append(f"🔴 T2: ₹{_md_tgt['downside_t2']:,.0f}")
+            st.caption(" | ".join(_md_tgt_parts) if _md_tgt_parts else "No targets available")
+
+            # Smart money positioning summary
+            st.markdown("**Smart Money:**")
+            _sm_parts = []
+            if _md_traps:
+                for _t in _md_traps[:3]:
+                    _sm_parts.append(f"{_t['type']} ({_t['probability']}%)")
+            _sm_parts.append(f"CE ΔOI {_md_tce:+.1f}L | PE ΔOI {_md_tpe:+.1f}L")
+            st.caption(" | ".join(_sm_parts))
+
+        except Exception as _md_err:
+            st.warning(f"Master Decision Engine error: {str(_md_err)[:100]}")
 
     # ===== SIGNAL HISTORY (Supabase) =====
     st.markdown("---")
