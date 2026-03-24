@@ -10733,26 +10733,53 @@ def _intra_fetch_all():
         return {}
     import yfinance as yf
     tickers = [s["yf"] for s in _INTRA_SECTORS] + [_INTRA_BENCH]
+    out = {}
     try:
         raw = yf.download(
             tickers, period="2d", interval="5m",
-            group_by="ticker", auto_adjust=True, progress=False
+            auto_adjust=True, progress=False
         )
-        out = {}
-        for sym in tickers:
+        if not raw.empty and isinstance(raw.columns, pd.MultiIndex):
+            lvl0 = list(raw.columns.get_level_values(0).unique())
+            lvl1 = list(raw.columns.get_level_values(1).unique())
+            for sym in tickers:
+                try:
+                    if sym in lvl0:
+                        # Old format: (ticker, field)
+                        df_s = raw[sym].copy()
+                    elif sym in lvl1:
+                        # New yfinance format: (field, ticker)
+                        df_s = raw.xs(sym, axis=1, level=1).copy()
+                    else:
+                        out[sym] = pd.DataFrame()
+                        continue
+                    df_s.columns = [c.lower() for c in df_s.columns]
+                    df_s = df_s.dropna(subset=["close"])
+                    out[sym] = df_s
+                except Exception:
+                    out[sym] = pd.DataFrame()
+        elif not raw.empty:
+            df_s = raw.copy()
+            df_s.columns = [c.lower() for c in df_s.columns]
+            df_s = df_s.dropna(subset=["close"])
+            out[tickers[0]] = df_s
+    except Exception:
+        pass
+    # Fallback: fetch individually for any missing tickers
+    for sym in tickers:
+        if sym not in out or out[sym].empty:
             try:
-                if len(tickers) == 1:
-                    df_s = raw.copy()
+                df_s = yf.download(sym, period="2d", interval="5m",
+                                   auto_adjust=True, progress=False)
+                if not df_s.empty:
+                    df_s.columns = [c.lower() for c in df_s.columns]
+                    df_s = df_s.dropna(subset=["close"])
+                    out[sym] = df_s
                 else:
-                    df_s = raw[sym].copy() if sym in raw.columns.get_level_values(0) else pd.DataFrame()
-                df_s.columns = [c.lower() for c in df_s.columns]
-                df_s = df_s.dropna(subset=["close"])
-                out[sym] = df_s
+                    out[sym] = pd.DataFrame()
             except Exception:
                 out[sym] = pd.DataFrame()
-        return out
-    except Exception:
-        return {}
+    return out
 
 def _intra_momentum(cl: pd.Series, bars: int) -> float:
     if len(cl) < bars + 1:
@@ -10773,12 +10800,9 @@ def _intra_phase(rs_ratio: float, rs_slope: float,
 
 def _intra_sector_score(mom5: float, mom15: float, mom1h: float) -> float:
     """Sector_Score = mom5×0.35 + mom15×0.35 + mom1h×0.30, normalised 0–100."""
-    vals = [v for v in [mom5, mom15, mom1h] if not np.isnan(v)]
-    if not vals:
-        return 50.0
     raw = mom5 * 0.35 + mom15 * 0.35 + mom1h * 0.30
     # Sigmoid-style map: raw ±2% → 0–100
-    return max(0, min(100, 50 + raw * 12.5))
+    return max(0.0, min(100.0, 50 + raw * 12.5))
 
 def show_intraday_sector_rotation():
     """Intraday Sector Rotation Engine — 5m/15m/1h RS and phase detection."""
@@ -10840,11 +10864,14 @@ def show_intraday_sector_rotation():
         mom15 = _intra_momentum(cl, B15)
         mom1h = _intra_momentum(cl, B1H)
 
-        phase = _intra_phase(rs, rs_slope, mom5 or 0, mom15 or 0, mom1h or 0)
-        score = _intra_sector_score(mom5 or 0, mom15 or 0, mom1h or 0)
+        def _safe(v): return 0.0 if (v is None or (isinstance(v, float) and np.isnan(v))) else v
+        m5, m15, m1h = _safe(mom5), _safe(mom15), _safe(mom1h)
+
+        phase = _intra_phase(rs, rs_slope, m5, m15, m1h)
+        score = _intra_sector_score(m5, m15, m1h)
 
         def _fmt(v):
-            return f"{v:+.2f}%" if not np.isnan(v) else "N/A"
+            return f"{v:+.2f}%" if not (v is None or (isinstance(v, float) and np.isnan(v))) else "N/A"
 
         rows.append({
             "Sector":        name,
@@ -10857,8 +10884,8 @@ def show_intraday_sector_rotation():
             "Rotation Signal": "—",
             "_raw_score":    score,
             "_phase":        phase,
-            "_mom5":         mom5 or 0,
-            "_mom15":        mom15 or 0,
+            "_mom5":         m5,
+            "_mom15":        m15,
             "_rs":           rs,
         })
 
