@@ -3282,6 +3282,7 @@ def _detect_chart_candle_types(df):
             direction = 'BUY'
 
         if detected:
+            vol = row.get('volume', 0) if hasattr(row, 'get') else (row['volume'] if 'volume' in row.index else 0)
             patterns.append({
                 'time': ts,
                 'pattern': detected,
@@ -3289,6 +3290,7 @@ def _detect_chart_candle_types(df):
                 'price': price,
                 'high': h,
                 'low': l,
+                'volume': vol,
             })
     return patterns
 
@@ -3405,6 +3407,15 @@ class GeometricPatternDetector:
         rr = abs(target - entry) / abs(entry - sl) if abs(entry - sl) > 0.001 else 0
         future_idx = min(bo_idx + 5, n - 1)
         move_pct = (df['close'].iloc[future_idx] - entry) / entry * 100 if entry else 0
+        # Volume at breakout and ratio vs recent average
+        bo_vol = 0
+        bo_vol_ratio = 0.0
+        if 'volume' in df.columns:
+            bo_vol = int(df['volume'].iloc[bo_idx])
+            _vol_start = max(0, bo_idx - 20)
+            _avg_v = df['volume'].iloc[_vol_start:bo_idx].mean() if bo_idx > 0 else bo_vol
+            bo_vol_ratio = round(bo_vol / _avg_v, 2) if _avg_v and _avg_v > 0 else 0.0
+
         return {
             'pattern': pat, 'pattern_type': pat_type,
             'sentiment': sentiment, 'signal': signal,
@@ -3418,6 +3429,8 @@ class GeometricPatternDetector:
             'highlight_idx': bo_idx,
             'draw_lines': draw_lines,
             'sr_zones': sr_zones,
+            'volume': bo_vol,
+            'vol_ratio': bo_vol_ratio,
         }
 
     # ── pattern detectors ─────────────────────────────────────────────────
@@ -14069,6 +14082,12 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
             sig_lbl = f"{icon} {sig}"
             ts = p['time']
             time_str = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else str(ts)
+            # Volume context for breakout
+            _p_vol = p.get('volume', 0)
+            _p_vol_str = f"{_p_vol:,}" if _p_vol else '—'
+            _p_vr = p.get('vol_ratio', 0)
+            _p_vr_str = f"{_p_vr:.2f}x" if _p_vr else '—'
+            _p_vol_sig = '🔥 Spike' if _p_vr > 2.0 else ('⬆️ High' if _p_vr > 1.5 else ('➡️ Avg' if _p_vr > 0.75 else '⬇️ Low')) if _p_vr else '—'
             _alert_rows.append({
                 'Time': time_str,
                 'Pattern': f"{icon} {p['pattern']}",
@@ -14078,6 +14097,9 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
                 'SL (₹)': f"₹{p['stoploss']:.0f}",
                 'Target (₹)': f"₹{p['target']:.0f}",
                 'RR': f"{p['rr']:.2f}",
+                'Volume': _p_vol_str,
+                'Vol Ratio': _p_vr_str,
+                'Vol Signal': _p_vol_sig,
                 'Confidence': p['confidence'],
                 'Move %': f"{p['move_pct']:+.2f}%",
             })
@@ -14094,23 +14116,38 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
             pat_counts = Counter(r['pattern'] for r in bt_results)
             pat_wins   = {}
             pat_total  = {}
+            pat_vol_sum = {}
+            pat_vol_cnt = {}
+            pat_spike_cnt = {}
             for r in bt_results:
                 k = r['pattern']
                 pat_total[k] = pat_total.get(k, 0) + 1
                 if r.get('result') == 'WIN':
                     pat_wins[k] = pat_wins.get(k, 0) + 1
+                _rv = r.get('volume', 0)
+                if _rv:
+                    pat_vol_sum[k] = pat_vol_sum.get(k, 0) + _rv
+                    pat_vol_cnt[k] = pat_vol_cnt.get(k, 0) + 1
+                _rvr = r.get('vol_ratio', 0)
+                if _rvr and _rvr > 1.5:
+                    pat_spike_cnt[k] = pat_spike_cnt.get(k, 0) + 1
 
             heatmap_rows = []
             for pat, cnt in sorted(pat_counts.items(), key=lambda x: -x[1]):
                 wins = pat_wins.get(pat, 0)
                 total = pat_total.get(pat, 1)
                 wr = wins / total * 100
+                avg_vol = int(pat_vol_sum.get(pat, 0) / pat_vol_cnt[pat]) if pat_vol_cnt.get(pat, 0) > 0 else 0
+                spikes = pat_spike_cnt.get(pat, 0)
                 heatmap_rows.append({
                     'Pattern': pat,
                     'Occurrences': cnt,
                     'Win Rate %': f"{wr:.1f}%",
                     'Wins': wins,
                     'Losses': total - wins,
+                    'Avg Vol': f"{avg_vol:,}" if avg_vol else '—',
+                    'Vol Spikes': spikes,
+                    'Spike %': f"{spikes / total * 100:.0f}%" if total > 0 else '0%',
                 })
             st.dataframe(pd.DataFrame(heatmap_rows), use_container_width=True, hide_index=True)
 
@@ -14160,6 +14197,8 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
                 sig_lbl = '🟢 BUY' if sig == 'BUY' else '🔴 SELL'
                 result = r.get('result', '')
                 res_lbl = '✅ WIN' if result == 'WIN' else '❌ LOSS'
+                _bt_vol = r.get('volume', 0)
+                _bt_vr = r.get('vol_ratio', 0)
                 bt_table_rows.append({
                     'Time': time_str,
                     'Pattern': r['pattern'],
@@ -14169,6 +14208,8 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
                     'SL (₹)': f"{r['stoploss']:.1f}",
                     'Target (₹)': f"{r['target']:.1f}",
                     'RR': f"{r['rr']:.2f}",
+                    'Volume': f"{_bt_vol:,}" if _bt_vol else '—',
+                    'Vol Ratio': f"{_bt_vr:.2f}x" if _bt_vr else '—',
                     'Actual Move %': f"{r.get('actual_move_pct', 0):+.2f}%",
                     'Result': res_lbl,
                     'Confidence': r['confidence'],
@@ -14802,6 +14843,75 @@ def main():
                 *VOB zones show volume-backed order flow areas with % distribution*
                 """)
 
+            # ── 📊 Volume Tabulation below chart ──────────────────────────
+            st.markdown("---")
+            st.markdown(f"### 📊 Volume Tabulation — {_date_label}")
+            st.caption(f"Per-candle volume analysis for NIFTY50 {selected_timeframe} chart with price action context")
+
+            if not _df_today.empty and 'volume' in _df_today.columns:
+                _vol_df = _df_today.copy()
+                _vol_df['vol_ma20'] = _vol_df['volume'].rolling(window=min(20, len(_vol_df)), min_periods=1).mean()
+                _vol_df['vol_ratio'] = _vol_df['volume'] / _vol_df['vol_ma20']
+                _vol_df['body'] = (_vol_df['close'] - _vol_df['open']).abs()
+                _vol_df['range'] = _vol_df['high'] - _vol_df['low']
+                _vol_df['candle_dir'] = _vol_df.apply(lambda r: '🟢 Bull' if r['close'] > r['open'] else ('🔴 Bear' if r['close'] < r['open'] else '⚪ Doji'), axis=1)
+
+                # Volume spike detection
+                _vol_df['vol_spike'] = _vol_df['vol_ratio'].apply(
+                    lambda v: '🔥 Spike' if v > 2.0 else ('⬆️ High' if v > 1.5 else ('➡️ Avg' if v > 0.75 else '⬇️ Low'))
+                )
+
+                # Build volume tabulation rows (last 30 candles, newest first)
+                _vol_rows = []
+                for idx in range(len(_vol_df) - 1, max(len(_vol_df) - 31, -1), -1):
+                    r = _vol_df.iloc[idx]
+                    ts = r['datetime']
+                    time_str = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else str(ts)
+                    vol = int(r['volume'])
+                    vol_ma = int(r['vol_ma20'])
+                    vol_r = r['vol_ratio']
+                    _vol_rows.append({
+                        'Time': time_str,
+                        'Open': f"{r['open']:.1f}",
+                        'High': f"{r['high']:.1f}",
+                        'Low': f"{r['low']:.1f}",
+                        'Close': f"{r['close']:.1f}",
+                        'Volume': f"{vol:,}",
+                        'Vol MA(20)': f"{vol_ma:,}",
+                        'Vol Ratio': f"{vol_r:.2f}x",
+                        'Vol Signal': r['vol_spike'],
+                        'Candle': r['candle_dir'],
+                        'Body %': f"{(r['body'] / r['range'] * 100):.0f}%" if r['range'] > 0 else '0%',
+                    })
+
+                if _vol_rows:
+                    st.dataframe(pd.DataFrame(_vol_rows), use_container_width=True, hide_index=True)
+
+                # Volume summary metrics
+                _total_vol = int(_vol_df['volume'].sum())
+                _avg_vol = int(_vol_df['volume'].mean())
+                _max_vol = int(_vol_df['volume'].max())
+                _max_vol_time = _vol_df.loc[_vol_df['volume'].idxmax(), 'datetime']
+                _max_vol_time_str = _max_vol_time.strftime('%H:%M') if hasattr(_max_vol_time, 'strftime') else str(_max_vol_time)
+                _bull_vol = int(_vol_df[_vol_df['close'] > _vol_df['open']]['volume'].sum())
+                _bear_vol = int(_vol_df[_vol_df['close'] < _vol_df['open']]['volume'].sum())
+                _vol_bias = 'Bullish' if _bull_vol > _bear_vol else ('Bearish' if _bear_vol > _bull_vol else 'Neutral')
+                _vol_bias_icon = '🟢' if _vol_bias == 'Bullish' else ('🔴' if _vol_bias == 'Bearish' else '⚪')
+                _spikes = int((_vol_df['vol_ratio'] > 2.0).sum())
+
+                vc1, vc2, vc3, vc4, vc5 = st.columns(5)
+                with vc1:
+                    st.metric("Total Volume", f"{_total_vol:,}")
+                with vc2:
+                    st.metric("Avg Volume/Candle", f"{_avg_vol:,}")
+                with vc3:
+                    st.metric("Peak Volume", f"{_max_vol:,}", f"at {_max_vol_time_str}")
+                with vc4:
+                    st.metric("Volume Bias", f"{_vol_bias_icon} {_vol_bias}",
+                              f"Bull {_bull_vol:,} / Bear {_bear_vol:,}")
+                with vc5:
+                    st.metric("Volume Spikes (>2x)", f"{_spikes}")
+
             # ── Pre-compute HTF pivot + VOB levels for candle pattern enrichment ──
             _cp_htf_supports    = []
             _cp_htf_resistances = []
@@ -14877,6 +14987,27 @@ def main():
                         _htf_col   = 'HTF S/R Context'
                         _vob_col   = 'VOB'
 
+                    # Volume context for the candle
+                    _cp_vol = _cp.get('volume', 0)
+                    _cp_vol_str = f"{int(_cp_vol):,}" if _cp_vol else '—'
+                    # Compute vol ratio vs MA20 at this candle's time
+                    _cp_vol_ratio_str = '—'
+                    _cp_vol_signal = '—'
+                    if _cp_vol and not _df_today.empty and 'volume' in _df_today.columns:
+                        try:
+                            _cp_ts = _cp['time']
+                            _cp_match = _df_today[_df_today['datetime'] == _cp_ts]
+                            if not _cp_match.empty:
+                                _cp_idx = _cp_match.index[0]
+                                _cp_win_start = max(0, _cp_idx - 20)
+                                _cp_avg_vol = _df_today.iloc[_cp_win_start:_cp_idx]['volume'].mean() if _cp_idx > 0 else _cp_vol
+                                if _cp_avg_vol and _cp_avg_vol > 0:
+                                    _cp_vr = _cp_vol / _cp_avg_vol
+                                    _cp_vol_ratio_str = f"{_cp_vr:.2f}x"
+                                    _cp_vol_signal = '🔥 Spike' if _cp_vr > 2.0 else ('⬆️ High' if _cp_vr > 1.5 else ('➡️ Avg' if _cp_vr > 0.75 else '⬇️ Low'))
+                        except Exception:
+                            pass
+
                     _ctype_rows.append({
                         'Time': _time_str,
                         'Pattern': _cp['pattern'],
@@ -14884,6 +15015,9 @@ def main():
                         'Price (₹)': f"{_price:.1f}",
                         'High (₹)': f"{_cp['high']:.1f}",
                         'Low (₹)': f"{_cp['low']:.1f}",
+                        'Volume': _cp_vol_str,
+                        'Vol Ratio': _cp_vol_ratio_str,
+                        'Vol Signal': _cp_vol_signal,
                         'Nearest HTF Pivot': _htf_label,
                         'Nearest VOB': _vob_label,
                     })
