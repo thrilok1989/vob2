@@ -14440,10 +14440,7 @@ def main():
         if success:
             st.sidebar.success(message)
             
-            # Send a test message
-            test_msg = "🔔 Nifty Analyzer - Test message successful! ✅"
-            send_telegram_message_sync(test_msg)
-            st.sidebar.success("Test message sent to Telegram!")
+            st.sidebar.success("Telegram connection verified!")
         else:
             st.sidebar.error(message)
     
@@ -16166,22 +16163,6 @@ def main():
                         if len(st.session_state.sentiment_history) > 200:
                             st.session_state.sentiment_history = st.session_state.sentiment_history[-200:]
 
-                    # ── Telegram alerts at 70/30 threshold crossings ─────────────
-                    if enable_signals and len(st.session_state.sentiment_history) >= 2:
-                        _prev_sent = st.session_state.sentiment_history[-2]['sentiment_score']
-                        _sent_alert_msg = None
-                        if _prev_sent < 70 <= _sentiment_score:
-                            _sent_alert_msg = (f"🚀 <b>BULLISH FLOW INCREASING</b>\n"
-                                               f"Spot: ₹{_pro_spot:.0f}\n"
-                                               f"Sentiment Score: {_sentiment_score}/100\n"
-                                               f"Breakout probability high")
-                        elif _prev_sent > 30 >= _sentiment_score:
-                            _sent_alert_msg = (f"🔥 <b>BEARISH FLOW INCREASING</b>\n"
-                                               f"Spot: ₹{_pro_spot:.0f}\n"
-                                               f"Sentiment Score: {_sentiment_score}/100\n"
-                                               f"Breakdown probability high")
-                        if _sent_alert_msg:
-                            send_telegram_message_sync(_sent_alert_msg)
 
                     # ── 7. Breakout Probability Score (0–100) ──────────────────
                     _pro_h    = st.session_state.pro_trader_history
@@ -16249,12 +16230,6 @@ def main():
                             if (_last_sig is None or
                                     (_pro_now - _last_sig[0]).total_seconds() > 300 or
                                     _last_sig[1] != _pro_alert):
-                                send_telegram_message_sync(
-                                    f"<b>VOB2 Pro Alert</b>\n{_pro_alert}\n"
-                                    f"Spot: {_pro_spot:.0f} | ATM: ₹{int(_pro_atm_val)}\n"
-                                    f"Straddle: {_pro_atm_straddle:.0f} | Score: {_pro_score}/100\n"
-                                    f"GEX: {_pro_net_gex:+.1f}L | Δ: {_pro_net_delta:+.0f}"
-                                )
                                 st.session_state.pro_smart_signal_last = (_pro_now, _pro_alert)
 
                     # ── Supabase write ─────────────────────────────────────────
@@ -19237,40 +19212,6 @@ def main():
                         if len(st.session_state.pressure_history) > 200:
                             st.session_state.pressure_history = st.session_state.pressure_history[-200:]
 
-                    # --- IV SKEW TELEGRAM SIGNALS ---
-                    if enable_signals:
-                        _actionable = _final_signal not in ("⏳ No Clear Edge",)
-                        _last_iv_sig = st.session_state.iv_skew_signal_last
-                        _cooldown_ok = (
-                            _last_iv_sig is None or
-                            (_ivp_now - _last_iv_sig[0]).total_seconds() > 300 or
-                            _last_iv_sig[1] != _final_signal
-                        )
-                        if _actionable and _cooldown_ok:
-                            _iv_tg_msg = (
-                                f"📡 <b>IV Skew Signal</b>\n"
-                                f"Signal: {_final_signal}\n"
-                                f"Spot: ₹{_ivp_underlying:.0f}\n"
-                                f"IV Skew: {_iv_skew:.3f} (CE {_avg_iv_ce:.1f}% / PE {_avg_iv_pe:.1f}%)\n"
-                                f"Net Pressure: {_net_pressure:+.3f}\n"
-                                f"IV Momentum: {_iv_momentum}"
-                            )
-                            if _spike_alert:
-                                _iv_tg_msg += f"\n⚡ {_spike_alert}"
-                            send_telegram_message_sync(_iv_tg_msg)
-                            st.session_state.iv_skew_signal_last = (_ivp_now, _final_signal)
-                        # Pressure spike alert (independent of signal cooldown)
-                        elif enable_signals and _spike_alert and (
-                            _last_iv_sig is None or
-                            (_ivp_now - _last_iv_sig[0]).total_seconds() > 60
-                        ):
-                            send_telegram_message_sync(
-                                f"⚡ <b>Pressure Spike Detected</b>\n"
-                                f"Spot: ₹{_ivp_underlying:.0f}\n"
-                                f"Net Pressure: {_net_pressure:+.3f} (Δ {_pressure_change:+.3f})\n"
-                                f"Current Signal: {_final_signal}"
-                            )
-                            st.session_state.iv_skew_signal_last = (_ivp_now, _final_signal)
 
                     # ======== UI OUTPUT ========
                     _ivp_c1, _ivp_c2, _ivp_c3 = st.columns(3)
@@ -19889,12 +19830,7 @@ def main():
                                 "",
                                 f"NIFTY Spot: ₹{int(_dg_underlying):,}",
                             ])
-                            try:
-                                send_telegram_message_sync(_dg_tg_msg)
-                                st.session_state.delta_gamma_last_alert = _dg_tg_now
-                                st.success("📨 Telegram Delta & Gamma alert sent!")
-                            except Exception as _dg_tg_e:
-                                st.warning(f"Telegram send failed: {_dg_tg_e}")
+                            st.session_state.delta_gamma_last_alert = _dg_tg_now
 
                     # ======== UI OUTPUT ========
                     _dg_c1, _dg_c2, _dg_c3, _dg_c4 = st.columns(4)
@@ -20225,54 +20161,6 @@ def main():
                 _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
                 _alert_minute = _ist_now.strftime('%Y-%m-%d %H:%M')
 
-                if _spike['spike_score'] >= 75 and st.session_state.last_spike_alert != _alert_minute:
-                    _spike_msg = (
-                        f"🚀 <b>INSTITUTIONAL SPIKE DETECTED</b>\n\n"
-                        f"Spot: ₹{_mae_underlying:.0f}\n"
-                        f"Spike Score: <b>{_spike['spike_score']}</b>\n"
-                        f"Signal: {_spike['signal']}\n"
-                        f"Direction: {_spike['direction']}\n"
-                        f"Conditions Met: {_spike['conditions_met']}/6\n"
-                        f"ATM Strike: {_mae_atm}\n"
-                        f"Gamma Pattern: {_gamma['pattern']}\n"
-                        f"Combined: {_combined_signal}\n"
-                        f"Time: {_mae_now_str} IST"
-                    )
-                    send_telegram_message_sync(_spike_msg)
-                    st.session_state.last_spike_alert = _alert_minute
-
-                if _gamma['pattern'] in ('Gamma Ramp Up', 'Gamma Ramp Down') and st.session_state.last_gamma_alert != _alert_minute:
-                    _gamma_msg = (
-                        f"📊 <b>GAMMA SEQUENCE SIGNAL</b>\n\n"
-                        f"Spot: ₹{_mae_underlying:.0f}\n"
-                        f"Pattern: <b>{_gamma['pattern']}</b>\n"
-                        f"Direction: {_gamma['direction']}\n"
-                        f"Dealer Signal: {_gamma['dealer_signal']}\n"
-                        f"{'⚡ Dealer Hedge Acceleration!' if _gamma['acceleration'] else ''}\n"
-                        f"{'⚠️ Trap: ' + _gamma['trap_signal'] if _gamma['trap_signal'] else ''}\n"
-                        f"Spike Score: {_spike['spike_score']}\n"
-                        f"Combined: {_combined_signal}\n"
-                        f"Time: {_mae_now_str} IST"
-                    )
-                    send_telegram_message_sync(_gamma_msg)
-                    st.session_state.last_gamma_alert = _alert_minute
-
-                if _expiry_spike['active'] and _expiry_spike['expiry_spike_score'] >= 80 and st.session_state.last_expiry_spike_alert != _alert_minute:
-                    _expiry_msg = (
-                        f"⚡ <b>EXPIRY MOVE DETECTED</b>\n\n"
-                        f"Spot: ₹{_mae_underlying:.0f}\n"
-                        f"Market Type: {_expiry_intel.get('market_type', 'N/A')}\n"
-                        f"Expiry Spike Score: <b>{_expiry_spike['expiry_spike_score']}</b>\n"
-                        f"Signal: {_expiry_spike['signal']}\n"
-                        f"{'SHORT COVERING DETECTED' if _expiry_spike['short_cover'] else ''}\n"
-                        f"{'LONG UNWINDING DETECTED' if _expiry_spike['long_unwind'] else ''}\n"
-                        f"Breakout Level: {_expiry_intel.get('breakout_level', 'N/A')}\n"
-                        f"Breakdown Level: {_expiry_intel.get('breakdown_level', 'N/A')}\n"
-                        f"Expiry Score: {_expiry_intel.get('expiry_score', 0)}\n"
-                        f"Confidence: HIGH\nTime: {_mae_now_str} IST"
-                    )
-                    send_telegram_message_sync(_expiry_msg)
-                    st.session_state.last_expiry_spike_alert = _alert_minute
 
                 # ---- DASHBOARD DISPLAY ----
                 # Top summary row
