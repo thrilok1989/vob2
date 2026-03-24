@@ -9222,29 +9222,46 @@ _NSE_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     ),
     "Accept": "application/json, text/plain, */*",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
     "Referer": "https://www.nseindia.com/",
+    "sec-ch-ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "sec-fetch-dest": "empty",
+    "sec-fetch-mode": "cors",
+    "sec-fetch-site": "same-origin",
+    "X-Requested-With": "XMLHttpRequest",
 }
 
 @st.cache_data(ttl=1800)
 def _fii_fetch_cash_data():
     """Fetch FII/DII daily cash segment data from NSE."""
     try:
-        import requests, json
+        import requests, time
         sess = requests.Session()
         sess.headers.update(_NSE_HEADERS)
-        # Warm up session with main page to get cookies
-        sess.get("https://www.nseindia.com", timeout=10)
+        # Warm up session with multiple pages to get cookies properly
+        sess.get("https://www.nseindia.com", timeout=15)
+        time.sleep(1)
+        sess.get("https://www.nseindia.com/market-data/fii-dii-activity", timeout=10)
+        time.sleep(0.5)
         resp = sess.get(
             "https://www.nseindia.com/api/fiidiiTradeReact",
-            timeout=10
+            timeout=15
         )
         if resp.status_code == 200:
-            data = resp.json()
-            return data
+            ct = resp.headers.get("Content-Type", "")
+            if "application/json" in ct or resp.text.strip().startswith(("[", "{")):
+                data = resp.json()
+                # Unwrap {"data": [...]} envelope if present
+                if isinstance(data, dict) and "data" in data:
+                    data = data["data"]
+                return data
     except Exception:
         pass
     return None
@@ -9253,11 +9270,12 @@ def _fii_fetch_cash_data():
 def _fii_fetch_futures_data():
     """Fetch participant-wise futures OI from NSE."""
     try:
-        import requests
+        import requests, time
         from datetime import datetime
         sess = requests.Session()
         sess.headers.update(_NSE_HEADERS)
-        sess.get("https://www.nseindia.com", timeout=10)
+        sess.get("https://www.nseindia.com", timeout=15)
+        time.sleep(0.5)
         today_str = datetime.now().strftime("%d-%b-%Y")
         url = (
             "https://www.nseindia.com/api/reports?"
@@ -9266,26 +9284,65 @@ def _fii_fetch_futures_data():
             "%22section%22%3A%22equity%22%7D%5D"
             f"&date={today_str}&type=archives&category=derivatives&section=equity"
         )
-        resp = sess.get(url, timeout=10)
+        resp = sess.get(url, timeout=15)
         if resp.status_code == 200:
-            return resp.json()
+            ct = resp.headers.get("Content-Type", "")
+            if "application/json" in ct or resp.text.strip().startswith(("[", "{")):
+                data = resp.json()
+                # Unwrap envelope if present
+                if isinstance(data, dict):
+                    for key in ("data", "records", "results"):
+                        if key in data and isinstance(data[key], list):
+                            return data[key]
+                return data
     except Exception:
         pass
     return None
 
 def _fii_parse_cash(raw):
-    """Parse NSE fiidiiTradeReact response into a clean DataFrame."""
+    """Parse NSE fiidiiTradeReact response into a clean DataFrame.
+
+    Handles multiple NSE key-name variants since NSE changes field names
+    periodically (fiiBuy vs fii_buy_cash vs fiiBuyVal etc.).
+    """
     if not raw or not isinstance(raw, list):
         return pd.DataFrame()
+
+    def _get_val(item, *keys):
+        """Try multiple key names and return first non-zero float found."""
+        for k in keys:
+            v = item.get(k)
+            if v is not None:
+                try:
+                    f = float(str(v).replace(",", "").replace(" ", "") or 0)
+                    if f != 0:
+                        return f
+                except Exception:
+                    pass
+        # Second pass: return first parseable value even if 0
+        for k in keys:
+            v = item.get(k)
+            if v is not None:
+                try:
+                    return float(str(v).replace(",", "").replace(" ", "") or 0)
+                except Exception:
+                    pass
+        return 0.0
+
     rows = []
     for item in raw[:15]:  # Last 15 trading days
         try:
+            date_val = item.get("date") or item.get("Date") or item.get("tradeDate") or ""
+            fii_buy  = _get_val(item, "fiiBuy",  "fii_buy_cash",  "fiiBuyVal",  "fii_buy",  "FII_BUY")
+            fii_sell = _get_val(item, "fiiSell", "fii_sell_cash", "fiiSellVal", "fii_sell", "FII_SELL")
+            dii_buy  = _get_val(item, "diiBuy",  "dii_buy_cash",  "diiBuyVal",  "dii_buy",  "DII_BUY")
+            dii_sell = _get_val(item, "diiSell", "dii_sell_cash", "diiSellVal", "dii_sell", "DII_SELL")
             rows.append({
-                "Date":           item.get("date", ""),
-                "FII Buy":        float(str(item.get("fiiBuy",  "0")).replace(",", "") or 0),
-                "FII Sell":       float(str(item.get("fiiSell", "0")).replace(",", "") or 0),
-                "DII Buy":        float(str(item.get("diiBuy",  "0")).replace(",", "") or 0),
-                "DII Sell":       float(str(item.get("diiSell", "0")).replace(",", "") or 0),
+                "Date":     date_val,
+                "FII Buy":  fii_buy,
+                "FII Sell": fii_sell,
+                "DII Buy":  dii_buy,
+                "DII Sell": dii_sell,
             })
         except Exception:
             continue
@@ -9294,6 +9351,9 @@ def _fii_parse_cash(raw):
     df = pd.DataFrame(rows)
     df["FII Net"] = df["FII Buy"] - df["FII Sell"]
     df["DII Net"] = df["DII Buy"] - df["DII Sell"]
+    # Return empty DataFrame if all buy/sell values are zero (bad parse / wrong keys)
+    if df["FII Buy"].sum() == 0 and df["DII Buy"].sum() == 0:
+        return pd.DataFrame()
     return df
 
 def _fii_parse_futures(raw):
@@ -9308,9 +9368,20 @@ def _fii_parse_futures(raw):
         # NSE returns a redirect to CSV; parse if list of dicts
         if isinstance(raw, list):
             for row in raw:
-                cat = str(row.get("clientType", row.get("category", ""))).upper()
-                long_  = float(str(row.get("futIndexLong",  row.get("long",  "0"))).replace(",","") or 0)
-                short_ = float(str(row.get("futIndexShort", row.get("short", "0"))).replace(",","") or 0)
+                cat = str(
+                    row.get("clientType") or row.get("client_type") or
+                    row.get("category") or row.get("participant") or ""
+                ).upper()
+                long_val = (
+                    row.get("futIndexLong") or row.get("fut_index_long") or
+                    row.get("futIdxLong") or row.get("long") or "0"
+                )
+                short_val = (
+                    row.get("futIndexShort") or row.get("fut_index_short") or
+                    row.get("futIdxShort") or row.get("short") or "0"
+                )
+                long_  = float(str(long_val).replace(",","") or 0)
+                short_ = float(str(short_val).replace(",","") or 0)
                 if "FII" in cat or "FOREIGN" in cat:
                     result["fii_long"]  += long_
                     result["fii_short"] += short_
