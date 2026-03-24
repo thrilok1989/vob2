@@ -16932,7 +16932,7 @@ def main():
                         _itm_now2 = datetime.now(pytz.timezone('Asia/Kolkata'))
                         _itm_ok   = (_last_itm[0] != _itm_key or
                                      (_last_itm[1] is not None and
-                                      (_itm_now2 - _last_itm[1]).total_seconds() > 600))
+                                      (_itm_now2 - _last_itm[1]).total_seconds() > 900))
                         if _itm_ok:
                             send_telegram_message_sync(
                                 f"<b>🗺️ INSTITUTIONAL TRADE SETUP</b>\n"
