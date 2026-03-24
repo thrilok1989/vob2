@@ -8321,24 +8321,6 @@ def _mda_synthetic_depth(df_summary: pd.DataFrame, spot: float, levels: int = 10
                      "source": "option_chain"})
     return bids, asks
 
-def _mda_demo_depth(spot: float):
-    """Generate realistic demo depth around spot for display when no API data."""
-    import random
-    random.seed(int(spot) % 1000)
-    step = 50  # NIFTY strikes at 50-pt intervals
-    bids, asks = [], []
-    for i in range(1, 11):
-        price = round(spot - i * step, 0)
-        # Occasionally create large walls
-        base = random.randint(5000, 30000)
-        multiplier = 4.0 if i in (2, 5) else (2.0 if i == 8 else 1.0)
-        bids.append({"price": price, "qty": int(base * multiplier)})
-    for i in range(1, 11):
-        price = round(spot + i * step, 0)
-        base = random.randint(5000, 30000)
-        multiplier = 4.0 if i in (3, 6) else (2.0 if i == 9 else 1.0)
-        asks.append({"price": price, "qty": int(base * multiplier)})
-    return bids, asks
 
 def _mda_find_clusters(levels: list, cluster_pct: float = 0.005):
     """Group nearby levels into liquidity clusters."""
@@ -8408,21 +8390,17 @@ def show_market_depth_engine(api=None, option_data: dict = None,
         if bids or asks:
             data_source = "nse"
 
-    # Fallback — demo
     if not bids and not asks:
-        bids, asks = _mda_demo_depth(spot)
-        data_source = "demo"
-        st.info(
-            "ℹ️ **Demo Mode** — No live depth data available. "
-            "Dhan API market depth works locally. "
-            "Option chain data adds synthetic depth when loaded."
+        st.error(
+            "❌ No market depth data available. "
+            "Load option chain data (adds synthetic depth) or connect Dhan API for live depth."
         )
+        return
 
     source_labels = {
         "dhan":         "✅ Live — Dhan API",
         "option_chain": "🔶 Synthetic — Option Chain Bid/Ask + OI",
         "nse":          "✅ Live — NSE API",
-        "demo":         "🔵 Demo Data",
     }
     st.caption(f"Data source: **{source_labels.get(data_source, data_source)}** | Spot: ₹{spot:,.0f}")
 
@@ -9025,9 +9003,8 @@ def show_market_sentiment_engine(api=None, option_data: dict = None,
             data_source = "option_chain"
 
     if not bids and not asks:
-        bids, asks = _mda_demo_depth(spot)
-        data_source = "demo"
-        st.info("ℹ️ Demo mode — live depth unavailable. Results are illustrative.")
+        st.error("❌ No market depth data available. Load option chain data or connect Dhan API.")
+        return
 
     bids = sorted(bids, key=lambda x: x["price"], reverse=True)[:10]
     asks = sorted(asks, key=lambda x: x["price"])[:10]
@@ -9466,41 +9443,22 @@ def show_fii_dii_analysis(df: pd.DataFrame = None, option_data: dict = None,
 
     data_ok = not cash_df.empty
 
-    # Fallback demo notice
+    # No live data — show error and stop
     if not data_ok:
-        st.info(
-            "ℹ️ Live NSE data unavailable (network/session restriction on cloud). "
-            "Showing last-available / demo values. Deploy locally for live data."
+        st.error(
+            "❌ Live FII/DII data unavailable. NSE API could not be reached or "
+            "returned no recognisable data (network/session restriction on cloud). "
+            "Please try again later or run the app locally for live NSE data."
         )
-        # Seed with plausible demo rows so all modules render
-        import random
-        random.seed(42)
-        demo_rows = []
-        from datetime import datetime, timedelta
-        base = datetime.now()
-        for i in range(10):
-            day = base - timedelta(days=i+1)
-            fb  = round(random.uniform(3000, 12000), 2)
-            fs  = round(random.uniform(3000, 12000), 2)
-            db  = round(random.uniform(2000,  8000), 2)
-            ds  = round(random.uniform(2000,  8000), 2)
-            demo_rows.append({
-                "Date": day.strftime("%d-%b-%Y"),
-                "FII Buy": fb, "FII Sell": fs,
-                "DII Buy": db, "DII Sell": ds,
-                "FII Net": round(fb - fs, 2),
-                "DII Net": round(db - ds, 2),
-            })
-        cash_df = pd.DataFrame(demo_rows)
-        data_ok = True
+        return
 
     # ── MODULE 2: Net Flow Calculation ────────────────────────────────
-    today_fii_net = cash_df["FII Net"].iloc[0] if data_ok else 0
-    today_dii_net = cash_df["DII Net"].iloc[0] if data_ok else 0
-    fii_3d = cash_df["FII Net"].iloc[:3].sum() if data_ok else 0
-    dii_3d = cash_df["DII Net"].iloc[:3].sum() if data_ok else 0
-    fii_5d = cash_df["FII Net"].iloc[:5].sum() if data_ok else 0
-    dii_5d = cash_df["DII Net"].iloc[:5].sum() if data_ok else 0
+    today_fii_net = cash_df["FII Net"].iloc[0]
+    today_dii_net = cash_df["DII Net"].iloc[0]
+    fii_3d = cash_df["FII Net"].iloc[:3].sum()
+    dii_3d = cash_df["DII Net"].iloc[:3].sum()
+    fii_5d = cash_df["FII Net"].iloc[:5].sum()
+    dii_5d = cash_df["DII Net"].iloc[:5].sum()
 
     # ── MODULE 3: Institutional Sentiment ────────────────────────────
     sentiment    = _fii_sentiment(today_fii_net, today_dii_net)
@@ -10022,30 +9980,11 @@ def show_news_intelligence_engine(df: pd.DataFrame = None,
         raw_articles = _nws_fetch_all_news()
 
     if not raw_articles:
-        st.warning(
-            "No news articles fetched. RSS feeds may be blocked in this environment. "
-            "Showing demo analysis."
+        st.error(
+            "❌ No news articles could be fetched. RSS feeds may be blocked in this environment. "
+            "Please try again later or run the app locally."
         )
-        raw_articles = [
-            {"source": "Demo", "title": "RBI keeps repo rate unchanged; maintains accommodative stance",
-             "summary": "Reserve Bank of India MPC voted to hold repo rate steady. Positive for banking sector.",
-             "pubDate": "", "link": ""},
-            {"source": "Demo", "title": "Nifty rallies 200 points as FII buying surges",
-             "summary": "Strong FII inflow boosts market sentiment. Banking and IT lead gains.",
-             "pubDate": "", "link": ""},
-            {"source": "Demo", "title": "Crude oil prices rise on geopolitical tensions",
-             "summary": "Oil climbs amid Middle East tensions, putting pressure on energy-importing nations.",
-             "pubDate": "", "link": ""},
-            {"source": "Demo", "title": "US Fed signals rate cut; dollar weakens",
-             "summary": "Federal Reserve hints at rate cuts boosting global risk appetite.",
-             "pubDate": "", "link": ""},
-            {"source": "Demo", "title": "IT sector outlook positive; TCS beats estimates",
-             "summary": "TCS quarterly results beat street estimates; management guides for strong FY growth.",
-             "pubDate": "", "link": ""},
-            {"source": "Demo", "title": "GDP growth slows to 6.4%; concerns about slowdown",
-             "summary": "India GDP growth misses forecast. Analysts worry about consumption slowdown.",
-             "pubDate": "", "link": ""},
-        ]
+        return
 
     # ── MODULE 2+3+4+5: Enrich ───────────────────────────────────────
     processed = _nws_process_articles(raw_articles)
@@ -10524,7 +10463,8 @@ def show_sector_rotation_engine():
         sector_data = _sre_fetch_all()
 
     if not sector_data:
-        st.info("ℹ️ Live sector data unavailable (network/yfinance). Showing demo values for layout preview.")
+        st.error("❌ Live sector data unavailable (network/yfinance). Please try again later.")
+        return
 
     # Get NIFTY50 as benchmark
     import yfinance as yf
@@ -10851,24 +10791,14 @@ def show_intraday_sector_rotation():
     with st.spinner("Fetching intraday sector data (5m)..."):
         data = _intra_fetch_all()
 
-    _intra_demo_mode = False
     if not data:
-        st.info("ℹ️ Live intraday sector data unavailable (network/yfinance). Showing demo values.")
-        _intra_demo_mode = True
+        st.error("❌ Live intraday sector data unavailable (network/yfinance). Please try again later.")
+        return
 
-    bench_df = data.get(_INTRA_BENCH, pd.DataFrame()) if data else pd.DataFrame()
+    bench_df = data.get(_INTRA_BENCH, pd.DataFrame())
     if bench_df.empty or "close" not in bench_df.columns:
-        if not _intra_demo_mode:
-            st.info("ℹ️ NIFTY 50 benchmark data unavailable. Showing demo values.")
-        _intra_demo_mode = True
-        # Generate synthetic benchmark series (75 5m bars ≈ 2 trading days)
-        import random as _rnd
-        _rnd.seed(42)
-        _base_bench = 23100.0
-        _bench_prices = [_base_bench]
-        for _ in range(74):
-            _bench_prices.append(_bench_prices[-1] * (1 + _rnd.uniform(-0.002, 0.002)))
-        bench_df = pd.DataFrame({"close": _bench_prices})
+        st.error("❌ NIFTY 50 benchmark intraday data unavailable. Please try again later.")
+        return
 
     bench_cl = bench_df["close"]
     bench_now = bench_cl.iloc[-1]
@@ -10883,17 +10813,10 @@ def show_intraday_sector_rotation():
     for sec in _INTRA_SECTORS:
         sym   = sec["yf"]
         name  = sec["name"]
-        df_s  = data.get(sym, pd.DataFrame()) if data else pd.DataFrame()
+        df_s  = data.get(sym, pd.DataFrame())
 
-        if _intra_demo_mode or df_s.empty or "close" not in df_s.columns or len(df_s) < 2:
-            # Generate synthetic demo series aligned with bench index
-            import random as _rnd2
-            _rnd2.seed(hash(sym) % 9999)
-            _base_s = bench_cl.iloc[-1] * _rnd2.uniform(0.85, 1.15)
-            _spx = [_base_s]
-            for _bb in bench_cl.iloc[1:]:
-                _spx.append(_spx[-1] * (1 + _rnd2.uniform(-0.0025, 0.0025)))
-            df_s = pd.DataFrame({"close": _spx}, index=bench_cl.index)
+        if df_s.empty or "close" not in df_s.columns or len(df_s) < 2:
+            continue  # Skip sectors with no live data
 
         cl = df_s["close"]
         now_price = cl.iloc[-1]
