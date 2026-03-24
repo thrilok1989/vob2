@@ -14286,6 +14286,20 @@ def main():
     if 'pcr_telegram_last_sent' not in st.session_state:
         st.session_state.pcr_telegram_last_sent = None
 
+    # Initialize session state for Call vs Put OI comparison (ATM ±2)
+    if 'call_put_oi_ce_history' not in st.session_state:
+        st.session_state.call_put_oi_ce_history = []       # CE OI per strike over time
+    if 'call_put_oi_pe_history' not in st.session_state:
+        st.session_state.call_put_oi_pe_history = []       # PE OI per strike over time
+    if 'call_put_chgoi_ce_history' not in st.session_state:
+        st.session_state.call_put_chgoi_ce_history = []    # CE Change-in-OI per strike
+    if 'call_put_chgoi_pe_history' not in st.session_state:
+        st.session_state.call_put_chgoi_pe_history = []    # PE Change-in-OI per strike
+    if 'call_put_oi_current_strikes' not in st.session_state:
+        st.session_state.call_put_oi_current_strikes = []
+    if 'call_put_oi_telegram_last_sent' not in st.session_state:
+        st.session_state.call_put_oi_telegram_last_sent = None
+
     # Initialize session state for Composite Direction Signal history
     if 'composite_signal_history' not in st.session_state:
         st.session_state.composite_signal_history = []
@@ -17450,10 +17464,25 @@ def main():
                                 pe_chg = row['changeinOpenInterest_PE']
                                 chgoi_entry[strike_label] = round(abs(pe_chg / ce_chg), 3) if ce_chg != 0 else 0.0
 
+                        # Collect raw CE/PE OI and ChgOI per strike for comparison charts
+                        ce_oi_entry = {'time': current_time}
+                        pe_oi_entry = {'time': current_time}
+                        ce_chgoi_entry = {'time': current_time}
+                        pe_chgoi_entry = {'time': current_time}
+                        for _, row in pcr_df.iterrows():
+                            strike_label = str(int(row['Strike']))
+                            ce_oi_entry[strike_label] = row.get('openInterest_CE', 0)
+                            pe_oi_entry[strike_label] = row.get('openInterest_PE', 0)
+                            if 'changeinOpenInterest_CE' in row:
+                                ce_chgoi_entry[strike_label] = row['changeinOpenInterest_CE']
+                            if 'changeinOpenInterest_PE' in row:
+                                pe_chgoi_entry[strike_label] = row['changeinOpenInterest_PE']
+
                         # Store current ATM ±2 strike positions for display
                         current_strikes = pcr_df['Strike'].tolist()
                         st.session_state.pcr_current_strikes = [int(s) for s in current_strikes]
                         st.session_state.pcr_chgoi_strike_current_strikes = [int(s) for s in current_strikes]
+                        st.session_state.call_put_oi_current_strikes = [int(s) for s in current_strikes]
 
                         # Check if we should add new entry (avoid duplicates within 30 seconds)
                         should_add = True
@@ -17472,6 +17501,21 @@ def main():
                                 st.session_state.pcr_chgoi_strike_history.append(chgoi_entry)
                                 if len(st.session_state.pcr_chgoi_strike_history) > 200:
                                     st.session_state.pcr_chgoi_strike_history = st.session_state.pcr_chgoi_strike_history[-200:]
+                            # Store raw CE/PE OI and ChgOI per strike
+                            if len(ce_oi_entry) > 1:
+                                st.session_state.call_put_oi_ce_history.append(ce_oi_entry)
+                                if len(st.session_state.call_put_oi_ce_history) > 200:
+                                    st.session_state.call_put_oi_ce_history = st.session_state.call_put_oi_ce_history[-200:]
+                                st.session_state.call_put_oi_pe_history.append(pe_oi_entry)
+                                if len(st.session_state.call_put_oi_pe_history) > 200:
+                                    st.session_state.call_put_oi_pe_history = st.session_state.call_put_oi_pe_history[-200:]
+                            if len(ce_chgoi_entry) > 1:
+                                st.session_state.call_put_chgoi_ce_history.append(ce_chgoi_entry)
+                                if len(st.session_state.call_put_chgoi_ce_history) > 200:
+                                    st.session_state.call_put_chgoi_ce_history = st.session_state.call_put_chgoi_ce_history[-200:]
+                                st.session_state.call_put_chgoi_pe_history.append(pe_chgoi_entry)
+                                if len(st.session_state.call_put_chgoi_pe_history) > 200:
+                                    st.session_state.call_put_chgoi_pe_history = st.session_state.call_put_chgoi_pe_history[-200:]
 
             except Exception as e:
                 st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
@@ -17767,12 +17811,310 @@ def main():
                         st.session_state.pcr_last_valid_data = None
                         st.session_state.pcr_chgoi_strike_history = []
                         st.session_state.gex_history = []
+                        st.session_state.call_put_oi_ce_history = []
+                        st.session_state.call_put_oi_pe_history = []
+                        st.session_state.call_put_chgoi_ce_history = []
+                        st.session_state.call_put_chgoi_pe_history = []
                         st.rerun()
 
             except Exception as e:
                 st.warning(f"Error displaying comparison charts: {str(e)}")
         else:
             st.info("📊 History will build up as the app refreshes. Please wait for data collection…")
+
+        # ===== ATM ±2 STRIKE COMPARISON: CALL OI vs PUT OI / CE ΔOI vs PE ΔOI =====
+        st.markdown("---")
+        st.markdown("## 📊 ATM ±2 Strike Comparison — Call OI · Put OI")
+
+        _cp_ce_hist = st.session_state.call_put_oi_ce_history
+        _cp_pe_hist = st.session_state.call_put_oi_pe_history
+        _cp_ce_chg_hist = st.session_state.call_put_chgoi_ce_history
+        _cp_pe_chg_hist = st.session_state.call_put_chgoi_pe_history
+
+        if len(_cp_ce_hist) > 0 and len(_cp_pe_hist) > 0:
+            try:
+                _cp_ce_df = pd.DataFrame(_cp_ce_hist)
+                _cp_pe_df = pd.DataFrame(_cp_pe_hist)
+                _cp_ce_chg_df = pd.DataFrame(_cp_ce_chg_hist) if _cp_ce_chg_hist else None
+                _cp_pe_chg_df = pd.DataFrame(_cp_pe_chg_hist) if _cp_pe_chg_hist else None
+
+                _cp_strikes = sorted(getattr(st.session_state, 'call_put_oi_current_strikes', []))
+                if not _cp_strikes:
+                    _cp_strikes = sorted(getattr(st.session_state, 'pcr_current_strikes', []))
+
+                _cp_pos_labels = ['🟣 ITM-2', '🟣 ITM-1', '🟡 ATM', '🔵 OTM+1', '🔵 OTM+2']
+
+                # ── Row 1: Call OI vs Put OI per strike ──
+                _cp_oi_cols = st.columns(5)
+                for _ci, _ccol in enumerate(_cp_oi_cols):
+                    with _ccol:
+                        if _ci >= len(_cp_strikes):
+                            st.info(f"{_cp_pos_labels[_ci]} N/A")
+                            continue
+
+                        _cp_strike = _cp_strikes[_ci]
+                        _cp_sc = str(_cp_strike)
+
+                        _cp_fig = go.Figure()
+
+                        # CE OI (solid cyan)
+                        if _cp_sc in _cp_ce_df.columns:
+                            _cp_fig.add_trace(go.Scatter(
+                                x=_cp_ce_df['time'], y=_cp_ce_df[_cp_sc],
+                                mode='lines+markers', name='Call OI',
+                                line=dict(color='#00ccff', width=2),
+                                marker=dict(size=3),
+                            ))
+                        # PE OI (dashed magenta)
+                        if _cp_sc in _cp_pe_df.columns:
+                            _cp_fig.add_trace(go.Scatter(
+                                x=_cp_pe_df['time'], y=_cp_pe_df[_cp_sc],
+                                mode='lines+markers', name='Put OI',
+                                line=dict(color='#ff44ff', width=2, dash='dash'),
+                                marker=dict(size=3),
+                            ))
+
+                        # Dynamic Y range
+                        _cp_oi_vals = []
+                        if _cp_sc in _cp_ce_df.columns:
+                            _cp_oi_vals += _cp_ce_df[_cp_sc].dropna().tolist()
+                        if _cp_sc in _cp_pe_df.columns:
+                            _cp_oi_vals += _cp_pe_df[_cp_sc].dropna().tolist()
+                        if _cp_oi_vals:
+                            _cp_oi_ymin = max(0, min(_cp_oi_vals) * 0.9)
+                            _cp_oi_ymax = max(_cp_oi_vals) * 1.1
+                        else:
+                            _cp_oi_ymin, _cp_oi_ymax = 0, 100
+
+                        # Current value markers
+                        _cp_ce_cur = None
+                        _cp_pe_cur = None
+                        if _cp_sc in _cp_ce_df.columns and len(_cp_ce_df) > 0:
+                            _cp_ce_cur = _cp_ce_df[_cp_sc].iloc[-1]
+                            _cp_fig.add_trace(go.Scatter(
+                                x=[_cp_ce_df['time'].iloc[-1]], y=[_cp_ce_cur],
+                                mode='markers+text', text=[f'{_cp_ce_cur:,.0f}'],
+                                textposition='top right', textfont=dict(size=9, color='#00ccff'),
+                                marker=dict(size=9, color='#00ccff', symbol='circle'),
+                                showlegend=False, hoverinfo='skip',
+                            ))
+                        if _cp_sc in _cp_pe_df.columns and len(_cp_pe_df) > 0:
+                            _cp_pe_cur = _cp_pe_df[_cp_sc].iloc[-1]
+                            _cp_fig.add_trace(go.Scatter(
+                                x=[_cp_pe_df['time'].iloc[-1]], y=[_cp_pe_cur],
+                                mode='markers+text', text=[f'{_cp_pe_cur:,.0f}'],
+                                textposition='bottom right', textfont=dict(size=9, color='#ff44ff'),
+                                marker=dict(size=9, color='#ff44ff', symbol='diamond'),
+                                showlegend=False, hoverinfo='skip',
+                            ))
+
+                        # Title with current values
+                        _cp_ce_str = f"CE: {_cp_ce_cur:,.0f}" if _cp_ce_cur is not None else "CE: --"
+                        _cp_pe_str = f"PE: {_cp_pe_cur:,.0f}" if _cp_pe_cur is not None else "PE: --"
+
+                        _cp_fig.update_layout(
+                            title=dict(text=f"{_cp_pos_labels[_ci]}<br>₹{_cp_strike}<br>{_cp_ce_str} | {_cp_pe_str}",
+                                       font=dict(size=11)),
+                            template='plotly_dark', height=300,
+                            showlegend=True,
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                                        xanchor='center', x=0.5, font=dict(size=8)),
+                            margin=dict(l=5, r=10, t=70, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                            yaxis=dict(title='OI', range=[_cp_oi_ymin, _cp_oi_ymax]),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                        )
+                        st.plotly_chart(_cp_fig, use_container_width=True)
+
+                        # Signal: which side dominates
+                        if _cp_ce_cur is not None and _cp_pe_cur is not None and _cp_ce_cur > 0:
+                            _cp_pcr_v = _cp_pe_cur / _cp_ce_cur
+                            _cp_sig = "🟢 Bull" if _cp_pcr_v > 1.2 else ("🔴 Bear" if _cp_pcr_v < 0.7 else "🟡 Ntrl")
+                            st.caption(f"PE/CE {_cp_pcr_v:.2f} {_cp_sig}")
+                        else:
+                            st.caption("--")
+
+                # ── Row 2: CE ΔOI vs PE ΔOI per strike (Change in OI) ──
+                if _cp_ce_chg_df is not None and _cp_pe_chg_df is not None:
+                    st.markdown("### 📊 ATM ±2 Strike Comparison — CE ΔOI · PE ΔOI")
+                    _cp_chg_cols = st.columns(5)
+                    for _ci, _ccol in enumerate(_cp_chg_cols):
+                        with _ccol:
+                            if _ci >= len(_cp_strikes):
+                                st.info(f"{_cp_pos_labels[_ci]} N/A")
+                                continue
+
+                            _cp_strike = _cp_strikes[_ci]
+                            _cp_sc = str(_cp_strike)
+
+                            _chg_fig = go.Figure()
+
+                            # CE ΔOI (solid green)
+                            if _cp_sc in _cp_ce_chg_df.columns:
+                                _chg_fig.add_trace(go.Scatter(
+                                    x=_cp_ce_chg_df['time'], y=_cp_ce_chg_df[_cp_sc],
+                                    mode='lines+markers', name='CE ΔOI',
+                                    line=dict(color='#00ff88', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            # PE ΔOI (dashed red)
+                            if _cp_sc in _cp_pe_chg_df.columns:
+                                _chg_fig.add_trace(go.Scatter(
+                                    x=_cp_pe_chg_df['time'], y=_cp_pe_chg_df[_cp_sc],
+                                    mode='lines+markers', name='PE ΔOI',
+                                    line=dict(color='#ff4444', width=2, dash='dash'),
+                                    marker=dict(size=3),
+                                ))
+
+                            # Zero reference line
+                            _chg_fig.add_hline(y=0, line_dash="solid", line_color="rgba(255,255,255,0.4)", line_width=1)
+
+                            # Dynamic Y range
+                            _chg_vals = []
+                            if _cp_sc in _cp_ce_chg_df.columns:
+                                _chg_vals += _cp_ce_chg_df[_cp_sc].dropna().tolist()
+                            if _cp_sc in _cp_pe_chg_df.columns:
+                                _chg_vals += _cp_pe_chg_df[_cp_sc].dropna().tolist()
+                            if _chg_vals:
+                                _chg_max_abs = max(abs(min(_chg_vals)), abs(max(_chg_vals)), 1)
+                                _chg_ymin = -_chg_max_abs * 1.1
+                                _chg_ymax = _chg_max_abs * 1.1
+                            else:
+                                _chg_ymin, _chg_ymax = -100, 100
+
+                            # Current value markers
+                            _chg_ce_cur = None
+                            _chg_pe_cur = None
+                            if _cp_sc in _cp_ce_chg_df.columns and len(_cp_ce_chg_df) > 0:
+                                _chg_ce_cur = _cp_ce_chg_df[_cp_sc].iloc[-1]
+                                _chg_fig.add_trace(go.Scatter(
+                                    x=[_cp_ce_chg_df['time'].iloc[-1]], y=[_chg_ce_cur],
+                                    mode='markers+text', text=[f'{_chg_ce_cur:+,.0f}'],
+                                    textposition='top right', textfont=dict(size=9, color='#00ff88'),
+                                    marker=dict(size=9, color='#00ff88', symbol='circle'),
+                                    showlegend=False, hoverinfo='skip',
+                                ))
+                            if _cp_sc in _cp_pe_chg_df.columns and len(_cp_pe_chg_df) > 0:
+                                _chg_pe_cur = _cp_pe_chg_df[_cp_sc].iloc[-1]
+                                _chg_fig.add_trace(go.Scatter(
+                                    x=[_cp_pe_chg_df['time'].iloc[-1]], y=[_chg_pe_cur],
+                                    mode='markers+text', text=[f'{_chg_pe_cur:+,.0f}'],
+                                    textposition='bottom right', textfont=dict(size=9, color='#ff4444'),
+                                    marker=dict(size=9, color='#ff4444', symbol='diamond'),
+                                    showlegend=False, hoverinfo='skip',
+                                ))
+
+                            _chg_ce_s = f"CE: {_chg_ce_cur:+,.0f}" if _chg_ce_cur is not None else "CE: --"
+                            _chg_pe_s = f"PE: {_chg_pe_cur:+,.0f}" if _chg_pe_cur is not None else "PE: --"
+
+                            _chg_fig.update_layout(
+                                title=dict(text=f"{_cp_pos_labels[_ci]}<br>₹{_cp_strike}<br>{_chg_ce_s} | {_chg_pe_s}",
+                                           font=dict(size=11)),
+                                template='plotly_dark', height=300,
+                                showlegend=True,
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                                            xanchor='center', x=0.5, font=dict(size=8)),
+                                margin=dict(l=5, r=10, t=70, b=30),
+                                xaxis=dict(tickformat='%H:%M', title='', tickfont=dict(size=8)),
+                                yaxis=dict(title='ΔOI', range=[_chg_ymin, _chg_ymax],
+                                           zeroline=True, zerolinecolor='white', zerolinewidth=1),
+                                plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                            )
+                            st.plotly_chart(_chg_fig, use_container_width=True)
+
+                            # Signal: net change direction
+                            if _chg_ce_cur is not None and _chg_pe_cur is not None:
+                                _net = _chg_pe_cur - _chg_ce_cur
+                                _chg_sig = "🟢 Bull" if _net > 0 else ("🔴 Bear" if _net < 0 else "🟡 Ntrl")
+                                st.caption(f"Net ΔOI {_net:+,.0f} {_chg_sig}")
+                            else:
+                                st.caption("--")
+
+                # ── Telegram: send Call OI vs Put OI chart every 5 minutes ──
+                _cp_now = datetime.now()
+                _cp_last_sent = st.session_state.call_put_oi_telegram_last_sent
+                _cp_should_send = (_cp_last_sent is None or (_cp_now - _cp_last_sent).total_seconds() >= 300)
+                if _cp_should_send and _cp_strikes:
+                    try:
+                        from plotly.subplots import make_subplots as _cp_make_subplots
+                        _cp_n = len(_cp_strikes)
+                        # Combined OI + ΔOI in 2 rows
+                        _has_chg = _cp_ce_chg_df is not None and _cp_pe_chg_df is not None
+                        _cp_rows = 2 if _has_chg else 1
+                        _cp_subtitles = [f"{_cp_pos_labels[i]}<br>₹{_cp_strikes[i]}" for i in range(_cp_n)]
+                        if _has_chg:
+                            _cp_subtitles += [f"ΔOI ₹{_cp_strikes[i]}" for i in range(_cp_n)]
+                        _cp_tg_fig = _cp_make_subplots(
+                            rows=_cp_rows, cols=_cp_n,
+                            subplot_titles=_cp_subtitles,
+                        )
+                        for _ci, _cs in enumerate(_cp_strikes):
+                            _csc = str(_cs)
+                            _col_idx = _ci + 1
+                            if _csc in _cp_ce_df.columns:
+                                _cp_tg_fig.add_trace(go.Scatter(
+                                    x=_cp_ce_df['time'], y=_cp_ce_df[_csc],
+                                    mode='lines', name='Call OI',
+                                    line=dict(color='#00ccff', width=2),
+                                    showlegend=(_ci == 0),
+                                ), row=1, col=_col_idx)
+                            if _csc in _cp_pe_df.columns:
+                                _cp_tg_fig.add_trace(go.Scatter(
+                                    x=_cp_pe_df['time'], y=_cp_pe_df[_csc],
+                                    mode='lines', name='Put OI',
+                                    line=dict(color='#ff44ff', width=2, dash='dash'),
+                                    showlegend=(_ci == 0),
+                                ), row=1, col=_col_idx)
+                            if _has_chg:
+                                if _csc in _cp_ce_chg_df.columns:
+                                    _cp_tg_fig.add_trace(go.Scatter(
+                                        x=_cp_ce_chg_df['time'], y=_cp_ce_chg_df[_csc],
+                                        mode='lines', name='CE ΔOI',
+                                        line=dict(color='#00ff88', width=2),
+                                        showlegend=(_ci == 0),
+                                    ), row=2, col=_col_idx)
+                                if _csc in _cp_pe_chg_df.columns:
+                                    _cp_tg_fig.add_trace(go.Scatter(
+                                        x=_cp_pe_chg_df['time'], y=_cp_pe_chg_df[_csc],
+                                        mode='lines', name='PE ΔOI',
+                                        line=dict(color='#ff4444', width=2, dash='dash'),
+                                        showlegend=(_ci == 0),
+                                    ), row=2, col=_col_idx)
+                        _cp_tg_fig.update_layout(
+                            title="ATM ±2 Strike Comparison — Call OI · Put OI · ΔOI",
+                            template='plotly_dark',
+                            height=350 * _cp_rows, width=1400,
+                            paper_bgcolor='#1e1e1e', plot_bgcolor='#1e1e1e',
+                            margin=dict(l=10, r=10, t=80, b=40),
+                            legend=dict(orientation='h', yanchor='bottom', y=1.06, xanchor='center', x=0.5),
+                        )
+                        _cp_tg_fig.update_xaxes(tickformat='%H:%M', tickfont=dict(size=8))
+                        _cp_tg_fig.update_yaxes(tickfont=dict(size=8))
+                        _cp_img = _cp_tg_fig.to_image(format="png", scale=2)
+                        _cp_caption = [f"<b>ATM ±2 Call OI · Put OI</b>  {_cp_now.strftime('%H:%M')}  Spot: ₹{underlying_price:.0f}"]
+                        for _ci, _cs in enumerate(_cp_strikes):
+                            _csc = str(_cs)
+                            _lbl = _cp_pos_labels[_ci].split(" ", 1)[-1]
+                            _ce_v = _cp_ce_df[_csc].iloc[-1] if _csc in _cp_ce_df.columns and len(_cp_ce_df) > 0 else None
+                            _pe_v = _cp_pe_df[_csc].iloc[-1] if _csc in _cp_pe_df.columns and len(_cp_pe_df) > 0 else None
+                            _ce_s = f"{_ce_v:,.0f}" if _ce_v is not None else "N/A"
+                            _pe_s = f"{_pe_v:,.0f}" if _pe_v is not None else "N/A"
+                            _sig = "🟢" if (_ce_v and _pe_v and _pe_v / _ce_v > 1.2) else (
+                                "🔴" if (_ce_v and _pe_v and _pe_v / _ce_v < 0.7) else "🟡")
+                            _cp_caption.append(f"{_sig} ₹{_cs} ({_lbl}): CE={_ce_s} | PE={_pe_s}")
+                        send_telegram_photo_sync(_cp_img, "\n".join(_cp_caption))
+                        st.session_state.call_put_oi_telegram_last_sent = _cp_now
+                    except Exception:
+                        pass  # silently skip if chart export fails
+
+                # ── Status ──
+                _cp_status = "🟢 Live" if pcr_data_available else "🟡 Using cached history"
+                st.caption(f"{_cp_status} | 📈 {len(_cp_ce_hist)} Call/Put OI pts")
+
+            except Exception as _cp_err:
+                st.warning(f"Error displaying Call/Put OI charts: {str(_cp_err)}")
+        else:
+            st.info("📊 Call/Put OI history will build up as the app refreshes. Please wait for data collection…")
 
         # ===== VOLUME PCR + STRADDLE + COMBINED SIGNAL (ATM ± 2) =====
         st.markdown("---")
