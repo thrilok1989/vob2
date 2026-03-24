@@ -10726,29 +10726,52 @@ _INTRA_SECTORS = [
 ]
 _INTRA_BENCH = "^NSEI"
 
+def _intra_fetch_single(sym: str):
+    """Fetch 5m intraday data for one ticker with a 12s timeout."""
+    import yfinance as yf
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
+    def _dl():
+        return yf.download(sym, period="2d", interval="5m",
+                           auto_adjust=True, progress=False)
+    try:
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_dl)
+            df_s = fut.result(timeout=12)
+        if df_s is not None and not df_s.empty:
+            df_s.columns = [c.lower() for c in df_s.columns]
+            df_s = df_s.dropna(subset=["close"])
+            return df_s
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+
 @st.cache_data(ttl=180)
 def _intra_fetch_all():
-    """Fetch 2-day 5m data for sectors + NIFTY50 benchmark."""
+    """Fetch 2-day 5m data for sectors + NIFTY50 benchmark (15s total timeout)."""
     if not _YF_AVAILABLE:
         return {}
     import yfinance as yf
+    from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
     tickers = [s["yf"] for s in _INTRA_SECTORS] + [_INTRA_BENCH]
     out = {}
+
+    # Batch fetch with 15s timeout
+    def _batch():
+        return yf.download(tickers, period="2d", interval="5m",
+                           auto_adjust=True, progress=False)
     try:
-        raw = yf.download(
-            tickers, period="2d", interval="5m",
-            auto_adjust=True, progress=False
-        )
+        with ThreadPoolExecutor(max_workers=1) as ex:
+            fut = ex.submit(_batch)
+            raw = fut.result(timeout=15)
         if not raw.empty and isinstance(raw.columns, pd.MultiIndex):
             lvl0 = list(raw.columns.get_level_values(0).unique())
             lvl1 = list(raw.columns.get_level_values(1).unique())
             for sym in tickers:
                 try:
                     if sym in lvl0:
-                        # Old format: (ticker, field)
                         df_s = raw[sym].copy()
                     elif sym in lvl1:
-                        # New yfinance format: (field, ticker)
                         df_s = raw.xs(sym, axis=1, level=1).copy()
                     else:
                         out[sym] = pd.DataFrame()
@@ -10765,20 +10788,12 @@ def _intra_fetch_all():
             out[tickers[0]] = df_s
     except Exception:
         pass
-    # Fallback: fetch individually for any missing tickers
+
+    # Fallback: fetch individually (12s each) for any still missing
     for sym in tickers:
         if sym not in out or out[sym].empty:
-            try:
-                df_s = yf.download(sym, period="2d", interval="5m",
-                                   auto_adjust=True, progress=False)
-                if not df_s.empty:
-                    df_s.columns = [c.lower() for c in df_s.columns]
-                    df_s = df_s.dropna(subset=["close"])
-                    out[sym] = df_s
-                else:
-                    out[sym] = pd.DataFrame()
-            except Exception:
-                out[sym] = pd.DataFrame()
+            out[sym] = _intra_fetch_single(sym)
+
     return out
 
 def _intra_momentum(cl: pd.Series, bars: int) -> float:
@@ -21054,7 +21069,10 @@ def main():
     # ===== BANK NIFTY MULTI-TICKER DASHBOARD =====
     st.markdown("---")
     with st.expander("📊 Bank Nifty Dashboard — Multi-Ticker & Indicator Table", expanded=False):
-        show_bn_dashboard(interval=timeframes.get(selected_timeframe, "1"))
+        try:
+            show_bn_dashboard(interval=timeframes.get(selected_timeframe, "1"))
+        except Exception as _bn_err:
+            st.warning(f"Bank Nifty Dashboard error: {str(_bn_err)}")
 
     # ===== UNIFIED CONFLUENCE ENTRY ALERT =====
     if enable_signals and option_data and option_data.get('underlying') and not df.empty:
