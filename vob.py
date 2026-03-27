@@ -6435,6 +6435,548 @@ def render_smart_money_master_analysis(option_data, current_price):
         )
 
 
+def render_pre_market_intelligence_report(option_data, current_price):
+    """
+    VOB2 Institutional Pre-Market Intelligence Report.
+
+    Uses ONLY existing formulas already present in the codebase:
+    - PCR: PE_OI / CE_OI  (from render_smart_money_master_analysis)
+    - GEX: calculate_dealer_gex  (Call_GEX + Put_GEX)
+    - Gamma Flip: sign-change strike from Net_GEX profile
+    - Max Pain: strike with minimum total options pain to writers
+    - OI Activity: price vs OI change direction logic
+    - Trap Detection: Bull/Bear/Gamma trap conditions
+    - Smart Money: OI spike > 3× average at strike
+    - Confidence: PCR(25%) + OI Shift(25%) + Gamma Regime(20%) +
+                  Chart Structure(15%) + Breakout Signals(15%)
+    - Volatility: ATM IV average
+    """
+    if option_data is None:
+        return
+    df_summary = option_data.get('df_summary')
+    if df_summary is None or df_summary.empty:
+        return
+
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+
+    underlying   = option_data.get('underlying', current_price or 0)
+    atm_strike   = option_data.get('atm_strike')
+    max_pain     = option_data.get('max_pain_strike')
+    total_ce_chg = option_data.get('total_ce_change', 0)
+    total_pe_chg = option_data.get('total_pe_change', 0)
+    expiry       = option_data.get('expiry', '')
+
+    if atm_strike is None:
+        return
+
+    LOT = 100000
+
+    def _gv(row, col, default=0.0):
+        try:
+            v = row[col] if hasattr(row, '__getitem__') else getattr(row, col, default)
+            return float(v) if pd.notna(v) else default
+        except Exception:
+            return default
+
+    ds = df_summary.sort_values('Strike').reset_index(drop=True)
+    atm_matches = ds[ds['Strike'] == atm_strike].index.tolist()
+    ai = atm_matches[0] if atm_matches else int((ds['Strike'] - atm_strike).abs().idxmin())
+
+    def _safe_row(i):
+        return ds.iloc[i] if 0 <= i < len(ds) else None
+
+    r_m2 = _safe_row(ai - 2); r_m1 = _safe_row(ai - 1)
+    r_0  = ds.iloc[ai]
+    r_p1 = _safe_row(ai + 1); r_p2 = _safe_row(ai + 2)
+
+    # ── 1. PCR ─────────────────────────────────────────────────────────────
+    total_ce_oi = ds['openInterest_CE'].sum() if 'openInterest_CE' in ds.columns else 0
+    total_pe_oi = ds['openInterest_PE'].sum() if 'openInterest_PE' in ds.columns else 0
+    pcr = (total_pe_oi / total_ce_oi) if total_ce_oi > 0 else 1.0
+    if pcr > 1.2:
+        pcr_label, pcr_pts = "Bullish (Put-heavy)", 1
+    elif pcr < 0.7:
+        pcr_label, pcr_pts = "Bearish (Call-heavy)", -1
+    else:
+        pcr_label, pcr_pts = "Neutral", 0
+
+    # ── 2. GEX (Net Gamma Exposure) ────────────────────────────────────────
+    gex_data = calculate_dealer_gex(ds, underlying, 25)
+    net_gex       = gex_data.get('total_gex', 0.0) if gex_data else 0.0
+    gamma_flip    = gex_data.get('gamma_flip_level') if gex_data else None
+    gex_signal    = gex_data.get('gex_signal', 'N/A') if gex_data else 'N/A'
+    gex_interp    = gex_data.get('gex_interpretation', 'N/A') if gex_data else 'N/A'
+    gex_magnet    = gex_data.get('gex_magnet') if gex_data else None
+
+    if net_gex > 50:
+        gex_regime, gex_pts = "Strong PIN (Range/Chop)", 1
+    elif net_gex > 0:
+        gex_regime, gex_pts = "Mild PIN (Mean Reversion)", 1
+    elif net_gex > -50:
+        gex_regime, gex_pts = "Mild TREND (Directional Bias)", -1
+    else:
+        gex_regime, gex_pts = "Strong TREND (Breakout/Violent Move)", -2
+
+    # ── 3. OI Activity (same logic as render_smart_money_master_analysis) ──
+    _price_up = underlying >= float(st.session_state.get('_oi_prev_underlying', underlying))
+    if _price_up and total_pe_chg > 0 and total_pe_chg >= abs(total_ce_chg):
+        oi_activity  = "Long Build-up"
+        oi_detail    = "Price ↑ + Put OI ↑ — bulls adding floor"
+        market_phase = "Long Build-up Day"
+        oi_pts       = 2
+    elif not _price_up and total_ce_chg > 0 and total_ce_chg >= abs(total_pe_chg):
+        oi_activity  = "Short Build-up"
+        oi_detail    = "Price ↓ + Call OI ↑ — bears adding resistance"
+        market_phase = "Short Build-up Day"
+        oi_pts       = -2
+    elif _price_up and total_ce_chg < 0:
+        oi_activity  = "Short Covering Rally"
+        oi_detail    = "Price ↑ + Call OI ↓ — shorts being covered"
+        market_phase = "Short Covering Rally"
+        oi_pts       = 1
+    elif not _price_up and total_pe_chg < 0:
+        oi_activity  = "Long Unwinding"
+        oi_detail    = "Price ↓ + Put OI ↓ — longs being unwound"
+        market_phase = "Long Unwinding Day"
+        oi_pts       = -1
+    else:
+        oi_activity  = "Mixed / Neutral"
+        oi_detail    = "No clear directional OI bias"
+        market_phase = "Range / Gamma Pin Day"
+        oi_pts       = 0
+
+    # Override market phase to Breakout Trend Day when GEX is strong negative
+    if net_gex < -50 and abs(total_ce_chg - total_pe_chg) > 0:
+        market_phase = "Breakout Trend Day"
+
+    # ── 4. Support & Resistance Strength ───────────────────────────────────
+    pe_chg_atm = _gv(r_0,  'changeinOpenInterest_PE')
+    ce_chg_atm = _gv(r_0,  'changeinOpenInterest_CE')
+    pe_chg_m1  = _gv(r_m1, 'changeinOpenInterest_PE') if r_m1 is not None else 0
+    pe_chg_m2  = _gv(r_m2, 'changeinOpenInterest_PE') if r_m2 is not None else 0
+    ce_chg_p1  = _gv(r_p1, 'changeinOpenInterest_CE') if r_p1 is not None else 0
+    ce_chg_p2  = _gv(r_p2, 'changeinOpenInterest_CE') if r_p2 is not None else 0
+    pe_oi_atm  = _gv(r_0,  'openInterest_PE')
+    ce_oi_atm  = _gv(r_0,  'openInterest_CE')
+    pe_oi_m1   = _gv(r_m1, 'openInterest_PE') if r_m1 is not None else 0
+    ce_oi_p1   = _gv(r_p1, 'openInterest_CE') if r_p1 is not None else 0
+
+    sup_score = sum([total_pe_chg > 0, total_pe_chg > abs(total_ce_chg),
+                     pe_chg_atm > 0, pe_chg_m1 > 0, pe_chg_m2 > 0, pe_oi_atm > pe_oi_m1])
+    res_score = sum([total_ce_chg > 0, total_ce_chg > abs(total_pe_chg),
+                     ce_chg_atm > 0, ce_chg_p1 > 0, ce_chg_p2 > 0, ce_oi_atm > ce_oi_p1])
+
+    _sup_labels = ["Very Weak", "Weak", "Moderate", "Strong", "Very Strong", "Dominant"]
+    _res_labels = ["Very Weak", "Weak", "Moderate", "Strong", "Very Strong", "Dominant"]
+    support_strength    = _sup_labels[min(sup_score, 5)]
+    resistance_strength = _res_labels[min(res_score, 5)]
+
+    # Key S/R strikes from max OI concentration
+    max_pe_strike = float(ds.loc[ds['openInterest_PE'].idxmax(), 'Strike']) if 'openInterest_PE' in ds.columns else None
+    max_ce_strike = float(ds.loc[ds['openInterest_CE'].idxmax(), 'Strike']) if 'openInterest_CE' in ds.columns else None
+
+    # ── 5. Strike Migration ────────────────────────────────────────────────
+    if ce_chg_atm < 0 and (ce_chg_p1 > 0 or ce_chg_p2 > 0):
+        resist_migration = "Shifting Higher (Bullish)"
+    elif ce_chg_atm > 0 and ce_chg_p1 < 0:
+        resist_migration = "Shifting Lower (Bearish)"
+    else:
+        resist_migration = "Stable"
+
+    if pe_chg_atm < 0 and (pe_chg_m1 > 0 or pe_chg_m2 > 0):
+        support_migration = "Shifting Lower (Bearish)"
+    elif pe_chg_atm > 0 and pe_chg_m1 < 0:
+        support_migration = "Shifting Higher (Bullish)"
+    else:
+        support_migration = "Stable"
+
+    # ── 6. Smart Money / Institutional Activity ────────────────────────────
+    smart_signals = []
+    inst_activity_parts = []
+    for side, pos_lbl, neg_lbl in [
+        ('CE', 'Institutional Call Writing', 'Institutional Call Unwinding'),
+        ('PE', 'Institutional Put Writing',  'Institutional Put Unwinding'),
+    ]:
+        col = f'changeinOpenInterest_{side}'
+        if col in ds.columns:
+            avg_abs = ds[col].abs().mean()
+            spikes  = ds[ds[col].abs() > avg_abs * 3]
+            for _, srow in spikes.head(2).iterrows():
+                lbl = pos_lbl if srow[col] > 0 else neg_lbl
+                smart_signals.append(f"{lbl} @ ₹{int(srow['Strike'])}")
+                inst_activity_parts.append(lbl)
+
+    # Classify institutional activity
+    if any('Call Writing' in s for s in smart_signals) and any('Put Writing' in s for s in smart_signals):
+        inst_call_put = "Call Writing + Put Writing (Both sides — Pinning expected)"
+    elif any('Call Writing' in s for s in smart_signals):
+        inst_call_put = "Call Writing (Resistance building)"
+    elif any('Put Writing' in s for s in smart_signals):
+        inst_call_put = "Put Writing (Support building)"
+    elif any('Unwinding' in s for s in smart_signals):
+        inst_call_put = "Unwinding (De-risking / Exits)"
+    else:
+        inst_call_put = "No major spikes — Normal flow"
+
+    # Smart money shift detection (institutional positioning)
+    if total_ce_chg < 0 and total_pe_chg > 0:
+        smart_money_direction = "Institutional Bullish Positioning (CE ↓ + PE ↑)"
+    elif total_pe_chg < 0 and total_ce_chg > 0:
+        smart_money_direction = "Institutional Bearish Positioning (PE ↓ + CE ↑)"
+    elif total_pe_chg > 0 and pcr > 1.2:
+        smart_money_direction = "Bullish Bias (Rising PCR + Put Writing)"
+    elif total_ce_chg > 0 and pcr < 0.7:
+        smart_money_direction = "Bearish Bias (Falling PCR + Call Writing)"
+    else:
+        smart_money_direction = "Mixed / Wait for confirmation"
+
+    # ── 7. Trap Detection ──────────────────────────────────────────────────
+    trap_signals, trap_pts = [], 0
+    trap_type = "None"
+
+    if total_pe_chg > 0 and total_ce_chg > total_pe_chg:
+        trap_signals.append("Bull Trap: PUT OI building but CALL OI growth stronger")
+        trap_pts += 2
+        trap_type = "Bull Trap"
+
+    if total_ce_chg > 0 and total_pe_chg > total_ce_chg:
+        trap_signals.append("Bear Trap: CALL OI building but PUT OI growth stronger")
+        trap_pts += 2
+        trap_type = "Bear Trap"
+
+    avg_oi = (total_ce_oi + total_pe_oi) / max(len(ds), 1)
+    if (ce_oi_atm + pe_oi_atm) > avg_oi * 2:
+        trap_signals.append("Gamma Trap: High OI concentration at ATM — price likely pinned")
+        trap_pts += 2
+        if trap_type == "None":
+            trap_type = "Gamma Trap"
+
+    if ce_chg_atm < 0 and pe_chg_atm < 0:
+        trap_signals.append("Fake Breakout Risk: Both CE & PE OI unwinding at ATM")
+        trap_pts += 1
+
+    # Gamma-based trap signals (from analyze_gamma_sequence_mae logic)
+    if net_gex > 0 and ce_chg_atm > 0 and resist_migration != "Shifting Higher (Bullish)":
+        trap_signals.append("Call Trap: Positive GEX + CE OI rising but no upward ramp")
+        trap_pts += 1
+        if trap_type == "None":
+            trap_type = "Bull Trap"
+
+    if net_gex < 0 and pe_chg_atm > 0 and support_migration != "Shifting Higher (Bullish)":
+        trap_signals.append("Put Trap: Negative GEX + PE OI rising but no downward ramp")
+        trap_pts += 1
+        if trap_type == "None":
+            trap_type = "Bear Trap"
+
+    # Expiry trap (from calculate_expiry_day_intelligence logic)
+    if expiry:
+        try:
+            expiry_dt  = datetime.strptime(expiry, "%Y-%m-%d")
+            dte        = (expiry_dt.date() - now.date()).days
+            straddle   = _gv(r_0, 'lastPrice_CE') + _gv(r_0, 'lastPrice_PE')
+            max_pain_v = max_pain or atm_strike
+            in_expiry_zone = (abs(underlying - max_pain_v) <= 50) if max_pain_v else False
+            if dte <= 2 and in_expiry_zone:
+                trap_signals.append(f"Expiry Manipulation Likely: DTE={dte}, Spot near Max Pain ₹{int(max_pain_v)}")
+                trap_pts += 2
+                market_phase = "Expiry Manipulation Day"
+                if trap_type == "None":
+                    trap_type = "Gamma Trap"
+        except Exception:
+            pass
+
+    trap_prob = "High" if trap_pts >= 4 else ("Medium" if trap_pts >= 2 else "Low")
+
+    # ── 8. Breakout Signals ────────────────────────────────────────────────
+    bo_pts = 0
+    if ce_chg_atm < 0: bo_pts += 1
+    if pe_chg_atm < 0: bo_pts += 1
+    if "Higher" in resist_migration: bo_pts += 2
+    if "Lower"  in support_migration: bo_pts += 2
+    raw_total_oi = (total_ce_oi + total_pe_oi) / LOT
+    if raw_total_oi > 0 and abs(total_ce_chg + total_pe_chg) / LOT / raw_total_oi > 0.05:
+        bo_pts += 1
+    if net_gex < -50: bo_pts += 1
+    bo_prob = "High" if bo_pts >= 4 else ("Medium" if bo_pts >= 2 else "Low")
+
+    # ── 9. Expected First Move ─────────────────────────────────────────────
+    if market_phase in ("Long Build-up Day", "Short Covering Rally"):
+        first_move = "Up"
+        first_move_color = "#00ff88"
+    elif market_phase in ("Short Build-up Day", "Long Unwinding Day"):
+        first_move = "Down"
+        first_move_color = "#ff4444"
+    elif "Higher" in resist_migration and sup_score >= 4:
+        first_move = "Up"
+        first_move_color = "#00ff88"
+    elif "Lower" in support_migration and res_score >= 4:
+        first_move = "Down"
+        first_move_color = "#ff4444"
+    elif trap_type in ("Bull Trap", "Bear Trap"):
+        first_move = "Range (Trap Reversal)"
+        first_move_color = "#FFD700"
+    else:
+        first_move = "Range"
+        first_move_color = "#aaaaaa"
+
+    # ── 10. Volatility Expectation ─────────────────────────────────────────
+    iv_ce_atm = _gv(r_0, 'impliedVolatility_CE', 15.0)
+    iv_pe_atm = _gv(r_0, 'impliedVolatility_PE', 15.0)
+    avg_iv = (iv_ce_atm + iv_pe_atm) / 2.0
+    iv_skew = iv_pe_atm - iv_ce_atm
+
+    if avg_iv >= 18 or abs(iv_skew) > 3:
+        vol_exp       = "High"
+        vol_detail    = f"ATM IV={avg_iv:.1f}% | Skew={iv_skew:+.1f}% — elevated uncertainty"
+        vol_color     = "#ff4444"
+    elif avg_iv >= 12:
+        vol_exp       = "Medium"
+        vol_detail    = f"ATM IV={avg_iv:.1f}% | Skew={iv_skew:+.1f}% — moderate swings expected"
+        vol_color     = "#FFD700"
+    else:
+        vol_exp       = "Low"
+        vol_detail    = f"ATM IV={avg_iv:.1f}% | Skew={iv_skew:+.1f}% — range / pin day likely"
+        vol_color     = "#00cc66"
+
+    # ── 11. Market Confidence Score ────────────────────────────────────────
+    # PCR Trend = 25%
+    pcr_conf = 75 if pcr_pts == 1 else (25 if pcr_pts == -1 else 50)
+    # OI Shift = 25%
+    oi_conf  = 80 if oi_pts == 2 else (65 if oi_pts == 1 else (35 if oi_pts == -1 else (20 if oi_pts == -2 else 50)))
+    # Gamma Regime = 20%
+    gex_conf = 70 if gex_pts == 1 else (40 if gex_pts == -1 else (30 if gex_pts == -2 else 50))
+    # Chart Structure (S/R alignment) = 15%
+    chart_conf = min(50 + (sup_score - res_score) * 5, 90)
+    chart_conf = max(chart_conf, 10)
+    # Breakout/Trap signals = 15%
+    bo_trap_conf = (85 if bo_prob == "High" else (60 if bo_prob == "Medium" else 40))
+    if trap_prob == "High": bo_trap_conf = max(bo_trap_conf - 20, 10)
+
+    confidence_raw = (
+        pcr_conf   * 0.25 +
+        oi_conf    * 0.25 +
+        gex_conf   * 0.20 +
+        chart_conf * 0.15 +
+        bo_trap_conf * 0.15
+    )
+    confidence = round(confidence_raw, 1)
+    if confidence >= 70:
+        conf_label = "HIGH"
+        conf_color = "#00ff88"
+    elif confidence >= 50:
+        conf_label = "MEDIUM"
+        conf_color = "#FFD700"
+    else:
+        conf_label = "LOW"
+        conf_color = "#ff4444"
+
+    # ── 12. Overall Market Sentiment ───────────────────────────────────────
+    ss = 0
+    ss += 2 if pcr > 1.2 else (1 if pcr > 0.9 else (-2 if pcr < 0.7 else -1))
+    ss += min(sup_score - 2, 2) - min(res_score - 2, 2)
+    if "Long Build"  in oi_activity: ss += 1
+    if "Short Build" in oi_activity: ss -= 1
+    if "Short Cover" in oi_activity: ss += 1
+    if "Long Unwind" in oi_activity: ss -= 1
+    if "Higher" in resist_migration: ss += 1
+    if "Lower"  in support_migration: ss -= 1
+
+    if   ss >= 6:   mkt_sentiment, s_clr = "Strong Bullish", "#00ff88"
+    elif ss >= 4:   mkt_sentiment, s_clr = "Bullish",        "#00cc66"
+    elif ss >= 2:   mkt_sentiment, s_clr = "Mildly Bullish", "#aacc00"
+    elif ss == 1:   mkt_sentiment, s_clr = "Slight Bullish", "#cccc00"
+    elif ss == 0:   mkt_sentiment, s_clr = "Neutral / Range","#aaaaaa"
+    elif ss == -1:  mkt_sentiment, s_clr = "Slight Bearish", "#cc9900"
+    elif ss >= -3:  mkt_sentiment, s_clr = "Mildly Bearish", "#cc6600"
+    elif ss >= -5:  mkt_sentiment, s_clr = "Bearish",        "#cc3333"
+    else:           mkt_sentiment, s_clr = "Strong Bearish", "#ff2222"
+
+    # ══════════════════════════════════════════════════════════════════════
+    # DISPLAY — PRE-MARKET INTELLIGENCE REPORT
+    # ══════════════════════════════════════════════════════════════════════
+
+    st.markdown("---")
+    st.markdown(
+        f"<div style='background:linear-gradient(135deg,#0a0f1e,#111827);border:1px solid #1e3a5f;"
+        f"border-radius:12px;padding:20px 24px;margin-bottom:16px'>"
+        f"<div style='display:flex;align-items:center;gap:12px'>"
+        f"<span style='font-size:1.8em'>🧠</span>"
+        f"<div>"
+        f"<div style='font-size:1.4em;font-weight:800;color:#e2e8f0;letter-spacing:0.05em'>"
+        f"VOB2 PRE-MARKET INTELLIGENCE REPORT</div>"
+        f"<div style='font-size:0.85em;color:#64748b'>Institutional Market Intelligence Engine &nbsp;·&nbsp; "
+        f"NIFTY 50 &nbsp;·&nbsp; {now.strftime('%d %b %Y %H:%M IST')} &nbsp;·&nbsp; "
+        f"Spot ₹{underlying:,.2f}</div>"
+        f"</div></div></div>",
+        unsafe_allow_html=True
+    )
+
+    # ── ROW 1: Phase · Sentiment · Confidence ──────────────────────────────
+    r1c1, r1c2, r1c3 = st.columns(3)
+
+    def _rpt_card(col_w, label, value, detail, color, icon=""):
+        with col_w:
+            st.markdown(
+                f"<div style='background:#0d1117;border-radius:10px;border-left:4px solid {color};"
+                f"padding:14px 16px;height:100%'>"
+                f"<div style='font-size:0.7em;color:#64748b;text-transform:uppercase;letter-spacing:0.08em'>{label}</div>"
+                f"<div style='font-size:1.05em;font-weight:700;color:{color};margin:4px 0'>{icon}{value}</div>"
+                f"<div style='font-size:0.78em;color:#94a3b8'>{detail}</div>"
+                f"</div>",
+                unsafe_allow_html=True
+            )
+
+    phase_color = ("#00ff88" if "Long" in market_phase or "Covering" in market_phase
+                   else "#ff4444" if "Short Build" in market_phase or "Unwinding" in market_phase
+                   else "#FFD700")
+    _rpt_card(r1c1, "Expected Market Phase", market_phase, oi_detail, phase_color)
+    _rpt_card(r1c2, "Market Sentiment", mkt_sentiment, f"Sentiment Score: {ss:+d}", s_clr)
+    _rpt_card(r1c3, "Confidence Score", f"{confidence}%  [{conf_label}]",
+              f"PCR×25% · OI×25% · GEX×20% · Chart×15% · BO×15%", conf_color)
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── ROW 2: PCR · GEX · Volatility ──────────────────────────────────────
+    r2c1, r2c2, r2c3 = st.columns(3)
+    pcr_color = "#00cc66" if pcr > 1.1 else ("#ff4444" if pcr < 0.8 else "#FFD700")
+    gex_color = "#00cc66" if net_gex > 50 else ("#FFD700" if net_gex > 0 else ("#ff8800" if net_gex > -50 else "#ff4444"))
+    _rpt_card(r2c1, "PCR (Overall)", f"{pcr:.3f} — {pcr_label}", f"Total CE OI: {total_ce_oi/LOT:.1f}L | PE OI: {total_pe_oi/LOT:.1f}L", pcr_color)
+    _rpt_card(r2c2, "Gamma Regime (GEX)", f"{net_gex:+.2f}L — {gex_regime}", gex_interp, gex_color)
+    _rpt_card(r2c3, "Volatility Expectation", vol_exp, vol_detail, vol_color)
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── ROW 3: Key Levels ──────────────────────────────────────────────────
+    r3c1, r3c2, r3c3, r3c4 = st.columns(4)
+    _rpt_card(r3c1, "Key Support",
+              f"₹{int(max_pe_strike)}" if max_pe_strike else "N/A",
+              f"Strength: {support_strength} | Migration: {support_migration}",
+              "#00cc66")
+    _rpt_card(r3c2, "Key Resistance",
+              f"₹{int(max_ce_strike)}" if max_ce_strike else "N/A",
+              f"Strength: {resistance_strength} | Migration: {resist_migration}",
+              "#ff4444")
+    _rpt_card(r3c3, "Gamma Flip Level",
+              f"₹{gamma_flip:,.2f}" if gamma_flip else "Not Found",
+              f"GEX Magnet: {'₹' + str(int(gex_magnet)) if gex_magnet else 'N/A'} | {gex_data.get('spot_vs_flip','N/A') if gex_data else 'N/A'}",
+              "#9b59b6")
+    _rpt_card(r3c4, "Max Pain",
+              f"₹{int(max_pain)}" if max_pain else "N/A",
+              ("Pull-Down likely" if max_pain and underlying > max_pain else
+               "Pull-Up likely" if max_pain and underlying < max_pain else "At Max Pain"),
+              "#3498db")
+
+    st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
+
+    # ── ROW 4: Smart Money · First Move · Trap ─────────────────────────────
+    r4c1, r4c2, r4c3 = st.columns(3)
+
+    trap_color = "#ff4444" if trap_prob == "High" else ("#FFD700" if trap_prob == "Medium" else "#00cc66")
+    _rpt_card(r4c1, "Institutional Activity",
+              inst_call_put,
+              smart_money_direction,
+              "#e67e22")
+    _rpt_card(r4c2, "Expected First Move",
+              first_move,
+              (f"BO Probability: {bo_prob} | S/R Score: {sup_score}/{res_score}"),
+              first_move_color)
+    _rpt_card(r4c3, "Trap Detected",
+              trap_type,
+              f"Trap Probability: {trap_prob}",
+              trap_color)
+
+    st.markdown("<div style='height:12px'></div>", unsafe_allow_html=True)
+
+    # ── ATM ±2 OI Snapshot ─────────────────────────────────────────────────
+    with st.expander("📊 ATM ±2 Strike Detail & OI Snapshot", expanded=False):
+        snap_rows = []
+        for lbl, row in [("ATM-2", r_m2), ("ATM-1", r_m1), ("ATM ★", r_0), ("ATM+1", r_p1), ("ATM+2", r_p2)]:
+            if row is None:
+                continue
+            snap_rows.append({
+                "Zone":           lbl,
+                "Strike":         int(_gv(row, 'Strike')),
+                "CE OI (L)":      f"{_gv(row,'openInterest_CE')/LOT:.2f}",
+                "CE ΔOI (L)":     f"{_gv(row,'changeinOpenInterest_CE')/LOT:+.2f}",
+                "PE OI (L)":      f"{_gv(row,'openInterest_PE')/LOT:.2f}",
+                "PE ΔOI (L)":     f"{_gv(row,'changeinOpenInterest_PE')/LOT:+.2f}",
+                "IV CE %":        f"{_gv(row,'impliedVolatility_CE',15):.1f}",
+                "IV PE %":        f"{_gv(row,'impliedVolatility_PE',15):.1f}",
+                "PCR":            f"{_gv(row,'PCR',1.0):.2f}" if 'PCR' in ds.columns else "—",
+            })
+        if snap_rows:
+            st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+
+    # ── Trap Signals Detail ────────────────────────────────────────────────
+    with st.expander("🪤 Trap Detection Detail", expanded=trap_prob == "High"):
+        if trap_signals:
+            for sig in trap_signals:
+                color_sig = "#ff4444" if "Trap" in sig or "Fake" in sig else "#FFD700"
+                st.markdown(
+                    f"<div style='background:#1a0a0a;border-left:3px solid {color_sig};"
+                    f"padding:6px 10px;margin:4px 0;border-radius:4px;font-size:0.9em;color:#e2e8f0'>"
+                    f"⚠️ {sig}</div>",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.success("✅ No trap patterns detected — market flow appears clean")
+
+    # ── Smart Money Signals Detail ─────────────────────────────────────────
+    with st.expander("🏦 Smart Money Signal Detail", expanded=False):
+        if smart_signals:
+            for sig in smart_signals:
+                color_sig = "#e67e22" if "Writing" in sig else "#3498db"
+                st.markdown(
+                    f"<div style='background:#0d1117;border-left:3px solid {color_sig};"
+                    f"padding:6px 10px;margin:4px 0;border-radius:4px;font-size:0.9em;color:#e2e8f0'>"
+                    f"🏦 {sig}</div>",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.info("✅ No major institutional spikes detected — normal flow")
+
+    # ── Final Summary Table ────────────────────────────────────────────────
+    st.markdown("#### 📋 Intelligence Summary")
+    sum_c1, sum_c2 = st.columns(2)
+    with sum_c1:
+        st.markdown(f"""
+| Field | Reading |
+|---|---|
+| **Market Phase** | {market_phase} |
+| **Market Sentiment** | {mkt_sentiment} (Score: {ss:+d}) |
+| **PCR** | {pcr:.3f} — {pcr_label} |
+| **Net GEX** | {net_gex:+.2f}L — {gex_regime} |
+| **OI Activity** | {oi_activity} |
+| **Volatility** | {vol_exp} (IV {avg_iv:.1f}%) |
+""")
+    with sum_c2:
+        st.markdown(f"""
+| Field | Reading |
+|---|---|
+| **Key Support** | {'₹'+str(int(max_pe_strike)) if max_pe_strike else 'N/A'} ({support_strength}) |
+| **Key Resistance** | {'₹'+str(int(max_ce_strike)) if max_ce_strike else 'N/A'} ({resistance_strength}) |
+| **Gamma Flip** | {'₹'+f'{gamma_flip:,.2f}' if gamma_flip else 'N/A'} |
+| **Max Pain** | {'₹'+str(int(max_pain)) if max_pain else 'N/A'} |
+| **Trap Detected** | {trap_type} ({trap_prob} probability) |
+| **Expected First Move** | {first_move} | Confidence: {confidence}% [{conf_label}] |
+""")
+
+    if trap_prob == "High":
+        st.warning(
+            "⚠️ **HIGH TRAP PROBABILITY** — Smart money may be setting a trap. "
+            "Avoid chasing the first move. Wait for confirmation before entry."
+        )
+    elif bo_prob == "High":
+        st.info(
+            "🚀 **HIGH BREAKOUT ENERGY** — OI unwinding + large total movement detected. "
+            "Use strict stop-losses. Breakout direction: " + (
+                "UPSIDE" if "Higher" in resist_migration and total_pe_chg > total_ce_chg else
+                "DOWNSIDE" if "Lower" in support_migration and total_ce_chg > total_pe_chg else
+                "UNCLEAR — wait for price confirmation"
+            )
+        )
+
 
 def display_analytics_dashboard(db, symbol="NIFTY50"):
     """Display analytics dashboard"""
@@ -6776,6 +7318,362 @@ def _bn_trend_label(pct: float, inverse: bool = False) -> str:
         return "🟡"
     return ("🔴" if inverse else "🟢") if pct > 0 else ("🟢" if inverse else "🔴")
 
+
+def show_global_correlation_intelligence():
+    """VOB2 Global Correlation Intelligence Engine.
+
+    Fetches live global market data, applies direct/reverse correlation scoring,
+    detects traps and special conditions, and outputs the full pre-market report.
+    """
+    import yfinance as yf
+
+    st.markdown(
+        """
+        <div style='background: linear-gradient(135deg,#0a0a1a 0%,#0d1b2a 50%,#0a0a1a 100%);
+                    border:1px solid #00d4ff; border-radius:12px; padding:20px; margin-bottom:18px;'>
+            <h2 style='color:#00d4ff; margin:0; text-align:center; letter-spacing:2px;'>
+                🌐 VOB2 GLOBAL CORRELATION INTELLIGENCE ENGINE
+            </h2>
+            <p style='color:#7ec8e3; margin:6px 0 0; text-align:center; font-size:13px;'>
+                Live Global Market Scoring — Direct &amp; Reverse Correlation Analysis
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Ticker map ─────────────────────────────────────────────────────────────
+    DIRECT_TICKERS = {
+        "Gift Nifty":   "^NSEI",       # proxy — NSE Nifty 50
+        "S&P 500":      "^GSPC",
+        "NASDAQ":       "^IXIC",
+        "Dow Jones":    "^DJI",
+        "Nikkei 225":   "^N225",
+        "Shanghai":     "000001.SS",
+        "Hang Seng":    "^HSI",
+        "KOSPI":        "^KS11",
+        "DAX":          "^GDAXI",
+        "FTSE 100":     "^FTSE",
+        "CAC 40":       "^FCHI",
+    }
+    REVERSE_TICKERS = {
+        "USD/INR":      "USDINR=X",
+        "DXY":          "DX-Y.NYB",
+        "Crude Oil":    "CL=F",
+        "India VIX":    "^INDIAVIX",
+        "US VIX":       "^VIX",
+        "US 10Y Yield": "^TNX",
+        "Gold":         "GC=F",
+    }
+
+    def _score_direct(pct: float) -> int:
+        if pct >= 1.0:   return 10
+        if pct >= 0.3:   return 5
+        if pct > -0.3:   return 0
+        if pct > -1.0:   return -5
+        return -10
+
+    def _score_reverse(pct: float) -> int:
+        if pct >= 1.0:   return -10
+        if pct >= 0.3:   return -5
+        if pct > -0.3:   return 0
+        if pct > -1.0:   return 5
+        return 10
+
+    def _fetch_pct(ticker: str) -> float | None:
+        try:
+            t = yf.Ticker(ticker)
+            hist = t.history(period="2d", interval="1d")
+            if hist.empty or len(hist) < 2:
+                hist = t.history(period="5d", interval="1d").dropna()
+            if len(hist) < 2:
+                return None
+            prev, last = float(hist["Close"].iloc[-2]), float(hist["Close"].iloc[-1])
+            return ((last - prev) / prev) * 100 if prev else None
+        except Exception:
+            return None
+
+    with st.spinner("Fetching live global market data…"):
+        direct_data, reverse_data = {}, {}
+        for name, sym in DIRECT_TICKERS.items():
+            direct_data[name] = _fetch_pct(sym)
+        for name, sym in REVERSE_TICKERS.items():
+            reverse_data[name] = _fetch_pct(sym)
+
+    # ── Score calculation ───────────────────────────────────────────────────────
+    direct_scores, reverse_scores = {}, {}
+    for name, pct in direct_data.items():
+        direct_scores[name] = _score_direct(pct) if pct is not None else 0
+    for name, pct in reverse_data.items():
+        # Gold is partial reverse — half weight
+        score = _score_reverse(pct) if pct is not None else 0
+        reverse_scores[name] = score // 2 if name == "Gold" else score
+
+    raw_total   = sum(direct_scores.values()) + sum(reverse_scores.values())
+    max_abs     = max(abs(raw_total), 1)
+    # Normalise to ±100 scale keeping sign
+    norm_score  = int(round((raw_total / max(len(direct_scores) + len(reverse_scores), 1)) * 5.5))
+    # Clamp to meaningful display range
+    norm_score  = max(-100, min(100, norm_score))
+
+    # Sentiment label
+    if   norm_score >  40: sentiment, s_color = "STRONG BULLISH",  "#00ff88"
+    elif norm_score >  15: sentiment, s_color = "BULLISH BIAS",    "#7fff00"
+    elif norm_score >= -15: sentiment, s_color = "NEUTRAL / MIXED", "#ffd700"
+    elif norm_score >= -40: sentiment, s_color = "BEARISH BIAS",   "#ff8c00"
+    else:                   sentiment, s_color = "STRONG BEARISH",  "#ff2244"
+
+    # ── Special conditions ──────────────────────────────────────────────────────
+    usdinr_pct  = reverse_data.get("USD/INR")   or 0.0
+    dxy_pct     = reverse_data.get("DXY")        or 0.0
+    india_vix_p = reverse_data.get("India VIX") or 0.0
+    us_vix_p    = reverse_data.get("US VIX")    or 0.0
+    crude_pct   = reverse_data.get("Crude Oil") or 0.0
+    yield_pct   = reverse_data.get("US 10Y Yield") or 0.0
+
+    currency_pressure = usdinr_pct > 0.3 and dxy_pct > 0.1
+    volatility_shock  = india_vix_p > 3.0 or us_vix_p > 5.0
+    energy_shock      = crude_pct > 1.5
+    liquidity_stress  = dxy_pct > 0.1 and yield_pct > 0.1 and crude_pct > 0.5 and us_vix_p > 3.0
+    risk_mode         = "Risk-Off" if liquidity_stress or (norm_score < -15) else "Risk-On"
+
+    # ── Trap detection ──────────────────────────────────────────────────────────
+    gift_pct   = direct_data.get("Gift Nifty") or 0.0
+    us_avg     = sum(direct_data.get(x, 0) or 0 for x in ["S&P 500", "NASDAQ", "Dow Jones"]) / 3
+    asia_avg   = sum(direct_data.get(x, 0) or 0
+                     for x in ["Nikkei 225", "Hang Seng", "KOSPI", "Shanghai"]) / 4
+    global_avg = (us_avg + asia_avg) / 2
+
+    if global_avg > 0.5 and gift_pct < -0.3:
+        trap = "Bull Trap Risk"
+        trap_color = "#ff8c00"
+    elif global_avg < -0.5 and gift_pct > 0.3:
+        trap = "Bear Trap Risk"
+        trap_color = "#ffd700"
+    else:
+        trap = "None"
+        trap_color = "#00ff88"
+
+    # ── Gap prediction ──────────────────────────────────────────────────────────
+    if gift_pct >= 0.4:   gap_pred, gap_color = "Gap Up",   "#00ff88"
+    elif gift_pct <= -0.4: gap_pred, gap_color = "Gap Down", "#ff2244"
+    else:                  gap_pred, gap_color = "Flat",      "#ffd700"
+
+    # ── Volatility expectation ──────────────────────────────────────────────────
+    vix_avg = (abs(india_vix_p) + abs(us_vix_p)) / 2
+    if vix_avg > 5 or volatility_shock:
+        vol_exp, vol_color = "High",   "#ff2244"
+    elif vix_avg > 2:
+        vol_exp, vol_color = "Medium", "#ffd700"
+    else:
+        vol_exp, vol_color = "Low",    "#00ff88"
+
+    # ── Most influential indicator ──────────────────────────────────────────────
+    all_impacts = {**{k: abs(v) for k, v in direct_scores.items()},
+                   **{k: abs(v) for k, v in reverse_scores.items()}}
+    top_indicator = max(all_impacts, key=all_impacts.get)
+
+    # ══════════════════════════════ DISPLAY ════════════════════════════════════
+
+    # Row 1 — Summary headline cards
+    c1, c2, c3, c4 = st.columns(4)
+    def _card(col, label, value, color, sub=""):
+        col.markdown(
+            f"""<div style='background:#0d1b2a;border:1px solid {color};border-radius:10px;
+                            padding:14px;text-align:center;'>
+                    <div style='color:#aaa;font-size:11px;letter-spacing:1px;'>{label}</div>
+                    <div style='color:{color};font-size:20px;font-weight:700;margin:4px 0;'>{value}</div>
+                    <div style='color:#888;font-size:11px;'>{sub}</div>
+                </div>""",
+            unsafe_allow_html=True,
+        )
+
+    _card(c1, "GLOBAL SENTIMENT", sentiment, s_color)
+    _card(c2, "GLOBAL SCORE",     f"{norm_score:+d}",   s_color, "Scale: ±100")
+    _card(c3, "GAP PROBABILITY",  gap_pred,   gap_color, f"Gift Nifty {gift_pct:+.2f}%")
+    _card(c4, "VOLATILITY",       vol_exp,    vol_color, f"VIX Avg {vix_avg:.1f}%")
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # Row 2 — Risk / Trap / Energy
+    r1, r2, r3, r4 = st.columns(4)
+    risk_color = "#ff2244" if risk_mode == "Risk-Off" else "#00ff88"
+    _card(r1, "RISK MODE",              risk_mode,      risk_color)
+    _card(r2, "TRAP RISK",              trap,           trap_color)
+    _card(r3, "MOST INFLUENTIAL",       top_indicator,  "#00d4ff")
+    _card(r4, "ENERGY SHOCK",
+          "ACTIVE" if energy_shock else "CLEAR",
+          "#ff2244" if energy_shock else "#00ff88",
+          f"Crude {crude_pct:+.2f}%")
+
+    st.markdown("---")
+
+    # ── Direct Correlation Table ────────────────────────────────────────────────
+    st.markdown(
+        "<h4 style='color:#00ff88;'>📈 Direct Correlation Indicators</h4>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Rise → Bullish  |  Fall → Bearish")
+
+    d_rows = []
+    for name in DIRECT_TICKERS:
+        pct   = direct_data.get(name)
+        score = direct_scores.get(name, 0)
+        pct_s = f"{pct:+.2f}%" if pct is not None else "N/A"
+        if score > 0:   arrow, clr = "▲", "#00ff88"
+        elif score < 0: arrow, clr = "▼", "#ff2244"
+        else:           arrow, clr = "—", "#ffd700"
+        d_rows.append((name, pct_s, arrow, score, clr))
+
+    cols = st.columns([3, 2, 1, 1, 3])
+    for hdr, w in zip(["Indicator", "Change %", "Dir", "Score", "Signal"], cols):
+        w.markdown(f"**{hdr}**")
+    for name, pct_s, arrow, score, clr in d_rows:
+        if   score >= 5:  label = "Bullish"
+        elif score <= -5: label = "Bearish"
+        else:             label = "Neutral"
+        c1, c2, c3, c4, c5 = st.columns([3, 2, 1, 1, 3])
+        c1.write(name)
+        c2.write(pct_s)
+        c3.markdown(f"<span style='color:{clr}'>{arrow}</span>", unsafe_allow_html=True)
+        c4.markdown(f"<span style='color:{clr}'>{score:+d}</span>", unsafe_allow_html=True)
+        c5.markdown(f"<span style='color:{clr}'>{label}</span>", unsafe_allow_html=True)
+
+    direct_total = sum(direct_scores.values())
+    st.markdown(
+        f"<div style='text-align:right;color:#00ff88;font-weight:700;'>"
+        f"Direct Sub-Total: {direct_total:+d}</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # ── Reverse Correlation Table ───────────────────────────────────────────────
+    st.markdown(
+        "<h4 style='color:#ff8c00;'>📉 Reverse Correlation Indicators</h4>",
+        unsafe_allow_html=True,
+    )
+    st.caption("Rise → Bearish  |  Fall → Bullish")
+
+    r_rows = []
+    for name in REVERSE_TICKERS:
+        pct   = reverse_data.get(name)
+        score = reverse_scores.get(name, 0)
+        pct_s = f"{pct:+.2f}%" if pct is not None else "N/A"
+        if score > 0:   arrow, clr = "▲", "#00ff88"
+        elif score < 0: arrow, clr = "▼", "#ff2244"
+        else:           arrow, clr = "—", "#ffd700"
+        r_rows.append((name, pct_s, arrow, score, clr))
+
+    cols2 = st.columns([3, 2, 1, 1, 3])
+    for hdr, w in zip(["Indicator", "Change %", "Dir", "Score", "Impact"], cols2):
+        w.markdown(f"**{hdr}**")
+    for name, pct_s, arrow, score, clr in r_rows:
+        if   score >= 5:  label = "Bullish Impact"
+        elif score <= -5: label = "Bearish Impact"
+        else:             label = "Neutral"
+        suffix = " (partial)" if name == "Gold" else ""
+        c1, c2, c3, c4, c5 = st.columns([3, 2, 1, 1, 3])
+        c1.write(f"{name}{suffix}")
+        c2.write(pct_s)
+        c3.markdown(f"<span style='color:{clr}'>{arrow}</span>", unsafe_allow_html=True)
+        c4.markdown(f"<span style='color:{clr}'>{score:+d}</span>", unsafe_allow_html=True)
+        c5.markdown(f"<span style='color:{clr}'>{label}</span>", unsafe_allow_html=True)
+
+    reverse_total = sum(reverse_scores.values())
+    st.markdown(
+        f"<div style='text-align:right;color:#ff8c00;font-weight:700;'>"
+        f"Reverse Sub-Total: {reverse_total:+d}</div>",
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("---")
+
+    # ── Special Conditions ──────────────────────────────────────────────────────
+    st.markdown("<h4 style='color:#00d4ff;'>⚠️ Special Conditions</h4>", unsafe_allow_html=True)
+    cond_cols = st.columns(4)
+    def _cond(col, title, active, detail=""):
+        clr = "#ff2244" if active else "#00ff88"
+        badge = "🔴 ACTIVE" if active else "🟢 CLEAR"
+        col.markdown(
+            f"""<div style='background:#0d1b2a;border:1px solid {clr};border-radius:8px;
+                            padding:12px;text-align:center;'>
+                    <div style='color:#aaa;font-size:11px;'>{title}</div>
+                    <div style='color:{clr};font-weight:700;margin:4px 0;'>{badge}</div>
+                    <div style='color:#888;font-size:11px;'>{detail}</div>
+                </div>""",
+            unsafe_allow_html=True,
+        )
+    _cond(cond_cols[0], "Currency Pressure",
+          currency_pressure, f"USDINR {usdinr_pct:+.2f}% | DXY {dxy_pct:+.2f}%")
+    _cond(cond_cols[1], "Volatility Shock",
+          volatility_shock,  f"India VIX {india_vix_p:+.2f}% | US VIX {us_vix_p:+.2f}%")
+    _cond(cond_cols[2], "Energy Shock",
+          energy_shock,      f"Crude {crude_pct:+.2f}%")
+    _cond(cond_cols[3], "Liquidity Stress",
+          liquidity_stress,  "DXY+Yield+Crude+VIX all rising")
+
+    st.markdown("---")
+
+    # ── Impact Summary ──────────────────────────────────────────────────────────
+    st.markdown("<h4 style='color:#00d4ff;'>📊 Impact Summary</h4>", unsafe_allow_html=True)
+    imp1, imp2, imp3 = st.columns(3)
+
+    # Currency
+    cur_impact = "NEGATIVE" if (usdinr_pct > 0.3 or dxy_pct > 0.3) else \
+                 "POSITIVE" if (usdinr_pct < -0.3 or dxy_pct < -0.3) else "NEUTRAL"
+    cur_clr    = "#ff2244" if cur_impact == "NEGATIVE" else \
+                 "#00ff88" if cur_impact == "POSITIVE" else "#ffd700"
+
+    # Commodity
+    com_impact = "NEGATIVE" if crude_pct > 1.0 else \
+                 "POSITIVE" if crude_pct < -1.0 else "NEUTRAL"
+    com_clr    = "#ff2244" if com_impact == "NEGATIVE" else \
+                 "#00ff88" if com_impact == "POSITIVE" else "#ffd700"
+
+    # Volatility
+    vol_impact = "HIGH RISK" if volatility_shock else \
+                 "ELEVATED"  if vix_avg > 2 else "LOW"
+    vol_imp_clr= "#ff2244" if vol_impact == "HIGH RISK" else \
+                 "#ffd700"  if vol_impact == "ELEVATED"  else "#00ff88"
+
+    imp1.markdown(
+        f"""<div style='background:#0d1b2a;border:1px solid {cur_clr};border-radius:8px;padding:14px;'>
+            <div style='color:#aaa;font-size:11px;'>Currency Impact</div>
+            <div style='color:{cur_clr};font-weight:700;font-size:18px;'>{cur_impact}</div>
+            <div style='color:#888;font-size:11px;'>USDINR {usdinr_pct:+.2f}% | DXY {dxy_pct:+.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+    imp2.markdown(
+        f"""<div style='background:#0d1b2a;border:1px solid {com_clr};border-radius:8px;padding:14px;'>
+            <div style='color:#aaa;font-size:11px;'>Commodity Impact</div>
+            <div style='color:{com_clr};font-weight:700;font-size:18px;'>{com_impact}</div>
+            <div style='color:#888;font-size:11px;'>Crude {crude_pct:+.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+    imp3.markdown(
+        f"""<div style='background:#0d1b2a;border:1px solid {vol_imp_clr};border-radius:8px;padding:14px;'>
+            <div style='color:#aaa;font-size:11px;'>Volatility Impact</div>
+            <div style='color:{vol_imp_clr};font-weight:700;font-size:18px;'>{vol_impact}</div>
+            <div style='color:#888;font-size:11px;'>India VIX {india_vix_p:+.2f}% | US {us_vix_p:+.2f}%</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Final Score Banner ──────────────────────────────────────────────────────
+    st.markdown(
+        f"""
+        <div style='background:linear-gradient(90deg,#0d1b2a,#0a0a1a);
+                    border:2px solid {s_color};border-radius:12px;padding:22px;text-align:center;margin-top:10px;'>
+            <div style='color:#aaa;font-size:13px;letter-spacing:2px;'>GLOBAL SENTIMENT SCORE</div>
+            <div style='color:{s_color};font-size:48px;font-weight:900;margin:8px 0;'>{norm_score:+d}</div>
+            <div style='color:{s_color};font-size:20px;font-weight:700;letter-spacing:3px;'>{sentiment}</div>
+            <div style='color:#888;font-size:12px;margin-top:8px;'>
+                Direct: {direct_total:+d} &nbsp;|&nbsp; Reverse: {reverse_total:+d} &nbsp;|&nbsp;
+                Gap: {gap_pred} &nbsp;|&nbsp; Risk: {risk_mode} &nbsp;|&nbsp; Trap: {trap}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def show_bn_dashboard(nifty_df: pd.DataFrame = None, interval: str = "1"):
@@ -9163,6 +10061,412 @@ def _nws_impact_score(news_score, n_articles, bulls, bears,
     elif fii_net < -500: base -= 5
     return max(0, min(100, base))
 
+def show_news_intelligence_engine(df: pd.DataFrame = None,
+                                   option_data: dict = None,
+                                   current_price: float = None,
+                                   fii_net_today: float = 0.0):
+    """12-Module Market News Intelligence Engine."""
+    st.markdown("### 📰 Market News Intelligence Engine")
+
+    # ── MODULE 1: Fetch news ──────────────────────────────────────────
+    with st.spinner("Fetching latest market news..."):
+        raw_articles = _nws_fetch_all_news()
+
+    if not raw_articles:
+        st.error(
+            "❌ No news articles could be fetched. RSS feeds may be blocked in this environment. "
+            "Please try again later or run the app locally."
+        )
+        return
+
+    # ── MODULE 2+3+4+5: Enrich ───────────────────────────────────────
+    processed = _nws_process_articles(raw_articles)
+    total_score, bulls, bears, neutral, sector_scores = _nws_aggregate_scores(processed)
+
+    # Price context
+    price_chg_pct = 0.0
+    vol_ratio     = 1.0
+    if df is not None and not df.empty and len(df) > 1:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        if "close" in df2.columns:
+            cl = df2["close"]
+            price_chg_pct = (cl.iloc[-1] - cl.iloc[-2]) / cl.iloc[-2] * 100
+        if "volume" in df2.columns:
+            vol = df2["volume"].fillna(0)
+            avg_vol = vol.rolling(20).mean().iloc[-1]
+            if avg_vol > 0:
+                vol_ratio = vol.iloc[-1] / avg_vol
+
+    n_art = len(processed)
+    sector_hit_count = sum(1 for v in sector_scores.values() if v != 0)
+    impact_score = _nws_impact_score(
+        total_score, n_art, bulls, bears,
+        vol_ratio, price_chg_pct, sector_hit_count, fii_net_today
+    )
+
+    # ── MODULE 8: Impact score label ─────────────────────────────────
+    if impact_score >= 70:
+        impact_label, impact_color = "STRONG BULLISH", "#00e676"
+    elif impact_score >= 58:
+        impact_label, impact_color = "BULLISH",         "#69f0ae"
+    elif impact_score <= 30:
+        impact_label, impact_color = "STRONG BEARISH",  "#ff5252"
+    elif impact_score <= 42:
+        impact_label, impact_color = "BEARISH",          "#ff8a80"
+    else:
+        impact_label, impact_color = "NEUTRAL",          "#ffeb3b"
+
+    # ── Top KPI row ───────────────────────────────────────────────────
+    kc1, kc2, kc3, kc4, kc5 = st.columns(5)
+    with kc1: st.metric("Total Articles", n_art)
+    with kc2: st.metric("🟢 Bullish",  bulls)
+    with kc3: st.metric("🔴 Bearish",  bears)
+    with kc4: st.metric("Net Sentiment Score", f"{total_score:+d}")
+    with kc5:
+        st.markdown(
+            f"<div style='text-align:center;padding:8px;"
+            f"background:#1e1e1e;border-radius:8px'>"
+            f"<span style='font-size:11px;color:#aaa'>News Impact Score</span><br>"
+            f"<span style='font-size:28px;font-weight:bold;color:{impact_color}'>"
+            f"{impact_score}</span><br>"
+            f"<span style='font-size:11px;color:{impact_color}'>{impact_label}</span>"
+            f"</div>",
+            unsafe_allow_html=True
+        )
+
+    # ── MODULE 6: Market reaction ─────────────────────────────────────
+    reaction = _nws_market_reaction_label(total_score, price_chg_pct)
+    st.info(f"**Market Reaction:** {reaction}  |  Price Change: {price_chg_pct:+.2f}%  |  Volume Ratio: {vol_ratio:.2f}x")
+
+    # ── MODULE 9: News Panel ──────────────────────────────────────────
+    st.markdown("#### 📋 Latest Market News Panel")
+
+    # Filters
+    fc1, fc2, fc3 = st.columns(3)
+    with fc1:
+        sent_filter = st.selectbox("Filter Sentiment", ["All","BULLISH","BEARISH","NEUTRAL"],
+                                   key="nws_sent_filter")
+    with fc2:
+        imp_filter = st.selectbox("Filter Importance", ["All","HIGH","MEDIUM","LOW"],
+                                  key="nws_imp_filter")
+    with fc3:
+        cat_filter = st.selectbox("Filter Category",
+                                  ["All"] + list(_NWS_CATEGORY_MAP.keys()) + ["General"],
+                                  key="nws_cat_filter")
+
+    filtered = processed
+    if sent_filter != "All":
+        filtered = [a for a in filtered if a["sentiment"] == sent_filter]
+    if imp_filter != "All":
+        filtered = [a for a in filtered if imp_filter in a["importance"]]
+    if cat_filter != "All":
+        filtered = [a for a in filtered if a["category"] == cat_filter]
+
+    if filtered:
+        panel_rows = []
+        for a in filtered[:30]:
+            panel_rows.append({
+                "Source":     a["source"],
+                "Headline":   a["title"][:90] + ("…" if len(a["title"]) > 90 else ""),
+                "Sentiment":  a["sentiment"],
+                "Category":   a["category"],
+                "Sector":     a["sectors"],
+                "Importance": a["importance"],
+            })
+        panel_df = pd.DataFrame(panel_rows)
+
+        _SENT_STYLE = {
+            "BULLISH":  "background-color:#1a3a1a; color:#00e676; font-weight:bold",
+            "BEARISH":  "background-color:#3a1a1a; color:#ff5252; font-weight:bold",
+            "NEUTRAL":  "color:#bdbdbd",
+        }
+        _IMP_STYLE = {
+            "🔴 HIGH":    "color:#ff5252; font-weight:bold",
+            "🟡 MEDIUM":  "color:#ffeb3b",
+            "⚪ LOW":     "color:#757575",
+        }
+
+        def _panel_style(row):
+            styles = [""] * len(row)
+            col_names = list(row.index)
+            for i, col in enumerate(col_names):
+                if col == "Sentiment":
+                    styles[i] = _SENT_STYLE.get(str(row[col]), "")
+                elif col == "Importance":
+                    styles[i] = _IMP_STYLE.get(str(row[col]), "")
+            return styles
+
+        st.dataframe(
+            panel_df.style.apply(_panel_style, axis=1),
+            use_container_width=True, hide_index=True, height=400
+        )
+    else:
+        st.info("No articles match the selected filters.")
+
+    # ── MODULE 5: High Impact Alerts ──────────────────────────────────
+    high_impact_arts = [a for a in processed if a["high_impact"]]
+    if high_impact_arts:
+        st.markdown("#### 🚨 High Impact News Alerts")
+        for a in high_impact_arts[:8]:
+            icon = "🟢" if a["score"] == 1 else ("🔴" if a["score"] == -1 else "🔵")
+            st.warning(f"{icon} **[{a['importance']}]** {a['title']} *(Source: {a['source']})*")
+
+    # ── MODULE 4: Sector Impact Panel ────────────────────────────────
+    st.markdown("#### 🏭 Sector News Impact")
+    sect_rows = []
+    for sector, score in sector_scores.items():
+        articles_count = sum(1 for a in processed if sector in a["sectors"])
+        if articles_count == 0:
+            continue
+        label = "BULLISH" if score > 0 else ("BEARISH" if score < 0 else "NEUTRAL")
+        sect_rows.append({
+            "Sector": sector,
+            "News Count": articles_count,
+            "Net Score": f"{score:+d}",
+            "Direction": label,
+        })
+    if sect_rows:
+        sect_df = pd.DataFrame(sect_rows).sort_values("News Count", ascending=False)
+
+        def _sect_style(row):
+            d = str(row["Direction"])
+            c = ("background-color:#1a3a1a; color:#00e676" if d == "BULLISH" else
+                 "background-color:#3a1a1a; color:#ff5252" if d == "BEARISH" else
+                 "color:#bdbdbd")
+            return ["", "", "", c]
+        st.dataframe(sect_df.style.apply(_sect_style, axis=1),
+                     use_container_width=True, hide_index=True)
+    else:
+        st.info("No sector-specific news detected.")
+
+    # ── MODULE 7: Smart Signal Alerts ────────────────────────────────
+    st.markdown("#### ⚡ Smart News Signals")
+    signals = []
+    if bulls >= bears * 2 and bulls >= 3:
+        signals.append(("🟢", "BULLISH NEWS MOMENTUM",
+                         f"{bulls} bullish vs {bears} bearish articles — market positive"))
+    if bears >= bulls * 2 and bears >= 3:
+        signals.append(("🔴", "BEARISH NEWS PRESSURE",
+                         f"{bears} bearish vs {bulls} bullish articles — market under pressure"))
+    leading_sector = max(sector_scores, key=sector_scores.get)
+    lagging_sector = min(sector_scores, key=sector_scores.get)
+    if sector_scores[leading_sector] > 1:
+        signals.append(("🏭", "SECTOR ROTATION SIGNAL",
+                         f"{leading_sector} strongest in news ({sector_scores[leading_sector]:+d}) "
+                         f"| {lagging_sector} weakest ({sector_scores[lagging_sector]:+d})"))
+    if high_impact_arts:
+        hi_sent = sum(a["score"] for a in high_impact_arts)
+        if hi_sent > 0:
+            signals.append(("⚡", "HIGH IMPACT BULLISH EVENT", f"{len(high_impact_arts)} major events — net bullish"))
+        elif hi_sent < 0:
+            signals.append(("⚡", "HIGH IMPACT BEARISH EVENT", f"{len(high_impact_arts)} major events — net bearish"))
+    if total_score > 0 and price_chg_pct > 0.3:
+        signals.append(("✅", "NEWS + PRICE CONFLUENCE",
+                         "Bullish news confirmed by upward price move — strong signal"))
+    if total_score < 0 and price_chg_pct < -0.3:
+        signals.append(("✅", "NEWS + PRICE BREAKDOWN CONFIRMED",
+                         "Bearish news confirmed by downward price move"))
+    if fii_net_today > 500 and total_score > 0:
+        signals.append(("💎", "INSTITUTIONAL + NEWS ALIGNED",
+                         "FII buying aligns with bullish news — high conviction"))
+    if fii_net_today < -500 and total_score < 0:
+        signals.append(("💎", "INSTITUTIONAL + NEWS ALIGNED BEARISH",
+                         "FII selling aligns with bearish news — high conviction sell"))
+
+    if signals:
+        for icon, title, desc in signals:
+            st.info(f"{icon} **{title}** — {desc}")
+    else:
+        st.success("✅ No extreme news signals — normal news flow")
+
+    # ── MODULE 12: Combined Intelligence Engine ───────────────────────
+    st.markdown("---")
+    st.markdown("#### 🧠 Combined Intelligence Engine — Final Market Prediction")
+
+    # Score each pillar 0-100
+    news_pillar = impact_score
+
+    # Price action pillar
+    pa_score = 50
+    if df is not None and not df.empty and len(df) > 5:
+        df3 = df.copy()
+        df3.columns = [c.lower() for c in df3.columns]
+        if "close" in df3.columns:
+            cl3 = df3["close"]
+            ema9  = cl3.ewm(span=9,  adjust=False).mean()
+            ema21 = cl3.ewm(span=21, adjust=False).mean()
+            ema50 = cl3.ewm(span=50, adjust=False).mean()
+            if ema9.iloc[-1] > ema21.iloc[-1] > ema50.iloc[-1]:
+                pa_score = 75
+            elif ema9.iloc[-1] < ema21.iloc[-1] < ema50.iloc[-1]:
+                pa_score = 25
+            elif ema9.iloc[-1] > ema21.iloc[-1]:
+                pa_score = 60
+            else:
+                pa_score = 40
+
+    # Options/OI pillar
+    oi_score = 50
+    if option_data:
+        pcr = option_data.get('pcr', 1.0) or 1.0
+        if pcr > 1.3:   oi_score = 70
+        elif pcr > 1.0: oi_score = 58
+        elif pcr < 0.7: oi_score = 30
+        elif pcr < 1.0: oi_score = 42
+
+    # FII pillar
+    fii_score = 50
+    if fii_net_today > 2000:   fii_score = 80
+    elif fii_net_today > 500:  fii_score = 65
+    elif fii_net_today < -2000: fii_score = 20
+    elif fii_net_today < -500:  fii_score = 35
+
+    # Sector pillar (from sector_scores)
+    pos_sectors = sum(1 for v in sector_scores.values() if v > 0)
+    neg_sectors = sum(1 for v in sector_scores.values() if v < 0)
+    total_sectors = len(sector_scores)
+    sect_score = int(50 + (pos_sectors - neg_sectors) / total_sectors * 30)
+
+    # Weighted composite
+    weights = {
+        "Price Action":  0.30,
+        "Options OI":    0.20,
+        "FII/DII Flow":  0.20,
+        "News Sentiment":0.20,
+        "Sector Pulse":  0.10,
+    }
+    scores = {
+        "Price Action":   pa_score,
+        "Options OI":     oi_score,
+        "FII/DII Flow":   fii_score,
+        "News Sentiment": news_pillar,
+        "Sector Pulse":   sect_score,
+    }
+    composite = int(sum(scores[k] * weights[k] for k in scores))
+
+    # Labels
+    def _score_label(s):
+        if s >= 70: return "BULLISH",  "#00e676"
+        if s >= 58: return "SLIGHTLY BULLISH", "#69f0ae"
+        if s <= 30: return "BEARISH",  "#ff5252"
+        if s <= 42: return "SLIGHTLY BEARISH", "#ff8a80"
+        return "NEUTRAL", "#ffeb3b"
+
+    # Display combined engine table
+    ci_rows = []
+    for pillar, score in scores.items():
+        lbl, clr = _score_label(score)
+        ci_rows.append({
+            "Pillar":  pillar,
+            "Score":   score,
+            "Weight":  f"{int(weights[pillar]*100)}%",
+            "Signal":  lbl,
+            "_clr":    clr,
+        })
+    ci_df = pd.DataFrame(ci_rows)
+
+    def _ci_style(row):
+        styles = [""] * len(row)
+        col_names = list(row.index)
+        for i, col in enumerate(col_names):
+            if col == "Signal":
+                lbl, clr = _score_label(int(row["Score"]))
+                styles[i] = f"color:{clr}; font-weight:bold"
+            elif col == "Score":
+                lbl, clr = _score_label(int(row["Score"]))
+                styles[i] = f"color:{clr}"
+        return styles
+
+    st.dataframe(
+        ci_df.drop(columns=["_clr"]).style.apply(_ci_style, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    # Final verdict
+    comp_lbl, comp_clr = _score_label(composite)
+    trend_prob   = composite
+    breakout_prob = min(100, max(0, composite + (10 if vol_ratio > 1.3 else -5)))
+    risk_level   = "HIGH" if abs(composite - 50) < 10 else ("LOW" if abs(composite - 50) > 25 else "MEDIUM")
+
+    vc1, vc2, vc3, vc4 = st.columns(4)
+    with vc1:
+        st.markdown(
+            f"<div style='text-align:center;padding:12px;"
+            f"background:#1e1e1e;border-radius:10px;border:1px solid {comp_clr}'>"
+            f"<span style='font-size:11px;color:#aaa'>Market Direction</span><br>"
+            f"<span style='font-size:22px;font-weight:bold;color:{comp_clr}'>{comp_lbl}</span>"
+            f"</div>", unsafe_allow_html=True
+        )
+    with vc2:
+        st.metric("Composite Score", f"{composite}/100")
+    with vc3:
+        st.metric("Trend Probability", f"{trend_prob}%")
+    with vc4:
+        st.metric("Breakout Probability", f"{breakout_prob}%",
+                  delta=f"Risk: {risk_level}")
+
+    # ── MODULE 10: News Backtest ───────────────────────────────────────
+    with st.expander("📊 News Signal Backtest Report", expanded=False):
+        st.markdown(
+            "**Methodology:** For each article in today's feed, we score its sentiment "
+            "and compare against the current session's price direction as a proxy for "
+            "news→price correlation."
+        )
+        bt_rows = []
+        for a in processed[:20]:
+            price_aligned = (
+                (a["score"] == 1  and price_chg_pct > 0) or
+                (a["score"] == -1 and price_chg_pct < 0) or
+                (a["score"] == 0)
+            )
+            outcome = "SIGNAL CONFIRMED" if price_aligned else "FALSE SIGNAL"
+            bt_rows.append({
+                "Headline":  a["title"][:70] + "…",
+                "Sentiment": a["sentiment"],
+                "Price Chg": f"{price_chg_pct:+.2f}%",
+                "Outcome":   outcome,
+            })
+        bt_df = pd.DataFrame(bt_rows)
+
+        def _bt_news_style(row):
+            c = ("background-color:#1a3a1a; color:#00e676"
+                 if row["Outcome"] == "SIGNAL CONFIRMED"
+                 else "background-color:#3a1a1a; color:#ff5252")
+            return [c] * len(row)
+
+        if bt_rows:
+            confirmed = sum(1 for r in bt_rows if r["Outcome"] == "SIGNAL CONFIRMED")
+            win_rate  = confirmed / len(bt_rows) * 100
+            st.markdown(
+                f"Articles analysed: **{len(bt_rows)}** | "
+                f"Confirmed: **{confirmed}** | "
+                f"Win Rate: **{win_rate:.0f}%**"
+            )
+            st.dataframe(bt_df.style.apply(_bt_news_style, axis=1),
+                         use_container_width=True, hide_index=True)
+
+    # ── MODULE 11: News event markers hint ───────────────────────────
+    with st.expander("📌 Chart Event Markers", expanded=False):
+        st.markdown(
+            "**News event markers** are overlaid on the main price chart below. "
+            "Green triangles = bullish news; Red triangles = bearish news; "
+            "Blue circles = high-impact events."
+        )
+        marker_rows = []
+        for a in high_impact_arts[:10]:
+            icon = "🔺" if a["score"] == 1 else ("🔻" if a["score"] == -1 else "🔵")
+            marker_rows.append({
+                "Icon": icon,
+                "Event": a["title"][:80],
+                "Category": a["category"],
+                "Sector Impact": a["sectors"],
+            })
+        if marker_rows:
+            st.dataframe(pd.DataFrame(marker_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No high-impact events to mark on chart in current feed.")
+
 
 # =====================================================================
 # SECTOR ROTATION ANALYSIS ENGINE
@@ -9798,6 +11102,3174 @@ def show_intraday_sector_rotation():
         for a in rotation_alerts:
             st.warning(a)
 
+
+# =====================================================================
+# ADVANCED MARKET INTELLIGENCE ENGINE
+# =====================================================================
+
+def _amie_detect_chart_pattern(df: pd.DataFrame) -> tuple:
+    """
+    Detect chart patterns from OHLCV data.
+    Returns (pattern_name, pattern_type, pattern_score 0-100)
+    """
+    if df is None or len(df) < 10:
+        return "No Pattern", "Neutral", 0
+
+    try:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        cl = df2["close"].values
+        hi = df2["high"].values if "high" in df2.columns else cl
+        lo = df2["low"].values  if "low"  in df2.columns else cl
+
+        n = len(cl)
+        last  = cl[-1]
+        prev5 = cl[-6:-1] if n >= 6 else cl[:-1]
+        prev10 = cl[-11:-1] if n >= 11 else cl[:-1]
+
+        # Local pivots
+        def _local_mins(arr, w=3):
+            return [i for i in range(w, len(arr)-w) if arr[i] == min(arr[i-w:i+w+1])]
+        def _local_maxs(arr, w=3):
+            return [i for i in range(w, len(arr)-w) if arr[i] == max(arr[i-w:i+w+1])]
+
+        lows  = _local_mins(lo)
+        highs = _local_maxs(hi)
+
+        # ── Double Bottom ──────────────────────────────────────────────
+        if len(lows) >= 2:
+            l1, l2 = lows[-2], lows[-1]
+            if abs(lo[l1] - lo[l2]) / (lo[l1] + 1e-6) < 0.005 and l2 > l1:
+                if last > (lo[l1] + lo[l2]) / 2 * 1.005:
+                    return "Double Bottom", "Bullish Reversal", 78
+
+        # ── Double Top ────────────────────────────────────────────────
+        if len(highs) >= 2:
+            h1, h2 = highs[-2], highs[-1]
+            if abs(hi[h1] - hi[h2]) / (hi[h1] + 1e-6) < 0.005 and h2 > h1:
+                if last < (hi[h1] + hi[h2]) / 2 * 0.995:
+                    return "Double Top", "Bearish Reversal", 78
+
+        # ── Head & Shoulders ─────────────────────────────────────────
+        if len(highs) >= 3:
+            h1, h2, h3 = highs[-3], highs[-2], highs[-1]
+            if hi[h2] > hi[h1] and hi[h2] > hi[h3] and abs(hi[h1] - hi[h3]) / (hi[h1] + 1e-6) < 0.01:
+                neckline = (lo[h1] + lo[h3]) / 2 if h3 < len(lo) else lo[-1]
+                if last < neckline:
+                    return "Head & Shoulders", "Bearish Reversal", 82
+
+        # ── Inverse H&S ───────────────────────────────────────────────
+        if len(lows) >= 3:
+            l1, l2, l3 = lows[-3], lows[-2], lows[-1]
+            if lo[l2] < lo[l1] and lo[l2] < lo[l3] and abs(lo[l1] - lo[l3]) / (lo[l1] + 1e-6) < 0.01:
+                neckline = (hi[l1] + hi[l3]) / 2 if l3 < len(hi) else hi[-1]
+                if last > neckline:
+                    return "Inverse Head & Shoulders", "Bullish Reversal", 82
+
+        # ── Falling Wedge ─────────────────────────────────────────────
+        if n >= 15:
+            hi15 = hi[-15:]
+            lo15 = lo[-15:]
+            if hi15[-1] < hi15[0] and lo15[-1] < lo15[0]:
+                hi_drop = (hi15[0] - hi15[-1]) / hi15[0]
+                lo_drop = (lo15[0] - lo15[-1]) / lo15[0]
+                if lo_drop > hi_drop and hi_drop > 0.01:
+                    return "Falling Wedge", "Bullish Reversal", 70
+
+        # ── Rising Wedge ──────────────────────────────────────────────
+        if n >= 15:
+            hi15 = hi[-15:]
+            lo15 = lo[-15:]
+            if hi15[-1] > hi15[0] and lo15[-1] > lo15[0]:
+                hi_rise = (hi15[-1] - hi15[0]) / hi15[0]
+                lo_rise = (lo15[-1] - lo15[0]) / lo15[0]
+                if lo_rise > hi_rise and hi_rise > 0.01:
+                    return "Rising Wedge", "Bearish Reversal", 70
+
+        # ── Bull Flag ─────────────────────────────────────────────────
+        if n >= 20:
+            impulse = cl[-20:-10]
+            flag    = cl[-10:]
+            imp_rtn = (impulse[-1] - impulse[0]) / (impulse[0] + 1e-6)
+            flag_rtn = (flag[-1] - flag[0]) / (flag[0] + 1e-6)
+            if imp_rtn > 0.015 and -0.01 < flag_rtn < 0.003:
+                return "Bull Flag", "Bullish Continuation", 72
+
+        # ── Bear Flag ─────────────────────────────────────────────────
+        if n >= 20:
+            impulse = cl[-20:-10]
+            flag    = cl[-10:]
+            imp_rtn = (impulse[-1] - impulse[0]) / (impulse[0] + 1e-6)
+            flag_rtn = (flag[-1] - flag[0]) / (flag[0] + 1e-6)
+            if imp_rtn < -0.015 and -0.003 < flag_rtn < 0.01:
+                return "Bear Flag", "Bearish Continuation", 72
+
+        # ── Ascending Triangle ────────────────────────────────────────
+        if len(highs) >= 2 and len(lows) >= 2:
+            h_flat = abs(hi[highs[-1]] - hi[highs[-2]]) / (hi[highs[-1]] + 1e-6) < 0.005
+            l_rising = lo[lows[-1]] > lo[lows[-2]]
+            if h_flat and l_rising:
+                return "Ascending Triangle", "Bullish Continuation", 68
+
+        # ── Descending Triangle ───────────────────────────────────────
+        if len(lows) >= 2 and len(highs) >= 2:
+            l_flat   = abs(lo[lows[-1]] - lo[lows[-2]]) / (lo[lows[-1]] + 1e-6) < 0.005
+            h_falling = hi[highs[-1]] < hi[highs[-2]]
+            if l_flat and h_falling:
+                return "Descending Triangle", "Bearish Continuation", 68
+
+        # ── Range Breakout / Breakdown ────────────────────────────────
+        if n >= 20:
+            rng = cl[-21:-1]
+            rng_hi = max(rng)
+            rng_lo = min(rng)
+            if last > rng_hi * 1.003:
+                return "Range Breakout", "Bullish Continuation", 75
+            elif last < rng_lo * 0.997:
+                return "Range Breakdown", "Bearish Continuation", 75
+
+        return "No Clear Pattern", "Neutral", 40
+
+    except Exception:
+        return "No Pattern", "Neutral", 30
+
+
+def _amie_oi_behavior(option_data: dict, df: pd.DataFrame) -> tuple:
+    """
+    Returns (oi_behavior, support_signal, resistance_signal, oi_score 0-100)
+    """
+    if not option_data:
+        return "Mixed / Neutral", "Unknown", "Unknown", 50
+
+    ds = option_data.get('df_summary')
+    underlying = option_data.get('underlying', 0)
+    total_ce_chg = option_data.get('total_ce_change', 0) or 0
+    total_pe_chg = option_data.get('total_pe_change', 0) or 0
+
+    if ds is None or ds.empty:
+        return "Mixed / Neutral", "Unknown", "Unknown", 50
+
+    # Price direction
+    price_up = True
+    if df is not None and not df.empty:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        if "close" in df2.columns and len(df2) >= 2:
+            price_up = df2["close"].iloc[-1] >= df2["close"].iloc[-2]
+
+    # OI behavior
+    if price_up and total_pe_chg > 0 and total_pe_chg >= abs(total_ce_chg):
+        oi_behavior = "Long Build-up"
+        oi_score = 72
+    elif not price_up and total_ce_chg > 0 and total_ce_chg >= abs(total_pe_chg):
+        oi_behavior = "Short Build-up"
+        oi_score = 28
+    elif price_up and total_ce_chg < 0:
+        oi_behavior = "Short Covering"
+        oi_score = 65
+    elif not price_up and total_pe_chg < 0:
+        oi_behavior = "Long Unwinding"
+        oi_score = 35
+    else:
+        oi_behavior = "Mixed / Neutral"
+        oi_score = 50
+
+    # Support & Resistance
+    try:
+        atm_idx = ds['Strike'].sub(underlying).abs().idxmin()
+        ai = ds.index.get_loc(atm_idx)
+
+        def safe_row(i):
+            return ds.iloc[i] if 0 <= i < len(ds) else None
+
+        r0   = ds.iloc[ai]
+        rm1  = safe_row(ai - 1)
+        rp1  = safe_row(ai + 1)
+
+        def gv(row, col, default=0):
+            if row is None: return default
+            return float(row.get(col, default) or default)
+
+        pe_chg_atm = gv(r0, 'changeinOpenInterest_PE')
+        ce_chg_atm = gv(r0, 'changeinOpenInterest_CE')
+        pe_chg_m1  = gv(rm1, 'changeinOpenInterest_PE') if rm1 is not None else 0
+        ce_chg_p1  = gv(rp1, 'changeinOpenInterest_CE') if rp1 is not None else 0
+
+        support_signal = "Building" if (total_pe_chg > 0 and pe_chg_atm > 0 and pe_chg_m1 > 0) else \
+                         "Weakening" if (total_pe_chg < 0 and pe_chg_atm < 0) else "Stable"
+        resistance_signal = "Building" if (total_ce_chg > 0 and ce_chg_atm > 0 and ce_chg_p1 > 0) else \
+                            "Weakening" if (total_ce_chg < 0 and ce_chg_atm < 0) else "Stable"
+    except Exception:
+        support_signal = "Unknown"
+        resistance_signal = "Unknown"
+
+    return oi_behavior, support_signal, resistance_signal, oi_score
+
+
+def _amie_atm_analysis(option_data: dict) -> dict:
+    """
+    ATM ±2 strike intelligence.
+    Returns dict with strike data, migration, smart money flags.
+    """
+    result = {
+        'atm': None, 'strikes': {},
+        'resist_migration': 'Stable', 'support_migration': 'Stable',
+        'smart_money': [], 'gamma_zone': None,
+        'score': 50
+    }
+    if not option_data:
+        return result
+
+    ds = option_data.get('df_summary')
+    underlying = option_data.get('underlying', 0)
+    if ds is None or ds.empty or underlying <= 0:
+        return result
+
+    try:
+        atm_idx = ds['Strike'].sub(underlying).abs().idxmin()
+        ai = ds.index.get_loc(atm_idx)
+        atm = float(ds.iloc[ai]['Strike'])
+        result['atm'] = atm
+
+        def gv(row, col, default=0):
+            return float(row.get(col, default) or default) if row is not None else default
+
+        strikes_info = {}
+        for offset, label in [(-2,'ATM-2'), (-1,'ATM-1'), (0,'ATM'), (1,'ATM+1'), (2,'ATM+2')]:
+            idx = ai + offset
+            if 0 <= idx < len(ds):
+                row = ds.iloc[idx]
+                strikes_info[label] = {
+                    'strike':    float(row.get('Strike', 0)),
+                    'ce_oi':     gv(row, 'openInterest_CE'),
+                    'pe_oi':     gv(row, 'openInterest_PE'),
+                    'ce_chg':    gv(row, 'changeinOpenInterest_CE'),
+                    'pe_chg':    gv(row, 'changeinOpenInterest_PE'),
+                    'ce_vol':    gv(row, 'totalTradedVolume_CE'),
+                    'pe_vol':    gv(row, 'totalTradedVolume_PE'),
+                    'ce_iv':     gv(row, 'impliedVolatility_CE'),
+                    'pe_iv':     gv(row, 'impliedVolatility_PE'),
+                    'ce_bid':    gv(row, 'bidQty_CE'),
+                    'pe_bid':    gv(row, 'bidQty_PE'),
+                    'ce_ask':    gv(row, 'askQty_CE'),
+                    'pe_ask':    gv(row, 'askQty_PE'),
+                }
+        result['strikes'] = strikes_info
+
+        atm_s = strikes_info.get('ATM', {})
+        atm1  = strikes_info.get('ATM+1', {})
+        atm2  = strikes_info.get('ATM+2', {})
+        atm_m1 = strikes_info.get('ATM-1', {})
+        atm_m2 = strikes_info.get('ATM-2', {})
+
+        # Resistance migration
+        if atm_s.get('ce_chg', 0) < 0 and (atm1.get('ce_chg', 0) > 0 or atm2.get('ce_chg', 0) > 0):
+            result['resist_migration'] = 'Shifting Higher (Bullish)'
+            result['score'] += 8
+        elif atm_s.get('ce_chg', 0) > 0 and atm1.get('ce_chg', 0) < 0:
+            result['resist_migration'] = 'Shifting Lower (Bearish)'
+            result['score'] -= 8
+
+        # Support migration
+        if atm_s.get('pe_chg', 0) < 0 and (atm_m1.get('pe_chg', 0) > 0 or atm_m2.get('pe_chg', 0) > 0):
+            result['support_migration'] = 'Shifting Lower (Bearish)'
+            result['score'] -= 8
+        elif atm_s.get('pe_chg', 0) > 0 and atm_m1.get('pe_chg', 0) < 0:
+            result['support_migration'] = 'Shifting Higher (Bullish)'
+            result['score'] += 8
+
+        # Smart money (large OI spikes > 3x avg)
+        for side, key in [('CE', 'ce_chg'), ('PE', 'pe_chg')]:
+            col = f'changeinOpenInterest_{side}'
+            if col in ds.columns:
+                avg_abs = ds[col].abs().mean()
+                spikes = ds[ds[col].abs() > avg_abs * 3]
+                for _, srow in spikes.head(2).iterrows():
+                    v = float(srow[col])
+                    lbl = (f"Institutional {'Call' if side=='CE' else 'Put'} "
+                           f"{'Writing' if v > 0 else 'Covering'} @ ₹{int(srow['Strike'])}")
+                    result['smart_money'].append(lbl)
+
+        # Gamma zone (highest combined gamma)
+        if 'GammaExp_Net' in ds.columns:
+            idx_g = ds['GammaExp_Net'].abs().idxmax()
+            result['gamma_zone'] = float(ds.loc[idx_g, 'Strike'])
+
+        result['score'] = max(0, min(100, result['score']))
+    except Exception:
+        pass
+
+    return result
+
+
+def _amie_depth_signal(option_data: dict) -> tuple:
+    """
+    Market depth reaction from bid/ask OI proxy.
+    Returns (signal_str, score 0-100, detail)
+    """
+    if not option_data:
+        return "Balanced", 50, "No data"
+
+    ds = option_data.get('df_summary')
+    if ds is None or ds.empty:
+        return "Balanced", 50, "No depth data"
+
+    try:
+        bid_cols = [c for c in ds.columns if 'bidQty' in c]
+        ask_cols = [c for c in ds.columns if 'askQty' in c]
+        if not bid_cols or not ask_cols:
+            return "Balanced", 50, "Bid/Ask not available"
+
+        total_bid = ds[bid_cols].sum().sum()
+        total_ask = ds[ask_cols].sum().sum()
+        sentiment_score = total_bid - total_ask
+        ratio = total_bid / (total_ask + 1e-6)
+
+        if ratio > 1.5:
+            signal = "Buyers Strong"
+            score = 72
+            detail = f"Bid/Ask ratio {ratio:.2f} — strong buying pressure"
+        elif ratio > 1.15:
+            signal = "Mild Buy Pressure"
+            score = 62
+            detail = f"Bid/Ask ratio {ratio:.2f} — moderate buying"
+        elif ratio < 0.67:
+            signal = "Sellers Strong"
+            score = 28
+            detail = f"Bid/Ask ratio {ratio:.2f} — heavy sell pressure"
+        elif ratio < 0.87:
+            signal = "Mild Sell Pressure"
+            score = 38
+            detail = f"Bid/Ask ratio {ratio:.2f} — moderate selling"
+        else:
+            signal = "Balanced"
+            score = 50
+            detail = f"Bid/Ask ratio {ratio:.2f} — equilibrium"
+
+        return signal, score, detail
+    except Exception:
+        return "Balanced", 50, "Calculation error"
+
+
+def _amie_sector_signal(session_state) -> tuple:
+    """
+    Extract sector signal from session state or return N/A.
+    Returns (signal_str, score 0-100)
+    """
+    try:
+        leaders = session_state.get("intra_prev_leaders", [])
+        if not leaders:
+            return "Data Unavailable", 50
+
+        banking_strong = any(s in leaders for s in ["NIFTY BANK", "FIN SERVICE", "Private Bank"])
+        it_strong = any(s in leaders for s in ["NIFTY IT", "IT"])
+
+        if banking_strong and it_strong:
+            return "Sectors Strong (Bank+IT Lead)", 72
+        elif banking_strong:
+            return "Banking Leads", 65
+        elif it_strong:
+            return "IT Leads", 62
+        else:
+            sector_name = leaders[0] if leaders else "Unknown"
+            return f"{sector_name} Leads", 58
+    except Exception:
+        return "Data Unavailable", 50
+
+
+def _amie_spike_type(session_state, option_data: dict) -> tuple:
+    """
+    Detect spike type: Normal vs Expiry Gamma.
+    Returns (spike_type, spike_score 0-100)
+    """
+    if not option_data:
+        return "No Spike", 50
+
+    expiry = option_data.get('expiry', '')
+    ds = option_data.get('df_summary')
+    underlying = option_data.get('underlying', 0)
+
+    try:
+        # Check DTE
+        dte = 999
+        if expiry:
+            try:
+                exp_dt = datetime.strptime(expiry, "%Y-%m-%d")
+                now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                dte = (exp_dt.date() - now.date()).days
+            except Exception:
+                pass
+
+        spike_history = session_state.get('spike_history', [])
+        expiry_history = session_state.get('expiry_spike_history', [])
+
+        # Calculate OI movement rate
+        oi_surge = False
+        if ds is not None and not ds.empty and len(spike_history) >= 2:
+            prev_snap = spike_history[-2]
+            if 'openInterest_CE' in prev_snap.columns and 'openInterest_CE' in ds.columns:
+                prev_total = prev_snap['openInterest_CE'].sum() + prev_snap.get('openInterest_PE', pd.Series([0])).sum()
+                curr_total = ds['openInterest_CE'].sum() + ds.get('openInterest_PE', pd.Series([0])).sum()
+                if prev_total > 0:
+                    oi_change_rate = abs(curr_total - prev_total) / prev_total
+                    oi_surge = oi_change_rate > 0.03
+
+        if dte <= 1 and oi_surge:
+            return "Expiry Gamma Spike", 85
+        elif dte <= 1:
+            return "Expiry Day Normal", 70
+        elif oi_surge:
+            return "Normal Spike", 68
+        else:
+            return "No Spike", 50
+    except Exception:
+        return "Unknown", 50
+
+
+def _amie_confidence(pattern_score, oi_score, depth_score, sector_score,
+                      spike_score, atm_score) -> int:
+    """
+    Composite confidence: weighted average of all signals.
+    Reduces if signals conflict.
+    """
+    weights = {
+        'pattern': 0.20,
+        'oi':      0.25,
+        'depth':   0.20,
+        'sector':  0.15,
+        'spike':   0.10,
+        'atm':     0.10,
+    }
+    scores = {
+        'pattern': pattern_score,
+        'oi':      oi_score,
+        'depth':   depth_score,
+        'sector':  sector_score,
+        'spike':   spike_score,
+        'atm':     atm_score,
+    }
+
+    weighted = sum(scores[k] * weights[k] for k in weights)
+
+    # Conflict penalty: measure spread of signals
+    vals = list(scores.values())
+    spread = max(vals) - min(vals)
+    conflict_penalty = spread * 0.10  # up to 10 pts penalty for high spread
+
+    confidence = int(max(35, min(95, weighted - conflict_penalty)))
+    return confidence
+
+
+def _amie_expected_move(pattern_type: str, oi_behavior: str, support_signal: str,
+                         resistance_signal: str, resist_migration: str,
+                         support_migration: str, depth_signal: str) -> tuple:
+    """
+    Predict expected move direction, breakout/reversal probability.
+    Returns (direction, bo_prob_pct, reversal_prob_pct, target_info)
+    """
+    bull_signals = 0
+    bear_signals = 0
+
+    if "Bullish" in pattern_type:          bull_signals += 2
+    if "Bearish" in pattern_type:          bear_signals += 2
+    if "Long Build" in oi_behavior:        bull_signals += 1
+    if "Short Cover" in oi_behavior:       bull_signals += 1
+    if "Short Build" in oi_behavior:       bear_signals += 1
+    if "Long Unwind" in oi_behavior:       bear_signals += 1
+    if "Building" in support_signal:       bull_signals += 1
+    if "Weakening" in support_signal:      bear_signals += 1
+    if "Building" in resistance_signal:    bear_signals += 1
+    if "Weakening" in resistance_signal:   bull_signals += 1
+    if "Higher" in resist_migration:       bull_signals += 1
+    if "Lower"  in support_migration:      bear_signals += 1
+    if "Buy" in depth_signal or "Buyer" in depth_signal:   bull_signals += 1
+    if "Sell" in depth_signal or "Seller" in depth_signal: bear_signals += 1
+
+    total = bull_signals + bear_signals + 1e-6
+    bull_pct = int(bull_signals / total * 100)
+    bear_pct = int(bear_signals / total * 100)
+
+    if bull_pct > 60:
+        direction = "Uptrend Expected"
+        bo_prob = min(bull_pct + 10, 90)
+        rv_prob = 100 - bo_prob
+    elif bear_pct > 60:
+        direction = "Downtrend Expected"
+        bo_prob = min(bear_pct + 10, 90)
+        rv_prob = 100 - bo_prob
+    elif "Continuation" in pattern_type:
+        direction = "Trend Continuation"
+        bo_prob = 65
+        rv_prob = 35
+    elif "Reversal" in pattern_type:
+        direction = "Reversal Setup"
+        bo_prob = 55
+        rv_prob = 45
+    else:
+        direction = "Range Bound"
+        bo_prob = 45
+        rv_prob = 55
+
+    target_info = f"Bo: {bo_prob}% | Rev: {rv_prob}%"
+    return direction, bo_prob, rv_prob, target_info
+
+
+# ── Global Correlation Intelligence Engine ────────────────────────────────
+GCORR_TICKERS = [
+    # US Markets — strong positive correlation with NIFTY
+    {"name": "S&P 500 Fut",  "yf": "ES=F",       "corr": +0.85, "group": "🇺🇸 US"},
+    {"name": "Nasdaq Fut",   "yf": "NQ=F",       "corr": +0.80, "group": "🇺🇸 US"},
+    {"name": "Dow Fut",      "yf": "YM=F",       "corr": +0.78, "group": "🇺🇸 US"},
+    # Asian Markets — moderate positive
+    {"name": "Nikkei 225",   "yf": "^N225",      "corr": +0.65, "group": "🌏 Asia"},
+    {"name": "Hang Seng",    "yf": "^HSI",       "corr": +0.55, "group": "🌏 Asia"},
+    {"name": "Shanghai Comp","yf": "000001.SS",   "corr": +0.40, "group": "🌏 Asia"},
+    # European Markets — moderate positive
+    {"name": "DAX",          "yf": "^GDAXI",     "corr": +0.60, "group": "🇪🇺 Europe"},
+    {"name": "FTSE 100",     "yf": "^FTSE",      "corr": +0.55, "group": "🇪🇺 Europe"},
+    # Macro / Commodities — inverse or mixed
+    {"name": "India VIX",    "yf": "^INDIAVIX",  "corr": -0.90, "group": "⚠ Macro"},
+    {"name": "USD/INR",      "yf": "USDINR=X",   "corr": -0.60, "group": "⚠ Macro"},
+    {"name": "Crude Oil",    "yf": "CL=F",       "corr": -0.35, "group": "⚠ Macro"},
+    {"name": "Gold",         "yf": "GC=F",       "corr": -0.20, "group": "⚠ Macro"},
+]
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _gcorr_fetch_global():
+    """Fetch latest % change for all global correlation tickers via yfinance."""
+    if not _YF_AVAILABLE:
+        return {}
+    syms = [t["yf"] for t in GCORR_TICKERS]
+    try:
+        raw = yf.download(syms, period="2d", interval="1d",
+                          group_by="ticker", auto_adjust=True,
+                          progress=False, threads=True)
+    except Exception:
+        return {}
+    result = {}
+    for t in GCORR_TICKERS:
+        sym = t["yf"]
+        try:
+            if isinstance(raw.columns, pd.MultiIndex):
+                df_t = raw[sym] if sym in raw.columns.get_level_values(0) else pd.DataFrame()
+            else:
+                df_t = raw
+            df_t = df_t.dropna(subset=["Close"])
+            if len(df_t) >= 2:
+                prev_close = float(df_t["Close"].iloc[-2])
+                last_close = float(df_t["Close"].iloc[-1])
+                pct = (last_close - prev_close) / prev_close * 100 if prev_close != 0 else 0.0
+            elif len(df_t) == 1:
+                pct = 0.0
+                last_close = float(df_t["Close"].iloc[-1])
+            else:
+                continue
+            result[sym] = {"pct": round(pct, 3), "price": round(last_close, 2)}
+        except Exception:
+            continue
+    return result
+
+
+def _gcorr_compute_signal(gcorr_data: dict) -> float:
+    """
+    Compute a weighted directional signal for NIFTY from global market data.
+    Returns a value normalised to -1.0 (strongly bearish) … +1.0 (strongly bullish).
+    """
+    if not gcorr_data:
+        return 0.0
+    total_weight = sum(abs(t["corr"]) for t in GCORR_TICKERS if t["yf"] in gcorr_data)
+    if total_weight == 0:
+        return 0.0
+    raw_score = 0.0
+    for t in GCORR_TICKERS:
+        d = gcorr_data.get(t["yf"])
+        if d is None:
+            continue
+        pct   = d["pct"]
+        corr  = t["corr"]
+        # Normalise pct change: cap at ±3% → maps to ±1
+        norm_pct = max(-1.0, min(1.0, pct / 3.0))
+        raw_score += norm_pct * corr * abs(corr)   # weight by |correlation|²
+    # Normalise by max possible score
+    max_score = sum(abs(t["corr"]) ** 2 for t in GCORR_TICKERS if t["yf"] in gcorr_data)
+    return max(-1.0, min(1.0, raw_score / max_score)) if max_score > 0 else 0.0
+
+
+def show_global_correlation_engine():
+    """🌐 Global Correlation Intelligence Engine — Pre-Market NIFTY Direction."""
+    st.markdown("### 🌐 Global Correlation Intelligence Engine")
+    st.caption("Tracks 12 global indices & macro assets, computes weighted NIFTY directional bias using historical correlation coefficients.")
+
+    if not _YF_AVAILABLE:
+        st.warning("⚠ yfinance not installed. Run `pip install yfinance` to enable this engine.")
+        return
+
+    with st.spinner("Fetching global market data…"):
+        gcorr_data = _gcorr_fetch_global()
+
+    if not gcorr_data:
+        st.warning("⚠ Could not fetch global data. Check internet connection or yfinance availability.")
+        return
+
+    gcorr_signal = _gcorr_compute_signal(gcorr_data)
+
+    # Direction label
+    if gcorr_signal > 0.30:
+        gc_dir = "🟢 STRONGLY BULLISH for NIFTY"
+        gc_color = "#00C853"
+    elif gcorr_signal > 0.10:
+        gc_dir = "🟢 MILDLY BULLISH for NIFTY"
+        gc_color = "#69F0AE"
+    elif gcorr_signal < -0.30:
+        gc_dir = "🔴 STRONGLY BEARISH for NIFTY"
+        gc_color = "#FF1744"
+    elif gcorr_signal < -0.10:
+        gc_dir = "🔴 MILDLY BEARISH for NIFTY"
+        gc_color = "#FF5252"
+    else:
+        gc_dir = "🟡 NEUTRAL / MIXED SIGNALS"
+        gc_color = "#FFD740"
+
+    # Header verdict card
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,{gc_color}18,{gc_color}08);
+                border:2px solid {gc_color};border-radius:12px;padding:16px;margin-bottom:14px;">
+        <div style="font-size:12px;color:#aaa;letter-spacing:1px;">GLOBAL CORRELATION SIGNAL</div>
+        <div style="font-size:24px;font-weight:bold;color:{gc_color};margin:4px 0;">{gc_dir}</div>
+        <div style="font-size:13px;color:#ccc;">Composite Score: <b>{gcorr_signal:+.3f}</b> / ±1.0 &nbsp;|&nbsp;
+             Based on {len(gcorr_data)}/{len(GCORR_TICKERS)} markets fetched</div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Per-market breakdown table ────────────────────────────────────────
+    rows = []
+    for t in GCORR_TICKERS:
+        d = gcorr_data.get(t["yf"])
+        if d is None:
+            rows.append({
+                "Group": t["group"], "Market": t["name"],
+                "Price": "—", "% Change": "—",
+                "Corr to NIFTY": f"{t['corr']:+.2f}",
+                "NIFTY Impact": "—", "Signal": "⚪ N/A"
+            })
+            continue
+        pct = d["pct"]
+        norm_pct = max(-1.0, min(1.0, pct / 3.0))
+        impact = norm_pct * t["corr"]  # positive = bullish contribution
+        if impact > 0.05:
+            sig = "🟢 Bullish"
+        elif impact < -0.05:
+            sig = "🔴 Bearish"
+        else:
+            sig = "🟡 Neutral"
+        pct_str = f"{pct:+.2f}%"
+        rows.append({
+            "Group": t["group"],
+            "Market": t["name"],
+            "Price": f"{d['price']:,.2f}",
+            "% Change": pct_str,
+            "Corr to NIFTY": f"{t['corr']:+.2f}",
+            "NIFTY Impact": f"{impact:+.3f}",
+            "Signal": sig,
+        })
+
+    df_gc = pd.DataFrame(rows)
+    st.dataframe(df_gc, use_container_width=True, hide_index=True)
+
+    # ── Contribution bar chart ────────────────────────────────────────────
+    import plotly.graph_objects as go
+    valid_rows = [r for r in rows if r["NIFTY Impact"] != "—"]
+    if valid_rows:
+        names   = [r["Market"] for r in valid_rows]
+        impacts = [float(r["NIFTY Impact"]) for r in valid_rows]
+        colors  = ["#00C853" if v > 0 else ("#FF5252" if v < 0 else "#888") for v in impacts]
+        fig_gc = go.Figure(go.Bar(
+            x=names, y=impacts,
+            marker_color=colors,
+            text=[f"{v:+.3f}" for v in impacts],
+            textposition="outside",
+        ))
+        fig_gc.update_layout(
+            height=240, margin=dict(l=10, r=10, t=40, b=60),
+            paper_bgcolor="#111", plot_bgcolor="#111",
+            font=dict(color="#ccc", size=10),
+            yaxis=dict(zeroline=True, zerolinecolor="#555", gridcolor="#333",
+                       title="NIFTY Impact (–bear … +bull)"),
+            xaxis=dict(tickangle=-35, gridcolor="#333"),
+            title=dict(text=f"Global Market Contributions to NIFTY Bias → Score: {gcorr_signal:+.3f}",
+                       font=dict(size=12)),
+        )
+        fig_gc.add_hline(y=0, line_color="#666", line_width=1)
+        st.plotly_chart(fig_gc, use_container_width=True)
+
+    # ── Narrative ─────────────────────────────────────────────────────────
+    bull_mkts = [r["Market"] for r in valid_rows if float(r["NIFTY Impact"]) > 0.05]
+    bear_mkts = [r["Market"] for r in valid_rows if float(r["NIFTY Impact"]) < -0.05]
+    st.markdown("**📝 Interpretation:**")
+    if bull_mkts:
+        st.markdown(f"- 🟢 **Bullish contributors:** {', '.join(bull_mkts)}")
+    if bear_mkts:
+        st.markdown(f"- 🔴 **Bearish contributors:** {', '.join(bear_mkts)}")
+    if gcorr_signal > 0.10:
+        st.info(f"🌐 Global cues are net **positive** for NIFTY. Pre-market bias: gap-up likely if US/Asia closed strong.")
+    elif gcorr_signal < -0.10:
+        st.warning(f"🌐 Global cues are net **negative** for NIFTY. Pre-market bias: gap-down risk. Watch support levels.")
+    else:
+        st.info("🌐 Global signals are **mixed**. NIFTY likely to open flat. Direction will be decided by domestic flows.")
+
+    st.caption(f"🌐 Global Correlation Engine · {len(gcorr_data)} markets · Cached 60s · Correlations: historical 5Y rolling")
+
+
+def show_ml_market_report(option_data=None, df=None, current_price=None):
+    """
+    ML-style Market Intelligence Report.
+    Combines ALL available signals from session state + live option data
+    into a single weighted ensemble score and generates a plain-English
+    multi-section market narrative.
+    """
+    import numpy as np
+
+    # ── 1. FEATURE EXTRACTION ────────────────────────────────────────────────
+    def _latest(history, key, default=None):
+        """Get the latest value of a key from a history list."""
+        for entry in reversed(history):
+            v = entry.get(key)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return v
+        return default
+
+    def _trend(history, key, window=5):
+        """Slope direction of last N values: +1 rising, -1 falling, 0 flat."""
+        vals = [entry.get(key) for entry in history[-window:] if entry.get(key) is not None]
+        if len(vals) < 2:
+            return 0
+        try:
+            vals = [float(v) for v in vals]
+            return 1 if vals[-1] > vals[0] * 1.005 else (-1 if vals[-1] < vals[0] * 0.995 else 0)
+        except Exception:
+            return 0
+
+    pro_h   = st.session_state.get('pro_trader_history', [])
+    iv_h    = st.session_state.get('iv_skew_history', [])
+    pres_h  = st.session_state.get('pressure_history', [])
+    sent_h  = st.session_state.get('sentiment_history', [])
+    comp_h  = st.session_state.get('composite_signal_history', [])
+    gex_h   = st.session_state.get('total_gex_history', [])
+    spike_h = st.session_state.get('spike_history', [])
+    amie_h  = st.session_state.get('amie_history', [])
+
+    # Live option chain scalars
+    spot      = (option_data.get('underlying') if option_data else None) or current_price or 0
+    df_sum    = option_data.get('df_summary') if option_data else None
+    atm_row   = df_sum[df_sum['Zone'] == 'ATM'].iloc[0] if (df_sum is not None and 'Zone' in df_sum.columns and len(df_sum[df_sum['Zone'] == 'ATM']) > 0) else None
+
+    def _safe(v, default=0.0):
+        try:
+            return float(v) if v is not None else default
+        except Exception:
+            return default
+
+    # ── 2. SIGNAL COMPONENTS (each normalised to -1…+1) ─────────────────────
+    signals = {}
+
+    # A. OPTIONS FLOW SIGNALS
+    pcr_oi   = _safe(_latest(pro_h, 'pcr_oi',   1.0), 1.0)
+    pcr_vol  = _safe(_latest(pro_h, 'pcr_vol',  1.0), 1.0)
+    pcr_chg  = _safe(_latest(pro_h, 'pcr_chgoi',1.0), 1.0)
+    # PCR > 1.2 = bullish (put writing), < 0.7 = bearish (call writing)
+    signals['PCR_OI']      = min(1, max(-1, (pcr_oi  - 1.0) / 0.5))
+    signals['PCR_VOL']     = min(1, max(-1, (pcr_vol - 1.0) / 0.5))
+    signals['PCR_CHGOI']   = min(1, max(-1, (pcr_chg - 1.0) / 0.5))
+
+    # B. IV SKEW SIGNAL
+    iv_skew = _safe(_latest(iv_h, 'iv_skew', 1.0), 1.0)
+    # <0.9 = CE cheap vs PE → bullish; >1.1 = PE expensive → bearish
+    if iv_skew < 0.85:   signals['IV_SKEW'] =  1.0
+    elif iv_skew < 0.95: signals['IV_SKEW'] =  0.5
+    elif iv_skew > 1.15: signals['IV_SKEW'] = -1.0
+    elif iv_skew > 1.05: signals['IV_SKEW'] = -0.5
+    else:                signals['IV_SKEW'] =  0.0
+    avg_iv_ce = _safe(_latest(iv_h, 'avg_iv_ce', 15), 15)
+    avg_iv_pe = _safe(_latest(iv_h, 'avg_iv_pe', 15), 15)
+
+    # C. PRESSURE SIGNALS
+    net_pres = _safe(_latest(pres_h, 'net_pressure', 0), 0)
+    signals['NET_PRESSURE'] = min(1, max(-1, net_pres * 4))
+    pres_trend = _trend(pres_h, 'net_pressure')
+    signals['PRESSURE_TREND'] = pres_trend * 0.5
+
+    # D. GAMMA EXPOSURE
+    net_gex = _safe(_latest(pro_h, 'net_gex', 0), 0)
+    # Negative GEX → trending/breakout; positive → pinned/range
+    signals['GEX_REGIME'] = min(1, max(-1, -net_gex / 50))  # inverted: neg GEX = +1 (trend)
+
+    # E. DELTA POSITIONING
+    net_delta = _safe(_latest(pro_h, 'net_delta', 0), 0)
+    signals['NET_DELTA'] = min(1, max(-1, net_delta / 5e7))
+
+    # F. SENTIMENT SCORE
+    sent_score = _safe(_latest(sent_h, 'sentiment_score', 50), 50)
+    signals['SENTIMENT'] = (sent_score - 50) / 50
+
+    # G. COMPOSITE DIRECTION
+    comp_score = _safe(_latest(comp_h, 'score', 0), 0)
+    signals['COMPOSITE'] = min(1, max(-1, comp_score / 100))
+
+    # H. STRADDLE MOMENTUM
+    straddle_trend = _trend(pro_h, 'straddle_atm', window=5)
+    signals['STRADDLE_EXPAND'] = straddle_trend * -0.3  # rising straddle = uncertainty
+
+    # I. BREAKOUT SCORE
+    bo_score = _safe(_latest(pro_h, 'breakout_score', 50), 50)
+    signals['BREAKOUT_SCORE'] = (bo_score - 50) / 50
+
+    # J. PRICE ACTION (from df candles)
+    pa_sig = 0.0
+    if df is not None and len(df) >= 50:
+        try:
+            close = df['close'].values
+            ema9  = float(pd.Series(close).ewm(span=9,  adjust=False).mean().iloc[-1])
+            ema21 = float(pd.Series(close).ewm(span=21, adjust=False).mean().iloc[-1])
+            ema50 = float(pd.Series(close).ewm(span=50, adjust=False).mean().iloc[-1])
+            last  = float(close[-1])
+            if last > ema9 > ema21 > ema50:   pa_sig =  1.0
+            elif last < ema9 < ema21 < ema50: pa_sig = -1.0
+            elif last > ema21:                pa_sig =  0.5
+            elif last < ema21:                pa_sig = -0.5
+        except Exception:
+            pass
+    signals['PRICE_ACTION'] = pa_sig
+
+    # K. NEWS SENTIMENT
+    news_score = _safe(st.session_state.get('_fid_news_score', 50), 50)
+    signals['NEWS'] = (news_score - 50) / 50
+
+    # L. SECTOR ROTATION
+    sect_score = _safe(st.session_state.get('_fid_sector_score', 50), 50)
+    signals['SECTOR'] = (sect_score - 50) / 50
+
+    # M. IV TREND
+    iv_trend = _trend(iv_h, 'avg_iv_ce', window=5)
+    signals['IV_TREND'] = iv_trend * -0.5  # rising CE IV = fear/uncertainty
+
+    # ── N. MACRO SIGNALS (VIX, USD/INR, CRUDE) — Inverse correlation ─────────
+    macro_signal_data = {}
+    _bn_data = None
+    try:
+        if _YF_AVAILABLE:
+            _bn_data = _bn_fetch_yf_data(tf1="15m", tf2="60m")
+    except Exception:
+        _bn_data = None
+
+    vix_pct, usdinr_pct, crude_pct = 0.0, 0.0, 0.0
+    if _bn_data is not None:
+        _vix_m   = _bn_ticker_metrics(_bn_data, "^INDIAVIX")
+        _usd_m   = _bn_ticker_metrics(_bn_data, "USDINR=X")
+        _crude_m = _bn_ticker_metrics(_bn_data, "CL=F")
+        if _vix_m:
+            vix_pct = _vix_m["pct_d"]
+        if _usd_m:
+            usdinr_pct = _usd_m["pct_d"]
+        if _crude_m:
+            crude_pct = _crude_m["pct_d"]
+
+    # Rising VIX / USD/INR / Crude = bearish for market → negate %change
+    signals['MACRO_VIX']    = min(1, max(-1, -vix_pct   / 2.0))
+    signals['MACRO_USDINR'] = min(1, max(-1, -usdinr_pct / 1.5))
+    signals['MACRO_CRUDE']  = min(1, max(-1, -crude_pct  / 3.0))
+    macro_signal_data = {
+        "vix_pct": vix_pct, "usdinr_pct": usdinr_pct, "crude_pct": crude_pct,
+    }
+
+    # ── O. NIFTY 50 INDICATOR DASHBOARD (multi-TF) ───────────────────────────
+    ind_rsi_score = 0.0
+    ind_vwap_score = 0.0
+    ind_trend_score = 0.0
+    ind_metrics = {}
+    if _bn_data is not None:
+        try:
+            ind_metrics = _bn_indicator_metrics(_bn_data, "^NSEI", tf_keys=("daily", "tf1", "tf2"))
+            _rsi_vals, _vwap_count, _trend_count, _tf_count = [], 0, 0, 0
+            for tf_key in ("daily", "tf1", "tf2"):
+                m = ind_metrics.get(tf_key)
+                if m is None:
+                    continue
+                _tf_count += 1
+                # RSI contribution
+                rsi_v = m.get("rsi")
+                if rsi_v is not None and not (isinstance(rsi_v, float) and np.isnan(rsi_v)):
+                    _rsi_vals.append(float(rsi_v))
+                # VWAP: price above VWAP = bullish
+                ltp_v, vwap_v = m.get("ltp", 0), m.get("vwap")
+                if vwap_v is not None and not (isinstance(vwap_v, float) and np.isnan(vwap_v)):
+                    _vwap_count += 1 if ltp_v > vwap_v else -1
+                # Trend: SuperTrend & EMA
+                st_dir = m.get("st_dir")
+                ema_v = m.get("ema")
+                if st_dir is not None:
+                    _trend_count += 1 if st_dir == -1 else -1  # -1 = bullish in supertrend calc
+                if ema_v is not None and not (isinstance(ema_v, float) and np.isnan(ema_v)):
+                    _trend_count += 1 if ltp_v > ema_v else -1
+            if _rsi_vals:
+                avg_rsi = sum(_rsi_vals) / len(_rsi_vals)
+                ind_rsi_score = min(1, max(-1, (avg_rsi - 50) / 50))
+            if _tf_count > 0:
+                ind_vwap_score  = min(1, max(-1, _vwap_count  / _tf_count))
+                ind_trend_score = min(1, max(-1, _trend_count / (_tf_count * 2)))
+        except Exception:
+            pass
+
+    signals['IND_RSI_MULTI']   = ind_rsi_score
+    signals['IND_VWAP_MULTI']  = ind_vwap_score
+    signals['IND_TREND_MULTI'] = ind_trend_score
+
+    # ── P. CANDLE PATTERNS (recent bars from df) ──────────────────────────────
+    candle_pattern_data = []
+    candle_sig = 0.0
+    if df is not None and len(df) >= 2:
+        try:
+            _recent_df = df.iloc[-30:].copy()  # last 30 bars
+            _cp_list = _detect_chart_candle_types(_recent_df)
+            candle_pattern_data = _cp_list
+            _cp_buy  = sum(1 for p in _cp_list if p['direction'] == 'BUY')
+            _cp_sell = sum(1 for p in _cp_list if p['direction'] == 'SELL')
+            _cp_tot  = _cp_buy + _cp_sell
+            candle_sig = (_cp_buy - _cp_sell) / _cp_tot if _cp_tot > 0 else 0.0
+            candle_sig = min(1, max(-1, candle_sig))
+        except Exception:
+            pass
+    signals['CANDLE_PATTERN'] = candle_sig
+
+    # ── Q. GEOMETRIC & REVERSAL PATTERNS ─────────────────────────────────────
+    geo_pattern_data = []
+    geo_sig = 0.0
+    if df is not None and len(df) >= 15:
+        try:
+            _geo_det = GeometricPatternDetector()
+            geo_pattern_data = _geo_det.detect_all(df)
+            _conf_map = {'Low': 0.25, 'Moderate': 0.5, 'High': 0.75,
+                         'Strong': 1.0, 'Institutional Setup': 1.0}
+            _geo_w_sum, _geo_score = 0.0, 0.0
+            for pat in geo_pattern_data:
+                _cw = _conf_map.get(pat.get('confidence', 'Low'), 0.25)
+                _geo_w_sum += _cw
+                _geo_score += _cw if pat.get('signal') == 'BUY' else (-_cw if pat.get('signal') == 'SELL' else 0)
+            if _geo_w_sum > 0:
+                geo_sig = min(1, max(-1, _geo_score / _geo_w_sum))
+        except Exception:
+            pass
+    signals['GEO_PATTERN'] = geo_sig
+
+    # ── R. GLOBAL CORRELATION SIGNAL ─────────────────────────────────────────
+    gcorr_sig = 0.0
+    gcorr_data_ml = {}
+    try:
+        gcorr_data_ml = _gcorr_fetch_global()
+        gcorr_sig = _gcorr_compute_signal(gcorr_data_ml)
+    except Exception:
+        gcorr_sig = 0.0
+    signals['GLOBAL_CORR'] = gcorr_sig
+
+    # ── 3. WEIGHTED ENSEMBLE (ML-style Random Forest voting) ─────────────────
+    weights = {
+        'PCR_OI':         0.12,
+        'PCR_VOL':        0.08,
+        'PCR_CHGOI':      0.10,
+        'IV_SKEW':        0.10,
+        'NET_PRESSURE':   0.10,
+        'PRESSURE_TREND': 0.04,
+        'GEX_REGIME':     0.06,
+        'NET_DELTA':      0.06,
+        'SENTIMENT':      0.08,
+        'COMPOSITE':      0.06,
+        'STRADDLE_EXPAND':0.03,
+        'BREAKOUT_SCORE': 0.05,
+        'PRICE_ACTION':   0.08,
+        'NEWS':           0.05,
+        'SECTOR':         0.03,
+        'IV_TREND':       0.06,
+        # Macro signals (inverse — rising = bearish)
+        'MACRO_VIX':      0.07,
+        'MACRO_USDINR':   0.04,
+        'MACRO_CRUDE':    0.03,
+        # NIFTY 50 multi-TF indicator signals
+        'IND_RSI_MULTI':   0.07,
+        'IND_VWAP_MULTI':  0.05,
+        'IND_TREND_MULTI': 0.06,
+        # Pattern signals
+        'CANDLE_PATTERN':  0.06,
+        'GEO_PATTERN':     0.08,
+        # Global correlation
+        'GLOBAL_CORR':     0.09,
+    }
+    # Normalise weights
+    w_total = sum(weights.values())
+    ensemble_score = sum(signals.get(k, 0) * weights[k] / w_total for k in weights)
+    # ensemble_score: -1 = strongly bearish, +1 = strongly bullish
+
+    # Confidence = agreement among signals
+    vals = [signals.get(k, 0) for k in weights]
+    bullish_votes = sum(1 for v in vals if v > 0.1)
+    bearish_votes = sum(1 for v in vals if v < -0.1)
+    neutral_votes = len(vals) - bullish_votes - bearish_votes
+    dominant = max(bullish_votes, bearish_votes)
+    confidence = round(dominant / len(vals) * 100) if vals else 50
+
+    # Map to readable label
+    if ensemble_score > 0.35:
+        ml_direction = "🟢 STRONGLY BULLISH"
+        ml_color = "#00C853"
+        ml_action = "Bias: BUY dips / hold longs"
+    elif ensemble_score > 0.12:
+        ml_direction = "🟢 MILDLY BULLISH"
+        ml_color = "#69F0AE"
+        ml_action = "Bias: Small longs, watch for breakout"
+    elif ensemble_score < -0.35:
+        ml_direction = "🔴 STRONGLY BEARISH"
+        ml_color = "#FF1744"
+        ml_action = "Bias: SELL rallies / hold shorts"
+    elif ensemble_score < -0.12:
+        ml_direction = "🔴 MILDLY BEARISH"
+        ml_color = "#FF5252"
+        ml_action = "Bias: Small shorts, watch for breakdown"
+    else:
+        ml_direction = "🟡 NEUTRAL / RANGE"
+        ml_color = "#FFD740"
+        ml_action = "Bias: Avoid naked directional trades; straddle or wait"
+
+    # GEX regime text
+    if net_gex > 50:
+        gex_text = "Strong PIN — dealers long gamma, price will revert to mean. Expect chop and range-bound action. Breakouts will be faded."
+    elif net_gex > 10:
+        gex_text = "Mild PIN — moderate dealer hedging caps sharp moves. Price likely oscillates around ATM."
+    elif net_gex < -50:
+        gex_text = "Strong TREND — dealers short gamma, forced to chase price. Moves can accelerate and extend beyond normal range."
+    elif net_gex < -10:
+        gex_text = "Mild TREND acceleration — gamma is not pinning price; directional moves have more room."
+    else:
+        gex_text = "Neutral GEX — no dominant dealer hedging pressure. Market direction will be driven by order flow."
+
+    # IV regime text
+    avg_iv = (avg_iv_ce + avg_iv_pe) / 2
+    if avg_iv > 20:
+        iv_regime = f"HIGH volatility (avg IV {avg_iv:.1f}%) — premiums are expensive. Prefer selling options or buying deep ITM. Expect large candles."
+    elif avg_iv > 12:
+        iv_regime = f"NORMAL volatility (avg IV {avg_iv:.1f}%) — fair premium environment. Both buyers and sellers have edge depending on direction."
+    else:
+        iv_regime = f"LOW volatility (avg IV {avg_iv:.1f}%) — premiums are cheap. Prefer buying options or straddles ahead of catalyst."
+
+    # IV skew interpretation
+    if iv_skew < 0.85:
+        skew_text = f"IV Skew {iv_skew:.3f} — CALL IV significantly cheaper than PUT IV. Market expects upside; smart money is buying calls or selling puts. Bullish."
+    elif iv_skew < 0.95:
+        skew_text = f"IV Skew {iv_skew:.3f} — Slight call discount. Mild bullish bias in options pricing."
+    elif iv_skew > 1.15:
+        skew_text = f"IV Skew {iv_skew:.3f} — PUT IV significantly more expensive than CALL IV. Market is paying up for downside protection. Bearish or hedging."
+    elif iv_skew > 1.05:
+        skew_text = f"IV Skew {iv_skew:.3f} — Mild put premium. Some downside protection being bought."
+    else:
+        skew_text = f"IV Skew {iv_skew:.3f} — Balanced. No directional bias in options pricing."
+
+    # PCR interpretation
+    if pcr_oi > 1.5:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Extremely high put writing. Dealers see strong support. Very bullish OI structure."
+    elif pcr_oi > 1.2:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Put writing dominant. Bullish OI structure — sellers expect floor holds."
+    elif pcr_oi < 0.7:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Extreme call writing. Strong resistance overhead. Bearish OI structure."
+    elif pcr_oi < 1.0:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Call writing slightly dominant. Mild resistance; market may struggle to push higher."
+    else:
+        pcr_text = f"PCR OI {pcr_oi:.2f} — Balanced OI. No clear directional bias from open interest."
+
+    # Pressure interpretation
+    if net_pres > 0.3:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Strong CALL-side aggression. Buyers actively hitting ask on calls. Momentum firmly up."
+    elif net_pres > 0.1:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Mild call bid pressure. Lean bullish flow."
+    elif net_pres < -0.3:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Strong PUT-side aggression. Sellers actively hitting bids on puts. Momentum firmly down."
+    elif net_pres < -0.1:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Mild put bid pressure. Lean bearish flow."
+    else:
+        pres_text = f"Net Pressure {net_pres:+.3f} — Balanced. Neither calls nor puts dominating flow."
+
+    # Sentiment narrative
+    if sent_score >= 75:
+        sent_text = f"Sentiment {sent_score}/100 — STRONG BULLISH TREND. Multiple pillars aligned upward. High-probability long environment."
+    elif sent_score >= 60:
+        sent_text = f"Sentiment {sent_score}/100 — Bullish lean. Most signals support upside but not overwhelmingly."
+    elif sent_score <= 25:
+        sent_text = f"Sentiment {sent_score}/100 — STRONG BEARISH. Broad-based selling pressure across options and price action."
+    elif sent_score <= 40:
+        sent_text = f"Sentiment {sent_score}/100 — Bearish lean. Risk-off environment; rallies likely sold."
+    else:
+        sent_text = f"Sentiment {sent_score}/100 — Neutral / Indecisive. Mixed signals; range-bound conditions likely."
+
+    # Price action narrative
+    if pa_sig >= 1.0:
+        pa_text = "Price action: EMA9 > EMA21 > EMA50 — Perfect bull alignment. Trend is intact across all timeframes."
+    elif pa_sig == 0.5:
+        pa_text = "Price action: Price above EMA21 but not full bull stack — partial uptrend, watch for breakout or failure."
+    elif pa_sig <= -1.0:
+        pa_text = "Price action: EMA9 < EMA21 < EMA50 — Perfect bear alignment. Trend is clearly down across all timeframes."
+    elif pa_sig == -0.5:
+        pa_text = "Price action: Price below EMA21 — short-term bearish, watch for potential mean-reversion or continuation."
+    else:
+        pa_text = "Price action: Insufficient candle data for EMA analysis."
+
+    # Spike signal
+    spike_score = _safe(_latest(spike_h, 'spike_score', 0), 0)
+    if spike_score >= 60:
+        spike_text = f"⚡ VOLUME SPIKE DETECTED (score {spike_score:.0f}/100) — Unusual options activity. Could signal institutional entry or news catalyst."
+    elif spike_score >= 30:
+        spike_text = f"Moderate activity (spike score {spike_score:.0f}/100) — Slightly elevated options flow."
+    else:
+        spike_text = f"Normal options flow (spike score {spike_score:.0f}/100)."
+
+    # FII/DII
+    fii_net = 0
+    try:
+        _fr = _fii_fetch_cash_data()
+        if _fr:
+            _fd = _fii_parse_cash(_fr)
+            if not _fd.empty:
+                fii_net = float(_fd['FII Net'].iloc[0])
+    except Exception:
+        pass
+    if fii_net > 1000:
+        fii_text = f"FII net ₹{fii_net:+,.0f} Cr — Strong institutional buying. Smart money is accumulating."
+    elif fii_net > 0:
+        fii_text = f"FII net ₹{fii_net:+,.0f} Cr — Mild FII buying. Supportive but not conviction-level."
+    elif fii_net < -1000:
+        fii_text = f"FII net ₹{fii_net:+,.0f} Cr — Heavy FII selling. Institutional distribution underway."
+    elif fii_net < 0:
+        fii_text = f"FII net ₹{fii_net:+,.0f} Cr — Mild FII selling. Caution warranted."
+    else:
+        fii_text = "FII/DII cash data unavailable (weekend/holiday or NSE API blocked)."
+
+    # Macro narrative
+    macro_lines = []
+    if _bn_data is not None:
+        vix_emoji = "🔴" if vix_pct > 1.0 else ("🟢" if vix_pct < -1.0 else "🟡")
+        macro_lines.append(f"{vix_emoji} India VIX {vix_pct:+.2f}% — {'Rising VIX signals fear/uncertainty (bearish)' if vix_pct > 1.0 else ('Falling VIX signals calm/confidence (bullish)' if vix_pct < -1.0 else 'VIX stable, no major macro fear')}")
+        usd_emoji = "🔴" if usdinr_pct > 0.3 else ("🟢" if usdinr_pct < -0.3 else "🟡")
+        macro_lines.append(f"{usd_emoji} USD/INR {usdinr_pct:+.2f}% — {'Rupee weakening, foreign outflows likely (bearish)' if usdinr_pct > 0.3 else ('Rupee strengthening, supportive for FII flows (bullish)' if usdinr_pct < -0.3 else 'Rupee stable')}")
+        crude_emoji = "🔴" if crude_pct > 2.0 else ("🟢" if crude_pct < -2.0 else "🟡")
+        macro_lines.append(f"{crude_emoji} Crude Oil {crude_pct:+.2f}% — {'Rising oil raises import costs, CAD risk (bearish)' if crude_pct > 2.0 else ('Falling oil eases inflation, positive for India (bullish)' if crude_pct < -2.0 else 'Crude stable, neutral macro impact')}")
+        macro_text = "\n".join(macro_lines)
+    else:
+        macro_text = "⚠ Macro data unavailable (yfinance not installed or network issue). VIX / USD/INR / Crude signals skipped."
+
+    # Indicator dashboard narrative
+    ind_lines = []
+    for tf_label, tf_key in [("Current (Daily)", "daily"), ("15m", "tf1"), ("60m", "tf2")]:
+        m = ind_metrics.get(tf_key)
+        if m is None:
+            ind_lines.append(f"[{tf_label}] — data unavailable")
+            continue
+        ltp_v  = m.get("ltp", 0)
+        vwap_v = m.get("vwap")
+        ema_v  = m.get("ema")
+        rsi_v  = m.get("rsi")
+        st_dir = m.get("st_dir")
+        adx_v  = m.get("adx", 0)
+        dip_v  = m.get("dip", 0)
+        dim_v  = m.get("dim", 0)
+        vwap_str = ("Above VWAP ✅" if ltp_v > vwap_v else "Below VWAP ❌") if vwap_v is not None else "—"
+        ema_str  = ("Above EMA20 ✅" if ltp_v > ema_v else "Below EMA20 ❌") if ema_v is not None else "—"
+        st_str   = ("SuperTrend UP ✅" if st_dir == -1 else "SuperTrend DOWN ❌") if st_dir is not None else "—"
+        rsi_str  = f"RSI {rsi_v:.1f}" if rsi_v is not None and not (isinstance(rsi_v, float) and np.isnan(rsi_v)) else "RSI —"
+        adx_str  = f"ADX {adx_v:.1f} ({'Trend' if adx_v >= 25 else 'Weak'})" if not (isinstance(adx_v, float) and np.isnan(adx_v)) else "ADX —"
+        di_str   = f"DI+ {dip_v:.1f} vs DI- {dim_v:.1f} → {'Bull' if dip_v > dim_v else 'Bear'}"
+        ind_lines.append(f"[{tf_label}] {vwap_str} | {ema_str} | {st_str} | {rsi_str} | {adx_str} | {di_str}")
+    ind_text = "\n".join(ind_lines) if ind_lines else "NIFTY 50 indicator data unavailable."
+
+    # Candle pattern narrative
+    if candle_pattern_data:
+        _cp_buy_list  = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'BUY']
+        _cp_sell_list = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'SELL']
+        _cp_neut_list = [p['pattern'] for p in candle_pattern_data if p['direction'] == 'NEUTRAL']
+        _cp_last = candle_pattern_data[-1]
+        candle_text = (
+            f"Last 30 bars: {len(_cp_buy_list)} BUY patterns, {len(_cp_sell_list)} SELL patterns, {len(_cp_neut_list)} NEUTRAL.\n"
+            f"Most recent: {_cp_last['pattern']} ({_cp_last['direction']}) @ ₹{_cp_last['price']:,.2f}\n"
+        )
+        if _cp_buy_list:
+            candle_text += f"Bullish candles: {', '.join(dict.fromkeys(_cp_buy_list))}\n"
+        if _cp_sell_list:
+            candle_text += f"Bearish candles: {', '.join(dict.fromkeys(_cp_sell_list))}"
+    else:
+        candle_text = "No candle patterns detected in the last 30 bars (insufficient data or no significant pattern formed)."
+
+    # Geometric pattern narrative
+    if geo_pattern_data:
+        geo_lines = []
+        for pat in geo_pattern_data:
+            sig_icon = "🟢" if pat.get('signal') == 'BUY' else ("🔴" if pat.get('signal') == 'SELL' else "🟡")
+            geo_lines.append(
+                f"{sig_icon} {pat['pattern']} — {pat.get('sentiment', '')} | "
+                f"Entry ₹{pat.get('entry', 0):,.0f} | SL ₹{pat.get('stoploss', 0):,.0f} | "
+                f"Target ₹{pat.get('target', 0):,.0f} | RR {pat.get('rr', 0):.1f}x | "
+                f"Confidence: {pat.get('confidence', '—')}"
+            )
+        geo_text = "\n".join(geo_lines)
+    else:
+        geo_text = "No geometric or reversal patterns detected on current data (pattern requires ≥15 bars with sufficient pivot swing structure)."
+
+    # Risk assessment
+    signal_spread = max(vals) - min(vals) if vals else 0
+    if signal_spread > 1.5 and confidence < 55:
+        risk_text = "⚠️ HIGH CONFLICT — Signals are contradicting each other significantly. Avoid high-leverage trades. Wait for clarity."
+    elif confidence < 50:
+        risk_text = "⚠️ MODERATE UNCERTAINTY — Mixed signals. Reduce position size and use wider stops."
+    elif confidence >= 75:
+        risk_text = "✅ HIGH CONVICTION — Most signals aligned. Acceptable risk for directional trades with normal sizing."
+    else:
+        risk_text = "✅ MODERATE CONVICTION — Reasonable signal alignment. Normal position sizing with defined SL."
+
+    # Global correlation narrative
+    if gcorr_data_ml:
+        gc_bull = [t["name"] for t in GCORR_TICKERS
+                   if t["yf"] in gcorr_data_ml and
+                   max(-1.0, min(1.0, gcorr_data_ml[t["yf"]]["pct"] / 3.0)) * t["corr"] > 0.05]
+        gc_bear = [t["name"] for t in GCORR_TICKERS
+                   if t["yf"] in gcorr_data_ml and
+                   max(-1.0, min(1.0, gcorr_data_ml[t["yf"]]["pct"] / 3.0)) * t["corr"] < -0.05]
+        gc_fetched = len(gcorr_data_ml)
+        if gcorr_sig > 0.30:
+            gcorr_text = (f"🌐 STRONGLY BULLISH global cues (score {gcorr_sig:+.3f}). "
+                          f"{gc_fetched} markets tracked. "
+                          f"Bullish drivers: {', '.join(gc_bull) if gc_bull else 'broad'} — "
+                          f"favours gap-up open and upside continuation for NIFTY.")
+        elif gcorr_sig > 0.10:
+            gcorr_text = (f"🌐 Mildly bullish global setup (score {gcorr_sig:+.3f}). "
+                          f"Positive contributors: {', '.join(gc_bull[:3]) if gc_bull else '—'}. "
+                          f"Gap-up bias but not high-conviction.")
+        elif gcorr_sig < -0.30:
+            gcorr_text = (f"🌐 STRONGLY BEARISH global cues (score {gcorr_sig:+.3f}). "
+                          f"Bearish drivers: {', '.join(gc_bear) if gc_bear else 'broad'} — "
+                          f"gap-down risk for NIFTY. Sell rallies until domestic data improves.")
+        elif gcorr_sig < -0.10:
+            gcorr_text = (f"🌐 Mildly bearish global setup (score {gcorr_sig:+.3f}). "
+                          f"Negative contributors: {', '.join(gc_bear[:3]) if gc_bear else '—'}. "
+                          f"Slight gap-down bias; watch key supports.")
+        else:
+            gcorr_text = (f"🌐 Mixed / neutral global cues (score {gcorr_sig:+.3f}). "
+                          f"Bullish: {', '.join(gc_bull[:2]) if gc_bull else '—'} | "
+                          f"Bearish: {', '.join(gc_bear[:2]) if gc_bear else '—'}. "
+                          f"NIFTY likely to open flat; direction set by domestic flows.")
+    else:
+        gcorr_text = "🌐 Global correlation data unavailable (yfinance not reachable or network issue). Signal defaulted to neutral."
+
+    # ── ADVANCED INTELLIGENCE MODULES (on top of ensemble) ───────────────────
+
+    # ── ADV-1: MARKET REGIME DETECTION ───────────────────────────────────────
+    _iv_trend_val      = _trend(iv_h, 'avg_iv_ce', window=5)
+    _straddle_trend_v  = _trend(pro_h, 'straddle_atm', window=5)
+    _bo_score_val      = bo_score
+
+    if net_gex > 20 and vix_pct < 0:
+        market_regime      = "🔒 LOW VOLATILITY RANGE"
+        regime_color       = "#FFD740"
+        regime_desc        = "GEX positive + VIX falling — dealers long gamma, price pinned. Expect chop and mean-reversion. Avoid naked directional trades."
+        regime_code        = "RANGE"
+    elif net_gex < -20 and _bo_score_val > 55:
+        market_regime      = "🚀 TRENDING MARKET"
+        regime_color       = "#00C853"
+        regime_desc        = "Negative GEX + rising breakout score — dealers short gamma, forced to chase price. Moves can extend and accelerate."
+        regime_code        = "TREND"
+    elif _iv_trend_val > 0 and _straddle_trend_v > 0:
+        market_regime      = "💥 HIGH VOLATILITY EXPANSION"
+        regime_color       = "#FF5252"
+        regime_desc        = "IV rising + straddle expanding — uncertainty spike incoming. Large candles expected. Favour debit spreads or long straddles."
+        regime_code        = "EXPANSION"
+    elif net_gex > 10 and abs(signals.get('BREAKOUT_SCORE', 0)) < 0.2:
+        market_regime      = "🗜️ GAMMA COMPRESSION"
+        regime_color       = "#FF9800"
+        regime_desc        = "GEX positive + low breakout score — price compressed near ATM. Explosive directional move building. Prepare for expansion."
+        regime_code        = "COMPRESSION"
+    elif _bo_score_val > 60 and net_gex < 5:
+        market_regime      = "⚡ PRE-BREAKOUT SETUP"
+        regime_color       = "#40C4FF"
+        regime_desc        = "High breakout score + low GEX resistance — conditions ripe for imminent directional breakout. Watch key levels closely."
+        regime_code        = "PRE_BREAKOUT"
+    else:
+        market_regime      = "🟡 NEUTRAL / TRANSITIONING"
+        regime_color       = "#888888"
+        regime_desc        = "Mixed regime signals. Market transitioning between states. Wait for one regime to dominate before committing capital."
+        regime_code        = "NEUTRAL"
+
+    # ── ADV-2: INSTITUTIONAL ACTIVITY DETECTION ───────────────────────────────
+    _pcr_trend_v   = _trend(pro_h, 'pcr_oi', window=5)
+    _delta_trend_v = _trend(pro_h, 'net_delta', window=5)
+    _price_rising  = pa_sig > 0
+    _price_falling = pa_sig < 0
+    _pres_positive = net_pres > 0.05
+    _pres_negative = net_pres < -0.05
+    _pcr_rising    = _pcr_trend_v > 0
+    _pcr_falling   = _pcr_trend_v < 0
+    _delta_positive = net_delta > 0
+
+    if _price_rising and _pcr_rising and _delta_positive and _pres_positive:
+        inst_activity  = "📈 LONG BUILD-UP"
+        inst_color     = "#00C853"
+        inst_desc      = ("Price rising + PCR rising + positive net delta + call-side pressure — "
+                          "institutions systematically building long positions. High-quality bullish signal.")
+        inst_code      = "LONG_BUILD"
+    elif _price_falling and _pcr_falling and _pres_negative:
+        inst_activity  = "📉 SHORT BUILD-UP"
+        inst_color     = "#FF5252"
+        inst_desc      = ("Price falling + PCR falling + put-side pressure — "
+                          "institutions accumulating short positions. Bearish distribution underway.")
+        inst_code      = "SHORT_BUILD"
+    elif _price_rising and _pcr_falling and not _delta_positive:
+        inst_activity  = "🔄 SHORT COVERING"
+        inst_color     = "#FFD740"
+        inst_desc      = ("Price rising + PCR falling + negative delta — shorts being covered, NOT fresh longs. "
+                          "Rally driven by forced buying. Watch for rally to fade once covering is exhausted.")
+        inst_code      = "SHORT_COVER"
+    elif _price_falling and _pcr_rising and _delta_positive:
+        inst_activity  = "🔄 LONG UNWINDING"
+        inst_color     = "#FF9800"
+        inst_desc      = ("Price falling + PCR rising + positive delta — existing longs being exited. "
+                          "Bearish distribution. Smart money reducing exposure into dips.")
+        inst_code      = "LONG_UNWIND"
+    else:
+        inst_activity  = "⚪ NEUTRAL / MIXED"
+        inst_color     = "#888888"
+        inst_desc      = ("No clear institutional directional bias detected from current PCR / delta / pressure combination. "
+                          "Positioning is mixed — wait for a cleaner signal.")
+        inst_code      = "NEUTRAL"
+
+    # ── ADV-3: SIGNAL CLUSTERING ───────────────────────────────────────────────
+    OPTIONS_CLUSTER = ['PCR_OI', 'PCR_VOL', 'PCR_CHGOI', 'IV_SKEW', 'NET_DELTA', 'STRADDLE_EXPAND', 'GEX_REGIME']
+    PRICE_CLUSTER   = ['PRICE_ACTION', 'BREAKOUT_SCORE', 'IND_VWAP_MULTI', 'IND_TREND_MULTI', 'CANDLE_PATTERN', 'GEO_PATTERN']
+    MACRO_CLUSTER   = ['MACRO_USDINR', 'MACRO_VIX', 'MACRO_CRUDE', 'GLOBAL_CORR']
+    FLOW_CLUSTER    = ['NET_PRESSURE', 'PRESSURE_TREND', 'SENTIMENT', 'COMPOSITE', 'SECTOR', 'NEWS', 'IV_TREND', 'IND_RSI_MULTI']
+
+    def _cluster_avg(keys):
+        _vs = [signals.get(k, 0) for k in keys]
+        return sum(_vs) / len(_vs) if _vs else 0.0
+
+    cluster_options = _cluster_avg(OPTIONS_CLUSTER)
+    cluster_price   = _cluster_avg(PRICE_CLUSTER)
+    cluster_macro   = _cluster_avg(MACRO_CLUSTER)
+    cluster_flow    = _cluster_avg(FLOW_CLUSTER)
+
+    clusters = {
+        'OPTIONS': cluster_options,
+        'PRICE':   cluster_price,
+        'MACRO':   cluster_macro,
+        'FLOW':    cluster_flow,
+    }
+
+    _bull_clusters    = sum(1 for v in clusters.values() if v > 0.1)
+    _bear_clusters    = sum(1 for v in clusters.values() if v < -0.1)
+    _dominant_clust   = max(_bull_clusters, _bear_clusters)
+    _cluster_dir      = "BULL" if _bull_clusters >= _bear_clusters else "BEAR"
+
+    if _dominant_clust >= 3:
+        cluster_alignment  = "💪 STRONG — 3+ Clusters Aligned"
+        cluster_align_col  = "#00C853" if _cluster_dir == "BULL" else "#FF5252"
+        cluster_desc       = (f"{_bull_clusters} bullish / {_bear_clusters} bearish clusters. "
+                              f"High-conviction move likely. {'Bullish' if _cluster_dir == 'BULL' else 'Bearish'} pressure dominant across multiple market dimensions.")
+        cluster_strength   = "STRONG"
+    elif _dominant_clust == 2:
+        cluster_alignment  = "🔶 MODERATE — 2 Clusters Aligned"
+        cluster_align_col  = "#FFD740"
+        cluster_desc       = (f"{_bull_clusters} bullish / {_bear_clusters} bearish clusters. "
+                              f"Moderate conviction. Await 3rd cluster confirmation for high-probability trade.")
+        cluster_strength   = "MODERATE"
+    else:
+        cluster_alignment  = "⚪ WEAK — Clusters Conflicting"
+        cluster_align_col  = "#888888"
+        cluster_desc       = "Clusters pulling in different directions. Low-confidence environment. Reduce size, use straddles, or stay flat."
+        cluster_strength   = "WEAK"
+
+    # ── ADV-4: TRAP DETECTION ─────────────────────────────────────────────────
+    _vwap_above  = ind_vwap_score > 0
+    _put_writing = pcr_oi > 1.2 and _pcr_rising
+
+    if signals.get('BREAKOUT_SCORE', 0) > 0.3 and net_gex > 15 and _pcr_falling:
+        trap_type  = "🪤 POSSIBLE BULL TRAP"
+        trap_color = "#FF9800"
+        trap_desc  = ("Breakout score high BUT GEX is pinning price AND PCR falling — "
+                      "breakout may be false. Institutions may be distributing into retail strength. "
+                      "Use tight stops on longs; watch for quick reversal below breakout level.")
+        trap_code  = "BULL_TRAP"
+    elif signals.get('BREAKOUT_SCORE', 0) < -0.3 and _put_writing and _vwap_above:
+        trap_type  = "🪤 POSSIBLE BEAR TRAP"
+        trap_color = "#FF9800"
+        trap_desc  = ("Breakdown signal BUT put writing is INCREASING and price holding VWAP — "
+                      "shorts may be trapped. A sharp short-squeeze reversal is possible. "
+                      "Avoid fresh shorts; wait for VWAP to break convincingly.")
+        trap_code  = "BEAR_TRAP"
+    elif abs(net_pres) > 0.25 and abs(pa_sig) < 0.3:
+        trap_type  = "💧 LIQUIDITY TRAP / ABSORPTION"
+        trap_color = "#FF9800"
+        trap_desc  = ("Strong order flow pressure but price barely moving — "
+                      "large institutional players are absorbing the flow silently. "
+                      "Direction will become clear once absorption completes. Wait for price to 'pop'.")
+        trap_code  = "LIQUIDITY_TRAP"
+    else:
+        trap_type  = "✅ NO TRAP DETECTED"
+        trap_color = "#00C853"
+        trap_desc  = "No classic bull/bear/liquidity trap patterns detected in current data. Signals appear genuine."
+        trap_code  = "NONE"
+
+    # ── ADV-5: MOMENTUM SHIFT DETECTOR ────────────────────────────────────────
+    _chgoi_trend_v  = _trend(pro_h, 'pcr_chgoi', window=5)
+    _sent_trend_v   = _trend(sent_h, 'sentiment_score', window=5)
+    _pres_trend_now = _trend(pres_h, 'net_pressure', window=3)
+
+    momentum_shift       = "⚪ NOT DETECTED"
+    momentum_shift_color = "#888888"
+    momentum_shift_desc  = "No significant momentum transition event detected. Current trend continuing without shift signals."
+    momentum_shift_code  = "NONE"
+
+    if _chgoi_trend_v > 0 and _delta_trend_v > 0 and _pres_trend_now > 0 and not _price_rising:
+        momentum_shift       = "🔄 SHORT COVERING → LONG BUILD-UP"
+        momentum_shift_color = "#00C853"
+        momentum_shift_desc  = ("PCR ChgOI rising + delta turning positive + improving order pressure — "
+                                "short positions being covered and fresh longs building simultaneously. "
+                                "High-probability trend reversal UP. Watch for breakout confirmation.")
+        momentum_shift_code  = "SHORT_COVER_TO_LONG"
+    elif _price_rising and _delta_trend_v < 0 and _pres_trend_now < 0 and _sent_trend_v < 0:
+        momentum_shift       = "🔄 LONG BUILD-UP → DISTRIBUTION"
+        momentum_shift_color = "#FF9800"
+        momentum_shift_desc  = ("Price rising but delta weakening + pressure falling + sentiment declining — "
+                                "smart money distributing into retail FOMO buying. Classic topping signal. "
+                                "Reduce longs, tighten stops.")
+        momentum_shift_code  = "LONG_TO_DISTRIBUTION"
+    elif _pcr_falling and _delta_trend_v < 0 and _pres_trend_now < 0:
+        momentum_shift       = "📉 SHORT BUILD-UP → BREAKDOWN"
+        momentum_shift_color = "#FF5252"
+        momentum_shift_desc  = ("PCR falling + delta turning negative + put pressure rising — "
+                                "fresh short positions accelerating. Breakdown momentum building. "
+                                "Avoid catching falling knife; trade only on bounces.")
+        momentum_shift_code  = "BUILD_TO_BREAKDOWN"
+
+    # ── ADV-6: NEXT MOVE PROBABILITY ──────────────────────────────────────────
+    base_bull  = max(0.0, ensemble_score)
+    base_bear  = max(0.0, -ensemble_score)
+    base_range = max(0.05, 1.0 - abs(ensemble_score))
+
+    _clu_avg           = sum(clusters.values()) / 4
+    cluster_bull_boost = max(0, _clu_avg) * 0.15
+    cluster_bear_boost = max(0, -_clu_avg) * 0.15
+
+    inst_bull_boost = 0.10 if inst_code == "LONG_BUILD"  else (0.05 if inst_code == "SHORT_COVER" else 0.0)
+    inst_bear_boost = 0.10 if inst_code == "SHORT_BUILD" else (0.05 if inst_code == "LONG_UNWIND" else 0.0)
+
+    regime_bull_boost  = 0.08 if (regime_code in ("TREND", "PRE_BREAKOUT") and ensemble_score > 0) else 0.0
+    regime_bear_boost  = 0.08 if (regime_code in ("TREND", "PRE_BREAKOUT") and ensemble_score < 0) else 0.0
+    regime_range_boost = 0.10 if regime_code in ("RANGE", "COMPRESSION") else 0.0
+
+    mom_bull_boost = 0.07 if momentum_shift_code == "SHORT_COVER_TO_LONG"  else 0.0
+    mom_bear_boost = 0.07 if momentum_shift_code == "BUILD_TO_BREAKDOWN"   else 0.0
+    mom_dist_boost = 0.05 if momentum_shift_code == "LONG_TO_DISTRIBUTION" else 0.0
+
+    trap_bull_penalty  = 0.10 if trap_code == "BULL_TRAP"  else 0.0
+    trap_bear_penalty  = 0.10 if trap_code == "BEAR_TRAP"  else 0.0
+
+    raw_bull  = max(0.0, base_bull  + cluster_bull_boost + inst_bull_boost  + regime_bull_boost + mom_bull_boost - trap_bull_penalty)
+    raw_bear  = max(0.0, base_bear  + cluster_bear_boost + inst_bear_boost  + regime_bear_boost + mom_bear_boost + mom_dist_boost - trap_bear_penalty)
+    raw_range = max(0.05, (base_range + regime_range_boost) * 0.5)
+
+    _total_raw = raw_bull + raw_bear + raw_range
+    prob_bull  = round((raw_bull  / _total_raw) * 100)
+    prob_bear  = round((raw_bear  / _total_raw) * 100)
+    prob_range = max(0, 100 - prob_bull - prob_bear)
+
+    _max_prob = max(prob_bull, prob_bear, prob_range)
+    if _max_prob >= 60:
+        prob_confidence   = "🟢 HIGH"
+        prob_conf_color   = "#00C853"
+    elif _max_prob >= 45:
+        prob_confidence   = "🟡 MEDIUM"
+        prob_conf_color   = "#FFD740"
+    else:
+        prob_confidence   = "🔴 LOW"
+        prob_conf_color   = "#FF5252"
+
+    # ── ADV-7: SMART MONEY CONFIRMATION ───────────────────────────────────────
+    _pcr_high            = pcr_oi > 1.2
+    _put_writing_active  = _pcr_high and _pcr_rising
+    _delta_bull          = net_delta > 0
+    _above_vwap          = ind_vwap_score > 0
+
+    sm_bull_score = sum([
+        1 if _put_writing_active else 0,
+        1 if _delta_bull else 0,
+        1 if _above_vwap else 0,
+        1 if net_pres > 0.1 else 0,
+        1 if pcr_vol > 1.1 else 0,
+    ])
+    sm_bear_score = sum([
+        1 if (pcr_oi < 0.8 and _pcr_falling) else 0,
+        1 if not _delta_bull else 0,
+        1 if not _above_vwap else 0,
+        1 if net_pres < -0.1 else 0,
+        1 if pcr_vol < 0.9 else 0,
+    ])
+
+    if sm_bull_score >= 4:
+        smart_money  = "🐋 SMART MONEY LONG"
+        sm_color     = "#00C853"
+        sm_desc      = (f"Score {sm_bull_score}/5 — "
+                        f"{'Put writing ✅ ' if _put_writing_active else ''}"
+                        f"{'Delta+ ✅ ' if _delta_bull else ''}"
+                        f"{'Above VWAP ✅ ' if _above_vwap else ''}"
+                        f"{'Call pressure ✅ ' if net_pres > 0.1 else ''}"
+                        f"Strong institutional long confirmation. High-quality entry zone for longs.")
+        sm_code      = "LONG"
+    elif sm_bull_score >= 3:
+        smart_money  = "🟢 SMART MONEY LEANING LONG"
+        sm_color     = "#69F0AE"
+        sm_desc      = f"Score {sm_bull_score}/5 — Moderate long bias. Not full conviction. Reduce size until 4th condition confirms."
+        sm_code      = "LEAN_LONG"
+    elif sm_bear_score >= 4:
+        smart_money  = "🐻 SMART MONEY SHORT"
+        sm_color     = "#FF5252"
+        sm_desc      = (f"Score {sm_bear_score}/5 — "
+                        f"{'Call writing ✅ ' if (pcr_oi < 0.8 and _pcr_falling) else ''}"
+                        f"{'Delta- ✅ ' if not _delta_bull else ''}"
+                        f"{'Below VWAP ✅ ' if not _above_vwap else ''}"
+                        f"{'Put pressure ✅ ' if net_pres < -0.1 else ''}"
+                        f"Strong institutional short confirmation. High-quality entry zone for shorts.")
+        sm_code      = "SHORT"
+    elif sm_bear_score >= 3:
+        smart_money  = "🔴 SMART MONEY LEANING SHORT"
+        sm_color     = "#FF5252"
+        sm_desc      = f"Score {sm_bear_score}/5 — Moderate short bias. Not full conviction. Await 4th condition."
+        sm_code      = "LEAN_SHORT"
+    else:
+        smart_money  = "⚪ SMART MONEY NEUTRAL"
+        sm_color     = "#888888"
+        sm_desc      = (f"Bull conditions: {sm_bull_score}/5 | Bear conditions: {sm_bear_score}/5 — "
+                        "No clear institutional directional bias. Institutions sitting on the fence.")
+        sm_code      = "NEUTRAL"
+
+    # ── 4. UI RENDERING ───────────────────────────────────────────────────────
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,{ml_color}18,{ml_color}08);
+                border:2px solid {ml_color};border-radius:14px;padding:20px;margin-bottom:18px;">
+        <div style="font-size:13px;color:#aaa;letter-spacing:1px;">ML ENSEMBLE MARKET VERDICT</div>
+        <div style="font-size:28px;font-weight:bold;color:{ml_color};margin:6px 0;">{ml_direction}</div>
+        <div style="font-size:14px;color:#ccc;">{ml_action}</div>
+        <div style="margin-top:10px;display:flex;gap:30px;flex-wrap:wrap;">
+            <div><span style="color:#888;font-size:12px;">ENSEMBLE SCORE</span><br>
+                 <span style="font-size:20px;font-weight:bold;color:{ml_color};">{ensemble_score:+.3f}</span>
+                 <span style="font-size:11px;color:#888;"> / ±1.0</span></div>
+            <div><span style="color:#888;font-size:12px;">SIGNAL CONFIDENCE</span><br>
+                 <span style="font-size:20px;font-weight:bold;color:#FFD740;">{confidence}%</span>
+                 <span style="font-size:11px;color:#888;"> ({dominant}/{len(vals)} agree)</span></div>
+            <div><span style="color:#888;font-size:12px;">VOTE BREAKDOWN</span><br>
+                 <span style="color:#00C853;">🟢 {bullish_votes} bull</span> &nbsp;
+                 <span style="color:#FF5252;">🔴 {bearish_votes} bear</span> &nbsp;
+                 <span style="color:#888;">⚪ {neutral_votes} neutral</span></div>
+            <div><span style="color:#888;font-size:12px;">SPOT PRICE</span><br>
+                 <span style="font-size:20px;font-weight:bold;color:#ccc;">₹{spot:,.2f}</span></div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Signal radar bar
+    st.markdown("#### 📊 Signal Radar — All 24 Inputs")
+    _sig_names  = list(weights.keys())
+    _sig_values = [signals.get(k, 0) for k in _sig_names]
+    _sig_colors = ['#00C853' if v > 0.05 else ('#FF5252' if v < -0.05 else '#FFD740') for v in _sig_values]
+    import plotly.graph_objects as go
+    _fig_radar = go.Figure(go.Bar(
+        x=_sig_names, y=_sig_values,
+        marker_color=_sig_colors,
+        text=[f"{v:+.2f}" for v in _sig_values],
+        textposition='outside',
+    ))
+    _fig_radar.update_layout(
+        height=260, margin=dict(l=10, r=10, t=30, b=60),
+        paper_bgcolor='#111', plot_bgcolor='#111',
+        font=dict(color='#ccc', size=10),
+        yaxis=dict(range=[-1.2, 1.2], zeroline=True, zerolinecolor='#555',
+                   gridcolor='#333', title='Signal Value (-1 bear … +1 bull)'),
+        xaxis=dict(tickangle=-35, gridcolor='#333'),
+        title=dict(text='ML Feature Vector — 24 signals normalised to -1…+1', font=dict(size=12)),
+    )
+    _fig_radar.add_hline(y=0.12,  line_dash='dash', line_color='#00C853', line_width=1)
+    _fig_radar.add_hline(y=-0.12, line_dash='dash', line_color='#FF5252', line_width=1)
+    st.plotly_chart(_fig_radar, use_container_width=True)
+
+    # Narrative sections
+    st.markdown("#### 🗣️ Plain-English Market Narrative")
+    sections = [
+        ("🎯 Overall Direction",        ml_direction + f" (score {ensemble_score:+.3f})"),
+        ("⚡ Market Regime (GEX)",       gex_text),
+        ("📐 Options OI Structure",      pcr_text),
+        ("📡 IV Skew & Volatility",      f"{skew_text}\n\n{iv_regime}"),
+        ("🌊 Real-time Order Flow",      f"{pres_text}\n\n{spike_text}"),
+        ("😊 Unified Sentiment",         sent_text),
+        ("📈 Price Action (EMA)",        pa_text),
+        ("🏦 Institutional Flow (FII)",  fii_text),
+        ("🛡️ Risk & Conviction",         risk_text),
+        ("⚠ Macro Signals",             macro_text),
+        ("📐 NIFTY Indicator Dashboard", ind_text),
+        ("🕯️ Candle Patterns Detected",  candle_text),
+        ("🔔 Geometric & Reversal Patterns", geo_text),
+        ("🌐 Global Correlation (Pre-Market)", gcorr_text),
+    ]
+
+    for title, body in sections:
+        st.markdown(f"""
+        <div style="background:#1a1a2e;border-left:3px solid {ml_color};
+                    padding:12px 16px;border-radius:6px;margin-bottom:8px;">
+            <div style="font-size:13px;font-weight:bold;color:{ml_color};margin-bottom:4px;">{title}</div>
+            <div style="font-size:13px;color:#ddd;white-space:pre-line;">{body}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── ADVANCED INTELLIGENCE REPORT ─────────────────────────────────────────
+    st.markdown("---")
+    st.markdown("### 🧠 Advanced ML Market Intelligence Report")
+    st.caption("Regime Detection · Institutional Positioning · Cluster Alignment · Trap Detection · Smart Money · Probability Engine")
+
+    # ── SUMMARY HEADER CARD ───────────────────────────────────────────────────
+    _prob_lead = "BULLISH" if prob_bull >= prob_bear and prob_bull >= prob_range else ("BEARISH" if prob_bear >= prob_range else "RANGE")
+    _prob_lead_pct = prob_bull if _prob_lead == "BULLISH" else (prob_bear if _prob_lead == "BEARISH" else prob_range)
+    _prob_lead_col = "#00C853" if _prob_lead == "BULLISH" else ("#FF5252" if _prob_lead == "BEARISH" else "#FFD740")
+
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#1a1a2e,#0d0d1e);
+                border:1px solid #333;border-radius:14px;padding:18px;margin-bottom:16px;">
+        <div style="font-size:11px;color:#888;letter-spacing:2px;margin-bottom:8px;">ADVANCED ML INTELLIGENCE SUMMARY</div>
+        <div style="display:flex;gap:24px;flex-wrap:wrap;align-items:center;">
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">MARKET REGIME</div>
+                <div style="font-size:14px;font-weight:bold;color:{regime_color};">{market_regime}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">INSTITUTIONAL ACTIVITY</div>
+                <div style="font-size:14px;font-weight:bold;color:{inst_color};">{inst_activity}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">CLUSTER ALIGNMENT</div>
+                <div style="font-size:14px;font-weight:bold;color:{cluster_align_col};">{cluster_alignment}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">TRAP RISK</div>
+                <div style="font-size:14px;font-weight:bold;color:{trap_color};">{trap_type}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">MOMENTUM SHIFT</div>
+                <div style="font-size:14px;font-weight:bold;color:{momentum_shift_color};">{momentum_shift}</div>
+            </div>
+            <div style="text-align:center;">
+                <div style="font-size:10px;color:#888;">SMART MONEY</div>
+                <div style="font-size:14px;font-weight:bold;color:{sm_color};">{smart_money}</div>
+            </div>
+            <div style="text-align:center;background:#0d1117;border-radius:8px;padding:8px 14px;border:1px solid {_prob_lead_col}44;">
+                <div style="font-size:10px;color:#888;">NEXT MOVE PROBABILITY</div>
+                <div style="font-size:22px;font-weight:bold;color:{_prob_lead_col};">{_prob_lead_pct}%</div>
+                <div style="font-size:11px;color:{_prob_lead_col};">{_prob_lead}</div>
+                <div style="font-size:10px;color:{prob_conf_color};">{prob_confidence} CONFIDENCE</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── DETAILED MODULE CARDS (2-column layout) ────────────────────────────────
+    _adv_col1, _adv_col2 = st.columns(2)
+
+    with _adv_col1:
+        # ADV-1: Market Regime
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {regime_color}55;border-left:3px solid {regime_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 1 — MARKET REGIME</div>
+            <div style="font-size:16px;font-weight:bold;color:{regime_color};margin:4px 0;">{market_regime}</div>
+            <div style="font-size:12px;color:#ccc;">{regime_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-3: Signal Clusters — Plotly horizontal bar (flexbox CSS unreliable in Streamlit)
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {cluster_align_col}55;border-left:3px solid {cluster_align_col};
+                    border-radius:8px 8px 0 0;padding:14px 14px 4px 14px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 3 — SIGNAL CLUSTER ALIGNMENT</div>
+            <div style="font-size:15px;font-weight:bold;color:{cluster_align_col};margin:4px 0 0 0;">{cluster_alignment}</div>
+        </div>
+        """, unsafe_allow_html=True)
+        _clust_names  = ["FLOW", "MACRO", "PRICE", "OPTIONS"]  # bottom→top in horizontal chart
+        _clust_vals   = [cluster_flow, cluster_macro, cluster_price, cluster_options]
+        _clust_colors = ["#00C853" if v > 0.1 else ("#FF5252" if v < -0.1 else "#FFD740") for v in _clust_vals]
+        _clust_labels = [f"{v:+.2f}" for v in _clust_vals]
+        _fig_clust = go.Figure(go.Bar(
+            x=_clust_vals,
+            y=_clust_names,
+            orientation='h',
+            marker_color=_clust_colors,
+            text=_clust_labels,
+            textposition='outside',
+            textfont=dict(size=11),
+            cliponaxis=False,
+        ))
+        _fig_clust.update_layout(
+            height=155,
+            margin=dict(l=10, r=55, t=4, b=4),
+            paper_bgcolor='#0d1117',
+            plot_bgcolor='#0d1117',
+            font=dict(color='#ccc', size=11),
+            xaxis=dict(range=[-1.2, 1.2], zeroline=True, zerolinecolor='#555',
+                       gridcolor='#1e1e1e', showticklabels=False),
+            yaxis=dict(gridcolor='#1e1e1e'),
+            showlegend=False,
+        )
+        _fig_clust.add_vline(x=0.1,  line_dash='dot', line_color='#00C853', line_width=1)
+        _fig_clust.add_vline(x=-0.1, line_dash='dot', line_color='#FF5252', line_width=1)
+        st.plotly_chart(_fig_clust, use_container_width=True, config={'displayModeBar': False})
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {cluster_align_col}33;border-left:3px solid {cluster_align_col};
+                    border-radius:0 0 8px 8px;padding:6px 14px 12px 14px;margin-top:-24px;margin-bottom:10px;">
+            <div style="font-size:12px;color:#aaa;">{cluster_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-5: Momentum Shift
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {momentum_shift_color}55;border-left:3px solid {momentum_shift_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 5 — MOMENTUM SHIFT DETECTOR</div>
+            <div style="font-size:15px;font-weight:bold;color:{momentum_shift_color};margin:4px 0;">{momentum_shift}</div>
+            <div style="font-size:12px;color:#ccc;">{momentum_shift_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-7: Smart Money
+        _sm_bars = [
+            ("Put Writing",   _put_writing_active,   sm_bull_score >= 1),
+            ("Net Delta +",   _delta_bull,            sm_bull_score >= 1),
+            ("Above VWAP",    _above_vwap,            True),
+            ("Call Pressure", net_pres > 0.1,         True),
+            ("PCR Vol >1.1",  pcr_vol > 1.1,          True),
+        ]
+        _sm_check_html = "".join([
+            f'<span style="color:{"#00C853" if cond else "#555"};font-size:12px;margin-right:8px;">{"✅" if cond else "⬜"} {lbl}</span>'
+            for lbl, cond, _ in _sm_bars
+        ])
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {sm_color}55;border-left:3px solid {sm_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 7 — SMART MONEY CONFIRMATION</div>
+            <div style="font-size:16px;font-weight:bold;color:{sm_color};margin:4px 0;">{smart_money}</div>
+            <div style="margin:6px 0;flex-wrap:wrap;">{_sm_check_html}</div>
+            <div style="font-size:12px;color:#aaa;margin-top:4px;">{sm_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with _adv_col2:
+        # ADV-2: Institutional Activity
+        _inst_indicators = [
+            ("Price Action", "Rising ▲" if _price_rising else ("Falling ▼" if _price_falling else "Flat"), "#00C853" if _price_rising else ("#FF5252" if _price_falling else "#888")),
+            ("PCR Trend",    "Rising ▲" if _pcr_rising else ("Falling ▼" if _pcr_falling else "Flat"),    "#00C853" if _pcr_rising else ("#FF5252" if _pcr_falling else "#888")),
+            ("Net Delta",    f"{net_delta:+.0f}",                                                           "#00C853" if _delta_positive else "#FF5252"),
+            ("Order Pressure", f"{net_pres:+.3f}",                                                          "#00C853" if _pres_positive else ("#FF5252" if _pres_negative else "#888")),
+        ]
+        _inst_html = "".join([
+            f'<div style="display:flex;justify-content:space-between;padding:3px 0;border-bottom:1px solid #1e1e1e;">'
+            f'<span style="font-size:11px;color:#888;">{lbl}</span>'
+            f'<span style="font-size:11px;font-weight:bold;color:{col};">{val}</span></div>'
+            for lbl, val, col in _inst_indicators
+        ])
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {inst_color}55;border-left:3px solid {inst_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 2 — INSTITUTIONAL ACTIVITY</div>
+            <div style="font-size:16px;font-weight:bold;color:{inst_color};margin:4px 0;">{inst_activity}</div>
+            {_inst_html}
+            <div style="font-size:12px;color:#aaa;margin-top:8px;">{inst_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-4: Trap Detection
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {trap_color}55;border-left:3px solid {trap_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 4 — TRAP DETECTION ENGINE</div>
+            <div style="font-size:15px;font-weight:bold;color:{trap_color};margin:4px 0;">{trap_type}</div>
+            <div style="font-size:12px;color:#ccc;">{trap_desc}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+        # ADV-6: Next Move Probability
+        _pb_bar  = int(prob_bull)
+        _pbe_bar = int(prob_bear)
+        _pr_bar  = int(prob_range)
+        st.markdown(f"""
+        <div style="background:#0d1117;border:1px solid {prob_conf_color}55;border-left:3px solid {prob_conf_color};
+                    border-radius:8px;padding:14px;margin-bottom:10px;">
+            <div style="font-size:11px;color:#888;letter-spacing:1px;">MODULE 6 — NEXT MOVE PROBABILITY</div>
+            <div style="margin:8px 0;">
+                <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                    <span style="font-size:12px;color:#00C853;">🟢 Bullish</span>
+                    <span style="font-size:13px;font-weight:bold;color:#00C853;">{prob_bull}%</span>
+                </div>
+                <div style="background:#1a1a2e;border-radius:4px;height:10px;overflow:hidden;margin-bottom:6px;">
+                    <div style="width:{_pb_bar}%;background:#00C853;height:100%;border-radius:4px;"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                    <span style="font-size:12px;color:#FF5252;">🔴 Bearish</span>
+                    <span style="font-size:13px;font-weight:bold;color:#FF5252;">{prob_bear}%</span>
+                </div>
+                <div style="background:#1a1a2e;border-radius:4px;height:10px;overflow:hidden;margin-bottom:6px;">
+                    <div style="width:{_pbe_bar}%;background:#FF5252;height:100%;border-radius:4px;"></div>
+                </div>
+                <div style="display:flex;justify-content:space-between;margin-bottom:3px;">
+                    <span style="font-size:12px;color:#FFD740;">🟡 Range</span>
+                    <span style="font-size:13px;font-weight:bold;color:#FFD740;">{prob_range}%</span>
+                </div>
+                <div style="background:#1a1a2e;border-radius:4px;height:10px;overflow:hidden;margin-bottom:6px;">
+                    <div style="width:{_pr_bar}%;background:#FFD740;height:100%;border-radius:4px;"></div>
+                </div>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-top:6px;padding-top:8px;border-top:1px solid #222;">
+                <span style="font-size:11px;color:#888;">Confidence Level</span>
+                <span style="font-size:13px;font-weight:bold;color:{prob_conf_color};">{prob_confidence}</span>
+            </div>
+            <div style="font-size:10px;color:#666;margin-top:4px;">Inputs: Ensemble · Clusters · Institutions · Regime · Traps · Momentum</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── FINAL INTELLIGENCE VERDICT ─────────────────────────────────────────────
+    _final_signals_aligned = (
+        (sm_code in ("LONG", "LEAN_LONG") and _prob_lead == "BULLISH" and inst_code in ("LONG_BUILD", "SHORT_COVER") and trap_code == "NONE") or
+        (sm_code in ("SHORT", "LEAN_SHORT") and _prob_lead == "BEARISH" and inst_code in ("SHORT_BUILD", "LONG_UNWIND") and trap_code == "NONE")
+    )
+    _final_dir_col  = "#00C853" if _prob_lead == "BULLISH" else ("#FF5252" if _prob_lead == "BEARISH" else "#FFD740")
+    _conviction_tag = "⚡ HIGH CONVICTION" if (_final_signals_aligned and cluster_strength == "STRONG" and _max_prob >= 55) else \
+                      ("🔶 MODERATE CONVICTION" if cluster_strength in ("STRONG", "MODERATE") and _max_prob >= 45 else "⚠️ LOW CONVICTION — WAIT")
+    _conv_col       = "#00C853" if "HIGH" in _conviction_tag else ("#FFD740" if "MODERATE" in _conviction_tag else "#FF5252")
+
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,{_final_dir_col}12,{_final_dir_col}05);
+                border:2px solid {_final_dir_col}66;border-radius:12px;padding:16px;margin-top:8px;">
+        <div style="font-size:11px;color:#888;letter-spacing:2px;">ADVANCED ML — FINAL VERDICT</div>
+        <div style="display:flex;flex-wrap:wrap;gap:20px;margin-top:10px;align-items:center;">
+            <div>
+                <div style="font-size:11px;color:#888;">REGIME</div>
+                <div style="font-size:13px;color:{regime_color};font-weight:bold;">{market_regime}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">INSTITUTIONS</div>
+                <div style="font-size:13px;color:{inst_color};font-weight:bold;">{inst_activity}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">CLUSTERS</div>
+                <div style="font-size:13px;color:{cluster_align_col};font-weight:bold;">{cluster_strength}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">TRAP</div>
+                <div style="font-size:13px;color:{trap_color};font-weight:bold;">{trap_code.replace('_',' ')}</div>
+            </div>
+            <div>
+                <div style="font-size:11px;color:#888;">SMART MONEY</div>
+                <div style="font-size:13px;color:{sm_color};font-weight:bold;">{sm_code.replace('_',' ')}</div>
+            </div>
+            <div style="background:#0d1117;border-radius:8px;padding:8px 16px;border:1px solid {_final_dir_col}44;">
+                <div style="font-size:11px;color:#888;">NEXT MOVE</div>
+                <div style="font-size:20px;font-weight:bold;color:{_final_dir_col};">{_prob_lead} {_prob_lead_pct}%</div>
+                <div style="font-size:12px;color:{_conv_col};margin-top:2px;">{_conviction_tag}</div>
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # Weighted contribution waterfall
+    st.markdown("#### ⚖️ Weighted Signal Contributions")
+    _contrib = {k: round(signals.get(k, 0) * weights[k] / w_total, 4) for k in weights}
+    _contrib_sorted = sorted(_contrib.items(), key=lambda x: abs(x[1]), reverse=True)
+    _cn, _cv = zip(*_contrib_sorted)
+    _cc = ['#00C853' if v > 0 else ('#FF5252' if v < 0 else '#888') for v in _cv]
+    _fig_c = go.Figure(go.Bar(
+        x=list(_cn), y=list(_cv),
+        marker_color=_cc,
+        text=[f"{v:+.4f}" for v in _cv],
+        textposition='outside',
+    ))
+    _fig_c.update_layout(
+        height=230, margin=dict(l=10, r=10, t=30, b=60),
+        paper_bgcolor='#111', plot_bgcolor='#111',
+        font=dict(color='#ccc', size=10),
+        yaxis=dict(zeroline=True, zerolinecolor='#555', gridcolor='#333',
+                   title='Contribution to ensemble score'),
+        xaxis=dict(tickangle=-35, gridcolor='#333'),
+        title=dict(text=f'Weighted Contributions → Final Score: {ensemble_score:+.3f}', font=dict(size=12)),
+    )
+    st.plotly_chart(_fig_c, use_container_width=True)
+
+    # Ensemble score history (store in session_state)
+    if 'ml_report_history' not in st.session_state:
+        st.session_state.ml_report_history = []
+    _now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+    if (not st.session_state.ml_report_history or
+            (_now_ist - st.session_state.ml_report_history[-1]['time']).total_seconds() >= 30):
+        st.session_state.ml_report_history.append({
+            'time': _now_ist, 'score': round(ensemble_score, 4),
+            'confidence': confidence, 'sent': sent_score,
+        })
+        if len(st.session_state.ml_report_history) > 200:
+            st.session_state.ml_report_history = st.session_state.ml_report_history[-200:]
+
+    if len(st.session_state.ml_report_history) >= 2:
+        _mh = pd.DataFrame(st.session_state.ml_report_history)
+        _fig_mh = go.Figure()
+        _fig_mh.add_trace(go.Scatter(
+            x=_mh['time'], y=_mh['score'],
+            mode='lines+markers', name='Ensemble Score',
+            line=dict(color=ml_color, width=2), marker=dict(size=4),
+            fill='tozeroy', fillcolor='rgba({},{},{},0.13)'.format(int(ml_color[1:3],16),int(ml_color[3:5],16),int(ml_color[5:7],16)),
+        ))
+        _fig_mh.add_hline(y=0.12,  line_dash='dash', line_color='#00C853', line_width=1,
+                          annotation_text='Bull', annotation_position='right')
+        _fig_mh.add_hline(y=-0.12, line_dash='dash', line_color='#FF5252', line_width=1,
+                          annotation_text='Bear', annotation_position='right')
+        _fig_mh.update_layout(
+            title='ML Ensemble Score Over Time',
+            height=200, margin=dict(l=10, r=60, t=35, b=30),
+            paper_bgcolor='#111', plot_bgcolor='#111',
+            font=dict(color='#ccc'),
+            xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333', range=[-1.1, 1.1]),
+            showlegend=False,
+        )
+        st.plotly_chart(_fig_mh, use_container_width=True)
+
+    st.caption(f"🤖 ML Ensemble: 25 signals · {len(weights)} weighted features · Updates every ~30s · "
+               f"{len(st.session_state.ml_report_history)} data points")
+
+
+def show_advanced_market_intelligence_engine(
+    df: pd.DataFrame = None,
+    option_data: dict = None,
+    current_price: float = None,
+):
+    """
+    Advanced Market Intelligence Engine — 12-Step NIFTY Analysis.
+    Combines: Chart Patterns · OI · ATM±2 · Depth · Sectors · Spikes · Smart Money.
+    Generates a timestamped analysis table with confidence scores.
+    """
+    st.markdown("## 🧠 Advanced Market Intelligence Engine")
+    st.caption("12-Step NIFTY Analysis · Pattern · OI · ATM±2 · Depth · Sectors · Spikes · Smart Money")
+
+    spot = current_price or 0.0
+    if spot <= 0 and option_data:
+        spot = float(option_data.get("underlying", 0) or 0)
+
+    if spot <= 0 and (df is None or df.empty):
+        st.warning("No market data available. Load NIFTY data first.")
+        return
+
+    now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+    ts = now_ist.strftime('%H:%M')
+
+    # ── STEP 1: Chart Pattern ──────────────────────────────────────────
+    pattern_name, pattern_type, pattern_score = _amie_detect_chart_pattern(df)
+
+    # ── STEP 2: Sentiment ─────────────────────────────────────────────
+    pcr = option_data.get('pcr', 1.0) if option_data else 1.0
+    if pcr > 1.3:   base_sentiment, sent_type = "Bullish",  "Breakout Setup"
+    elif pcr > 1.1: base_sentiment, sent_type = "Bullish",  "Continuation"
+    elif pcr < 0.7: base_sentiment, sent_type = "Bearish",  "Breakdown Setup"
+    elif pcr < 0.9: base_sentiment, sent_type = "Bearish",  "Continuation"
+    else:           base_sentiment, sent_type = "Neutral",  "Range"
+
+    if "Trap" in pattern_name:
+        sent_type = "Trap Setup"
+
+    # ── STEP 3: OI Behavior ───────────────────────────────────────────
+    oi_behavior, support_signal, resistance_signal, oi_score = _amie_oi_behavior(option_data, df)
+
+    # ── STEP 4: ATM ±2 Intelligence ───────────────────────────────────
+    atm_result = _amie_atm_analysis(option_data)
+    resist_migration = atm_result['resist_migration']
+    support_migration = atm_result['support_migration']
+    atm_score = atm_result['score']
+    smart_money_signals = atm_result['smart_money']
+    gamma_zone = atm_result['gamma_zone']
+
+    # ── STEP 5: Market Depth ─────────────────────────────────────────
+    depth_signal, depth_score, depth_detail = _amie_depth_signal(option_data)
+
+    # ── STEP 6: Sector Signal ────────────────────────────────────────
+    sector_signal, sector_score = _amie_sector_signal(st.session_state)
+
+    # ── STEP 7: Spike Detection ───────────────────────────────────────
+    spike_type, spike_score = _amie_spike_type(st.session_state, option_data)
+
+    # ── STEP 8: Smart Money Summary ───────────────────────────────────
+    if not smart_money_signals:
+        smart_money_signals = ["No major institutional spikes detected"]
+
+    # ── STEP 9: Expected Move ─────────────────────────────────────────
+    direction, bo_prob, rv_prob, target_info = _amie_expected_move(
+        pattern_type, oi_behavior, support_signal, resistance_signal,
+        resist_migration, support_migration, depth_signal
+    )
+
+    # ── STEP 10 & 11: Confidence Score ────────────────────────────────
+    confidence = _amie_confidence(
+        pattern_score, oi_score, depth_score, sector_score,
+        spike_score, atm_score
+    )
+
+    # ── DISPLAY ───────────────────────────────────────────────────────
+    # Row 1: Key metrics
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        clr = "#00cc66" if "Bull" in base_sentiment else ("#ff4444" if "Bear" in base_sentiment else "#FFD700")
+        st.markdown(f"""
+        <div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:3px solid {clr};'>
+        <div style='color:#aaa;font-size:0.75rem;'>SENTIMENT</div>
+        <div style='color:{clr};font-size:1.1rem;font-weight:bold;'>{base_sentiment}</div>
+        <div style='color:#888;font-size:0.75rem;'>{sent_type}</div>
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        oi_clr = "#00cc66" if "Long Build" in oi_behavior or "Short Cover" in oi_behavior else \
+                 "#ff4444" if "Short Build" in oi_behavior or "Long Unwind" in oi_behavior else "#FFD700"
+        st.markdown(f"""
+        <div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:3px solid {oi_clr};'>
+        <div style='color:#aaa;font-size:0.75rem;'>OI BEHAVIOR</div>
+        <div style='color:{oi_clr};font-size:1.1rem;font-weight:bold;'>{oi_behavior}</div>
+        <div style='color:#888;font-size:0.75rem;'>Sup: {support_signal} · Res: {resistance_signal}</div>
+        </div>""", unsafe_allow_html=True)
+    with c3:
+        dep_clr = "#00cc66" if "Buy" in depth_signal else ("#ff4444" if "Sell" in depth_signal else "#FFD700")
+        st.markdown(f"""
+        <div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:3px solid {dep_clr};'>
+        <div style='color:#aaa;font-size:0.75rem;'>DEPTH SIGNAL</div>
+        <div style='color:{dep_clr};font-size:1.1rem;font-weight:bold;'>{depth_signal}</div>
+        <div style='color:#888;font-size:0.75rem;'>{depth_detail[:40]}</div>
+        </div>""", unsafe_allow_html=True)
+    with c4:
+        conf_clr = "#00ff88" if confidence >= 75 else ("#FFD700" if confidence >= 55 else "#ff4444")
+        st.markdown(f"""
+        <div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:3px solid {conf_clr};'>
+        <div style='color:#aaa;font-size:0.75rem;'>CONFIDENCE</div>
+        <div style='color:{conf_clr};font-size:1.5rem;font-weight:bold;'>{confidence}%</div>
+        <div style='color:#888;font-size:0.75rem;'>{target_info}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # Main Analysis Table (Step 10)
+    st.markdown("### 📊 Analysis Table")
+    analysis_row = {
+        "Time":          ts,
+        "Pattern":       pattern_name,
+        "Sentiment":     base_sentiment,
+        "Type":          sent_type,
+        "OI Behavior":   oi_behavior,
+        "Depth Signal":  depth_signal,
+        "Sector Signal": sector_signal,
+        "Spike Type":    spike_type,
+        "Expected Move": direction,
+        "Confidence":    f"{confidence}%",
+    }
+
+    # Store in session_state for history
+    if 'amie_history' not in st.session_state:
+        st.session_state.amie_history = []
+    # Only append if new timestamp
+    if (not st.session_state.amie_history or
+            st.session_state.amie_history[-1].get('Time') != ts or
+            st.session_state.amie_history[-1].get('Pattern') != pattern_name):
+        st.session_state.amie_history.append(analysis_row.copy())
+        if len(st.session_state.amie_history) > 20:
+            st.session_state.amie_history = st.session_state.amie_history[-20:]
+
+    # Display history table (most recent first)
+    history_rows = list(reversed(st.session_state.amie_history))
+    df_table = pd.DataFrame(history_rows)
+
+    def _amie_style(row):
+        styles = []
+        for val in row:
+            val_str = str(val)
+            if any(x in val_str for x in ["Bullish", "Long Build", "Short Cover", "Buyers", "Up", "Strong"]):
+                styles.append("background-color: #1a3a1a; color: #00cc66;")
+            elif any(x in val_str for x in ["Bearish", "Short Build", "Long Unwind", "Sellers", "Down", "Weak"]):
+                styles.append("background-color: #3a1a1a; color: #ff4444;")
+            elif "%" in val_str:
+                pct = int(val_str.replace('%', '')) if val_str.replace('%', '').isdigit() else 50
+                if pct >= 75:
+                    styles.append("background-color: #1a3a1a; color: #00ff88; font-weight: bold;")
+                elif pct >= 55:
+                    styles.append("background-color: #2a2a1a; color: #FFD700; font-weight: bold;")
+                else:
+                    styles.append("background-color: #3a1a1a; color: #ff4444; font-weight: bold;")
+            else:
+                styles.append("")
+        return styles
+
+    styled = df_table.style.apply(_amie_style, axis=1)
+    st.dataframe(styled, use_container_width=True)
+
+    # ── ATM ±2 Intelligence Table ─────────────────────────────────────
+    if atm_result['strikes']:
+        st.markdown("### 🎯 ATM ±2 Strike Intelligence")
+        strike_rows = []
+        for label in ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']:
+            s = atm_result['strikes'].get(label)
+            if s:
+                # Dominant side
+                ce_total = s.get('ce_oi', 0) + abs(s.get('ce_chg', 0))
+                pe_total = s.get('pe_oi', 0) + abs(s.get('pe_chg', 0))
+                dom = "CALLS" if ce_total > pe_total else "PUTS"
+                strike_rows.append({
+                    "Label":    label,
+                    "Strike":   f"₹{int(s.get('strike', 0))}",
+                    "CE OI":    f"{int(s.get('ce_oi', 0)):,}",
+                    "PE OI":    f"{int(s.get('pe_oi', 0)):,}",
+                    "CE ΔOI":   f"{int(s.get('ce_chg', 0)):+,}",
+                    "PE ΔOI":   f"{int(s.get('pe_chg', 0)):+,}",
+                    "CE IV%":   f"{s.get('ce_iv', 0):.1f}",
+                    "PE IV%":   f"{s.get('pe_iv', 0):.1f}",
+                    "Dominant": dom,
+                })
+        if strike_rows:
+            df_atm = pd.DataFrame(strike_rows)
+            def _atm_highlight(row):
+                if row.get("Label") == "ATM":
+                    return ["background-color: #1a2a3a; font-weight: bold;"] * len(row)
+                return [""] * len(row)
+            st.dataframe(
+                df_atm.style.apply(_atm_highlight, axis=1),
+                use_container_width=True
+            )
+
+        # Migration signal
+        ma_col1, ma_col2 = st.columns(2)
+        with ma_col1:
+            mig_clr = "#00cc66" if "Higher" in resist_migration else ("#ff4444" if "Lower" in resist_migration else "#FFD700")
+            st.markdown(f"**Resistance Migration:** <span style='color:{mig_clr}'>{resist_migration}</span>", unsafe_allow_html=True)
+        with ma_col2:
+            sup_clr = "#00cc66" if "Higher" in support_migration else ("#ff4444" if "Lower" in support_migration else "#FFD700")
+            st.markdown(f"**Support Migration:** <span style='color:{sup_clr}'>{support_migration}</span>", unsafe_allow_html=True)
+
+        if gamma_zone:
+            st.markdown(f"**⚡ Gamma Zone:** ₹{int(gamma_zone)} — highest gamma concentration")
+
+    # ── Smart Money Section ───────────────────────────────────────────
+    st.markdown("### 🏦 Smart Money & Institutional Activity")
+    for sig in smart_money_signals[:5]:
+        icon = "🟢" if "Writing" in sig else "🟠"
+        st.markdown(f"{icon} {sig}")
+
+    # ── Expected Move Summary ─────────────────────────────────────────
+    st.markdown("### 🎯 Expected Move Prediction")
+    dir_clr = "#00cc66" if "Up" in direction else ("#ff4444" if "Down" in direction else "#FFD700")
+    col_a, col_b, col_c = st.columns(3)
+    with col_a:
+        st.metric("Direction", direction)
+    with col_b:
+        st.metric("Breakout Probability", f"{bo_prob}%")
+    with col_c:
+        st.metric("Reversal Probability", f"{rv_prob}%")
+
+    # ── PCR & Max Pain ────────────────────────────────────────────────
+    max_pain = option_data.get('max_pain_strike') if option_data else None
+    atm_str  = option_data.get('atm_strike') if option_data else None
+    st.markdown("### 📈 Key Levels")
+    kl1, kl2, kl3, kl4 = st.columns(4)
+    with kl1:
+        st.metric("Spot Price", f"₹{spot:,.0f}")
+    with kl2:
+        st.metric("ATM Strike", f"₹{int(atm_str):,}" if atm_str else "N/A")
+    with kl3:
+        st.metric("Max Pain", f"₹{int(max_pain):,}" if max_pain else "N/A")
+    with kl4:
+        pcr_clr_lbl = "↑ Bullish" if pcr > 1.1 else ("↓ Bearish" if pcr < 0.9 else "→ Neutral")
+        st.metric("PCR", f"{pcr:.2f}", delta=pcr_clr_lbl)
+
+    # Clear history button
+    st.markdown("")
+    if st.button("🗑️ Clear AMIE History", key="clr_amie"):
+        st.session_state.amie_history = []
+        st.rerun()
+
+
+# =====================================================================
+# FINAL INTELLIGENCE DASHBOARD
+# =====================================================================
+
+def _fid_ema_align(df: pd.DataFrame) -> tuple:
+    """Returns (trend_str, score_0_100) from EMA stack."""
+    try:
+        cl = df["close"] if "close" in df.columns else df.iloc[:, 3]
+        e9  = cl.ewm(span=9,  adjust=False).mean().iloc[-1]
+        e21 = cl.ewm(span=21, adjust=False).mean().iloc[-1]
+        e50 = cl.ewm(span=50, adjust=False).mean().iloc[-1]
+        if e9 > e21 > e50:   return "BULLISH STACK",  78
+        if e9 < e21 < e50:   return "BEARISH STACK",  22
+        if e9 > e21:         return "SHORT-TERM BULL", 60
+        return "SHORT-TERM BEAR", 40
+    except Exception:
+        return "UNKNOWN", 50
+
+def _fid_adx(df: pd.DataFrame) -> float:
+    try:
+        hi, lo, cl = df["high"], df["low"], df["close"]
+        tr = pd.concat([hi-lo, (hi-cl.shift()).abs(), (lo-cl.shift()).abs()], axis=1).max(axis=1)
+        dm_p = hi.diff().clip(lower=0)
+        dm_m = (-lo.diff()).clip(lower=0)
+        dm_p = dm_p.where(dm_p > dm_m, 0)
+        dm_m = dm_m.where(dm_m > dm_p, 0)
+        atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+        di_p  = 100 * dm_p.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+        di_m  = 100 * dm_m.ewm(alpha=1/14, adjust=False).mean() / atr14.replace(0, np.nan)
+        dx    = 100 * (di_p - di_m).abs() / (di_p + di_m).replace(0, np.nan)
+        return float(dx.ewm(alpha=1/14, adjust=False).mean().iloc[-1])
+    except Exception:
+        return 20.0
+
+def show_final_intelligence_dashboard(df: pd.DataFrame = None,
+                                       option_data: dict = None,
+                                       current_price: float = None):
+    """
+    Master Intelligence Dashboard — aggregates ALL engines into one
+    institutional-grade summary panel.
+    """
+    st.markdown("## 🎯 NIFTY Intelligence Summary — Master Dashboard")
+    st.caption("Real-time composite view across Options · Futures · FII · Sectors · News · Depth")
+
+    spot = current_price or 0.0
+    if spot <= 0 and option_data:
+        spot = float(option_data.get("underlying", 0) or 0)
+
+    # ── Pull from option_data ─────────────────────────────────────────
+    pcr       = option_data.get("pcr", 1.0) if option_data else 1.0
+    max_pain  = option_data.get("max_pain_strike") if option_data else None
+    atm       = option_data.get("atm_strike") if option_data else None
+    expiry    = option_data.get("expiry", "") if option_data else ""
+    df_sum    = option_data.get("df_summary") if option_data else None
+    total_ce_chg = option_data.get("total_ce_change", 0) if option_data else 0
+    total_pe_chg = option_data.get("total_pe_change", 0) if option_data else 0
+
+    # ── Compute GEX quick ─────────────────────────────────────────────
+    gex_total, gex_flip, gex_signal = 0.0, None, "N/A"
+    if df_sum is not None and not df_sum.empty and spot > 0:
+        gex_data = calculate_dealer_gex(df_sum, spot, 25)
+        if gex_data:
+            gex_total = gex_data.get("total_gex", 0)
+            gex_flip  = gex_data.get("gamma_flip_level")
+            gex_signal = gex_data.get("gex_signal", "N/A")
+
+    # ── Compute OI S/R walls ──────────────────────────────────────────
+    max_ce_strike, max_pe_strike = None, None
+    if df_sum is not None and not df_sum.empty:
+        if "openInterest_CE" in df_sum.columns:
+            max_ce_strike = float(df_sum.loc[df_sum["openInterest_CE"].idxmax(), "Strike"])
+        if "openInterest_PE" in df_sum.columns:
+            max_pe_strike = float(df_sum.loc[df_sum["openInterest_PE"].idxmax(), "Strike"])
+
+    # ── EMA + ADX from price chart ────────────────────────────────────
+    ema_trend, ema_score = "UNKNOWN", 50
+    adx_val = 20.0
+    price_chg_pct = 0.0
+    if df is not None and not df.empty and len(df) >= 10:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        if "close" in df2.columns:
+            ema_trend, ema_score = _fid_ema_align(df2)
+            adx_val = _fid_adx(df2)
+            cl2 = df2["close"]
+            if len(cl2) > 1:
+                price_chg_pct = (cl2.iloc[-1] - cl2.iloc[-2]) / cl2.iloc[-2] * 100
+
+    # ── Composite scoring ─────────────────────────────────────────────
+    # Price Action (30%)
+    pa_score = ema_score
+
+    # Options / OI (20%)
+    oi_score = 50
+    if pcr > 1.3:   oi_score = 72
+    elif pcr > 1.1: oi_score = 60
+    elif pcr < 0.7: oi_score = 28
+    elif pcr < 0.9: oi_score = 40
+
+    # GEX contribution to oi_score
+    if gex_total > 50:  oi_score = min(oi_score + 5, 100)
+    elif gex_total < -50: oi_score = max(oi_score - 5, 0)
+
+    # FII (20%) — try session state if FII engine ran
+    fii_score = 50
+    fii_net_str = "N/A"
+    try:
+        _fii_raw = _fii_fetch_cash_data()
+        if _fii_raw:
+            _fii_cd = _fii_parse_cash(_fii_raw)
+            if not _fii_cd.empty:
+                fii_net = float(_fii_cd["FII Net"].iloc[0])
+                fii_net_str = f"₹{fii_net:+,.0f} Cr"
+                if fii_net > 2000:   fii_score = 82
+                elif fii_net > 500:  fii_score = 65
+                elif fii_net < -2000: fii_score = 18
+                elif fii_net < -500:  fii_score = 35
+    except Exception:
+        pass
+
+    # News (15%) — use cached value from session if available
+    news_score = st.session_state.get("_fid_news_score", 50)
+
+    # Sector (5%)
+    sect_score = st.session_state.get("_fid_sector_score", 50)
+
+    # Greeks / Delta & Gamma (15%) — from Delta & Gamma Engine session state
+    dg_score = 50
+    dg_detail = "N/A — DG Engine not run"
+    _dg_hist = st.session_state.get('delta_gamma_history', [])
+    if _dg_hist:
+        _dg_latest = _dg_hist[-1]
+        _dg_nd = _dg_latest.get('net_delta', 0)
+        _dg_ng = _dg_latest.get('net_gamma', 0)
+        _dg_gc = (_dg_hist[-1]['net_gamma'] - _dg_hist[-2]['net_gamma']) if len(_dg_hist) >= 2 else 0
+        # Base score from net_delta
+        if _dg_nd > 0.15:    dg_score = 78
+        elif _dg_nd > 0.05:  dg_score = 62
+        elif _dg_nd < -0.15: dg_score = 22
+        elif _dg_nd < -0.05: dg_score = 38
+        else:                 dg_score = 50
+        # Gamma expansion/contraction modifier
+        if _dg_gc > 0:   dg_score = min(dg_score + 5, 100)
+        elif _dg_gc < 0: dg_score = max(dg_score - 5, 0)
+        _dg_dir = "⬆️" if _dg_gc > 0 else "⬇️"
+        dg_detail = f"Δ:{_dg_nd:+.4f}  Γ:{_dg_ng:+.2f}L {_dg_dir}"
+
+    # Combined composite (weights adjusted to include Greeks pillar)
+    weights = {"PA": 0.25, "OI": 0.20, "FII": 0.20, "News": 0.15, "Sector": 0.05, "Greeks": 0.15}
+    scores  = {"PA": pa_score, "OI": oi_score, "FII": fii_score, "News": news_score, "Sector": sect_score, "Greeks": dg_score}
+    composite = int(sum(scores[k] * weights[k] for k in scores))
+
+    # Trend probability
+    trend_prob = composite
+    # Breakout probability
+    adx_boost = 10 if adx_val > 25 else -5
+    vol_boost  = 10 if abs(price_chg_pct) > 0.5 else 0
+    breakout_prob = min(100, max(0, composite + adx_boost + vol_boost))
+    # Risk level
+    indecision = abs(composite - 50)
+    risk_level = "HIGH" if indecision < 10 else ("LOW" if indecision > 25 else "MEDIUM")
+
+    # Direction label
+    if composite >= 70:
+        direction, dir_color, dir_icon = "STRONG BULLISH",  "#00e676", "🟢"
+    elif composite >= 55:
+        direction, dir_color, dir_icon = "BULLISH",         "#69f0ae", "🟢"
+    elif composite <= 30:
+        direction, dir_color, dir_icon = "STRONG BEARISH",  "#ff5252", "🔴"
+    elif composite <= 45:
+        direction, dir_color, dir_icon = "BEARISH",         "#ff8a80", "🔴"
+    else:
+        direction, dir_color, dir_icon = "NEUTRAL / RANGE", "#ffeb3b", "🟡"
+
+    # Trend strength label from ADX
+    if adx_val >= 40:    trend_str = "VERY STRONG"
+    elif adx_val >= 25:  trend_str = "STRONG"
+    elif adx_val >= 18:  trend_str = "MODERATE"
+    else:                trend_str = "WEAK / CHOPPY"
+
+    # ── SECTION 1: Hero metrics ───────────────────────────────────────
+    st.markdown("---")
+    h1, h2, h3, h4, h5 = st.columns(5)
+
+    def _hero(col, title, value, sub, color, icon=""):
+        col.markdown(
+            f"<div style='text-align:center;padding:14px;background:#1e1e1e;"
+            f"border-radius:10px;border:1px solid {color};'>"
+            f"<div style='font-size:10px;color:#888;text-transform:uppercase'>{title}</div>"
+            f"<div style='font-size:22px;font-weight:bold;color:{color};margin:4px 0'>{icon} {value}</div>"
+            f"<div style='font-size:11px;color:#aaa'>{sub}</div>"
+            f"</div>", unsafe_allow_html=True
+        )
+
+    _hero(h1, "Market Direction",    direction,            f"Composite: {composite}/100",   dir_color,    dir_icon)
+    _hero(h2, "Trend Strength",      trend_str,            f"ADX: {adx_val:.1f}",           "#40c4ff",    "📈")
+    _hero(h3, "Breakout Probability",f"{breakout_prob}%",  f"Vol Δ: {price_chg_pct:+.2f}%", "#ffeb3b",    "⚡")
+    _hero(h4, "Risk Level",          risk_level,           f"Indecision: {indecision}pts",  "#ff9800",    "⚠️")
+    _hero(h5, "Institutional Flow",  fii_net_str if fii_net_str != "N/A" else "N/A",
+          f"FII Score: {fii_score}",  "#ce93d8",    "🏛️")
+
+    st.markdown("---")
+
+    # ── SECTION 2: Engine Pillar Scores ──────────────────────────────
+    st.markdown("#### 🧠 Intelligence Pillar Breakdown")
+
+    def _score_style(s):
+        if s >= 65: return "#00e676", "BULLISH"
+        if s >= 55: return "#69f0ae", "SLIGHTLY BULLISH"
+        if s <= 35: return "#ff5252", "BEARISH"
+        if s <= 45: return "#ff8a80", "SLIGHTLY BEARISH"
+        return "#ffeb3b", "NEUTRAL"
+
+    pillar_rows = []
+    pillar_info = [
+        ("Price Action (EMA+ADX)",      pa_score,   "25%", ema_trend),
+        ("Options / OI (PCR+GEX)",      oi_score,   "20%", f"PCR={pcr:.2f} GEX={gex_signal}"),
+        ("FII / DII Flow",              fii_score,  "20%", fii_net_str),
+        ("News Sentiment",              news_score, "15%", "Keyword-scored RSS"),
+        ("Greeks (Delta+Gamma Engine)", dg_score,   "15%", dg_detail),
+        ("Sector Rotation",             sect_score,  "5%", "RS-Ratio vs NIFTY"),
+    ]
+    for name, sc, wt, detail in pillar_info:
+        clr, lbl = _score_style(sc)
+        pillar_rows.append({"Pillar": name, "Score": sc, "Weight": wt,
+                             "Signal": lbl, "Detail": detail, "_clr": clr})
+
+    pillar_df = pd.DataFrame(pillar_rows)
+
+    def _pillar_style(row):
+        clr, _ = _score_style(int(row["Score"]))
+        styles = ["", f"color:{clr};font-weight:bold", "", f"color:{clr};font-weight:bold", ""]
+        return styles
+
+    st.dataframe(
+        pillar_df.drop(columns=["_clr"]).style.apply(_pillar_style, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    # ── SECTION 3: Options Pressure Panel ────────────────────────────
+    st.markdown("#### 📊 Options Intelligence Summary")
+    oc1, oc2, oc3, oc4, oc5, oc6 = st.columns(6)
+    oc1.metric("PCR (OI)",        f"{pcr:.2f}",   delta="Bullish" if pcr > 1.0 else "Bearish")
+    oc2.metric("ATM Strike",      f"{atm:,.0f}"  if atm else "N/A")
+    oc3.metric("Max Pain",        f"{max_pain:,.0f}" if max_pain else "N/A")
+    oc4.metric("Call Wall (Res)", f"{max_ce_strike:,.0f}" if max_ce_strike else "N/A")
+    oc5.metric("Put Wall (Sup)",  f"{max_pe_strike:,.0f}" if max_pe_strike else "N/A")
+    oc6.metric("GEX Signal",      gex_signal,
+               delta=f"Total: {gex_total:+.0f}",
+               delta_color="normal" if gex_total > 0 else "inverse")
+
+    # ── SECTION 4: Gamma Levels ───────────────────────────────────────
+    st.markdown("#### 🎯 Gamma & Key Price Levels")
+    gc1, gc2, gc3, gc4 = st.columns(4)
+    gc1.metric("Spot Price",       f"₹{spot:,.0f}")
+    gc2.metric("Gamma Flip Level", f"₹{gex_flip:,.0f}" if gex_flip else "N/A",
+               delta="Above Flip" if gex_flip and spot > gex_flip else "Below Flip")
+    gc3.metric("Max Pain Level",   f"₹{max_pain:,.0f}" if max_pain else "N/A",
+               delta=f"{spot-max_pain:+.0f} pts" if max_pain else None)
+    gc4.metric("Expiry", expiry if expiry else "N/A")
+
+    # Key S/R from OI
+    if max_ce_strike and max_pe_strike:
+        sr_dist = max_ce_strike - max_pe_strike
+        st.markdown(
+            f"<div style='padding:10px;background:#1e2530;border-radius:8px;margin:6px 0'>"
+            f"🟢 <b>Support (Put Wall)</b>: ₹{max_pe_strike:,.0f} &nbsp;&nbsp;"
+            f"| 🔴 <b>Resistance (Call Wall)</b>: ₹{max_ce_strike:,.0f} &nbsp;&nbsp;"
+            f"| 📏 <b>Range Width</b>: {sr_dist:.0f} pts &nbsp;&nbsp;"
+            f"| 📍 <b>Spot vs Range</b>: "
+            f"{'Upper Half' if spot > (max_pe_strike+max_ce_strike)/2 else 'Lower Half'}"
+            f"</div>", unsafe_allow_html=True
+        )
+
+    # ── SECTION 5: OI Activity ────────────────────────────────────────
+    st.markdown("#### 📦 Real-Time OI Activity")
+    oia1, oia2, oia3 = st.columns(3)
+    oia1.metric("CE OI Change (L)", f"{total_ce_chg:+.1f}", delta_color="inverse")
+    oia2.metric("PE OI Change (L)", f"{total_pe_chg:+.1f}", delta_color="normal")
+    net_chg = total_pe_chg - total_ce_chg
+    oia3.metric("Net OI Bias",
+                "BUY PRESSURE" if net_chg > 0 else "SELL PRESSURE",
+                delta=f"{net_chg:+.1f}L")
+
+    # ── SECTION 6: Final Verdict ──────────────────────────────────────
+    st.markdown("---")
+    st.markdown("#### 🏁 Final Verdict")
+    v1, v2, v3 = st.columns([2, 1, 1])
+    with v1:
+        st.markdown(
+            f"<div style='padding:18px;background:#1e1e1e;border-radius:12px;"
+            f"border:2px solid {dir_color};text-align:center'>"
+            f"<div style='font-size:13px;color:#aaa'>COMPOSITE MARKET DIRECTION</div>"
+            f"<div style='font-size:36px;font-weight:bold;color:{dir_color};margin:8px 0'>"
+            f"{dir_icon} {direction}</div>"
+            f"<div style='font-size:12px;color:#888'>"
+            f"Score {composite}/100 | ADX {adx_val:.0f} | {trend_str} trend"
+            f"</div></div>", unsafe_allow_html=True
+        )
+    with v2:
+        st.metric("Trend Probability",    f"{trend_prob}%")
+        st.metric("Breakout Probability", f"{breakout_prob}%")
+    with v3:
+        st.metric("Risk Level", risk_level)
+        st.metric("EMA Alignment", ema_trend.split()[0])
+
+
+# =====================================================================
+# CANDLESTICK INTELLIGENCE ENGINE — Helper Functions
+# =====================================================================
+
+def _cie_detect_swing_sr(df, lookback=200, cluster_pct=0.003):
+    """Detect swing high/low S/R levels and cluster nearby ones."""
+    if df is None or len(df) < 10:
+        return [], []
+    recent = df.tail(lookback).copy().reset_index(drop=True)
+    n = len(recent)
+    raw_sup, raw_res = [], []
+    for i in range(2, n - 2):
+        lo = recent['low'].iloc[i]
+        hi = recent['high'].iloc[i]
+        if (lo < recent['low'].iloc[i-1] and lo < recent['low'].iloc[i-2] and
+                lo < recent['low'].iloc[i+1] and lo < recent['low'].iloc[i+2]):
+            raw_sup.append(lo)
+        if (hi > recent['high'].iloc[i-1] and hi > recent['high'].iloc[i-2] and
+                hi > recent['high'].iloc[i+1] and hi > recent['high'].iloc[i+2]):
+            raw_res.append(hi)
+
+    def _cluster(levels):
+        if not levels:
+            return []
+        levels = sorted(levels)
+        clusters, group = [], [levels[0]]
+        for lvl in levels[1:]:
+            if abs(lvl - group[-1]) / (group[-1] + 1e-6) <= cluster_pct:
+                group.append(lvl)
+            else:
+                clusters.append(float(np.mean(group)))
+                group = [lvl]
+        clusters.append(float(np.mean(group)))
+        return clusters
+
+    return _cluster(raw_sup), _cluster(raw_res)
+
+
+def _cie_find_nearest_sr(price, supports, resistances, thr=0.002):
+    """Return (level, type, dist_pct) of nearest S/R within threshold."""
+    best_dist, best_lvl, best_type = float('inf'), None, None
+    for lvl in supports:
+        d = abs(price - lvl) / (lvl + 1e-6)
+        if d < best_dist and d <= thr:
+            best_dist, best_lvl, best_type = d, lvl, 'support'
+    for lvl in resistances:
+        d = abs(price - lvl) / (lvl + 1e-6)
+        if d < best_dist and d <= thr:
+            best_dist, best_lvl, best_type = d, lvl, 'resistance'
+    return best_lvl, best_type, best_dist
+
+
+def _cie_detect_patterns(df, supports, resistances):
+    """Detect reversal and continuation patterns near S/R levels."""
+    signals = []
+    if df is None or len(df) < 3:
+        return signals
+
+    n = len(df)
+    avg_body = (df['close'] - df['open']).abs().rolling(20, min_periods=3).mean().fillna(50)
+    avg_vol = df['volume'].rolling(20, min_periods=3).mean().fillna(1)
+    thr = 0.002  # 0.2% proximity threshold
+
+    for i in range(2, n):
+        c  = df.iloc[i]
+        p1 = df.iloc[i - 1]
+        candle_range = c['high'] - c['low']
+        if candle_range < 1e-6:
+            continue
+        body        = abs(c['close'] - c['open'])
+        upper_wick  = c['high'] - max(c['close'], c['open'])
+        lower_wick  = min(c['close'], c['open']) - c['low']
+        is_green    = c['close'] >= c['open']
+        is_red      = c['close'] < c['open']
+        avg_b       = max(avg_body.iloc[i], 1)
+        vol_spike   = bool(c['volume'] > avg_vol.iloc[i] * 1.5)
+        ts          = c['datetime'] if 'datetime' in df.columns else i
+
+        # S/R proximity — check low side for support, high side for resistance
+        probe_sup = c['low'] if is_red else min(c['close'], c['open'])
+        probe_res = c['high'] if is_green else max(c['close'], c['open'])
+        lvl_s, typ_s, dist_s = _cie_find_nearest_sr(probe_sup, supports, resistances, thr)
+        lvl_r, typ_r, dist_r = _cie_find_nearest_sr(probe_res, supports, resistances, thr)
+        near_sup = typ_s == 'support'
+        near_res = typ_r == 'resistance'
+
+        # ── BULLISH REVERSALS AT SUPPORT ────────────────────────────────
+        if near_sup:
+            # 1. Hammer
+            if lower_wick > 2 * max(body, 1) and upper_wick <= body * 0.5 and lower_wick > candle_range * 0.5:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Hammer', 'direction': 'BUY',
+                    'category': 'Reversal', 'price': c['close'], 'level': lvl_s,
+                    'level_type': 'Support', 'dist_pct': dist_s, 'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(lower_wick / candle_range * 28)),
+                })
+            # 2. Long Lower Wick Rejection
+            if lower_wick > candle_range * 0.60:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Long Lower Wick Rejection',
+                    'direction': 'BUY', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(lower_wick / candle_range * 28)),
+                })
+            # 3. Bullish Engulfing
+            if (p1['close'] < p1['open'] and is_green and
+                    min(c['open'], c['close']) <= min(p1['open'], p1['close']) and
+                    max(c['open'], c['close']) >= max(p1['open'], p1['close'])):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bullish Engulfing',
+                    'direction': 'BUY', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 14)),
+                })
+            # 4. Morning Star (3-candle)
+            if i >= 2:
+                c0, c1, c2 = df.iloc[i-2], df.iloc[i-1], c
+                b0 = abs(c0['close'] - c0['open'])
+                b1 = abs(c1['close'] - c1['open'])
+                mid0 = (c0['open'] + c0['close']) / 2
+                if (c0['close'] < c0['open'] and b0 > avg_b * 0.8 and b1 < avg_b * 0.4 and
+                        c2['close'] > c2['open'] and c2['close'] > mid0):
+                    signals.append({
+                        'index': i, 'time': ts, 'pattern': 'Morning Star',
+                        'direction': 'BUY', 'category': 'Reversal', 'price': c2['close'],
+                        'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                        'vol_spike': vol_spike, 'candle_strength': 25,
+                    })
+            # 5. Bullish Marubozu (continuation)
+            if (is_green and body > avg_b * 1.5 and upper_wick < body * 0.1 and lower_wick < body * 0.1):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bullish Marubozu',
+                    'direction': 'BUY', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 12)),
+                })
+            # 6. Inside Bar Breakout (prev candle range small, curr breaks above)
+            p1_rng = p1['high'] - p1['low']
+            if (p1_rng < avg_b * 0.8 and c['high'] > p1['high'] and is_green):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Inside Bar Breakout',
+                    'direction': 'BUY', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike, 'candle_strength': 18,
+                })
+
+        # ── BEARISH REVERSALS AT RESISTANCE ─────────────────────────────
+        if near_res:
+            # 7. Shooting Star
+            if upper_wick > 2 * max(body, 1) and lower_wick <= body * 0.5 and upper_wick > candle_range * 0.5:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Shooting Star',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(upper_wick / candle_range * 28)),
+                })
+            # 8. Upper Wick Rejection
+            if upper_wick > candle_range * 0.60:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Upper Wick Rejection',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(upper_wick / candle_range * 28)),
+                })
+            # 9. Bearish Engulfing
+            if (p1['close'] > p1['open'] and is_red and
+                    min(c['open'], c['close']) <= min(p1['open'], p1['close']) and
+                    max(c['open'], c['close']) >= max(p1['open'], p1['close'])):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bearish Engulfing',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 14)),
+                })
+            # 10. Evening Star (3-candle)
+            if i >= 2:
+                c0, c1, c2 = df.iloc[i-2], df.iloc[i-1], c
+                b0 = abs(c0['close'] - c0['open'])
+                b1 = abs(c1['close'] - c1['open'])
+                mid0 = (c0['open'] + c0['close']) / 2
+                if (c0['close'] > c0['open'] and b0 > avg_b * 0.8 and b1 < avg_b * 0.4 and
+                        c2['close'] < c2['open'] and c2['close'] < mid0):
+                    signals.append({
+                        'index': i, 'time': ts, 'pattern': 'Evening Star',
+                        'direction': 'SELL', 'category': 'Reversal', 'price': c2['close'],
+                        'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                        'vol_spike': vol_spike, 'candle_strength': 25,
+                    })
+            # 11. Bearish Marubozu (continuation)
+            if (is_red and body > avg_b * 1.5 and upper_wick < body * 0.1 and lower_wick < body * 0.1):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bearish Marubozu',
+                    'direction': 'SELL', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 12)),
+                })
+
+    # 12. Lower Low Momentum (last 5 candles making lower highs & lows)
+    if n >= 6:
+        last6 = df.tail(6)
+        if (all(last6['high'].iloc[j] < last6['high'].iloc[j-1] for j in range(1, 6)) and
+                all(last6['low'].iloc[j] < last6['low'].iloc[j-1] for j in range(1, 6))):
+            cl = df.iloc[-1]
+            lvl_r2, _, dr2 = _cie_find_nearest_sr(cl['high'], supports, resistances, 0.005)
+            signals.append({
+                'index': n - 1,
+                'time': cl['datetime'] if 'datetime' in df.columns else n - 1,
+                'pattern': 'Lower Low Momentum', 'direction': 'SELL',
+                'category': 'Continuation', 'price': cl['close'],
+                'level': lvl_r2, 'level_type': 'Resistance', 'dist_pct': dr2,
+                'vol_spike': False, 'candle_strength': 20,
+            })
+
+    # Return only signals from last 4 candles
+    cutoff = max(0, n - 4)
+    return [s for s in signals if s.get('index', 0) >= cutoff]
+
+
+def _cie_options_confirmation(signal, df_summary, straddle_history, underlying_price):
+    """
+    Apply options flow filters and volatility filter.
+    Returns (confirmed: bool, details: dict).
+    """
+    if df_summary is None or underlying_price is None:
+        return False, {'volatility_filter': 'No data'}
+    try:
+        atm_strike = min(df_summary['Strike'].tolist(), key=lambda x: abs(x - underlying_price))
+        atm_rows = df_summary[df_summary['Strike'] == atm_strike]
+        details = {}
+        opt_score = 0
+
+        # Straddle ROC (volatility filter)
+        straddle_roc = 0.0
+        if len(straddle_history) >= 2:
+            s_last = straddle_history[-1].get('straddle', 0) if isinstance(straddle_history[-1], dict) else 0
+            s_prev = straddle_history[-2].get('straddle', 0) if isinstance(straddle_history[-2], dict) else 0
+            if s_prev > 0:
+                straddle_roc = abs((s_last - s_prev) / s_prev * 100)
+        details['straddle_roc'] = round(straddle_roc, 2)
+        details['straddle_expanding'] = straddle_roc >= 0.5
+
+        if straddle_roc < 0.5:
+            details['volatility_filter'] = 'BLOCKED'
+            return False, details
+        details['volatility_filter'] = 'PASS'
+        opt_score += 10
+
+        if not atm_rows.empty:
+            row = atm_rows.iloc[0]
+            pcr    = float(row.get('PCR', 1.0) or 1.0)
+            ce_chg = float(row.get('changeinOpenInterest_CE', 0) or 0)
+            pe_chg = float(row.get('changeinOpenInterest_PE', 0) or 0)
+            d_ce   = float(row.get('Delta_CE', 0) or 0)
+            d_pe   = float(row.get('Delta_PE', 0) or 0)
+            gamma  = row.get('Gamma_SR', '-')
+            details.update({
+                'pcr': round(pcr, 2),
+                'ce_chg_oi': round(ce_chg, 0),
+                'pe_chg_oi': round(pe_chg, 0),
+                'net_delta': round(d_ce + d_pe, 4),
+                'gamma_sr': str(gamma),
+            })
+
+            if signal['direction'] == 'BUY':
+                if pcr > 1.0:
+                    opt_score += 15
+                    details['pcr_conf'] = f'Bullish PCR {pcr:.2f} ✅'
+                if pe_chg > 0:
+                    opt_score += 15
+                    details['oi_conf'] = 'Put Writing ✅'
+                elif ce_chg < 0:
+                    opt_score += 8
+                    details['oi_conf'] = 'Call Unwinding ✅'
+                if 'Support' in str(gamma):
+                    opt_score += 10
+                    details['gamma_conf'] = 'Gamma Support ✅'
+                else:
+                    details['gamma_conf'] = str(gamma) or '-'
+                if (d_ce + d_pe) > 0:
+                    opt_score += 10
+                    details['delta_conf'] = 'Delta Positive ✅'
+            else:  # SELL
+                if pcr < 1.0:
+                    opt_score += 15
+                    details['pcr_conf'] = f'Bearish PCR {pcr:.2f} ✅'
+                if ce_chg > 0:
+                    opt_score += 15
+                    details['oi_conf'] = 'Call Writing ✅'
+                elif pe_chg < 0:
+                    opt_score += 8
+                    details['oi_conf'] = 'Put Unwinding ✅'
+                if 'Resist' in str(gamma):
+                    opt_score += 10
+                    details['gamma_conf'] = 'Gamma Resistance ✅'
+                else:
+                    details['gamma_conf'] = str(gamma) or '-'
+                if (d_ce + d_pe) < 0:
+                    opt_score += 10
+                    details['delta_conf'] = 'Delta Negative ✅'
+
+        details['options_score'] = opt_score
+        confirmed = opt_score >= 20
+        details['confirmed'] = confirmed
+        return confirmed, details
+    except Exception:
+        return False, {'volatility_filter': 'Error'}
+
+
+def _cie_confidence_score(signal, opt_details, opt_confirmed):
+    """
+    Score 0-100:
+      Candle strength     0-28
+      Distance to S/R     0-20
+      OI + options score  0-15
+      Gamma               0-15
+      Straddle expansion  0-10
+      Volume spike        0-10
+      Institutional bonus 0-10 (vol spike + confirmed + strong candle)
+    """
+    score = 0
+    score += min(28, signal.get('candle_strength', 10))
+
+    dist_pct = signal.get('dist_pct') or 0.002
+    score += max(0, min(20, 20 - int(dist_pct / 0.0001)))
+
+    score += min(15, int(opt_details.get('options_score', 0) * 0.25))
+
+    gamma_conf = str(opt_details.get('gamma_conf', ''))
+    if '✅' in gamma_conf:
+        score += 15
+    elif gamma_conf and gamma_conf != '-':
+        score += 4
+
+    if opt_details.get('straddle_expanding'):
+        score += 10
+
+    if signal.get('vol_spike'):
+        score += 10
+
+    if signal.get('vol_spike') and opt_confirmed and signal.get('candle_strength', 0) >= 20:
+        score += 10  # institutional bonus
+
+    return min(100, score)
+
+
+def run_candlestick_intelligence_engine(df, option_data, straddle_history, underlying_price, is_expiry=False):
+    """
+    Main CIE entry point. Returns list of scored, filtered signal dicts.
+    Each signal contains: pattern, direction, category, price, level,
+    level_type, confidence, signal_strength, strength_color, options_details.
+    """
+    if df is None or len(df) < 5 or underlying_price is None:
+        return []
+
+    df_summary = option_data.get('df_summary') if option_data else None
+    sr_data    = option_data.get('sr_data', []) if option_data else []
+    vob_blocks = option_data.get('vob_blocks', {}) if option_data else {}
+
+    # Build S/R from swing detection
+    supports, resistances = _cie_detect_swing_sr(df)
+
+    # Augment with option_data S/R
+    for sr in (sr_data or []):
+        v = sr.get('value', 0)
+        if v > 0:
+            (supports if sr.get('type') == 'low' else resistances).append(float(v))
+
+    if isinstance(vob_blocks, dict):
+        for b in vob_blocks.get('bullish', []):
+            if b.get('mid', 0) > 0:
+                supports.append(float(b['mid']))
+        for b in vob_blocks.get('bearish', []):
+            if b.get('mid', 0) > 0:
+                resistances.append(float(b['mid']))
+
+    # Re-cluster merged levels
+    def _recluster(lvls, pct=0.003):
+        if not lvls:
+            return []
+        lvls = sorted(set([round(l, 1) for l in lvls if l > 0]))
+        clusters, grp = [], [lvls[0]]
+        for l in lvls[1:]:
+            if abs(l - grp[-1]) / (grp[-1] + 1e-6) <= pct:
+                grp.append(l)
+            else:
+                clusters.append(float(np.mean(grp)))
+                grp = [l]
+        clusters.append(float(np.mean(grp)))
+        return clusters
+
+    supports    = _recluster(supports)
+    resistances = _recluster(resistances)
+
+    raw_signals = _cie_detect_patterns(df, supports, resistances)
+    final_signals = []
+
+    for sig in raw_signals:
+        opt_confirmed, opt_details = _cie_options_confirmation(
+            sig, df_summary, straddle_history, underlying_price)
+
+        # Volatility filter — skip unless expiry day
+        if opt_details.get('volatility_filter') == 'BLOCKED' and not is_expiry:
+            continue
+
+        confidence = _cie_confidence_score(sig, opt_details, opt_confirmed)
+        if confidence < 40:
+            continue
+
+        sig['confidence']       = confidence
+        sig['options_confirmed'] = opt_confirmed
+        sig['options_details']  = opt_details
+
+        if confidence >= 85:
+            sig['signal_strength'] = 'INSTITUTIONAL'
+            sig['strength_color']  = '#ff6600'
+        elif confidence >= 70:
+            sig['signal_strength'] = 'STRONG'
+            sig['strength_color']  = '#ffaa00'
+        else:
+            sig['signal_strength'] = 'NORMAL'
+            sig['strength_color']  = '#00aaff'
+
+        final_signals.append(sig)
+
+    # ── Volume spike & institutional activity detection ──────────────
+    if df is not None and len(df) >= 10 and 'volume' in df.columns:
+        avg_vol = df['volume'].rolling(20).mean()
+        for _vi in range(max(0, len(df) - 5), len(df)):
+            _v = df['volume'].iloc[_vi]
+            _avg = avg_vol.iloc[_vi] if _vi < len(avg_vol) else df['volume'].mean()
+            if pd.isna(_avg) or _avg <= 0:
+                continue
+            _vol_ratio = _v / _avg
+            if _vol_ratio >= 1.5:
+                _v_close = df['close'].iloc[_vi]
+                _v_open = df['open'].iloc[_vi]
+                _v_dir = 'BUY' if _v_close > _v_open else 'SELL'
+                _v_time = df['datetime'].iloc[_vi] if 'datetime' in df.columns else None
+
+                # Volume strength classification
+                if _vol_ratio >= 3.0:
+                    _vol_strength = 'INSTITUTIONAL'
+                    _vol_color = '#ff6600'
+                    _vol_conf = 90
+                elif _vol_ratio >= 2.0:
+                    _vol_strength = 'HIGH'
+                    _vol_color = '#ffaa00'
+                    _vol_conf = 75
+                else:
+                    _vol_strength = 'ELEVATED'
+                    _vol_color = '#00aaff'
+                    _vol_conf = 60
+
+                _vol_sig = {
+                    'pattern': f'Volume Spike ({_vol_ratio:.1f}x)',
+                    'direction': _v_dir,
+                    'category': 'Volume Analysis',
+                    'price': _v_close,
+                    'level': _v_close,
+                    'level_type': 'Volume Spike',
+                    'confidence': _vol_conf,
+                    'signal_strength': _vol_strength,
+                    'strength_color': _vol_color,
+                    'options_confirmed': False,
+                    'options_details': {
+                        'volume_ratio': _vol_ratio,
+                        'volume_strength': _vol_strength,
+                    },
+                    'time': _v_time,
+                }
+                final_signals.append(_vol_sig)
+
+    # Deduplicate by (pattern, direction), keep highest confidence
+    seen, deduped = set(), []
+    for s in sorted(final_signals, key=lambda x: -x['confidence']):
+        key = (s['pattern'], s['direction'])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(s)
+
+    return deduped
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GEOMETRIC PATTERN ANALYSIS — UI RENDERING
+# ══════════════════════════════════════════════════════════════════════════════
+
+def render_geo_pattern_analysis(df, df_full, date_label='Today'):
+    """
+    Render the full Pattern Analysis panel:
+      1. Real-time pattern alerts
+      2. Pattern detection results table
+      3. Backtest chart + summary
+    """
+    if df is None or df.empty:
+        return
+
+    detector = GeometricPatternDetector()
+
+    # ── Live patterns on today's / selected-date df ────────────────────
+    live_patterns = detector.detect_all(df)
+
+    st.markdown("---")
+    st.markdown("## 📐 Geometric & Reversal Pattern Analysis")
+    st.caption(f"Detecting 10 pattern types on NIFTY50 — {date_label}")
+
+    # ── Pattern Alerts — single unified table ─────────────────────────
+    st.markdown("### 🔔 Pattern Alerts")
+    if live_patterns:
+        _alert_rows = []
+        for p in sorted(live_patterns, key=lambda x: x['time'], reverse=True):
+            sig = p['signal']
+            icon = '🟢' if sig == 'BUY' else ('🔴' if sig == 'SELL' else '🟡')
+            sig_lbl = f"{icon} {sig}"
+            ts = p['time']
+            time_str = ts.strftime('%H:%M') if hasattr(ts, 'strftime') else str(ts)
+            # Volume context for breakout
+            _p_vol = p.get('volume', 0)
+            _p_vol_str = f"{_p_vol:,}" if _p_vol else '—'
+            _p_vr = p.get('vol_ratio', 0)
+            _p_vr_str = f"{_p_vr:.2f}x" if _p_vr else '—'
+            _p_vol_sig = '🔥 Spike' if _p_vr > 2.0 else ('⬆️ High' if _p_vr > 1.5 else ('➡️ Avg' if _p_vr > 0.75 else '⬇️ Low')) if _p_vr else '—'
+            _alert_rows.append({
+                'Time': time_str,
+                'Pattern': f"{icon} {p['pattern']}",
+                'Sentiment': p['sentiment'],
+                'Signal': sig_lbl,
+                'Breakout (₹)': f"₹{p['entry']:.0f}",
+                'SL (₹)': f"₹{p['stoploss']:.0f}",
+                'Target (₹)': f"₹{p['target']:.0f}",
+                'RR': f"{p['rr']:.2f}",
+                'Volume': _p_vol_str,
+                'Vol Ratio': _p_vr_str,
+                'Vol Signal': _p_vol_sig,
+                'Confidence': p['confidence'],
+                'Move %': f"{p['move_pct']:+.2f}%",
+            })
+        st.dataframe(pd.DataFrame(_alert_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No geometric patterns detected on current price data. Patterns will appear when confirmed breakouts occur.")
+
+    # ── Pattern Heatmap (frequency by pattern name) ───────────────────
+    st.markdown("### 🗺️ Pattern Heatmap")
+    if df_full is not None and not df_full.empty and len(df_full) >= 30:
+        bt_results = detector.backtest_scan(df_full, step=10)
+        if bt_results:
+            from collections import Counter
+            pat_counts = Counter(r['pattern'] for r in bt_results)
+            pat_wins   = {}
+            pat_total  = {}
+            pat_vol_sum = {}
+            pat_vol_cnt = {}
+            pat_spike_cnt = {}
+            for r in bt_results:
+                k = r['pattern']
+                pat_total[k] = pat_total.get(k, 0) + 1
+                if r.get('result') == 'WIN':
+                    pat_wins[k] = pat_wins.get(k, 0) + 1
+                _rv = r.get('volume', 0)
+                if _rv:
+                    pat_vol_sum[k] = pat_vol_sum.get(k, 0) + _rv
+                    pat_vol_cnt[k] = pat_vol_cnt.get(k, 0) + 1
+                _rvr = r.get('vol_ratio', 0)
+                if _rvr and _rvr > 1.5:
+                    pat_spike_cnt[k] = pat_spike_cnt.get(k, 0) + 1
+
+            heatmap_rows = []
+            for pat, cnt in sorted(pat_counts.items(), key=lambda x: -x[1]):
+                wins = pat_wins.get(pat, 0)
+                total = pat_total.get(pat, 1)
+                wr = wins / total * 100
+                avg_vol = int(pat_vol_sum.get(pat, 0) / pat_vol_cnt[pat]) if pat_vol_cnt.get(pat, 0) > 0 else 0
+                spikes = pat_spike_cnt.get(pat, 0)
+                heatmap_rows.append({
+                    'Pattern': pat,
+                    'Occurrences': cnt,
+                    'Win Rate %': f"{wr:.1f}%",
+                    'Wins': wins,
+                    'Losses': total - wins,
+                    'Avg Vol': f"{avg_vol:,}" if avg_vol else '—',
+                    'Vol Spikes': spikes,
+                    'Spike %': f"{spikes / total * 100:.0f}%" if total > 0 else '0%',
+                })
+            st.dataframe(pd.DataFrame(heatmap_rows), use_container_width=True, hide_index=True)
+
+            # Most frequent pattern indicator
+            top_pat = max(pat_counts, key=pat_counts.get)
+            best_wr_pat = max(pat_wins, key=lambda k: pat_wins[k] / pat_total.get(k, 1)) if pat_wins else top_pat
+            worst_wr_pat = min(pat_total, key=lambda k: pat_wins.get(k, 0) / pat_total[k]) if pat_total else top_pat
+
+            col_h1, col_h2, col_h3 = st.columns(3)
+            with col_h1:
+                st.metric("Most Frequent Pattern", top_pat, f"{pat_counts[top_pat]} times")
+            with col_h2:
+                best_wr = pat_wins.get(best_wr_pat, 0) / pat_total.get(best_wr_pat, 1) * 100
+                st.metric("Highest Win Rate", best_wr_pat, f"{best_wr:.1f}%")
+            with col_h3:
+                worst_wr = pat_wins.get(worst_wr_pat, 0) / pat_total.get(worst_wr_pat, 1) * 100
+                st.metric("Lowest Win Rate", worst_wr_pat, f"{worst_wr:.1f}%")
+
+            # ── Backtest Summary Panel ─────────────────────────────────
+            st.markdown("### 📋 Backtest Summary")
+            total_detected = len(bt_results)
+            total_wins = sum(1 for r in bt_results if r.get('result') == 'WIN')
+            overall_wr = total_wins / total_detected * 100 if total_detected > 0 else 0
+            avg_move = np.mean([abs(r.get('actual_move_pct', 0)) for r in bt_results]) if bt_results else 0
+            buy_results = [r for r in bt_results if r['signal'] == 'BUY']
+            sell_results = [r for r in bt_results if r['signal'] == 'SELL']
+
+            bs_col1, bs_col2, bs_col3, bs_col4 = st.columns(4)
+            with bs_col1:
+                st.metric("Total Patterns Detected", total_detected)
+            with bs_col2:
+                st.metric("Overall Win Rate", f"{overall_wr:.1f}%",
+                          delta=f"{total_wins}W / {total_detected - total_wins}L")
+            with bs_col3:
+                st.metric("Avg Move After Breakout", f"{avg_move:.2f}%")
+            with bs_col4:
+                buy_wr = sum(1 for r in buy_results if r.get('result') == 'WIN') / max(len(buy_results), 1) * 100
+                st.metric("BUY Signal Win Rate", f"{buy_wr:.1f}%", f"{len(buy_results)} signals")
+
+            # Backtest table (last 30 entries)
+            st.markdown("#### Recent Backtest Results (last 30)")
+            bt_table_rows = []
+            for r in bt_results[-30:]:
+                ts = r['time']
+                time_str = ts.strftime('%d-%b %H:%M') if hasattr(ts, 'strftime') else str(ts)
+                sig = r['signal']
+                sig_lbl = '🟢 BUY' if sig == 'BUY' else '🔴 SELL'
+                result = r.get('result', '')
+                res_lbl = '✅ WIN' if result == 'WIN' else '❌ LOSS'
+                _bt_vol = r.get('volume', 0)
+                _bt_vr = r.get('vol_ratio', 0)
+                bt_table_rows.append({
+                    'Time': time_str,
+                    'Pattern': r['pattern'],
+                    'Sentiment': r['sentiment'],
+                    'Signal': sig_lbl,
+                    'Entry (₹)': f"{r['entry']:.1f}",
+                    'SL (₹)': f"{r['stoploss']:.1f}",
+                    'Target (₹)': f"{r['target']:.1f}",
+                    'RR': f"{r['rr']:.2f}",
+                    'Volume': f"{_bt_vol:,}" if _bt_vol else '—',
+                    'Vol Ratio': f"{_bt_vr:.2f}x" if _bt_vr else '—',
+                    'Actual Move %': f"{r.get('actual_move_pct', 0):+.2f}%",
+                    'Result': res_lbl,
+                    'Confidence': r['confidence'],
+                })
+            if bt_table_rows:
+                st.dataframe(pd.DataFrame(bt_table_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Not enough historical data to run backtest scan.")
+    else:
+        st.info("Load more data (increase 'Days Back') to enable backtest scan.")
+
+
 # =====================================================================
 # MASTER DATA ENGINE — Passive cache populated by main() flow
 # Eliminates duplicate calculations; all engines read from here.
@@ -9870,7 +14342,7 @@ class MasterDataEngine:
             self._data['htf_resistances'] = sorted([p['value'] for p in pivots_raw if p['type'] == 'high'])
 
         # VOB
-        if isinstance(vob_sr, dict):
+        if vob_sr is not None:
             self._data['vob_sr'] = vob_sr
             self._data['vob_supports'] = sorted(vob_sr.get('support', []), reverse=True)
             self._data['vob_resistances'] = sorted(vob_sr.get('resistance', []))
@@ -10038,6 +14510,58 @@ def run_smart_money_trap_detection(mde):
                 'detail': f"Dropped {tr:.2f}% but now {price_chg:+.2f}%", 'level': mde.val('day_low', spot)})
     return traps
 
+
+# ── Market Regime Detection Engine ───────────────────────────────────
+def detect_market_regime(mde):
+    """Classify market: Trending / Range / Breakout / Vol Expansion / Compression / Trap."""
+    df_today = mde.val('df_today')
+    spot = mde.val('spot_price', 0)
+    gex_data = mde.val('gex_data')
+    price_chg = mde.val('price_change_pct', 0)
+    result = {'regime': 'Unknown', 'confidence': 0, 'details': [], 'color': '#888', 'scores': {}}
+    if df_today is None or df_today.empty or len(df_today) < 10:
+        return result
+
+    closes = df_today['close']
+    highs, lows = df_today['high'], df_today['low']
+    tr = pd.concat([highs - lows, abs(highs - closes.shift(1)), abs(lows - closes.shift(1))], axis=1).max(axis=1)
+    atr_14 = tr.rolling(14).mean().iloc[-1] if len(tr) >= 14 else tr.mean()
+    atr_pct = (atr_14 / spot * 100) if spot else 0
+    ema9 = closes.ewm(span=9, adjust=False).mean()
+    ema21 = closes.ewm(span=21, adjust=False).mean()
+    trend_up = ema9.iloc[-1] > ema21.iloc[-1] and closes.iloc[-1] > ema9.iloc[-1]
+    trend_dn = ema9.iloc[-1] < ema21.iloc[-1] and closes.iloc[-1] < ema9.iloc[-1]
+    range_pct = ((highs.max() - lows.min()) / spot * 100) if spot else 0
+    total_gex = gex_data.get('total_gex', 0) if gex_data and isinstance(gex_data, dict) else 0
+
+    details = []
+    sc = {'trend': 0, 'range': 0, 'breakout': 0, 'vol_expand': 0, 'vol_compress': 0, 'trap': 0}
+
+    if trend_up or trend_dn:
+        sc['trend'] += 30; details.append(f"EMA trend {'Up' if trend_up else 'Down'}")
+    if abs(price_chg) > 0.5:
+        sc['trend'] += 20; details.append(f"Price {price_chg:+.2f}% from open")
+    if range_pct < 0.6:
+        sc['range'] += 40; details.append(f"Tight range {range_pct:.2f}%")
+    if atr_pct < 0.08:
+        sc['range'] += 20; sc['vol_compress'] += 30; details.append(f"Low ATR {atr_pct:.3f}%")
+    if range_pct > 1.0 and abs(price_chg) > 0.6:
+        sc['breakout'] += 40; details.append(f"Wide range {range_pct:.2f}% + directional")
+    if atr_pct > 0.15:
+        sc['vol_expand'] += 20; details.append(f"High ATR {atr_pct:.3f}%")
+    if total_gex > 50:
+        sc['trap'] += 25; details.append(f"+GEX {total_gex:.0f}L pins price")
+    elif total_gex < -50:
+        sc['vol_expand'] += 15; details.append(f"-GEX {total_gex:.0f}L accelerates")
+
+    rmap = {'trend': ('Trending', '#00e676'), 'range': ('Range-Bound', '#ffeb3b'),
+            'breakout': ('Breakout Setup', '#ff6600'), 'vol_expand': ('Volatility Expansion', '#ff4444'),
+            'vol_compress': ('Volatility Compression', '#00aaff'), 'trap': ('Trap Zone / Pinned', '#ff44ff')}
+    best = max(sc, key=sc.get)
+    label, color = rmap[best]
+    conf = min(95, sc[best])
+    if conf < 25: label, color, conf = 'Indeterminate', '#888', 20
+    return {'regime': label, 'confidence': conf, 'details': details, 'color': color, 'scores': sc}
 
 
 # ── Price Target Projection Engine ───────────────────────────────────
@@ -10278,6 +14802,8 @@ def main():
         st.session_state.pressure_last_valid = None
     if 'iv_skew_signal_last' not in st.session_state:
         st.session_state.iv_skew_signal_last = None  # (timestamp, signal_text)
+    if 'ml_report_history' not in st.session_state:
+        st.session_state.ml_report_history = []
 
     # Initialize session state for Pro Trader Dashboard
     if 'pro_trader_history' not in st.session_state:
@@ -10305,9 +14831,16 @@ def main():
         st.session_state.last_gamma_alert = None
     if 'last_expiry_spike_alert' not in st.session_state:
         st.session_state.last_expiry_spike_alert = None
+    # Candlestick Intelligence Engine
+    if 'cie_signal_history' not in st.session_state:
+        st.session_state.cie_signal_history = []   # list of signal dicts with timestamp
+    if 'cie_last_alert' not in st.session_state:
+        st.session_state.cie_last_alert = {}        # pattern -> last alert datetime
     # Cross-Market Confirmation Engine
     if 'cmce_last_alert' not in st.session_state:
         st.session_state.cmce_last_alert = None     # datetime of last CMCE Telegram alert
+    if 'iofce_last_alert' not in st.session_state:
+        st.session_state.iofce_last_alert = None    # datetime of last IOFCE Telegram alert
     if 'delta_gamma_last_alert' not in st.session_state:
         st.session_state.delta_gamma_last_alert = None  # datetime of last Delta & Gamma Telegram alert
 
@@ -11023,6 +15556,8 @@ def main():
                     })
                 st.dataframe(pd.DataFrame(_ctype_rows), use_container_width=True, hide_index=True)
 
+            # ── Geometric & Reversal Pattern Analysis ──────────────────────
+            render_geo_pattern_analysis(_df_today, df, date_label=_date_label)
 
             # ── HTF Support & Resistance + VOB Summary ────────────────────
             st.markdown("---")
@@ -11501,6 +16036,8 @@ def main():
         # ── 🧠 SMART MONEY PANEL — shown first so it's always visible ────────
         render_smart_money_master_analysis(option_data, current_price)
 
+        # ── 🧠 VOB2 PRE-MARKET INTELLIGENCE REPORT ──────────────────────────
+        render_pre_market_intelligence_report(option_data, current_price)
 
         # OI Change metrics
         st.markdown("## Open Interest Change (in Lakhs)")
@@ -14312,6 +18849,31 @@ def main():
         except Exception as _trap_err:
             st.warning(f"Trap Detection error: {str(_trap_err)[:80]}")
 
+        # ===== MARKET REGIME DETECTION ENGINE =====
+        st.markdown("---")
+        st.markdown("## 📊 Market Regime Detection Engine")
+        try:
+            _regime = detect_market_regime(mde)
+            _reg_c1, _reg_c2, _reg_c3 = st.columns([2, 1, 1])
+            with _reg_c1:
+                st.markdown(f"""<div style='background:#1e1e1e;padding:16px;border-radius:8px;border-left:5px solid {_regime['color']}'>
+                <div style='color:#aaa;font-size:11px'>CURRENT REGIME</div>
+                <div style='font-size:26px;font-weight:bold;color:{_regime['color']}'>{_regime['regime']}</div>
+                <div style='color:#ccc;font-size:13px'>Confidence: {_regime['confidence']}%</div>
+                </div>""", unsafe_allow_html=True)
+            with _reg_c2:
+                st.markdown("**Factors:**")
+                for _rd in _regime.get('details', [])[:5]:
+                    st.caption(f"• {_rd}")
+            with _reg_c3:
+                _rsc = _regime.get('scores', {})
+                if _rsc:
+                    _rsc_sorted = sorted(_rsc.items(), key=lambda x: x[1], reverse=True)[:3]
+                    st.markdown("**Top Scores:**")
+                    for _rn, _rv in _rsc_sorted:
+                        st.caption(f"{_rn}: {_rv}")
+        except Exception as _reg_err:
+            st.warning(f"Regime Detection error: {str(_reg_err)[:80]}")
 
         # ===== PRICE TARGET PROJECTION ENGINE =====
         st.markdown("---")
@@ -16953,6 +21515,18 @@ def main():
             mime="text/csv"
         )
 
+    # ===== FINAL INTELLIGENCE DASHBOARD (Master Summary) =====
+    st.markdown("---")
+    with st.expander("🎯 NIFTY Intelligence Summary — Master Dashboard", expanded=True):
+        try:
+            show_final_intelligence_dashboard(
+                df=df if not df.empty else None,
+                option_data=option_data,
+                current_price=current_price,
+            )
+        except Exception as _fid_err:
+            st.warning(f"Intelligence Dashboard error: {str(_fid_err)}")
+
     # ===== MARKET ACCELERATION ENGINE =====
     st.markdown("---")
     with st.expander("🚀 Market Acceleration Engine — Spike · Gamma · Expiry Intelligence", expanded=False):
@@ -17306,6 +21880,478 @@ def main():
         except Exception as _mae_e:
             st.warning(f"Market Acceleration Engine error: {str(_mae_e)}")
 
+    # ===== CANDLESTICK INTELLIGENCE ENGINE =====
+    st.markdown("---")
+    with st.expander("🕯️ Candlestick Intelligence Engine — Reversal & Continuation Signals", expanded=False):
+        try:
+            # CIE can run on price data alone; option_data augments S/R with OI levels
+            _cie_has_data = not df.empty and current_price
+            if _cie_has_data:
+                # Use option_data underlying if available, else fall back to current_price
+                _cie_underlying = (option_data.get('underlying')
+                                   if option_data and option_data.get('underlying')
+                                   else current_price)
+                _cie_straddle_hist = st.session_state.straddle_history
+
+                # Show a notice when running without option chain (price-only mode)
+                if not (option_data and option_data.get('underlying')):
+                    st.info(
+                        "ℹ️ **Running in Price-Only Mode** — Candlestick patterns, S/R levels, "
+                        "EMA and momentum signals are active. OI-based level augmentation requires "
+                        "a live option chain (Dhan API)."
+                    )
+
+                # Determine expiry day (DTE ≤ 2)
+                try:
+                    _cie_expiry_str = option_data.get('expiry', '') if option_data else ''
+                    _cie_expiry_dt  = datetime.strptime(_cie_expiry_str, "%Y-%m-%d") if _cie_expiry_str else None
+                    _cie_dte = (_cie_expiry_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days if _cie_expiry_dt else 999
+                    _cie_is_expiry = _cie_dte <= 2
+                except Exception:
+                    _cie_is_expiry = False
+
+                # Run engine — option_data=None is handled gracefully inside
+                _cie_signals = run_candlestick_intelligence_engine(
+                    df, option_data, _cie_straddle_hist, _cie_underlying, is_expiry=_cie_is_expiry
+                )
+
+                # Build S/R for chart display
+                _cie_sup, _cie_res = _cie_detect_swing_sr(df)
+
+                # ── Header metrics ───────────────────────────────────────────
+                _cie_hc1, _cie_hc2, _cie_hc3, _cie_hc4 = st.columns(4)
+                _total_sigs   = len(_cie_signals)
+                _buy_sigs     = sum(1 for s in _cie_signals if s['direction'] == 'BUY')
+                _sell_sigs    = sum(1 for s in _cie_signals if s['direction'] == 'SELL')
+                _inst_sigs    = sum(1 for s in _cie_signals if s.get('signal_strength') == 'INSTITUTIONAL')
+                with _cie_hc1:
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00aaff'>
+                    <div style='color:#aaa;font-size:11px'>ACTIVE SIGNALS</div>
+                    <div style='font-size:28px;font-weight:bold;color:#00aaff'>{_total_sigs}</div>
+                    <div style='color:#ccc;font-size:12px'>Patterns Detected</div>
+                    </div>""", unsafe_allow_html=True)
+                with _cie_hc2:
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00ff88'>
+                    <div style='color:#aaa;font-size:11px'>BUY SIGNALS</div>
+                    <div style='font-size:28px;font-weight:bold;color:#00ff88'>{_buy_sigs}</div>
+                    <div style='color:#ccc;font-size:12px'>Bullish Patterns</div>
+                    </div>""", unsafe_allow_html=True)
+                with _cie_hc3:
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #ff4444'>
+                    <div style='color:#aaa;font-size:11px'>SELL SIGNALS</div>
+                    <div style='font-size:28px;font-weight:bold;color:#ff4444'>{_sell_sigs}</div>
+                    <div style='color:#ccc;font-size:12px'>Bearish Patterns</div>
+                    </div>""", unsafe_allow_html=True)
+                with _cie_hc4:
+                    _inst_clr = '#ff6600' if _inst_sigs > 0 else '#888'
+                    st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {_inst_clr}'>
+                    <div style='color:#aaa;font-size:11px'>INSTITUTIONAL</div>
+                    <div style='font-size:28px;font-weight:bold;color:{_inst_clr}'>{_inst_sigs}</div>
+                    <div style='color:#ccc;font-size:12px'>Score ≥ 85</div>
+                    </div>""", unsafe_allow_html=True)
+
+                st.markdown("")
+                if _cie_is_expiry:
+                    st.warning("⚡ **EXPIRY DAY MODE** — Volatility filter relaxed. Prioritising wick rejections, engulfing & marubozu patterns.")
+
+                # ── Tabs ─────────────────────────────────────────────────────
+                _cie_tab1, _cie_tab2, _cie_tab3, _cie_tab4 = st.tabs(
+                    ["📋 Signals", "📈 Price + S/R Chart", "🌊 Options Flow Charts", "📜 Signal History"]
+                )
+
+                # ── TAB 1: Signals ────────────────────────────────────────
+                with _cie_tab1:
+                    if not _cie_signals:
+                        st.info("No qualifying signals at this time. Patterns require:\n"
+                                "• Near S/R level (within 0.2%)\n"
+                                "• Straddle expanding (ROC ≥ 0.5%)\n"
+                                "• Options flow confirmation\n"
+                                "• Confidence ≥ 40")
+                        # ── Today's Signal History ────────────────────────────
+                        _today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+                        _today_hist = [
+                            _h for _h in st.session_state.cie_signal_history
+                            if hasattr(_h.get('time'), 'date') and _h['time'].date() == _today_ist
+                        ]
+                        if _today_hist:
+                            st.markdown("#### 📜 Today's Signal History")
+                            _today_rows = []
+                            for _h in reversed(_today_hist):
+                                _dir_sym = '🟢 BUY' if _h.get('direction') == 'BUY' else '🔴 SELL'
+                                _conf_val = _h.get('confidence', 0)
+                                _today_rows.append({
+                                    'Time': _h['time'].strftime('%H:%M:%S'),
+                                    'Pattern': _h.get('pattern', ''),
+                                    'Direction': _dir_sym,
+                                    'Spot': f"₹{_h.get('spot', 0):.0f}",
+                                    'Price': f"₹{_h.get('price', 0):.0f}",
+                                    'Level': f"₹{_h.get('level', 0):.0f}" if _h.get('level') else 'N/A',
+                                    'Type': _h.get('level_type', ''),
+                                    'Confidence': _conf_val,
+                                    'Strength': _h.get('strength', ''),
+                                })
+                            st.dataframe(pd.DataFrame(_today_rows), use_container_width=True, hide_index=True)
+                        else:
+                            st.caption("No signals recorded today yet.")
+                    else:
+                        _cie_now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        for _sig in _cie_signals:
+                            _dir      = _sig['direction']
+                            _pat      = _sig['pattern']
+                            _cat      = _sig.get('category', '')
+                            _price    = _sig['price']
+                            _level    = _sig.get('level')
+                            _lvl_type = _sig.get('level_type', '')
+                            _conf     = _sig['confidence']
+                            _strength = _sig['signal_strength']
+                            _sclr     = _sig['strength_color']
+                            _opt      = _sig.get('options_details', {})
+                            _vol_sp   = '⚡ Vol Spike' if _sig.get('vol_spike') else ''
+                            _dir_emoji = '🟢' if _dir == 'BUY' else '🔴'
+                            _dir_clr   = '#00ff88' if _dir == 'BUY' else '#ff4444'
+                            _level_str = f"₹{_level:.0f}" if _level else 'N/A'
+                            _dist_str  = f"{(_sig.get('dist_pct') or 0)*100:.2f}%"
+                            _pcr_str   = f"PCR {_opt.get('pcr', 'N/A')}" if 'pcr' in _opt else ''
+                            _gamma_str = _opt.get('gamma_conf', _opt.get('gamma_sr', ''))
+                            _oi_str    = _opt.get('oi_conf', '')
+                            _delta_str = _opt.get('delta_conf', '')
+                            _strad_str = f"Straddle ROC {_opt.get('straddle_roc','N/A')}%" if 'straddle_roc' in _opt else ''
+                            _conf_bar_w = int(_conf)
+                            _conf_clr  = '#ff6600' if _conf >= 85 else ('#ffaa00' if _conf >= 70 else '#00aaff')
+
+                            st.markdown(f"""
+<div style='background:#1a1a2e;border:1px solid {_dir_clr};border-radius:10px;padding:16px;margin-bottom:12px'>
+<div style='display:flex;justify-content:space-between;align-items:center'>
+  <span style='font-size:20px;font-weight:bold;color:{_dir_clr}'>{_dir_emoji} {_dir} — {_pat}</span>
+  <span style='background:{_sclr};color:#000;font-size:11px;font-weight:bold;padding:4px 10px;border-radius:12px'>{_strength} {_vol_sp}</span>
+</div>
+<div style='color:#aaa;font-size:12px;margin-top:4px'>{_cat} · {_lvl_type} · Spot: ₹{_cie_underlying:.0f}</div>
+<div style='margin:10px 0 4px;display:flex;gap:16px;flex-wrap:wrap'>
+  <span style='color:#fff'>Price: <b>₹{_price:.0f}</b></span>
+  <span style='color:#aaa'>{_lvl_type}: <b style="color:{_dir_clr}">{_level_str}</b></span>
+  <span style='color:#aaa'>Distance: {_dist_str}</span>
+</div>
+<div style='margin:6px 0;font-size:12px;color:#ccc'>
+  {_pcr_str} &nbsp;|&nbsp; {_gamma_str} &nbsp;|&nbsp; {_oi_str} &nbsp;|&nbsp; {_delta_str} &nbsp;|&nbsp; {_strad_str}
+</div>
+<div style='margin-top:8px'>
+  <div style='font-size:11px;color:#aaa;margin-bottom:2px'>Confidence Score</div>
+  <div style='background:#333;border-radius:4px;height:10px;width:100%'>
+    <div style='background:{_conf_clr};height:10px;width:{_conf_bar_w}%;border-radius:4px'></div>
+  </div>
+  <div style='color:{_conf_clr};font-weight:bold;font-size:14px;margin-top:2px'>{_conf}/100 — {_strength}</div>
+</div>
+</div>""", unsafe_allow_html=True)
+
+                            # Telegram alert (throttled per pattern, 5 min cooldown)
+                            if enable_signals:
+                                _cie_last_ts = st.session_state.cie_last_alert.get(_pat)
+                                _cie_should_alert = (
+                                    _cie_last_ts is None or
+                                    (_cie_now_ist - _cie_last_ts).total_seconds() > 300
+                                )
+                                if _cie_should_alert and _conf >= 70:
+                                    _cie_tg_msg = (
+                                        f"{_dir_emoji} <b>CIE {_dir} SIGNAL — {_pat}</b>\n\n"
+                                        f"Spot: ₹{_cie_underlying:.0f}\n"
+                                        f"Pattern: {_pat} ({_cat})\n"
+                                        f"Price: ₹{_price:.0f}\n"
+                                        f"{_lvl_type}: {_level_str} (dist {_dist_str})\n"
+                                        f"{_pcr_str}\n"
+                                        f"{_gamma_str}\n"
+                                        f"{_oi_str}\n"
+                                        f"Straddle: {'Expanding ✅' if _opt.get('straddle_expanding') else 'Flat'}\n"
+                                        f"Confidence: {_conf}/100 — {_strength}\n"
+                                        f"Time: {_cie_now_ist.strftime('%H:%M:%S')} IST"
+                                    )
+                                    send_telegram_message_sync(_cie_tg_msg)
+                                    st.session_state.cie_last_alert[_pat] = _cie_now_ist
+                                    db.save_signal(
+                                        signal_type='CIE',
+                                        direction=_dir,
+                                        source=f'Candlestick Intelligence Engine — {_pat}',
+                                        spot_price=_cie_underlying,
+                                        confidence=str(_conf),
+                                        entry=_price,
+                                        details={'pattern': _pat, 'category': _cat,
+                                                 'level_type': _lvl_type, 'strength': _strength},
+                                    )
+                                    # Store in history
+                                    st.session_state.cie_signal_history.append({
+                                        'time': _cie_now_ist,
+                                        'pattern': _pat,
+                                        'direction': _dir,
+                                        'price': _price,
+                                        'level': _level,
+                                        'level_type': _lvl_type,
+                                        'confidence': _conf,
+                                        'strength': _strength,
+                                        'spot': _cie_underlying,
+                                    })
+                                    if len(st.session_state.cie_signal_history) > 100:
+                                        st.session_state.cie_signal_history = st.session_state.cie_signal_history[-100:]
+
+                # ── TAB 2: Price + S/R Chart ──────────────────────────────
+                with _cie_tab2:
+                    try:
+                        _cie_chart_df = df.tail(80).copy().reset_index(drop=True)
+                        _cie_fig = go.Figure()
+
+                        # Candlestick
+                        _cie_fig.add_trace(go.Candlestick(
+                            x=_cie_chart_df['datetime'],
+                            open=_cie_chart_df['open'],
+                            high=_cie_chart_df['high'],
+                            low=_cie_chart_df['low'],
+                            close=_cie_chart_df['close'],
+                            name='NIFTY 5m',
+                            increasing_line_color='#00ff88',
+                            decreasing_line_color='#ff4444',
+                        ))
+
+                        # Support levels
+                        for _sl in _cie_sup[-6:]:
+                            _cie_fig.add_hline(y=_sl, line_dash='dash', line_color='rgba(0,255,136,0.4)',
+                                               line_width=1, annotation_text=f'S {_sl:.0f}',
+                                               annotation_font_color='#00ff88', annotation_font_size=9)
+                        # Resistance levels
+                        for _rl in _cie_res[-6:]:
+                            _cie_fig.add_hline(y=_rl, line_dash='dash', line_color='rgba(255,68,68,0.4)',
+                                               line_width=1, annotation_text=f'R {_rl:.0f}',
+                                               annotation_font_color='#ff4444', annotation_font_size=9)
+
+                        # Highlight signal candles
+                        for _sig in _cie_signals:
+                            _sig_idx = _sig.get('index', -1)
+                            _chart_offset = len(df) - len(_cie_chart_df)
+                            _local_idx = _sig_idx - _chart_offset
+                            if 0 <= _local_idx < len(_cie_chart_df):
+                                _sc = _cie_chart_df.iloc[_local_idx]
+                                _sig_clr = 'rgba(0,255,136,0.25)' if _sig['direction'] == 'BUY' else 'rgba(255,68,68,0.25)'
+                                _cie_fig.add_vrect(
+                                    x0=_sc['datetime'], x1=_sc['datetime'],
+                                    fillcolor=_sig_clr, opacity=0.6, line_width=3,
+                                    line_color=_sig['strength_color'],
+                                    annotation_text=_sig['pattern'][:12],
+                                    annotation_position="top left",
+                                    annotation_font_size=9,
+                                    annotation_font_color=_sig['strength_color'],
+                                )
+
+                        # Spot price line
+                        _cie_fig.add_hline(y=_cie_underlying, line_dash='dot', line_color='#ffffff',
+                                           line_width=1.5, annotation_text=f'Spot {_cie_underlying:.0f}',
+                                           annotation_font_color='#fff', annotation_font_size=10)
+
+                        _cie_fig.update_layout(
+                            title='NIFTY 5-Min — Candlestick Intelligence Engine S/R Map',
+                            template='plotly_dark', height=480,
+                            xaxis_rangeslider_visible=False,
+                            margin=dict(l=10, r=80, t=50, b=30),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                            xaxis=dict(type='category', tickangle=-45, nticks=15,
+                                       tickfont=dict(size=8)),
+                        )
+                        st.plotly_chart(_cie_fig, use_container_width=True)
+
+                        # Support / Resistance level table
+                        st.markdown("**Detected S/R Levels**")
+                        _cie_sr_rows = (
+                            [{'Level': f'₹{r:.0f}', 'Type': '🔴 Resistance', 'Zone': 'R'} for r in sorted(_cie_res, reverse=True)[-6:]] +
+                            [{'Level': f'₹{s:.0f}', 'Type': '🟢 Support', 'Zone': 'S'} for s in sorted(_cie_sup, reverse=True)[:6]]
+                        )
+                        if _cie_sr_rows:
+                            st.dataframe(pd.DataFrame(_cie_sr_rows), use_container_width=True, hide_index=True)
+
+                        # ── Detected Reversal Candle Table ─────────────────
+                        st.markdown("**Reversal & Continuation Candles Detected**")
+                        if _cie_signals:
+                            _cie_candle_rows = []
+                            for _sig in _cie_signals:
+                                _ts = _sig.get('time')
+                                if hasattr(_ts, 'strftime'):
+                                    _ts_str = _ts.strftime('%H:%M')
+                                elif hasattr(_ts, 'to_pydatetime'):
+                                    _ts_str = _ts.to_pydatetime().strftime('%H:%M')
+                                else:
+                                    # Fallback: derive from df index
+                                    _si = _sig.get('index', -1)
+                                    if 0 <= _si < len(df) and 'datetime' in df.columns:
+                                        _ts_raw = df['datetime'].iloc[_si]
+                                        _ts_str = _ts_raw.strftime('%H:%M') if hasattr(_ts_raw, 'strftime') else str(_ts_raw)[:5]
+                                    else:
+                                        _ts_str = 'N/A'
+                                _cie_candle_rows.append({
+                                    'Time': _ts_str,
+                                    'Pattern': _sig['pattern'],
+                                    'Signal': _sig['direction'],
+                                    'Category': _sig.get('category', ''),
+                                    'Price': f"₹{_sig['price']:.0f}",
+                                    'Level Type': _sig.get('level_type', ''),
+                                    'Level': f"₹{_sig['level']:.0f}" if _sig.get('level') else 'N/A',
+                                    'Dist %': f"{(_sig.get('dist_pct') or 0)*100:.2f}%",
+                                    'Vol Spike': '⚡ Yes' if _sig.get('vol_spike') else 'No',
+                                    'Confidence': f"{_sig['confidence']}/100",
+                                    'Strength': _sig.get('signal_strength', ''),
+                                })
+                            _cie_candle_df = pd.DataFrame(_cie_candle_rows)
+                            # Color rows by direction
+                            def _cie_color_row(row):
+                                clr = 'background-color: rgba(0,255,136,0.08)' if row['Signal'] == 'BUY' else 'background-color: rgba(255,68,68,0.08)'
+                                return [clr] * len(row)
+                            st.dataframe(
+                                _cie_candle_df.style.apply(_cie_color_row, axis=1),
+                                use_container_width=True, hide_index=True
+                            )
+                        else:
+                            st.info("No patterns detected near S/R levels.")
+                    except Exception as _cie_chart_err:
+                        st.warning(f"Chart error: {str(_cie_chart_err)[:80]}")
+
+                # ── TAB 3: Options Flow Charts ────────────────────────────
+                with _cie_tab3:
+                    _cie_flow_c1, _cie_flow_c2 = st.columns(2)
+
+                    # IV Skew history
+                    with _cie_flow_c1:
+                        _cie_iv_hist = st.session_state.get('iv_skew_history', [])
+                        if len(_cie_iv_hist) >= 3:
+                            _cie_iv_df = pd.DataFrame(_cie_iv_hist)
+                            _cie_iv_fig = go.Figure()
+                            if 'iv_skew' in _cie_iv_df.columns:
+                                _cie_iv_fig.add_trace(go.Scatter(
+                                    x=list(range(len(_cie_iv_df))),
+                                    y=_cie_iv_df['iv_skew'],
+                                    mode='lines', name='IV Skew (PE/CE)',
+                                    line=dict(color='#ff9900', width=2),
+                                ))
+                            _cie_iv_fig.add_hline(y=1.10, line_dash='dot', line_color='#ff4444',
+                                                  annotation_text='Bearish 1.10')
+                            _cie_iv_fig.add_hline(y=0.90, line_dash='dot', line_color='#00ff88',
+                                                  annotation_text='Bullish 0.90')
+                            _cie_iv_fig.update_layout(
+                                title='IV Skew (PE IV / CE IV)',
+                                template='plotly_dark', height=260,
+                                margin=dict(l=30, r=30, t=40, b=20),
+                                plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                                xaxis=dict(title='Snapshot', showticklabels=False),
+                                yaxis=dict(title='Skew'),
+                            )
+                            st.plotly_chart(_cie_iv_fig, use_container_width=True)
+                        else:
+                            st.info("IV Skew history building…")
+
+                    # Bid vs Ask Pressure
+                    with _cie_flow_c2:
+                        _cie_pres_hist = st.session_state.get('pressure_history', [])
+                        if len(_cie_pres_hist) >= 3:
+                            _cie_pres_df = pd.DataFrame(_cie_pres_hist)
+                            _cie_pres_fig = go.Figure()
+                            if 'net_pressure' in _cie_pres_df.columns:
+                                _cie_pres_clrs = ['#00ff88' if v > 0 else '#ff4444'
+                                                  for v in _cie_pres_df['net_pressure']]
+                                _cie_pres_fig.add_trace(go.Bar(
+                                    x=list(range(len(_cie_pres_df))),
+                                    y=_cie_pres_df['net_pressure'],
+                                    marker_color=_cie_pres_clrs,
+                                    name='Net Bid/Ask Pressure',
+                                ))
+                            _cie_pres_fig.add_hline(y=0.15, line_dash='dot', line_color='#00ff88',
+                                                    annotation_text='Bull 0.15')
+                            _cie_pres_fig.add_hline(y=-0.15, line_dash='dot', line_color='#ff4444',
+                                                    annotation_text='Bear -0.15')
+                            _cie_pres_fig.update_layout(
+                                title='Net Bid/Ask Pressure',
+                                template='plotly_dark', height=260,
+                                margin=dict(l=30, r=30, t=40, b=20),
+                                plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                                xaxis=dict(title='Snapshot', showticklabels=False),
+                                yaxis=dict(title='Pressure'),
+                            )
+                            st.plotly_chart(_cie_pres_fig, use_container_width=True)
+                        else:
+                            st.info("Pressure history building…")
+
+                    # Straddle movement
+                    _cie_strad_hist = st.session_state.get('straddle_history', [])
+                    if len(_cie_strad_hist) >= 3:
+                        _cie_strad_df = pd.DataFrame(_cie_strad_hist)
+                        _cie_strad_fig = go.Figure()
+                        if 'straddle' in _cie_strad_df.columns:
+                            _cie_strad_fig.add_trace(go.Scatter(
+                                x=list(range(len(_cie_strad_df))),
+                                y=_cie_strad_df['straddle'],
+                                mode='lines+markers', name='ATM Straddle',
+                                line=dict(color='#ff9900', width=2),
+                                marker=dict(size=3),
+                            ))
+                        _cie_strad_fig.update_layout(
+                            title='ATM Straddle Movement',
+                            template='plotly_dark', height=240,
+                            margin=dict(l=30, r=30, t=40, b=20),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                            xaxis=dict(title='Snapshot', showticklabels=False),
+                            yaxis=dict(title='Straddle ₹'),
+                        )
+                        st.plotly_chart(_cie_strad_fig, use_container_width=True)
+
+                    # Gamma Exposure history
+                    _cie_gex_hist = st.session_state.get('total_gex_history', [])
+                    if len(_cie_gex_hist) >= 3:
+                        _cie_gex_df = pd.DataFrame(_cie_gex_hist)
+                        _cie_gex_fig = go.Figure()
+                        if 'total_gex' in _cie_gex_df.columns:
+                            _cie_gex_clrs = ['#00ff88' if v >= 0 else '#ff4444'
+                                             for v in _cie_gex_df['total_gex']]
+                            _cie_gex_fig.add_trace(go.Bar(
+                                x=list(range(len(_cie_gex_df))),
+                                y=_cie_gex_df['total_gex'],
+                                marker_color=_cie_gex_clrs,
+                                name='Net GEX (L)',
+                            ))
+                        _cie_gex_fig.update_layout(
+                            title='Gamma Exposure (GEX) Over Time',
+                            template='plotly_dark', height=240,
+                            margin=dict(l=30, r=30, t=40, b=20),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                            xaxis=dict(title='Snapshot', showticklabels=False),
+                            yaxis=dict(title='GEX (L)'),
+                        )
+                        st.plotly_chart(_cie_gex_fig, use_container_width=True)
+
+                # ── TAB 4: Signal History ─────────────────────────────────
+                with _cie_tab4:
+                    _cie_hist = st.session_state.cie_signal_history
+                    if not _cie_hist:
+                        st.info("No signals have been alerted yet this session.")
+                    else:
+                        _cie_hist_rows = []
+                        for _h in reversed(_cie_hist[-50:]):
+                            _cie_hist_rows.append({
+                                'Time': _h['time'].strftime('%H:%M:%S') if hasattr(_h.get('time'), 'strftime') else str(_h.get('time', '')),
+                                'Pattern': _h.get('pattern', ''),
+                                'Direction': _h.get('direction', ''),
+                                'Price': f"₹{_h.get('price', 0):.0f}",
+                                'Spot': f"₹{_h.get('spot', 0):.0f}",
+                                'Level': f"₹{_h.get('level', 0):.0f}" if _h.get('level') else 'N/A',
+                                'Type': _h.get('level_type', ''),
+                                'Confidence': _h.get('confidence', 0),
+                                'Strength': _h.get('strength', ''),
+                            })
+                        st.dataframe(pd.DataFrame(_cie_hist_rows), use_container_width=True, hide_index=True)
+
+                    _cie_bcol1, _cie_bcol2 = st.columns([4, 1])
+                    with _cie_bcol2:
+                        if st.button("🗑️ Clear CIE History", key="clr_cie"):
+                            st.session_state.cie_signal_history = []
+                            st.session_state.cie_last_alert = {}
+                            st.rerun()
+
+            else:
+                st.warning("No price chart data available. Load NIFTY chart data to enable this engine.")
+        except Exception as _cie_err:
+            st.warning(f"Candlestick Intelligence Engine error: {str(_cie_err)}")
+
     # ===== CROSS-MARKET CONFIRMATION ENGINE =====
     st.markdown("---")
     with st.expander("🔗 Cross-Market Confirmation Engine — Reversal / Continuation / Trap", expanded=False):
@@ -17321,6 +22367,175 @@ def main():
             )
         except Exception as _cmce_err:
             st.warning(f"Cross-Market Confirmation Engine error: {str(_cmce_err)}")
+
+    # ===== INSTITUTIONAL ORDER FLOW CONFIRMATION ENGINE =====
+    st.markdown("---")
+    with st.expander("🏦 Institutional Order Flow Confirmation Engine (IOFCE)", expanded=False):
+        try:
+            _iofce_cie_sigs = _cie_signals if '_cie_signals' in dir() and not df.empty else []
+            _iofce_price    = current_price if current_price else (
+                option_data.get('underlying') if option_data else None)
+            _iofce_tg = enable_signals and bool(
+                option_data and option_data.get('underlying')
+            )
+            show_iofce(
+                option_data=option_data if option_data else {},
+                df=df if not df.empty else None,
+                underlying_price=_iofce_price,
+                cie_signals=_iofce_cie_sigs,
+                send_telegram=_iofce_tg,
+                ultimate_rsi_data=ultimate_rsi_data_for_chart if 'ultimate_rsi_data_for_chart' in dir() else None,
+                db=db,
+            )
+        except Exception as _iofce_err:
+            st.warning(f"Institutional Order Flow Engine error: {str(_iofce_err)}")
+
+    # ===== MASTER MARKET DECISION ENGINE =====
+    st.markdown("---")
+    with st.expander("🧠 Master Market Decision Engine — Final Analysis", expanded=True):
+        try:
+            _mde_spot = mde.val('spot_price', 0) or (current_price if 'current_price' in dir() else 0)
+            _mde_price_chg = mde.val('price_change_pct', 0)
+
+            # ── Collect scores from all engines ──
+            _md_scores = {}
+
+            # 1. Market Regime
+            _md_regime = detect_market_regime(mde)
+            _md_scores['Market Regime'] = {'score': _md_regime['confidence'],
+                'signal': _md_regime['regime'], 'color': _md_regime['color']}
+
+            # 2. Price Action (EMA-based)
+            _md_pa = 50
+            _md_df_today = mde.val('df_today')
+            if _md_df_today is not None and not _md_df_today.empty and len(_md_df_today) > 20:
+                _md_cl = _md_df_today['close']
+                _md_e9 = _md_cl.ewm(span=9, adjust=False).mean().iloc[-1]
+                _md_e21 = _md_cl.ewm(span=21, adjust=False).mean().iloc[-1]
+                if _md_e9 > _md_e21 and _md_cl.iloc[-1] > _md_e9: _md_pa = 75
+                elif _md_e9 < _md_e21 and _md_cl.iloc[-1] < _md_e9: _md_pa = 25
+                elif _md_e9 > _md_e21: _md_pa = 60
+                else: _md_pa = 40
+            _md_scores['Price Action'] = {'score': _md_pa,
+                'signal': 'Bullish' if _md_pa > 60 else ('Bearish' if _md_pa < 40 else 'Neutral'),
+                'color': '#00e676' if _md_pa > 60 else ('#ff4444' if _md_pa < 40 else '#ffeb3b')}
+
+            # 3. Options OI
+            _md_oi = 50
+            _md_tce = mde.val('total_ce_change', 0) or 0
+            _md_tpe = mde.val('total_pe_change', 0) or 0
+            if _md_tpe > _md_tce * 1.5: _md_oi = 70
+            elif _md_tce > _md_tpe * 1.5: _md_oi = 30
+            elif _md_tpe > _md_tce: _md_oi = 58
+            elif _md_tce > _md_tpe: _md_oi = 42
+            _md_scores['OI Positioning'] = {'score': _md_oi,
+                'signal': 'Bullish (PE Dominant)' if _md_oi > 60 else ('Bearish (CE Dominant)' if _md_oi < 40 else 'Neutral'),
+                'color': '#00e676' if _md_oi > 60 else ('#ff4444' if _md_oi < 40 else '#ffeb3b')}
+
+            # 4. GEX
+            _md_gex = 50
+            _md_gex_data = mde.val('gex_data')
+            if _md_gex_data and isinstance(_md_gex_data, dict):
+                _tgex = _md_gex_data.get('total_gex', 0)
+                if _tgex > 50: _md_gex = 60  # Pinned = neutral to slightly bullish
+                elif _tgex < -50: _md_gex = 55 if _md_pa > 50 else 35  # Acceleration in price direction
+            _md_scores['GEX Flow'] = {'score': _md_gex,
+                'signal': 'Pin/Stable' if _md_gex > 55 else ('Acceleration' if _md_gex < 40 else 'Neutral'),
+                'color': '#00aaff' if _md_gex > 55 else ('#ff6600' if _md_gex < 40 else '#ffeb3b')}
+
+            # 5. Trap Detection
+            _md_traps = run_smart_money_trap_detection(mde)
+            _md_trap_score = 50
+            if _md_traps:
+                max_trap_prob = max(t['probability'] for t in _md_traps)
+                _md_trap_score = max(20, 50 - int(max_trap_prob * 0.3))
+            _md_scores['Trap Safety'] = {'score': _md_trap_score,
+                'signal': f"{len(_md_traps)} traps" if _md_traps else 'Clean',
+                'color': '#ff4444' if _md_trap_score < 35 else ('#ffeb3b' if _md_trap_score < 50 else '#00e676')}
+
+            # 6. S/R Reaction
+            _md_sr = detect_sr_reactions(mde)
+            _md_sr_score = 50
+            if _md_sr:
+                _md_bounces = sum(1 for r in _md_sr if r['reaction'] == 'Bounce')
+                _md_breakdowns = sum(1 for r in _md_sr if r['reaction'] == 'Breakdown')
+                _md_sr_score = 55 + _md_bounces * 5 - _md_breakdowns * 5
+                _md_sr_score = max(20, min(80, _md_sr_score))
+            _md_scores['S/R Reaction'] = {'score': _md_sr_score,
+                'signal': f"{len(_md_sr)} levels",
+                'color': '#00e676' if _md_sr_score > 60 else ('#ff4444' if _md_sr_score < 40 else '#ffeb3b')}
+
+            # 7. Price Targets
+            _md_tgt = project_price_targets(mde)
+            _md_tgt_score = 50
+            if _md_tgt.get('magnet') and _mde_spot:
+                _mg_dist = (_md_tgt['magnet'] - _mde_spot) / _mde_spot * 100
+                if _mg_dist > 0.1: _md_tgt_score = 60  # Magnet above = bullish pull
+                elif _mg_dist < -0.1: _md_tgt_score = 40  # Magnet below = bearish pull
+            _md_scores['Target Bias'] = {'score': _md_tgt_score,
+                'signal': f"Magnet ₹{_md_tgt['magnet']:,.0f}" if _md_tgt.get('magnet') else 'N/A',
+                'color': '#00e676' if _md_tgt_score > 55 else ('#ff4444' if _md_tgt_score < 45 else '#ffeb3b')}
+
+            # ── Weighted composite ──
+            _md_weights = {
+                'Price Action': 0.25, 'OI Positioning': 0.20, 'GEX Flow': 0.15,
+                'Market Regime': 0.10, 'Trap Safety': 0.10, 'S/R Reaction': 0.10,
+                'Target Bias': 0.10,
+            }
+            _md_composite = int(sum(_md_scores[k]['score'] * _md_weights.get(k, 0.1) for k in _md_scores))
+
+            # Direction
+            if _md_composite >= 65: _md_dir, _md_dir_clr = "BULLISH", "#00e676"
+            elif _md_composite >= 55: _md_dir, _md_dir_clr = "SLIGHTLY BULLISH", "#69f0ae"
+            elif _md_composite <= 35: _md_dir, _md_dir_clr = "BEARISH", "#ff5252"
+            elif _md_composite <= 45: _md_dir, _md_dir_clr = "SLIGHTLY BEARISH", "#ff8a80"
+            else: _md_dir, _md_dir_clr = "NEUTRAL", "#ffeb3b"
+
+            # ── Display ──
+            _md_hc1, _md_hc2, _md_hc3, _md_hc4 = st.columns(4)
+            with _md_hc1:
+                st.markdown(f"""<div style='background:#1e1e1e;padding:16px;border-radius:8px;border-left:5px solid {_md_dir_clr};text-align:center'>
+                <div style='color:#aaa;font-size:10px'>MARKET DIRECTION</div>
+                <div style='font-size:24px;font-weight:bold;color:{_md_dir_clr}'>{_md_dir}</div>
+                </div>""", unsafe_allow_html=True)
+            with _md_hc2:
+                st.metric("Composite Score", f"{_md_composite}/100")
+            with _md_hc3:
+                _md_bp = min(100, max(0, _md_composite + 10 if _md_regime['regime'] == 'Breakout Setup' else _md_composite))
+                st.metric("Breakout Prob", f"{_md_bp}%")
+            with _md_hc4:
+                _md_risk = "LOW" if abs(_md_composite - 50) > 20 else ("HIGH" if abs(_md_composite - 50) < 8 else "MEDIUM")
+                st.metric("Risk Level", _md_risk)
+
+            # Pillar table
+            _md_rows = []
+            for _mk, _mv in _md_scores.items():
+                _md_rows.append({'Engine': _mk, 'Score': _mv['score'],
+                    'Weight': f"{int(_md_weights.get(_mk, 0.1) * 100)}%",
+                    'Signal': _mv['signal']})
+            st.dataframe(pd.DataFrame(_md_rows), use_container_width=True, hide_index=True)
+
+            # Intraday targets summary
+            st.markdown("**Intraday Targets:**")
+            _md_tgt_parts = []
+            if _md_tgt.get('upside_t1'): _md_tgt_parts.append(f"🟢 T1: ₹{_md_tgt['upside_t1']:,.0f}")
+            if _md_tgt.get('upside_t2'): _md_tgt_parts.append(f"🟢 T2: ₹{_md_tgt['upside_t2']:,.0f}")
+            if _md_tgt.get('magnet'): _md_tgt_parts.append(f"🧲 Magnet: ₹{_md_tgt['magnet']:,.0f}")
+            if _md_tgt.get('downside_t1'): _md_tgt_parts.append(f"🔴 T1: ₹{_md_tgt['downside_t1']:,.0f}")
+            if _md_tgt.get('downside_t2'): _md_tgt_parts.append(f"🔴 T2: ₹{_md_tgt['downside_t2']:,.0f}")
+            st.caption(" | ".join(_md_tgt_parts) if _md_tgt_parts else "No targets available")
+
+            # Smart money positioning summary
+            st.markdown("**Smart Money:**")
+            _sm_parts = []
+            if _md_traps:
+                for _t in _md_traps[:3]:
+                    _sm_parts.append(f"{_t['type']} ({_t['probability']}%)")
+            _sm_parts.append(f"CE ΔOI {_md_tce:+.1f}L | PE ΔOI {_md_tpe:+.1f}L")
+            st.caption(" | ".join(_sm_parts))
+
+        except Exception as _md_err:
+            st.warning(f"Master Decision Engine error: {str(_md_err)[:100]}")
 
     # ===== SIGNAL HISTORY (Supabase) =====
     st.markdown("---")
@@ -17405,6 +22620,18 @@ def main():
         except Exception as _fii_err:
             st.warning(f"FII/DII Analysis Engine error: {str(_fii_err)}")
 
+    # ===== MARKET NEWS INTELLIGENCE ENGINE =====
+    with st.expander("📰 Market News Intelligence Engine", expanded=False):
+        try:
+            show_news_intelligence_engine(
+                df=df if not df.empty else None,
+                option_data=option_data,
+                current_price=current_price,
+                fii_net_today=_fii_net_today_for_news,
+            )
+        except Exception as _nws_err:
+            st.warning(f"News Intelligence Engine error: {str(_nws_err)}")
+
     # ===== MARKET DEPTH ANALYSIS ENGINE =====
     with st.expander("📖 Market Depth Analysis Engine", expanded=False):
         try:
@@ -17428,6 +22655,37 @@ def main():
         except Exception as _mse_err:
             st.warning(f"Market Sentiment Engine error: {str(_mse_err)}")
 
+    # ===== GLOBAL CORRELATION INTELLIGENCE ENGINE =====
+    st.markdown("---")
+    with st.expander("🌐 Global Correlation Intelligence Engine — Pre-Market NIFTY Direction", expanded=True):
+        try:
+            show_global_correlation_intelligence()
+        except Exception as _gci_err:
+            st.warning(f"Global Correlation Intelligence Engine error: {str(_gci_err)}")
+
+    # ===== ML MARKET INTELLIGENCE REPORT =====
+    st.markdown("---")
+    with st.expander("🤖 ML Market Intelligence Report — Unified Analysis of All Data", expanded=True):
+        try:
+            show_ml_market_report(
+                option_data=option_data,
+                df=df if not df.empty else None,
+                current_price=current_price,
+            )
+        except Exception as _ml_err:
+            st.warning(f"ML Market Report error: {str(_ml_err)}")
+
+    # ===== ADVANCED MARKET INTELLIGENCE ENGINE =====
+    st.markdown("---")
+    with st.expander("🧠 Advanced Market Intelligence Engine — 12-Step Analysis", expanded=True):
+        try:
+            show_advanced_market_intelligence_engine(
+                df=df if not df.empty else None,
+                option_data=option_data,
+                current_price=current_price,
+            )
+        except Exception as _amie_err:
+            st.warning(f"Advanced Market Intelligence Engine error: {str(_amie_err)}")
 
     # ===== BANK NIFTY MULTI-TICKER DASHBOARD =====
     st.markdown("---")
@@ -18074,6 +23332,599 @@ def show_cross_market_confirmation_engine(
                 st.warning(f"Telegram send failed: {_tg_e}")
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# INSTITUTIONAL ORDER FLOW CONFIRMATION ENGINE (IOFCE)
+# Uses only existing VOB2 data: options chain, OI, GEX, depth, candles
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _iofce_identify_zones(df_summary, underlying_price: float) -> dict:
+    """Step 1: Identify Key Institutional Zones from existing options chain data.
+
+    Returns dict with: max_pain, oi_resistance, oi_support, gamma_flip,
+    gamma_support, gamma_resistance, depth_cluster_above, depth_cluster_below
+    """
+    zones = {
+        "max_pain": None,
+        "oi_resistance": None,      # highest CE OI strike
+        "oi_support": None,         # highest PE OI strike
+        "gamma_flip": None,
+        "gamma_resistance": None,   # highest CE gamma × OI strike
+        "gamma_support": None,      # highest PE gamma × OI strike
+        "depth_cluster_above": None,
+        "depth_cluster_below": None,
+    }
+    if df_summary is None or df_summary.empty or underlying_price is None:
+        return zones
+
+    try:
+        # OI walls
+        if 'openInterest_CE' in df_summary.columns:
+            idx = df_summary['openInterest_CE'].idxmax()
+            zones["oi_resistance"] = float(df_summary.loc[idx, 'Strike'])
+        if 'openInterest_PE' in df_summary.columns:
+            idx = df_summary['openInterest_PE'].idxmax()
+            zones["oi_support"] = float(df_summary.loc[idx, 'Strike'])
+
+        # Max pain: strike where total pain (sum of OI × |price-strike|) is maximum
+        try:
+            mp, _ = calculate_max_pain(df_summary, underlying_price)
+            zones["max_pain"] = float(mp) if mp else None
+        except Exception:
+            pass
+
+        # Gamma exposure zones
+        gex_result = calculate_dealer_gex(df_summary, underlying_price)
+        if gex_result:
+            zones["gamma_flip"]       = gex_result.get("gamma_flip_level")
+            zones["gamma_resistance"] = gex_result.get("gex_repeller")
+            zones["gamma_support"]    = gex_result.get("gex_magnet")
+
+        # Depth cluster using bid/ask columns as proxy for liquidity
+        ask_cols = [c for c in df_summary.columns if 'askQty' in c]
+        bid_cols = [c for c in df_summary.columns if 'bidQty' in c]
+        if ask_cols and bid_cols:
+            df_above = df_summary[df_summary['Strike'] > underlying_price].copy()
+            df_below = df_summary[df_summary['Strike'] < underlying_price].copy()
+            if not df_above.empty:
+                ask_sum = df_above[ask_cols].sum(axis=1)
+                zones["depth_cluster_above"] = float(df_above.loc[ask_sum.idxmax(), 'Strike'])
+            if not df_below.empty:
+                bid_sum = df_below[bid_cols].sum(axis=1)
+                zones["depth_cluster_below"] = float(df_below.loc[bid_sum.idxmax(), 'Strike'])
+    except Exception:
+        pass
+
+    return zones
+
+
+def _iofce_oi_score(df_summary, underlying_price: float,
+                    total_ce_chg: float, total_pe_chg: float) -> tuple:
+    """Step 2: OI Expansion Detection — score 0-2, direction, label.
+
+    Returns (score 0-2, activity_label str, detail str)
+    """
+    if df_summary is None or df_summary.empty:
+        return 0, "No OI Data", "Options chain unavailable"
+
+    try:
+        # Determine ATM
+        atm_strike = float(min(df_summary['Strike'].tolist(),
+                               key=lambda x: abs(x - underlying_price)))
+        atm_row = df_summary[df_summary['Strike'] == atm_strike]
+
+        ce_atm_chg = float(atm_row['changeinOpenInterest_CE'].iloc[0]) if (
+            not atm_row.empty and 'changeinOpenInterest_CE' in atm_row.columns) else 0
+        pe_atm_chg = float(atm_row['changeinOpenInterest_PE'].iloc[0]) if (
+            not atm_row.empty and 'changeinOpenInterest_PE' in atm_row.columns) else 0
+
+        score = 0
+        label = "Neutral OI"
+        detail = ""
+
+        # Strong call writing near resistance → institutional defense
+        if total_ce_chg > 0 and total_ce_chg > abs(total_pe_chg) * 1.2:
+            score += 1
+            label  = "Institutional Defense (CE Writing)"
+            detail = f"Call OI +{total_ce_chg:.1f}L vs Put OI {total_pe_chg:+.1f}L"
+
+        # Strong put writing near support → institutional accumulation
+        elif total_pe_chg > 0 and total_pe_chg > abs(total_ce_chg) * 1.2:
+            score += 1
+            label  = "Institutional Accumulation (PE Writing)"
+            detail = f"Put OI +{total_pe_chg:.1f}L vs Call OI {total_ce_chg:+.1f}L"
+
+        # Large OI change at ATM confirms smart money positioning
+        if abs(ce_atm_chg) + abs(pe_atm_chg) > 50000:   # significant ATM activity
+            score += 1
+            detail += f" | ATM activity CE:{ce_atm_chg:+.0f} PE:{pe_atm_chg:+.0f}"
+
+        if score == 0:
+            label  = "Weak / Mixed OI"
+            detail = f"CE chg:{total_ce_chg:+.1f}L  PE chg:{total_pe_chg:+.1f}L"
+
+        return min(2, score), label, detail.strip(" |")
+    except Exception:
+        return 0, "OI Error", "Calculation failed"
+
+
+def _iofce_futures_score(df, option_data: dict) -> tuple:
+    """Step 3: Futures Positioning Confirmation — score 0-2.
+
+    Uses existing _amie_oi_behavior which classifies Long/Short Build-up etc.
+    Returns (score 0-2, positioning_label str, detail str)
+    """
+    oi_behavior, support_sig, resistance_sig, oi_score = _amie_oi_behavior(option_data, df)
+
+    # Map AMIE OI behavior to institutional futures score
+    score_map = {
+        "Long Build-up":   2,   # price up + OI up → institutional longs building
+        "Short Build-up":  2,   # price down + OI up → institutional shorts building
+        "Short Covering":  1,   # price up + OI down → short covering (less definitive)
+        "Long Unwinding":  1,   # price down + OI down → longs exiting
+        "Mixed / Neutral": 0,
+    }
+    score = score_map.get(oi_behavior, 0)
+
+    # Determine direction context
+    if oi_behavior in ("Long Build-up", "Short Covering"):
+        detail = f"Bullish positioning — {support_sig} support | {resistance_sig} resistance"
+    elif oi_behavior in ("Short Build-up", "Long Unwinding"):
+        detail = f"Bearish positioning — {resistance_sig} resistance | {support_sig} support"
+    else:
+        detail = f"Mixed positioning — support:{support_sig} | resistance:{resistance_sig}"
+
+    return score, oi_behavior, detail
+
+
+def _iofce_depth_score(option_data: dict) -> tuple:
+    """Step 4: Market Depth Absorption Detection — score 0-2.
+
+    Uses existing _amie_depth_signal which reads bid/ask OI proxy.
+    Returns (score 0-2, depth_label str, detail str)
+    """
+    depth_signal, depth_score_raw, depth_detail = _amie_depth_signal(option_data)
+
+    # Map 0-100 score to 0-2 bands
+    if depth_score_raw >= 68:        # strong buying pressure (ratio > 1.5)
+        score = 2
+    elif depth_score_raw >= 58:      # mild buying
+        score = 1
+    elif depth_score_raw <= 32:      # strong selling
+        score = 2
+    elif depth_score_raw <= 42:      # mild selling
+        score = 1
+    else:                            # balanced (no clear absorption)
+        score = 0
+
+    return score, depth_signal, depth_detail
+
+
+def _iofce_gamma_score(df_summary, underlying_price: float) -> tuple:
+    """Step 5: Gamma Reaction Confirmation — score 0-2.
+
+    Uses existing GEX calculation to check if price is reacting at gamma levels.
+    Returns (score 0-2, gamma_label str, detail str)
+    """
+    if df_summary is None or df_summary.empty or underlying_price is None:
+        return 0, "No Gamma Data", "GEX calculation unavailable"
+
+    try:
+        gex = calculate_dealer_gex(df_summary, underlying_price)
+        if not gex:
+            return 0, "GEX Error", "Could not compute GEX"
+
+        total_gex     = gex.get("total_gex", 0)
+        flip_level    = gex.get("gamma_flip_level")
+        gex_signal    = gex.get("gex_signal", "")
+        gex_interp    = gex.get("gex_interpretation", "")
+        spot_vs_flip  = gex.get("spot_vs_flip", "N/A")
+        gex_magnet    = gex.get("gex_magnet")
+        gex_repeller  = gex.get("gex_repeller")
+
+        score = 0
+        label = "Neutral Gamma"
+        detail = f"GEX={total_gex:.0f}  Flip={flip_level or 'N/A'}  {spot_vs_flip}"
+
+        # Strong GEX signal
+        if gex_signal in ("Breakout", "Trending"):
+            # Negative GEX: dealers short gamma → directional moves amplified
+            score += 1
+            label  = f"Gamma Breakout Zone ({gex_signal})"
+        elif gex_signal in ("Pin/Chop", "Range"):
+            # Positive GEX: dealers long gamma → price pinning / mean reversion
+            score += 1
+            label  = f"Gamma Pinning ({gex_signal})"
+
+        # Price near gamma flip → high dealer hedging activity → institutional reaction
+        if flip_level and abs(underlying_price - flip_level) / (flip_level + 1e-6) < 0.005:
+            score += 1
+            label += " + Near Gamma Flip"
+            detail += f"  |  Price {underlying_price:.0f} near Flip {flip_level:.0f}"
+        elif gex_repeller and abs(underlying_price - gex_repeller) / (gex_repeller + 1e-6) < 0.004:
+            score += 1
+            label += " + At Gamma Repeller (Resistance)"
+        elif gex_magnet and abs(underlying_price - gex_magnet) / (gex_magnet + 1e-6) < 0.004:
+            score += 1
+            label += " + At Gamma Magnet (Support)"
+
+        return min(2, score), label, detail
+    except Exception:
+        return 0, "Gamma Error", "Calculation failed"
+
+
+def run_iofce(option_data: dict, df, underlying_price: float,
+              cie_signals: list) -> dict:
+    """Run Institutional Order Flow Confirmation Engine (IOFCE).
+
+    Steps: Zones → OI Expansion → Futures Positioning → Depth Absorption → Gamma Reaction
+    Produces institutional_score 0-8, classification, trap_risk, and adjusts CIE signal confidence.
+
+    Returns enriched result dict.
+    """
+    result = {
+        "zones":                  {},
+        "oi_score":               0,  "oi_label":    "",  "oi_detail":    "",
+        "futures_score":          0,  "futures_label": "", "futures_detail": "",
+        "depth_score":            0,  "depth_label": "",  "depth_detail":  "",
+        "gamma_score":            0,  "gamma_label": "",  "gamma_detail":  "",
+        "institutional_score":    0,
+        "classification":         "",
+        "trap_risk":              "",
+        "signal_adjustment":      "",
+        "adjusted_signals":       [],
+    }
+
+    if option_data is None:
+        option_data = {}
+
+    df_summary      = option_data.get("df_summary")
+    total_ce_chg    = option_data.get("total_ce_change", 0) or 0
+    total_pe_chg    = option_data.get("total_pe_change", 0) or 0
+    underlying      = underlying_price or option_data.get("underlying", 0) or 0
+
+    # Step 1 — Zones
+    result["zones"] = _iofce_identify_zones(df_summary, underlying)
+
+    # Step 2 — OI Expansion
+    result["oi_score"], result["oi_label"], result["oi_detail"] = _iofce_oi_score(
+        df_summary, underlying, total_ce_chg, total_pe_chg)
+
+    # Step 3 — Futures Positioning
+    result["futures_score"], result["futures_label"], result["futures_detail"] = _iofce_futures_score(
+        df, option_data)
+
+    # Step 4 — Depth Absorption
+    result["depth_score"], result["depth_label"], result["depth_detail"] = _iofce_depth_score(option_data)
+
+    # Step 5 — Gamma Reaction
+    result["gamma_score"], result["gamma_label"], result["gamma_detail"] = _iofce_gamma_score(
+        df_summary, underlying)
+
+    # Step 6 — Institutional Score (max = 8)
+    inst_score = (result["oi_score"] + result["futures_score"] +
+                  result["depth_score"] + result["gamma_score"])
+    result["institutional_score"] = inst_score
+
+    # Step 7 — Classification
+    if inst_score >= 6:
+        result["classification"] = "Institutional Move Confirmed"
+        result["trap_risk"]      = "Low"
+    elif inst_score >= 3:
+        result["classification"] = "Possible Institutional Activity"
+        result["trap_risk"]      = "Medium"
+    else:
+        result["classification"] = "Weak / Retail Driven Move"
+        result["trap_risk"]      = "High"
+
+    # Step 8 — Signal Adjustment on CIE signals
+    adjusted = []
+    for sig in (cie_signals or []):
+        sig = dict(sig)  # copy
+        original_conf = sig.get("confidence", 50)
+        if inst_score >= 6:
+            new_conf = min(100, original_conf + 8)
+            sig["iofce_adjustment"] = f"+8 (Institutional Confirmed)"
+        elif inst_score >= 3:
+            new_conf = original_conf          # no change
+            sig["iofce_adjustment"] = "0 (Possible Activity)"
+        else:
+            new_conf = max(30, original_conf - 8)
+            sig["iofce_adjustment"] = f"-8 (Retail/Weak)"
+        sig["confidence"]        = new_conf
+        sig["iofce_trap_risk"]   = result["trap_risk"]
+        sig["iofce_score"]       = inst_score
+        # Re-classify signal_strength after adjustment
+        if new_conf >= 85:
+            sig["signal_strength"] = "INSTITUTIONAL"
+            sig["strength_color"]  = "#ff6600"
+        elif new_conf >= 70:
+            sig["signal_strength"] = "STRONG"
+            sig["strength_color"]  = "#ffaa00"
+        else:
+            sig["signal_strength"] = "NORMAL"
+            sig["strength_color"]  = "#00aaff"
+        adjusted.append(sig)
+    result["adjusted_signals"] = adjusted
+
+    # Step 9 — Trap Enhancement note
+    if inst_score <= 2:
+        result["signal_adjustment"] = "High Trap Probability — reduce position size or wait for confirmation"
+    elif inst_score >= 6:
+        result["signal_adjustment"] = "Low Trap Risk — signal backed by institutional order flow"
+    else:
+        result["signal_adjustment"] = "Moderate — confirm with price action before entry"
+
+    return result
+
+
+def _iofce_build_telegram_message(res: dict, underlying_price: float,
+                                   dominant_signal: dict,
+                                   ultimate_rsi_data: dict = None) -> str:
+    """Format Telegram alert message for IOFCE result."""
+    inst_score  = res["institutional_score"]
+    classif     = res["classification"]
+    trap_risk   = res["trap_risk"]
+    sig_adj     = res["signal_adjustment"]
+    zones       = res.get("zones", {})
+
+    score_emoji = "🔥" if inst_score >= 6 else ("📊" if inst_score >= 3 else "⚠️")
+    trap_emoji  = "🟢" if trap_risk == "Low" else ("🟡" if trap_risk == "Medium" else "🔴")
+    dir_arrow   = ""
+    if dominant_signal:
+        d = dominant_signal.get("direction", "")
+        dir_arrow = "🟢 BUY" if d == "BUY" else ("🔴 SELL" if d == "SELL" else "")
+
+    lines = [
+        f"<b>🏦 Institutional Order Flow Confirmation</b>",
+        "",
+    ]
+    if dir_arrow:
+        lines.append(f"<b>Signal:</b> {dir_arrow}  |  {dominant_signal.get('pattern', '')}")
+    lines += [
+        f"<b>Inst. Score:</b> {score_emoji} {inst_score} / 8",
+        f"<b>Classification:</b> {classif}",
+        f"<b>Trap Risk:</b> {trap_emoji} {trap_risk}",
+        "",
+        "<b>Component Breakdown:</b>",
+        f"  OI Activity:        {res['oi_label']} ({res['oi_score']}/2)",
+        f"  Futures Pos:        {res['futures_label']} ({res['futures_score']}/2)",
+        f"  Depth Absorption:   {res['depth_label']} ({res['depth_score']}/2)",
+        f"  Gamma Reaction:     {res['gamma_label']} ({res['gamma_score']}/2)",
+    ]
+
+    # Zones
+    zone_label_map = {
+        "max_pain":            "Max Pain",
+        "oi_resistance":       "OI Resistance",
+        "oi_support":          "OI Support",
+        "gamma_flip":          "Gamma Flip",
+    }
+    zone_parts = [
+        f"{zone_label_map[k]}: ₹{v:,.0f}"
+        for k, v in zones.items()
+        if v is not None and k in zone_label_map
+    ]
+    if zone_parts:
+        lines += ["", "<b>Key Levels:</b>  " + "  |  ".join(zone_parts)]
+
+    # Adjusted signals summary
+    adj_sigs = res.get("adjusted_signals", [])
+    if adj_sigs:
+        lines.append("")
+        lines.append("<b>IOFCE-Adjusted Signals:</b>")
+        for s in adj_sigs[:3]:  # cap at 3 to keep message concise
+            lines.append(
+                f"  {s.get('direction','')} {s.get('pattern','')} → "
+                f"Conf:{s.get('confidence',0)}%  Adj:{s.get('iofce_adjustment','-')}"
+            )
+
+    # RSI section
+    if ultimate_rsi_data:
+        ursi_val      = ultimate_rsi_data.get('latest_arsi', 50)
+        ursi_sig      = ultimate_rsi_data.get('latest_signal', 50)
+        ursi_zone     = ultimate_rsi_data.get('zone', 'Neutral')
+        ursi_cross    = ultimate_rsi_data.get('cross_signal', 'None')
+        ursi_momentum = ultimate_rsi_data.get('momentum', 'Neutral')
+
+        if ursi_zone == 'Overbought':
+            rsi_zone_icon = "🔴"
+            rsi_note      = "Overbought — watch for bearish reversal"
+        elif ursi_zone == 'Oversold':
+            rsi_zone_icon = "🟢"
+            rsi_note      = "Oversold — watch for bullish bounce"
+        else:
+            rsi_zone_icon = "⚪"
+            rsi_note      = "Neutral zone"
+
+        cross_icon = "🔼" if 'Bullish' in ursi_cross else ("🔽" if 'Bearish' in ursi_cross else "➖")
+        lines += [
+            "",
+            f"<b>📈 Ultimate RSI (LuxAlgo):</b>",
+            f"  Value: {ursi_val:.1f}  |  Signal: {ursi_sig:.1f}",
+            f"  Zone: {rsi_zone_icon} <b>{ursi_zone}</b> — {rsi_note}",
+            f"  Momentum: {ursi_momentum}  |  Cross: {cross_icon} {ursi_cross}",
+        ]
+
+    lines += ["", f"<b>Guidance:</b> {sig_adj}"]
+    if underlying_price:
+        lines.append(f"<b>NIFTY Spot:</b> ₹{underlying_price:,.0f}")
+
+    return "\n".join(lines)
+
+
+def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list,
+               send_telegram: bool = False, ultimate_rsi_data: dict = None, db=None):
+    """UI panel for the Institutional Order Flow Confirmation Engine."""
+    st.markdown("#### 🏦 Institutional Order Flow Confirmation Engine")
+    st.caption(
+        "Confirms whether smart money is active behind the signal. "
+        "Uses only live VOB2 data: Options OI, GEX, Market Depth, Futures Positioning. Score: 0–8."
+    )
+
+    with st.spinner("Analysing institutional order flow…"):
+        res = run_iofce(option_data, df, underlying_price, cie_signals)
+
+    inst_score = res["institutional_score"]
+    classif    = res["classification"]
+    trap_risk  = res["trap_risk"]
+
+    score_color = ("#00ff88" if inst_score >= 6
+                   else ("#ffaa00" if inst_score >= 3 else "#ff4444"))
+    trap_color  = ("#00ff88" if trap_risk == "Low"
+                   else ("#ffaa00" if trap_risk == "Medium" else "#ff4444"))
+
+    # ── Summary KPIs ──────────────────────────────────────────────────
+    k1, k2, k3, k4 = st.columns(4)
+    with k1:
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {score_color}'>
+        <div style='color:#aaa;font-size:11px'>INST. SCORE</div>
+        <div style='font-size:28px;font-weight:bold;color:{score_color}'>{inst_score} / 8</div>
+        <div style='color:#ccc;font-size:11px'>{classif}</div>
+        </div>""", unsafe_allow_html=True)
+    with k2:
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {trap_color}'>
+        <div style='color:#aaa;font-size:11px'>TRAP RISK</div>
+        <div style='font-size:20px;font-weight:bold;color:{trap_color}'>{trap_risk}</div>
+        <div style='color:#ccc;font-size:11px'>{'Institutional Confirmed 🔥' if inst_score>=6 else ('Active 📊' if inst_score>=3 else 'Retail / Weak ⚠️')}</div>
+        </div>""", unsafe_allow_html=True)
+    with k3:
+        sub_label = f"OI:{res['oi_score']}  Fut:{res['futures_score']}  Depth:{res['depth_score']}  GEX:{res['gamma_score']}"
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid #00aaff'>
+        <div style='color:#aaa;font-size:11px'>COMPONENT BREAKDOWN</div>
+        <div style='font-size:13px;font-weight:bold;color:#00aaff'>{sub_label}</div>
+        <div style='color:#ccc;font-size:11px'>Each component max 2</div>
+        </div>""", unsafe_allow_html=True)
+    with k4:
+        adj_color = "#00ff88" if "Low" in res["signal_adjustment"] else ("#ffaa00" if "Moderate" in res["signal_adjustment"] else "#ff4444")
+        st.markdown(f"""<div style='background:#1e1e1e;padding:12px;border-radius:8px;border-left:4px solid {adj_color}'>
+        <div style='color:#aaa;font-size:11px'>SIGNAL GUIDANCE</div>
+        <div style='font-size:11px;font-weight:bold;color:{adj_color}'>{res['signal_adjustment']}</div>
+        </div>""", unsafe_allow_html=True)
+
+    st.markdown("")
+
+    # ── Component Detail Table ─────────────────────────────────────────
+    st.markdown("##### Component Analysis")
+    comp_rows = [
+        {
+            "Component":    "OI Expansion",
+            "Score":        f"{res['oi_score']} / 2",
+            "Activity":     res["oi_label"],
+            "Detail":       res["oi_detail"],
+        },
+        {
+            "Component":    "Futures Positioning",
+            "Score":        f"{res['futures_score']} / 2",
+            "Activity":     res["futures_label"],
+            "Detail":       res["futures_detail"],
+        },
+        {
+            "Component":    "Depth Absorption",
+            "Score":        f"{res['depth_score']} / 2",
+            "Activity":     res["depth_label"],
+            "Detail":       res["depth_detail"],
+        },
+        {
+            "Component":    "Gamma Reaction",
+            "Score":        f"{res['gamma_score']} / 2",
+            "Activity":     res["gamma_label"],
+            "Detail":       res["gamma_detail"],
+        },
+    ]
+    st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+
+    # ── Institutional Zones ────────────────────────────────────────────
+    zones = res["zones"]
+    non_null_zones = {k: v for k, v in zones.items() if v is not None}
+    if non_null_zones:
+        st.markdown("##### Key Institutional Zones")
+        zone_labels = {
+            "max_pain":            "Max Pain (Price Magnet)",
+            "oi_resistance":       "OI Wall Resistance (Max CE OI)",
+            "oi_support":          "OI Wall Support (Max PE OI)",
+            "gamma_flip":          "Gamma Flip Level",
+            "gamma_resistance":    "Gamma Repeller (Resistance)",
+            "gamma_support":       "Gamma Magnet (Support)",
+            "depth_cluster_above": "Depth Cluster Above",
+            "depth_cluster_below": "Depth Cluster Below",
+        }
+        zone_rows = [
+            {"Zone": zone_labels.get(k, k), "Level (₹)": f"₹{v:,.0f}"}
+            for k, v in non_null_zones.items()
+        ]
+        st.dataframe(pd.DataFrame(zone_rows), use_container_width=True, hide_index=True)
+
+    # ── Adjusted CIE Signals ───────────────────────────────────────────
+    if res["adjusted_signals"]:
+        st.markdown("##### IOFCE-Adjusted CIE Signals")
+        sig_rows = []
+        for s in res["adjusted_signals"]:
+            sig_rows.append({
+                "Pattern":      s.get("pattern", "-"),
+                "Direction":    s.get("direction", "-"),
+                "Confidence":   f"{s.get('confidence', 0)}%",
+                "IOFCE Adj":    s.get("iofce_adjustment", "-"),
+                "Trap Risk":    s.get("iofce_trap_risk", "-"),
+                "Strength":     s.get("signal_strength", "-"),
+            })
+        st.dataframe(pd.DataFrame(sig_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No CIE signals available for IOFCE adjustment.")
+
+    # ── Institutional Score Gauge ─────────────────────────────────────
+    bar_pct = int(inst_score / 8 * 100)
+    gauge_label = ("Institutional Move Confirmed 🔥" if inst_score >= 6
+                   else ("Possible Institutional Activity 📊" if inst_score >= 3
+                         else "Retail / Weak Move ⚠️"))
+    st.markdown(f"""
+    <div style='margin-top:10px'>
+      <div style='color:#aaa;font-size:12px;margin-bottom:4px'>Institutional Score: {inst_score}/8 — {gauge_label}</div>
+      <div style='background:#333;border-radius:6px;height:16px;width:100%'>
+        <div style='background:{score_color};width:{bar_pct}%;height:16px;border-radius:6px;transition:width 0.4s'></div>
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    st.markdown("""
+    <div style='margin-top:8px;font-size:11px;color:#888'>
+    Score Guide: &nbsp;
+    <span style='color:#00ff88'>≥6 Institutional Confirmed</span> &nbsp;|&nbsp;
+    <span style='color:#ffaa00'>3–5 Possible Activity</span> &nbsp;|&nbsp;
+    <span style='color:#ff4444'>≤2 Retail / Trap Risk</span>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Telegram Alert (rate-limited to 5 min, only when BUY/SELL signal present) ──
+    if send_telegram:
+        _now  = datetime.now(pytz.timezone('Asia/Kolkata'))
+        _last = st.session_state.get('iofce_last_alert')
+        if _last is None or (_now - _last).total_seconds() > 300:
+            # Derive dominant signal — only send if explicit BUY or SELL direction
+            _dom_sig = None
+            if cie_signals:
+                _sell = [s for s in cie_signals if s.get('direction') == 'SELL']
+                _buy  = [s for s in cie_signals if s.get('direction') == 'BUY']
+                _dom_sig = (_sell[0] if len(_sell) >= len(_buy) and _sell
+                            else (_buy[0] if _buy else None))
+            if _dom_sig and _dom_sig.get('direction') in ('BUY', 'SELL'):
+                msg = _iofce_build_telegram_message(res, underlying_price, _dom_sig,
+                                                    ultimate_rsi_data=ultimate_rsi_data)
+                try:
+                    send_telegram_message_sync(msg)
+                    st.session_state.iofce_last_alert = _now
+                    if db:
+                        db.save_signal(
+                            signal_type='IOFCE',
+                            direction=_dom_sig.get('direction'),
+                            source='Institutional Order Flow Confirmation Engine',
+                            spot_price=underlying_price,
+                            confidence=str(inst_score),
+                            details={'inst_score': inst_score, 'classification': classif,
+                                     'trap_risk': trap_risk, 'pattern': _dom_sig.get('pattern', '')},
+                        )
+                    st.success("📨 Telegram IOFCE alert sent!")
+                except Exception as _tg_e:
+                    st.warning(f"Telegram send failed: {_tg_e}")
 
 
 if __name__ == "__main__":
