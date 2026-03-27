@@ -14344,8 +14344,16 @@ class MasterDataEngine:
         # VOB
         if vob_sr is not None:
             self._data['vob_sr'] = vob_sr
-            self._data['vob_supports'] = sorted(vob_sr.get('support', []), reverse=True)
-            self._data['vob_resistances'] = sorted(vob_sr.get('resistance', []))
+            if isinstance(vob_sr, dict):
+                self._data['vob_supports'] = sorted(vob_sr.get('support', []), reverse=True)
+                self._data['vob_resistances'] = sorted(vob_sr.get('resistance', []))
+            elif isinstance(vob_sr, list):
+                # get_sr_levels() returns a flat list of dicts with 'Type' and 'mid' keys
+                self._data['vob_supports'] = sorted(
+                    [item['mid'] for item in vob_sr if 'Support' in item.get('Type', '')],
+                    reverse=True)
+                self._data['vob_resistances'] = sorted(
+                    [item['mid'] for item in vob_sr if 'Resistance' in item.get('Type', '')])
         if vob_blocks is not None:
             self._data['vob_blocks'] = vob_blocks
 
