@@ -422,3 +422,59 @@ class SupabaseDB:
             return pd.DataFrame(result.data) if result.data else pd.DataFrame()
         except:
             return pd.DataFrame()
+
+    # ── Alerts History ──
+    def upsert_alert(self, alert_type, direction=None, strike_price=None, underlying_price=None,
+                     signal_details=None, score=None, metadata=None, sent_via='telegram'):
+        now = datetime.now(IST)
+        record = {
+            'timestamp': now.isoformat(),
+            'trading_day': now.date().isoformat(),
+            'alert_type': alert_type,
+            'direction': direction,
+            'strike_price': float(strike_price) if strike_price else None,
+            'underlying_price': float(underlying_price) if underlying_price else None,
+            'signal_details': signal_details,
+            'score': float(score) if score else None,
+            'metadata': json.dumps(metadata) if metadata else None,
+            'sent_via': sent_via,
+            'data_source': 'computed',
+            'update_time': datetime.now(pytz.UTC).isoformat()
+        }
+        self._safe_upsert('alerts_history', [record], 'timestamp,alert_type,strike_price')
+
+    def get_alerts_history(self, trading_day=None, alert_type=None):
+        if trading_day is None:
+            trading_day = datetime.now(IST).date().isoformat()
+        def query():
+            q = self.client.table('alerts_history').select('*').eq('trading_day', trading_day)
+            if alert_type:
+                q = q.eq('alert_type', alert_type)
+            return q.order('timestamp', desc=False).execute()
+        return self._safe_query('alerts_history', query, {'trading_day': trading_day})
+
+    # ── Max Pain History ──
+    def upsert_max_pain(self, expiry, max_pain_strike, underlying_price=None):
+        now = datetime.now(IST)
+        distance = abs(underlying_price - max_pain_strike) if underlying_price and max_pain_strike else None
+        record = {
+            'timestamp': now.isoformat(),
+            'trading_day': now.date().isoformat(),
+            'expiry': expiry,
+            'max_pain_strike': float(max_pain_strike),
+            'underlying_price': float(underlying_price) if underlying_price else None,
+            'distance_from_spot': float(distance) if distance else None,
+            'data_source': 'computed',
+            'update_time': datetime.now(pytz.UTC).isoformat()
+        }
+        self._safe_upsert('max_pain_history', [record], 'timestamp,expiry')
+
+    def get_max_pain_history(self, expiry=None, trading_day=None):
+        if trading_day is None:
+            trading_day = datetime.now(IST).date().isoformat()
+        def query():
+            q = self.client.table('max_pain_history').select('*').eq('trading_day', trading_day)
+            if expiry:
+                q = q.eq('expiry', expiry)
+            return q.order('timestamp', desc=False).execute()
+        return self._safe_query('max_pain_history', query, {'trading_day': trading_day})
