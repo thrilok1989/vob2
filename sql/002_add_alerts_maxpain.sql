@@ -15,9 +15,9 @@ CREATE TABLE IF NOT EXISTS alerts_history (
     metadata JSONB,
     sent_via TEXT DEFAULT 'telegram',
     data_source TEXT NOT NULL DEFAULT 'computed',
-    update_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(timestamp, alert_type, COALESCE(strike_price, 0))
+    update_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_alerts_unique ON alerts_history(timestamp, alert_type, COALESCE(strike_price, 0));
 CREATE INDEX IF NOT EXISTS idx_alerts_timestamp ON alerts_history(timestamp);
 CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts_history(alert_type);
 CREATE INDEX IF NOT EXISTS idx_alerts_trading_day ON alerts_history(trading_day);
