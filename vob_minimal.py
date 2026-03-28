@@ -9,7 +9,6 @@ import pytz
 import time
 from datetime import datetime, timedelta
 import json
-from supabase import create_client, Client
 import hashlib
 import numpy as np
 import math
@@ -17,6 +16,7 @@ from scipy.stats import norm
 from pytz import timezone
 import io
 import os
+from db.supabase_client import SupabaseDB
 
 st.set_page_config(
     page_title="Nifty Trading & Options Analyzer",
@@ -116,140 +116,6 @@ def test_telegram_connection():
     except Exception as e:
         return False, f"❌ Telegram connection failed: {str(e)}"
 
-class SupabaseDB:
-    def __init__(self, url, key):
-        self.client: Client = create_client(url, key)
-
-    def create_tables(self):
-        try:
-            self.client.table('candle_data').select('id').limit(1).execute()
-        except:
-            st.info("Database tables may need to be created. Please run the SQL setup first.")
-
-    def save_candle_data(self, symbol, exchange, timeframe, df):
-        if df.empty:
-            return
-        try:
-            records = []
-            for _, row in df.iterrows():
-                record = {
-                    'symbol': symbol,
-                    'exchange': exchange,
-                    'timeframe': timeframe,
-                    'timestamp': int(row['timestamp']),
-                    'datetime': row['datetime'].isoformat(),
-                    'open': float(row['open']),
-                    'high': float(row['high']),
-                    'low': float(row['low']),
-                    'close': float(row['close']),
-                    'volume': int(row['volume'])
-                }
-                records.append(record)
-            self.client.table('candle_data').upsert(
-                records,
-                on_conflict="symbol,exchange,timeframe,timestamp"
-            ).execute()
-        except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving candle data: {str(e)}")
-
-    def get_candle_data(self, symbol, exchange, timeframe, hours_back=24):
-        try:
-            cutoff_time = datetime.now(pytz.UTC) - timedelta(hours=hours_back)
-            result = self.client.table('candle_data')\
-                .select('*')\
-                .eq('symbol', symbol)\
-                .eq('exchange', exchange)\
-                .eq('timeframe', timeframe)\
-                .gte('datetime', cutoff_time.isoformat())\
-                .order('timestamp', desc=False)\
-                .execute()
-            if result.data:
-                df = pd.DataFrame(result.data)
-                df['datetime'] = pd.to_datetime(df['datetime'])
-                return df
-            else:
-                return pd.DataFrame()
-        except Exception as e:
-            st.error(f"Error retrieving candle data: {str(e)}")
-            return pd.DataFrame()
-
-    def clear_old_candle_data(self, days_old=7):
-        try:
-            cutoff_date = datetime.now(pytz.UTC) - timedelta(days=days_old)
-            result = self.client.table('candle_data')\
-                .delete()\
-                .lt('datetime', cutoff_date.isoformat())\
-                .execute()
-            return len(result.data) if result.data else 0
-        except Exception as e:
-            st.error(f"Error clearing old data: {str(e)}")
-            return 0
-
-    def save_user_preferences(self, user_id, timeframe, auto_refresh, days_back, pivot_settings, pivot_proximity=5):
-        try:
-            data = {
-                'user_id': user_id,
-                'timeframe': timeframe,
-                'auto_refresh': auto_refresh,
-                'days_back': days_back,
-                'pivot_settings': json.dumps(pivot_settings),
-                'pivot_proximity': pivot_proximity,
-                'updated_at': datetime.now(pytz.UTC).isoformat()
-            }
-            self.client.table('user_preferences').upsert(
-                data,
-                on_conflict="user_id"
-            ).execute()
-        except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving preferences: {str(e)}")
-
-    @staticmethod
-    def _default_prefs():
-        return {'timeframe': '5', 'auto_refresh': True, 'days_back': 1, 'pivot_proximity': 5,
-                'pivot_settings': {'show_3m': True, 'show_5m': True, 'show_10m': True, 'show_15m': True}}
-
-    def get_user_preferences(self, user_id):
-        try:
-            result = self.client.table('user_preferences').select('*').eq('user_id', user_id).execute()
-            if result.data:
-                prefs = result.data[0]
-                if 'pivot_settings' in prefs and prefs['pivot_settings']:
-                    prefs['pivot_settings'] = json.loads(prefs['pivot_settings'])
-                else:
-                    prefs['pivot_settings'] = {'show_3m': True, 'show_5m': True, 'show_10m': True, 'show_15m': True}
-                return prefs
-            return self._default_prefs()
-        except Exception as e:
-            st.error(f"Error retrieving preferences: {str(e)}")
-            return self._default_prefs()
-
-    def save_market_analytics(self, symbol, analytics_data):
-        try:
-            data = {'symbol': symbol, 'date': datetime.now(pytz.timezone('Asia/Kolkata')).date().isoformat()}
-            data.update({k: analytics_data[k] for k in ['day_high','day_low','day_open','day_close','total_volume','avg_price','price_change','price_change_pct']})
-            self.client.table('market_analytics').upsert(data, on_conflict="symbol,date").execute()
-        except Exception as e:
-            if "23505" not in str(e) and "duplicate key" not in str(e).lower():
-                st.error(f"Error saving analytics: {str(e)}")
-
-    def get_market_analytics(self, symbol, days_back=30):
-        try:
-            cutoff_date = datetime.now().date() - timedelta(days=days_back)
-            result = self.client.table('market_analytics')\
-                .select('*')\
-                .eq('symbol', symbol)\
-                .gte('date', cutoff_date.isoformat())\
-                .order('date', desc=False)\
-                .execute()
-            if result.data:
-                return pd.DataFrame(result.data)
-            else:
-                return pd.DataFrame()
-        except Exception as e:
-            st.error(f"Error retrieving analytics: {str(e)}")
-            return pd.DataFrame()
 
 class DhanAPI:
     def __init__(self, access_token, client_id):
@@ -2432,10 +2298,41 @@ def main():
             """)
             return
         db = SupabaseDB(supabase_url, supabase_key)
-        db.create_tables()
+        db.sync_pending()
     except Exception as e:
         st.error(f"Database connection error: {str(e)}")
         return
+
+    # Load PCR/GEX history from Supabase if session_state is empty (e.g. after page refresh)
+    if not st.session_state.pcr_history:
+        try:
+            pcr_db_df = db.get_pcr_history()
+            if not pcr_db_df.empty and 'timestamp' in pcr_db_df.columns:
+                pcr_db_df['timestamp'] = pd.to_datetime(pcr_db_df['timestamp'])
+                grouped = pcr_db_df.groupby('timestamp')
+                for ts, group in grouped:
+                    entry = {'time': ts.to_pydatetime()}
+                    for _, row in group.iterrows():
+                        entry[str(int(row['strike_price']))] = float(row['pcr_value'])
+                    st.session_state.pcr_history.append(entry)
+                st.session_state.pcr_history = st.session_state.pcr_history[-200:]
+        except Exception:
+            pass
+
+    if not st.session_state.gex_history:
+        try:
+            gex_db_df = db.get_gex_history()
+            if not gex_db_df.empty and 'timestamp' in gex_db_df.columns:
+                gex_db_df['timestamp'] = pd.to_datetime(gex_db_df['timestamp'])
+                grouped = gex_db_df.groupby('timestamp')
+                for ts, group in grouped:
+                    entry = {'time': ts.to_pydatetime(), 'total_gex': float(group['total_gex'].iloc[0])}
+                    for _, row in group.iterrows():
+                        entry[str(int(row['strike_price']))] = float(row['net_gex'])
+                    st.session_state.gex_history.append(entry)
+                st.session_state.gex_history = st.session_state.gex_history[-200:]
+        except Exception:
+            pass
 
     try:
         if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
@@ -2562,7 +2459,7 @@ def main():
     cleanup_days = st.sidebar.selectbox("Clear History Older Than", [7, 14, 30], index=0)
 
     if st.sidebar.button("🗑 Clear History"):
-        deleted_count = db.clear_old_candle_data(cleanup_days)
+        deleted_count = db.clear_old_candles(cleanup_days)
         st.sidebar.success(f"Deleted {deleted_count} old records")
 
     st.sidebar.header("🔧 Connection Test")
@@ -2604,20 +2501,25 @@ def main():
         df = pd.DataFrame()
         current_price = None
         if use_cache:
-            df = db.get_candle_data("NIFTY50", "IDX_I", interval, hours_back=days_back*24)
+            df = db.get_candles("NIFTY50", "IDX_I", interval, hours_back=days_back*24)
         need_fetch = not use_cache or df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_convert(pytz.UTC)).total_seconds() > 300
         if need_fetch:
             with st.spinner("Fetching data from API..."):
                 data = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval=interval, days_back=days_back)
                 if data:
                     df = process_candle_data(data, interval)
-                    db.save_candle_data("NIFTY50", "IDX_I", interval, df)
+                    db.upsert_candles("NIFTY50", "IDX_I", interval, df)
         ltp_data = api.get_ltp_data("13", "IDX_I")
         if ltp_data and 'data' in ltp_data:
             for exchange, data in ltp_data['data'].items():
                 for security_id, price_data in data.items():
                     current_price = price_data.get('last_price', 0)
                     break
+        if current_price is not None and current_price > 0:
+            try:
+                db.upsert_spot_data(current_price, security_id='13', exchange_segment='IDX_I')
+            except Exception:
+                pass
         if current_price is None and not df.empty:
             current_price = df['close'].iloc[-1]
         if not df.empty:
@@ -2643,6 +2545,75 @@ def main():
                 swing_data_for_chart = swing_calculator.analyze(df)
             except Exception:
                 swing_data_for_chart = None
+        # Persist detected patterns (VOB, POC, Swing) to Supabase
+        try:
+            patterns_to_store = []
+            if vob_blocks_for_chart:
+                for block_type in ['bullish', 'bearish']:
+                    for block in vob_blocks_for_chart.get(block_type, []):
+                        patterns_to_store.append({
+                            'pattern_type': f'VOB_{block_type.upper()}',
+                            'timeframe': interval,
+                            'direction': block_type,
+                            'price_level': block.get('mid'),
+                            'upper_bound': block.get('upper'),
+                            'lower_bound': block.get('lower'),
+                            'score': block.get('volume_pct'),
+                            'metadata': {'volume': block.get('volume', 0), 'datetime': str(block.get('datetime', ''))}
+                        })
+            if poc_data_for_chart:
+                for poc_key in ['poc1', 'poc2', 'poc3']:
+                    poc = poc_data_for_chart.get(poc_key)
+                    if poc:
+                        period = poc_data_for_chart.get('periods', {}).get(poc_key, '')
+                        patterns_to_store.append({
+                            'pattern_type': f'POC_{poc_key.upper()}',
+                            'timeframe': str(period),
+                            'direction': 'neutral',
+                            'price_level': poc.get('poc'),
+                            'upper_bound': poc.get('upper_poc'),
+                            'lower_bound': poc.get('lower_poc'),
+                            'score': None,
+                            'metadata': {'high': poc.get('high', 0), 'low': poc.get('low', 0), 'volume': poc.get('volume', 0)}
+                        })
+            if swing_data_for_chart:
+                swings = swing_data_for_chart.get('swings', {})
+                projection = swing_data_for_chart.get('projection')
+                if projection:
+                    patterns_to_store.append({
+                        'pattern_type': 'SWING_PROJECTION',
+                        'timeframe': interval,
+                        'direction': projection.get('direction', 'unknown'),
+                        'price_level': projection.get('target'),
+                        'upper_bound': projection.get('from_value'),
+                        'lower_bound': None,
+                        'score': projection.get('swing_pct'),
+                        'metadata': {'volume_delta': swing_data_for_chart.get('volume', {}).get('delta', 0)}
+                    })
+                last_high = swings.get('last_swing_high')
+                last_low = swings.get('last_swing_low')
+                if last_high:
+                    patterns_to_store.append({
+                        'pattern_type': 'SWING_HIGH',
+                        'timeframe': interval,
+                        'direction': 'bearish',
+                        'price_level': last_high.get('value'),
+                        'upper_bound': None, 'lower_bound': None, 'score': None,
+                        'metadata': {'index': last_high.get('index', 0)}
+                    })
+                if last_low:
+                    patterns_to_store.append({
+                        'pattern_type': 'SWING_LOW',
+                        'timeframe': interval,
+                        'direction': 'bullish',
+                        'price_level': last_low.get('value'),
+                        'upper_bound': None, 'lower_bound': None, 'score': None,
+                        'metadata': {'index': last_low.get('index', 0)}
+                    })
+            if patterns_to_store:
+                db.upsert_detected_patterns(patterns_to_store)
+        except Exception:
+            pass
         if not df.empty:
             fig = create_candlestick_chart(
                 df,
@@ -2699,6 +2670,48 @@ def main():
                         vob_data = None
                 bull_score, bull_signals, bull_verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
                 bear_score, bear_signals, bear_verdict = ReversalDetector.calculate_bearish_reversal_score(df, pivot_highs)
+                # Persist reversal patterns to Supabase
+                try:
+                    reversal_patterns = []
+                    if bull_score >= 3:
+                        reversal_patterns.append({
+                            'pattern_type': 'REVERSAL_BULLISH',
+                            'timeframe': interval,
+                            'direction': 'bullish',
+                            'price_level': bull_signals.get('Current_Price'),
+                            'upper_bound': bull_signals.get('Day_High'),
+                            'lower_bound': bull_signals.get('Day_Low'),
+                            'score': bull_score,
+                            'metadata': {
+                                'verdict': bull_verdict,
+                                'vwap': bull_signals.get('VWAP'),
+                                'selling_exhausted': bull_signals.get('Selling_Exhausted', ''),
+                                'higher_low': bull_signals.get('Higher_Low', ''),
+                                'volume_signal': bull_signals.get('Volume_Signal', ''),
+                                'support_level': bull_signals.get('Support_Level'),
+                            }
+                        })
+                    if bear_score <= -3:
+                        reversal_patterns.append({
+                            'pattern_type': 'REVERSAL_BEARISH',
+                            'timeframe': interval,
+                            'direction': 'bearish',
+                            'price_level': bear_signals.get('Current_Price'),
+                            'upper_bound': bear_signals.get('Day_High'),
+                            'lower_bound': bear_signals.get('Day_Low'),
+                            'score': abs(bear_score),
+                            'metadata': {
+                                'verdict': bear_verdict,
+                                'vwap': bear_signals.get('VWAP'),
+                                'buying_exhausted': bear_signals.get('Buying_Exhausted', ''),
+                                'lower_high': bear_signals.get('Lower_High', ''),
+                                'volume_signal': bear_signals.get('Volume_Signal', ''),
+                            }
+                        })
+                    if reversal_patterns:
+                        db.upsert_detected_patterns(reversal_patterns)
+                except Exception:
+                    pass
                 col_bull, col_bear = st.columns(2)
                 for col, title, verdict, sigs, score_key, items in [
                     (col_bull, "### 🟢 Bullish Reversal", bull_verdict, bull_signals, 'Reversal_Score',
@@ -2869,6 +2882,29 @@ def main():
         if option_data and option_data.get('underlying'):
             underlying_price = option_data['underlying']
             df_summary = option_data['df_summary']
+            expiry = option_data.get('expiry', selected_expiry)
+            atm_strike = df_summary.loc[df_summary['Zone'] == 'ATM', 'Strike'].values[0] if df_summary is not None and 'Zone' in df_summary.columns and not df_summary[df_summary['Zone'] == 'ATM'].empty else underlying_price
+            # Store option chain, ATM strike data, and orderbook to Supabase
+            if df_summary is not None and len(df_summary) > 0 and expiry:
+                try:
+                    db.upsert_option_chain(df_summary, expiry, underlying_price, atm_strike)
+                    db.upsert_atm_strike_data(df_summary, expiry, underlying_price, atm_strike)
+                    # Store orderbook depth data
+                    orderbook_entries = []
+                    for _, row in df_summary.iterrows():
+                        orderbook_entries.append({
+                            'strike': float(row['Strike']),
+                            'bid_qty_ce': int(row.get('bidQty_CE', 0) or 0),
+                            'ask_qty_ce': int(row.get('askQty_CE', 0) or 0),
+                            'bid_qty_pe': int(row.get('bidQty_PE', 0) or 0),
+                            'ask_qty_pe': int(row.get('askQty_PE', 0) or 0),
+                            'pressure': float(row.get('BidAskPressure', 0) or 0),
+                            'bias': str(row.get('PressureBias', '') or '')
+                        })
+                    if orderbook_entries:
+                        db.upsert_orderbook(orderbook_entries, expiry)
+                except Exception:
+                    pass
             st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
             if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
                 check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
@@ -2893,6 +2929,12 @@ def main():
         st.markdown("## 📈 HTF Support & Resistance Levels")
         sr_data = option_data.get('sr_data', [])
         max_pain_strike = option_data.get('max_pain_strike')
+        # Store max pain to Supabase
+        if max_pain_strike and option_data.get('expiry'):
+            try:
+                db.upsert_max_pain(option_data['expiry'], max_pain_strike, option_data.get('underlying'))
+            except Exception:
+                pass
         if sr_data:
             support_data = [d for d in sr_data if '🟢' in d['Type'] or '🎯' in d['Type']]
             resistance_data = [d for d in sr_data if '🔴' in d['Type']]
@@ -2974,6 +3016,24 @@ def main():
                             st.session_state.pcr_history.append(pcr_entry)
                             if len(st.session_state.pcr_history) > 200:
                                 st.session_state.pcr_history = st.session_state.pcr_history[-200:]
+                            # Persist PCR to Supabase
+                            try:
+                                expiry_for_pcr = option_data.get('expiry', selected_expiry) if option_data else selected_expiry
+                                pcr_records = []
+                                for _, row in pcr_df.iterrows():
+                                    pcr_records.append({
+                                        'timestamp': current_time,
+                                        'expiry': expiry_for_pcr,
+                                        'strike': float(row['Strike']),
+                                        'atm_strike': float(atm_strike) if 'atm_strike' in dir() else 0,
+                                        'pcr': float(row['PCR']) if pd.notna(row['PCR']) else 0,
+                                        'oi_ce': int(row.get('openInterest_CE', 0) or 0),
+                                        'oi_pe': int(row.get('openInterest_PE', 0) or 0),
+                                    })
+                                if pcr_records:
+                                    db.upsert_pcr_history(pcr_records)
+                            except Exception:
+                                pass
             except Exception as e:
                 st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
         if len(st.session_state.pcr_history) > 0:
@@ -3183,6 +3243,28 @@ def main():
                         st.session_state.gex_history.append(gex_entry)
                         if len(st.session_state.gex_history) > 200:
                             st.session_state.gex_history = st.session_state.gex_history[-200:]
+                        # Persist GEX to Supabase
+                        try:
+                            expiry_for_gex = option_data.get('expiry', selected_expiry) if option_data else selected_expiry
+                            gex_records = []
+                            for _, row in gex_df.iterrows():
+                                gex_records.append({
+                                    'timestamp': current_time,
+                                    'expiry': expiry_for_gex,
+                                    'strike': float(row['Strike']),
+                                    'atm_strike': float(atm_strike) if 'atm_strike' in dir() else 0,
+                                    'total_gex': float(gex_data['total_gex']),
+                                    'call_gex': float(row.get('Call_GEX', 0)),
+                                    'put_gex': float(row.get('Put_GEX', 0)),
+                                    'net_gex': float(row.get('Net_GEX', 0)),
+                                    'gamma_flip': gex_data.get('gamma_flip_level'),
+                                    'signal': gex_data.get('gex_signal', ''),
+                                    'spot': float(underlying_price),
+                                })
+                            if gex_records:
+                                db.upsert_gex_history(gex_records)
+                        except Exception:
+                            pass
                     def create_gex_chart(history_df, col_name, color, title_prefix):
                         """Helper to create individual GEX chart per strike"""
                         if col_name and col_name in history_df.columns:
