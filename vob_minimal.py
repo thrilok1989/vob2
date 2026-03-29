@@ -17,6 +17,8 @@ from pytz import timezone
 import io
 import os
 from db.supabase_client import SupabaseDB
+from indicators.money_flow_profile import calculate_money_flow_profile
+from indicators.volume_delta import calculate_volume_delta
 
 st.set_page_config(
     page_title="Nifty Trading & Options Analyzer",
@@ -1564,17 +1566,20 @@ def process_candle_data(data, interval):
 
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None):
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, money_flow_data=None, volume_delta_data=None):
     if df.empty:
         return go.Figure()
 
+    # Use 3 rows if volume delta is available (price, delta overlay, volume)
+    has_delta = volume_delta_data is not None and volume_delta_data.get('df') is not None
     fig = make_subplots(
-        rows=2,
+        rows=3 if has_delta else 2,
         cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.05,
-        row_heights=[0.7, 0.3],
-        specs=[[{"secondary_y": False}], [{"secondary_y": False}]]
+        vertical_spacing=0.03,
+        row_heights=[0.55, 0.2, 0.25] if has_delta else [0.7, 0.3],
+        specs=[[{"secondary_y": False}]] * (3 if has_delta else 2),
+        subplot_titles=(['', 'Volume Delta', 'Volume'] if has_delta else ['', 'Volume'])
     )
 
     fig.add_trace(
@@ -1715,6 +1720,123 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
         except Exception as e:
             pass
 
+    # ── Money Flow Profile overlay on price chart ──
+    if money_flow_data and money_flow_data.get('rows'):
+        try:
+            mf_rows = money_flow_data['rows']
+            poc_price = money_flow_data['poc_price']
+            va_high = money_flow_data['value_area_high']
+            va_low = money_flow_data['value_area_low']
+            x_start = df['datetime'].min()
+            x_end = df['datetime'].max()
+
+            # Draw horizontal bars as shapes on the right side of the chart
+            max_vol = max(r['total_volume'] for r in mf_rows) if mf_rows else 1
+            for row in mf_rows:
+                ratio = row['total_volume'] / max_vol if max_vol > 0 else 0
+                if ratio < 0.05:
+                    continue
+                # Color by node type
+                if row['node_type'] == 'High':
+                    fill_color = 'rgba(255, 235, 59, 0.25)'
+                elif row['node_type'] == 'Low':
+                    fill_color = 'rgba(242, 54, 69, 0.15)'
+                else:
+                    fill_color = 'rgba(41, 98, 255, 0.18)'
+
+                fig.add_shape(type="rect", x0=x_start, x1=x_end,
+                              y0=row['bin_low'], y1=row['bin_high'],
+                              fillcolor=fill_color, line=dict(width=0),
+                              layer='below', row=1, col=1)
+
+            # POC line
+            fig.add_shape(type="line", x0=x_start, x1=x_end,
+                          y0=poc_price, y1=poc_price,
+                          line=dict(color='#ffeb3b', width=2, dash='solid'),
+                          row=1, col=1)
+            fig.add_annotation(x=x_end, y=poc_price,
+                               text=f"MF-POC ₹{poc_price:.0f}",
+                               showarrow=False, font=dict(color='#ffeb3b', size=10),
+                               xanchor="left", row=1, col=1)
+
+            # Value area boundaries
+            fig.add_shape(type="line", x0=x_start, x1=x_end,
+                          y0=va_high, y1=va_high,
+                          line=dict(color='#2962ff', width=1, dash='dot'),
+                          row=1, col=1)
+            fig.add_shape(type="line", x0=x_start, x1=x_end,
+                          y0=va_low, y1=va_low,
+                          line=dict(color='#2962ff', width=1, dash='dot'),
+                          row=1, col=1)
+            fig.add_annotation(x=x_start, y=va_high,
+                               text=f"VA-H ₹{va_high:.0f}",
+                               showarrow=False, font=dict(color='#2962ff', size=9),
+                               xanchor="right", row=1, col=1)
+            fig.add_annotation(x=x_start, y=va_low,
+                               text=f"VA-L ₹{va_low:.0f}",
+                               showarrow=False, font=dict(color='#2962ff', size=9),
+                               xanchor="right", row=1, col=1)
+        except Exception:
+            pass
+
+    # ── Volume Delta Candles (row 2) ──
+    vol_row = 3 if has_delta else 2
+    if has_delta:
+        try:
+            delta_df = volume_delta_data['df']
+            delta_colors = ['#089981' if d > 0 else '#f23645' for d in delta_df['delta'].values]
+            # Divergence: bullish candle but negative delta (or vice versa) - use dimmed opposite color
+            for i in range(len(delta_df)):
+                row_d = delta_df.iloc[i]
+                if row_d['divergence']:
+                    delta_colors[i] = '#f2364580' if row_d['bar_type'] == 'bullish' else '#08998180'
+
+            fig.add_trace(
+                go.Bar(
+                    x=delta_df['datetime'],
+                    y=delta_df['delta'],
+                    name='Volume Delta',
+                    marker_color=delta_colors,
+                    opacity=0.85,
+                    showlegend=False,
+                    hovertemplate='Delta: %{y:,.0f}<extra></extra>'
+                ),
+                row=2, col=1
+            )
+            fig.add_hline(y=0, line_dash="solid", line_color="white", line_width=1, row=2, col=1)
+
+            # Cumulative delta line overlay
+            fig.add_trace(
+                go.Scatter(
+                    x=delta_df['datetime'],
+                    y=delta_df['cum_delta'],
+                    mode='lines',
+                    name='Cum Delta',
+                    line=dict(color='#FFD700', width=1.5),
+                    opacity=0.7,
+                    yaxis='y4' if has_delta else 'y3',
+                    showlegend=False,
+                    hovertemplate='Cum Δ: %{y:,.0f}<extra></extra>'
+                ),
+                row=2, col=1, secondary_y=False
+            )
+
+            # Max volume price dots on the price chart
+            fig.add_trace(
+                go.Scatter(
+                    x=delta_df['datetime'],
+                    y=delta_df['max_vol_price'],
+                    mode='markers',
+                    name='Max Vol Price',
+                    marker=dict(size=3, color='white', opacity=0.4),
+                    showlegend=False,
+                    hovertemplate='Max Vol: ₹%{y:.2f}<extra></extra>'
+                ),
+                row=1, col=1
+            )
+        except Exception:
+            pass
+
     volume_colors = ['#00ff88' if close >= open else '#ff4444'
                     for close, open in zip(df['close'], df['open'])]
 
@@ -1727,14 +1849,15 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
             opacity=0.7,
             showlegend=False
         ),
-        row=2, col=1
+        row=vol_row, col=1
     )
 
+    chart_height = 850 if has_delta else 700
     fig.update_layout(
         title=title,
         template='plotly_dark',
         xaxis_rangeslider_visible=False,
-        height=700,
+        height=chart_height,
         showlegend=False,
         margin=dict(l=0, r=0, t=40, b=0),
         font=dict(color='white'),
@@ -1743,10 +1866,13 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
     )
 
     _gc = dict(showgrid=True, gridwidth=1, gridcolor='#333333')
-    fig.update_xaxes(title_text="Time (IST)", type='date', row=2, col=1, **_gc)
+    fig.update_xaxes(title_text="Time (IST)", type='date', row=vol_row, col=1, **_gc)
     fig.update_xaxes(type='date', row=1, col=1, **_gc)
     fig.update_yaxes(title_text="Price (₹)", side='left', row=1, col=1, **_gc)
-    fig.update_yaxes(title_text="Volume", side='left', row=2, col=1, **_gc)
+    fig.update_yaxes(title_text="Volume", side='left', row=vol_row, col=1, **_gc)
+    if has_delta:
+        fig.update_xaxes(type='date', row=2, col=1, **_gc)
+        fig.update_yaxes(title_text="Delta", side='left', row=2, col=1, **_gc)
 
     return fig
 
@@ -2614,6 +2740,59 @@ def main():
                 db.upsert_detected_patterns(patterns_to_store)
         except Exception:
             pass
+        # ── Compute Money Flow Profile & Volume Delta ──
+        money_flow_data = None
+        volume_delta_data = None
+        if not df.empty and len(df) > 20:
+            try:
+                money_flow_data = calculate_money_flow_profile(df, num_rows=25, source='Volume')
+            except Exception:
+                money_flow_data = None
+            try:
+                volume_delta_data = calculate_volume_delta(df)
+            except Exception:
+                volume_delta_data = None
+            # Store Money Flow Profile POC + Volume Delta summary as patterns
+            try:
+                mf_vd_patterns = []
+                if money_flow_data:
+                    mf_vd_patterns.append({
+                        'pattern_type': 'MONEY_FLOW_POC',
+                        'timeframe': interval,
+                        'direction': money_flow_data.get('highest_sentiment_direction', 'neutral').lower(),
+                        'price_level': money_flow_data.get('poc_price'),
+                        'upper_bound': money_flow_data.get('value_area_high'),
+                        'lower_bound': money_flow_data.get('value_area_low'),
+                        'score': None,
+                        'metadata': {
+                            'total_volume': money_flow_data.get('total_volume', 0),
+                            'num_rows': money_flow_data.get('num_rows', 25),
+                            'sentiment_price': money_flow_data.get('highest_sentiment_price', 0),
+                            'source': money_flow_data.get('source', 'Volume'),
+                        }
+                    })
+                if volume_delta_data and volume_delta_data.get('summary'):
+                    vds = volume_delta_data['summary']
+                    mf_vd_patterns.append({
+                        'pattern_type': 'VOLUME_DELTA',
+                        'timeframe': interval,
+                        'direction': vds.get('bias', 'neutral').lower(),
+                        'price_level': current_price,
+                        'upper_bound': None,
+                        'lower_bound': None,
+                        'score': vds.get('delta_ratio'),
+                        'metadata': {
+                            'total_delta': vds.get('total_delta', 0),
+                            'buy_volume': vds.get('total_buy_volume', 0),
+                            'sell_volume': vds.get('total_sell_volume', 0),
+                            'divergence_bars': vds.get('divergence_bars', 0),
+                            'cum_delta': vds.get('cum_delta_last', 0),
+                        }
+                    })
+                if mf_vd_patterns:
+                    db.upsert_detected_patterns(mf_vd_patterns)
+            except Exception:
+                pass
         if not df.empty:
             fig = create_candlestick_chart(
                 df,
@@ -2623,7 +2802,9 @@ def main():
                 pivot_settings=pivot_settings,
                 vob_blocks=vob_blocks_for_chart,
                 poc_data=poc_data_for_chart,
-                swing_data=swing_data_for_chart
+                swing_data=swing_data_for_chart,
+                money_flow_data=money_flow_data,
+                volume_delta_data=volume_delta_data
             )
             st.plotly_chart(fig, use_container_width=True)
             infos = [
@@ -2647,6 +2828,90 @@ def main():
                 *R = Resistance (Price ceiling), S = Support (Price floor)*
                 *VOB zones show volume-backed order flow areas with % distribution*
                 """)
+            # ── Money Flow Profile & Volume Delta Tables ──
+            st.markdown("---")
+            mf_tab, vd_tab = st.tabs(["💰 Money Flow Profile", "📊 Volume Delta Candles"])
+            with mf_tab:
+                if money_flow_data and money_flow_data.get('rows'):
+                    mc1, mc2, mc3, mc4 = st.columns(4)
+                    mc1.metric("MF-POC", f"₹{money_flow_data['poc_price']:.0f}")
+                    mc2.metric("Value Area", f"₹{money_flow_data['value_area_low']:.0f} - ₹{money_flow_data['value_area_high']:.0f}")
+                    mc3.metric("Top Sentiment", f"{money_flow_data['highest_sentiment_direction']} @ ₹{money_flow_data['highest_sentiment_price']:.0f}")
+                    mc4.metric("Bars", f"{money_flow_data['num_bars']}")
+                    mf_df = pd.DataFrame(money_flow_data['rows'])
+                    mf_display = mf_df[['price_level', 'total_volume', 'bull_volume', 'bear_volume', 'delta', 'volume_pct', 'node_type', 'sentiment', 'sentiment_strength']].copy()
+                    mf_display.columns = ['Price', 'Total Vol', 'Buy Vol', 'Sell Vol', 'Delta', 'Vol %', 'Node', 'Sentiment', 'Strength %']
+                    mf_display['Price'] = mf_display['Price'].apply(lambda x: f"₹{x:.0f}")
+                    mf_display['Total Vol'] = mf_display['Total Vol'].apply(lambda x: f"{x:,.0f}")
+                    mf_display['Buy Vol'] = mf_display['Buy Vol'].apply(lambda x: f"{x:,.0f}")
+                    mf_display['Sell Vol'] = mf_display['Sell Vol'].apply(lambda x: f"{x:,.0f}")
+                    mf_display['Delta'] = mf_display['Delta'].apply(lambda x: f"{x:+,.0f}")
+                    def _mf_color(val):
+                        if val == 'High': return 'background-color: #ffeb3b40; color: white'
+                        if val == 'Low': return 'background-color: #f2364540; color: white'
+                        return 'background-color: #2962ff30; color: white'
+                    def _sent_color(val):
+                        if val == 'Bullish': return 'background-color: #26a69a40; color: white'
+                        if val == 'Bearish': return 'background-color: #ef535040; color: white'
+                        return ''
+                    styled_mf = mf_display.style.applymap(_mf_color, subset=['Node']).applymap(_sent_color, subset=['Sentiment'])
+                    st.dataframe(styled_mf, use_container_width=True, hide_index=True)
+                    st.markdown("""
+                    **Money Flow Profile:**
+                    - 🟡 **High Traded Nodes**: Consolidation/value areas - price tends to spend time here
+                    - 🔵 **Average Nodes**: Normal trading activity levels
+                    - 🔴 **Low Traded Nodes**: Supply/demand zones, liquidity gaps - price moves fast through these
+                    - **MF-POC**: Price level with highest traded volume (Point of Control)
+                    - **VA-H/VA-L**: Value Area boundaries (consolidation zone)
+                    """)
+                else:
+                    st.info("Money Flow Profile requires more data. Please wait...")
+
+            with vd_tab:
+                if volume_delta_data and volume_delta_data.get('summary'):
+                    vd_summary = volume_delta_data['summary']
+                    vc1, vc2, vc3, vc4, vc5 = st.columns(5)
+                    bias_color = "normal" if vd_summary['bias'] == 'Bullish' else "inverse"
+                    vc1.metric("Total Delta", f"{vd_summary['total_delta']:+,}", delta=vd_summary['bias'], delta_color=bias_color)
+                    vc2.metric("Buy Volume", f"{vd_summary['total_buy_volume']:,}")
+                    vc3.metric("Sell Volume", f"{vd_summary['total_sell_volume']:,}")
+                    vc4.metric("Delta Ratio", f"{vd_summary['delta_ratio']:.2f}")
+                    vc5.metric("Divergences", f"{vd_summary['divergence_bars']}")
+                    vd_df = volume_delta_data['df'].copy()
+                    vd_display = vd_df[['datetime', 'open', 'high', 'low', 'close', 'volume', 'buy_volume', 'sell_volume', 'delta', 'delta_pct', 'cum_delta', 'divergence']].tail(50).copy()
+                    vd_display.columns = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Buy Vol', 'Sell Vol', 'Delta', 'Delta %', 'Cum Delta', 'Divergence']
+                    vd_display['Time'] = vd_display['Time'].dt.strftime('%H:%M')
+                    def _delta_color(val):
+                        try:
+                            v = float(str(val).replace(',', '').replace('+', ''))
+                            if v > 0: return 'background-color: #08998130; color: white'
+                            if v < 0: return 'background-color: #f2364530; color: white'
+                        except: pass
+                        return ''
+                    def _div_color(val):
+                        if val: return 'background-color: #FFD70040; color: white'
+                        return ''
+                    styled_vd = vd_display.style.applymap(_delta_color, subset=['Delta', 'Cum Delta']).applymap(_div_color, subset=['Divergence'])
+                    st.dataframe(styled_vd, use_container_width=True, hide_index=True)
+                    dc1, dc2 = st.columns(2)
+                    with dc1:
+                        st.markdown(f"""
+                        **Volume Delta Summary:**
+                        - +Delta Streak: **{vd_summary['max_positive_streak']}** bars
+                        - -Delta Streak: **{vd_summary['max_negative_streak']}** bars
+                        - +Delta Bars: **{vd_summary['positive_bars']}** | -Delta Bars: **{vd_summary['negative_bars']}**
+                        """)
+                    with dc2:
+                        st.markdown("""
+                        **Interpretation:**
+                        - **+Delta**: Buyers dominating (price should rise)
+                        - **-Delta**: Sellers dominating (price should fall)
+                        - **Divergence**: Candle direction opposes delta (potential reversal)
+                        - **Cum Delta**: Running total - trend of buying/selling pressure
+                        """)
+                else:
+                    st.info("Volume Delta requires more data. Please wait...")
+
             st.markdown("---")
             st.markdown("## 🔄 Intraday Reversal Detector")
             try:

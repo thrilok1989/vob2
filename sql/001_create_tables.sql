@@ -176,9 +176,9 @@ CREATE TABLE IF NOT EXISTS detected_patterns (
     score NUMERIC(8,2),
     metadata JSONB,
     data_source TEXT NOT NULL DEFAULT 'computed',
-    update_time TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(timestamp, pattern_type, price_level, COALESCE(timeframe, ''))
+    update_time TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_patterns_unique ON detected_patterns(timestamp, pattern_type, COALESCE(price_level, 0), COALESCE(timeframe, ''));
 CREATE INDEX IF NOT EXISTS idx_patterns_timestamp ON detected_patterns(timestamp);
 CREATE INDEX IF NOT EXISTS idx_patterns_type ON detected_patterns(pattern_type);
 CREATE INDEX IF NOT EXISTS idx_patterns_trading_day ON detected_patterns(trading_day);
