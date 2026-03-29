@@ -27,7 +27,14 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-st_autorefresh(interval=30000, key="datarefresh")
+# Only auto-refresh during market hours (8:30 AM - 3:45 PM IST, weekdays)
+_ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+_is_market_open = (
+    _ist_now.weekday() < 5 and
+    _ist_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _ist_now <= _ist_now.replace(hour=15, minute=45, second=0, microsecond=0)
+)
+if _is_market_open:
+    st_autorefresh(interval=30000, key="datarefresh")
 
 st.markdown("""
 <style>
@@ -85,6 +92,10 @@ def cached_iv_average(option_data_json):
 
 def send_telegram_message_sync(message):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    # Only send during market hours (8:30 AM - 3:45 PM IST, weekdays)
+    _now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    if _now.weekday() >= 5 or not (_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _now <= _now.replace(hour=15, minute=45, second=0, microsecond=0)):
         return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
