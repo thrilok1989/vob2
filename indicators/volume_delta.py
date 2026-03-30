@@ -24,6 +24,12 @@ def calculate_volume_delta(df):
     if df.empty or len(df) < 2:
         return None
 
+    # Ensure required columns exist
+    required = ['datetime', 'open', 'high', 'low', 'close', 'volume']
+    for col in required:
+        if col not in df.columns:
+            return None
+
     result = df[['datetime', 'open', 'high', 'low', 'close', 'volume']].copy()
 
     h = result['high'].values

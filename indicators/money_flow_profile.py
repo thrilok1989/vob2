@@ -20,8 +20,14 @@ def calculate_money_flow_profile(df, num_rows=25, source='Volume', sentiment_met
     Returns:
         dict with profile data, POC, sentiment, and summary table
     """
-    if df.empty or len(df) < 10:
+    if df.empty or len(df) < 5:
         return None
+
+    # Ensure required columns exist
+    required = ['open', 'high', 'low', 'close', 'volume']
+    for col in required:
+        if col not in df.columns:
+            return None
 
     price_low = df['low'].min()
     price_high = df['high'].max()

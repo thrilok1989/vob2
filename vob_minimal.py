@@ -2748,14 +2748,16 @@ def main():
         # ── Compute Money Flow Profile & Volume Delta ──
         money_flow_data = None
         volume_delta_data = None
-        if not df.empty and len(df) > 20:
+        if not df.empty and len(df) > 5:
             try:
                 money_flow_data = calculate_money_flow_profile(df, num_rows=25, source='Volume')
-            except Exception:
+            except Exception as e:
+                st.caption(f"⚠️ MF Profile error: {str(e)[:80]}")
                 money_flow_data = None
             try:
                 volume_delta_data = calculate_volume_delta(df)
-            except Exception:
+            except Exception as e:
+                st.caption(f"⚠️ Volume Delta error: {str(e)[:80]}")
                 volume_delta_data = None
             # Store Money Flow Profile POC + Volume Delta summary as patterns
             try:
@@ -2870,7 +2872,7 @@ def main():
                     - **VA-H/VA-L**: Value Area boundaries (consolidation zone)
                     """)
                 else:
-                    st.info("Money Flow Profile requires more data. Please wait...")
+                    st.info(f"Money Flow Profile: No data yet. df rows={len(df) if not df.empty else 0}, money_flow_data={'computed' if money_flow_data else 'None'}")
 
             with vd_tab:
                 if volume_delta_data and volume_delta_data.get('summary'):
@@ -2915,7 +2917,7 @@ def main():
                         - **Cum Delta**: Running total - trend of buying/selling pressure
                         """)
                 else:
-                    st.info("Volume Delta requires more data. Please wait...")
+                    st.info(f"Volume Delta: No data yet. df rows={len(df) if not df.empty else 0}, volume_delta_data={'computed' if volume_delta_data else 'None'}")
 
             st.markdown("---")
             st.markdown("## 🔄 Intraday Reversal Detector")
