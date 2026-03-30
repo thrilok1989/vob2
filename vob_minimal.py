@@ -2748,14 +2748,16 @@ def main():
         # ── Compute Money Flow Profile & Volume Delta ──
         money_flow_data = None
         volume_delta_data = None
-        if not df.empty and len(df) > 20:
+        if not df.empty and len(df) > 5:
             try:
                 money_flow_data = calculate_money_flow_profile(df, num_rows=25, source='Volume')
-            except Exception:
+            except Exception as e:
+                st.caption(f"⚠️ MF Profile error: {str(e)[:80]}")
                 money_flow_data = None
             try:
                 volume_delta_data = calculate_volume_delta(df)
-            except Exception:
+            except Exception as e:
+                st.caption(f"⚠️ Volume Delta error: {str(e)[:80]}")
                 volume_delta_data = None
             # Store Money Flow Profile POC + Volume Delta summary as patterns
             try:
@@ -2851,15 +2853,22 @@ def main():
                     mf_display['Buy Vol'] = mf_display['Buy Vol'].apply(lambda x: f"{x:,.0f}")
                     mf_display['Sell Vol'] = mf_display['Sell Vol'].apply(lambda x: f"{x:,.0f}")
                     mf_display['Delta'] = mf_display['Delta'].apply(lambda x: f"{x:+,.0f}")
-                    def _mf_color(val):
-                        if val == 'High': return 'background-color: #ffeb3b40; color: white'
-                        if val == 'Low': return 'background-color: #f2364540; color: white'
-                        return 'background-color: #2962ff30; color: white'
-                    def _sent_color(val):
-                        if val == 'Bullish': return 'background-color: #26a69a40; color: white'
-                        if val == 'Bearish': return 'background-color: #ef535040; color: white'
-                        return ''
-                    styled_mf = mf_display.style.applymap(_mf_color, subset=['Node']).applymap(_sent_color, subset=['Sentiment'])
+                    mf_display = mf_display.reset_index(drop=True)
+                    def _mf_row_style(row):
+                        styles = [''] * len(row)
+                        try:
+                            node = row.get('Node', '')
+                            sent = row.get('Sentiment', '')
+                            node_idx = list(row.index).index('Node')
+                            sent_idx = list(row.index).index('Sentiment')
+                            if node == 'High': styles[node_idx] = 'background-color: #ffeb3b40; color: white'
+                            elif node == 'Low': styles[node_idx] = 'background-color: #f2364540; color: white'
+                            else: styles[node_idx] = 'background-color: #2962ff30; color: white'
+                            if sent == 'Bullish': styles[sent_idx] = 'background-color: #26a69a40; color: white'
+                            elif sent == 'Bearish': styles[sent_idx] = 'background-color: #ef535040; color: white'
+                        except: pass
+                        return styles
+                    styled_mf = mf_display.style.apply(_mf_row_style, axis=1)
                     st.dataframe(styled_mf, use_container_width=True, hide_index=True)
                     st.markdown("""
                     **Money Flow Profile:**
@@ -2870,7 +2879,7 @@ def main():
                     - **VA-H/VA-L**: Value Area boundaries (consolidation zone)
                     """)
                 else:
-                    st.info("Money Flow Profile requires more data. Please wait...")
+                    st.info(f"Money Flow Profile: No data yet. df rows={len(df) if not df.empty else 0}, money_flow_data={'computed' if money_flow_data else 'None'}")
 
             with vd_tab:
                 if volume_delta_data and volume_delta_data.get('summary'):
@@ -2885,18 +2894,23 @@ def main():
                     vd_df = volume_delta_data['df'].copy()
                     vd_display = vd_df[['datetime', 'open', 'high', 'low', 'close', 'volume', 'buy_volume', 'sell_volume', 'delta', 'delta_pct', 'cum_delta', 'divergence']].tail(50).copy()
                     vd_display.columns = ['Time', 'Open', 'High', 'Low', 'Close', 'Volume', 'Buy Vol', 'Sell Vol', 'Delta', 'Delta %', 'Cum Delta', 'Divergence']
-                    vd_display['Time'] = vd_display['Time'].dt.strftime('%H:%M')
-                    def _delta_color(val):
+                    vd_display['Time'] = pd.to_datetime(vd_display['Time']).dt.strftime('%H:%M')
+                    vd_display = vd_display.reset_index(drop=True)
+                    def _vd_style(row):
+                        styles = [''] * len(row)
                         try:
-                            v = float(str(val).replace(',', '').replace('+', ''))
-                            if v > 0: return 'background-color: #08998130; color: white'
-                            if v < 0: return 'background-color: #f2364530; color: white'
+                            d = float(row['Delta'])
+                            color = '#08998130' if d > 0 else '#f2364530' if d < 0 else ''
+                            if color:
+                                for i, col in enumerate(row.index):
+                                    if col in ['Delta', 'Cum Delta']:
+                                        styles[i] = f'background-color: {color}; color: white'
+                            if row['Divergence']:
+                                div_idx = list(row.index).index('Divergence')
+                                styles[div_idx] = 'background-color: #FFD70040; color: white'
                         except: pass
-                        return ''
-                    def _div_color(val):
-                        if val: return 'background-color: #FFD70040; color: white'
-                        return ''
-                    styled_vd = vd_display.style.applymap(_delta_color, subset=['Delta', 'Cum Delta']).applymap(_div_color, subset=['Divergence'])
+                        return styles
+                    styled_vd = vd_display.style.apply(_vd_style, axis=1)
                     st.dataframe(styled_vd, use_container_width=True, hide_index=True)
                     dc1, dc2 = st.columns(2)
                     with dc1:
@@ -2915,7 +2929,7 @@ def main():
                         - **Cum Delta**: Running total - trend of buying/selling pressure
                         """)
                 else:
-                    st.info("Volume Delta requires more data. Please wait...")
+                    st.info(f"Volume Delta: No data yet. df rows={len(df) if not df.empty else 0}, volume_delta_data={'computed' if volume_delta_data else 'None'}")
 
             st.markdown("---")
             st.markdown("## 🔄 Intraday Reversal Detector")

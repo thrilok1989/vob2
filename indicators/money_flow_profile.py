@@ -20,8 +20,14 @@ def calculate_money_flow_profile(df, num_rows=25, source='Volume', sentiment_met
     Returns:
         dict with profile data, POC, sentiment, and summary table
     """
-    if df.empty or len(df) < 10:
+    if df.empty or len(df) < 5:
         return None
+
+    # Ensure required columns exist
+    required = ['open', 'high', 'low', 'close', 'volume']
+    for col in required:
+        if col not in df.columns:
+            return None
 
     price_low = df['low'].min()
     price_high = df['high'].max()
@@ -34,11 +40,15 @@ def calculate_money_flow_profile(df, num_rows=25, source='Volume', sentiment_met
     total_vol = np.zeros(num_rows)
     bull_vol = np.zeros(num_rows)
 
-    opens = df['open'].values
-    highs = df['high'].values
-    lows = df['low'].values
-    closes = df['close'].values
-    volumes = df['volume'].values
+    opens = df['open'].values.astype(float)
+    highs = df['high'].values.astype(float)
+    lows = df['low'].values.astype(float)
+    closes = df['close'].values.astype(float)
+    volumes = df['volume'].values.astype(float)
+
+    # If all volumes are 0 (e.g. cached data), use bar range as synthetic volume
+    if np.sum(volumes) == 0:
+        volumes = np.abs(highs - lows) + 1
 
     for i in range(len(df)):
         h, l, o, c, v = highs[i], lows[i], opens[i], closes[i], volumes[i]
