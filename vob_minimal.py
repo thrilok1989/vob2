@@ -1143,6 +1143,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
                 break
 
 def check_atm_verdict_alert(df_summary, underlying_price):
+    """ATM verdict alert — display only, no Telegram."""
     if df_summary is None or len(df_summary) == 0 or not underlying_price:
         return
 
@@ -1186,12 +1187,7 @@ def check_atm_verdict_alert(df_summary, underlying_price):
 • Operator Entry: {_g('Operator_Entry','N/A')} • Scalp/Momentum: {_g('Scalp_Moment','N/A')}
 📋 <b>SUGGESTED REVIEW:</b> {atm_strike} {opt} | Manual verification required
 🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}"""
-    try:
-        send_telegram_message_sync(message)
-        st.session_state.last_atm_verdict_alert = alert_key
-        st.success(f"{'🟢' if is_bull else '🔴'} ATM Strong {direction.title()} alert sent for strike {atm_strike}!")
-    except Exception as e:
-        st.error(f"Failed to send ATM verdict alert: {e}")
+    st.session_state.last_atm_verdict_alert = alert_key
 
 def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
     if df_summary is None or df_summary.empty:
@@ -1363,9 +1359,7 @@ def check_gex_alert(gex_data, df_summary, underlying_price):
         if alert_triggered:
             alert_key = f"{alert_type}_{current_time.strftime('%Y%m%d_%H%M')}"
             if st.session_state.last_gex_alert != alert_key:
-                send_telegram_message_sync(alert_message)
                 st.session_state.last_gex_alert = alert_key
-                st.success(f"📊 {alert_type} alert sent!")
 
     except Exception as e:
         pass
