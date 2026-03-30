@@ -32,11 +32,16 @@ def calculate_volume_delta(df):
 
     result = df[['datetime', 'open', 'high', 'low', 'close', 'volume']].copy()
 
-    h = result['high'].values
-    l = result['low'].values
-    o = result['open'].values
-    c = result['close'].values
-    v = result['volume'].values
+    h = result['high'].values.astype(float)
+    l = result['low'].values.astype(float)
+    o = result['open'].values.astype(float)
+    c = result['close'].values.astype(float)
+    v = result['volume'].values.astype(float)
+
+    # If all volumes are 0 (e.g. cached data), use bar range as synthetic volume
+    if np.sum(v) == 0:
+        v = np.abs(h - l) + 1
+        result['volume'] = v
 
     bar_range = h - l
     bar_range = np.where(bar_range == 0, 1, bar_range)  # avoid division by zero
