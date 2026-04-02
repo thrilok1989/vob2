@@ -7,3 +7,4 @@ scipy>=1.11.0
 plotly>=5.17.0
 pytz>=2023.3
 supabase>=1.0.3
+yfinance>=0.2.28
