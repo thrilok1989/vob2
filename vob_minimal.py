@@ -2884,28 +2884,80 @@ def get_candle_location(price, support_levels, resistance_levels, gex_data, ob_d
     return locations if locations else ["Middle (No key level)"]
 
 def fetch_alignment_data(api):
-    """Fetch LTP for BANKNIFTY, NIFTY IT, RELIANCE, ICICI for alignment check."""
-    # Dhan security IDs: BANKNIFTY=25, NIFTY IT=30 (approx), RELIANCE=2885, ICICIBANK=4963
-    alignment = {}
+    """Fetch candle data for SENSEX, BANKNIFTY, NIFTY IT, RELIANCE, ICICI, VIX.
+    Detect candle patterns, compute 10m/1h/4h sentiment for each."""
+    # Dhan security IDs
     tickers = [
-        ('BANKNIFTY', '25', 'IDX_I'),
-        ('NIFTY IT', '30', 'IDX_I'),
-        ('RELIANCE', '2885', 'NSE_EQ'),
-        ('ICICIBANK', '4963', 'NSE_EQ'),
+        ('SENSEX', '51', 'BSE_EQ', 'INDEX'),
+        ('BANKNIFTY', '25', 'IDX_I', 'INDEX'),
+        ('NIFTY IT', '30', 'IDX_I', 'INDEX'),
+        ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY'),
+        ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY'),
+        ('INDIA VIX', '26', 'IDX_I', 'INDEX'),
     ]
-    for name, sec_id, seg in tickers:
+    alignment = {}
+    for name, sec_id, seg, inst in tickers:
         try:
-            resp = api.get_ltp_data(sec_id, seg)
-            if resp and 'data' in resp:
-                data = resp['data']
-                if isinstance(data, dict):
-                    for seg_key, items in data.items():
-                        if items:
-                            item = items[0] if isinstance(items, list) else items
-                            alignment[name] = {'ltp': item.get('last_price', 0)}
-                            break
+            # Fetch 1-min candle data (last 1 day)
+            data = api.get_intraday_data(security_id=sec_id, exchange_segment=seg, instrument=inst, interval="1", days_back=1)
+            if data and 'open' in data:
+                adf = process_candle_data(data, "1")
+                if adf.empty:
+                    alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
+                                       'candle_dir': 'N/A', 'candles': [],
+                                       'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
+                    continue
+
+                ltp = adf.iloc[-1]['close']
+                # Candle pattern detection
+                cp = detect_candle_patterns(adf, lookback=5)
+
+                # Multi-timeframe sentiment
+                def calc_sentiment(sub_df):
+                    if sub_df is None or len(sub_df) < 2:
+                        return 'N/A', 0
+                    first_close = sub_df.iloc[0]['close']
+                    last_close = sub_df.iloc[-1]['close']
+                    pct = ((last_close - first_close) / first_close) * 100 if first_close > 0 else 0
+                    green_count = sum(1 for _, r in sub_df.iterrows() if r['close'] > r['open'])
+                    bear_count = len(sub_df) - green_count
+                    if pct > 0.1 and green_count > bear_count:
+                        return 'Bullish', round(pct, 2)
+                    elif pct < -0.1 and bear_count > green_count:
+                        return 'Bearish', round(pct, 2)
+                    else:
+                        return 'Neutral', round(pct, 2)
+
+                # Last 10 minutes
+                s_10m, pct_10m = calc_sentiment(adf.tail(10))
+                # Last 60 minutes (1 hour)
+                s_1h, pct_1h = calc_sentiment(adf.tail(60))
+                # Last 240 minutes (4 hours)
+                s_4h, pct_4h = calc_sentiment(adf.tail(240))
+
+                # Overall trend from LTP
+                prev_ltp = adf.iloc[-2]['close'] if len(adf) >= 2 else ltp
+                trend = 'Bullish' if ltp > prev_ltp else 'Bearish' if ltp < prev_ltp else 'Flat'
+
+                alignment[name] = {
+                    'ltp': ltp, 'trend': trend,
+                    'candle_pattern': cp['pattern'], 'candle_dir': cp['direction'],
+                    'candles': cp.get('candles', []),
+                    'bull_count': cp.get('bull_count', 0), 'bear_count': cp.get('bear_count', 0),
+                    'sentiment_10m': s_10m, 'pct_10m': pct_10m,
+                    'sentiment_1h': s_1h, 'pct_1h': pct_1h,
+                    'sentiment_4h': s_4h, 'pct_4h': pct_4h,
+                    'day_high': adf['high'].max(), 'day_low': adf['low'].min(),
+                    'open': adf.iloc[0]['open'],
+                }
+            else:
+                alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
+                                   'candle_dir': 'N/A', 'candles': [],
+                                   'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
         except Exception:
-            alignment[name] = {'ltp': 0}
+            alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
+                               'candle_dir': 'N/A', 'candles': [],
+                               'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
     return alignment
 
 def fetch_vix_data(api):
@@ -2963,7 +3015,7 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     except Exception:
         pass
 
-    # 7. Index Alignment (with caching)
+    # 7. Index & Stock Alignment (with caching - fetch every 120s to reduce API calls)
     alignment = {}
     try:
         if 'alignment_data' not in st.session_state:
@@ -2971,23 +3023,52 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
             st.session_state.alignment_last_fetch = None
         ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
         should_fetch = st.session_state.alignment_last_fetch is None or \
-            (ist_now - st.session_state.alignment_last_fetch).total_seconds() > 60
+            (ist_now - st.session_state.alignment_last_fetch).total_seconds() > 120
         if should_fetch:
             alignment = fetch_alignment_data(api)
             if alignment:
-                # Store previous for trend
-                st.session_state.alignment_prev = st.session_state.alignment_data.copy()
                 st.session_state.alignment_data = alignment
                 st.session_state.alignment_last_fetch = ist_now
         alignment = st.session_state.alignment_data
-        prev_alignment = getattr(st.session_state, 'alignment_prev', {})
-        for name in alignment:
-            curr_ltp = alignment[name].get('ltp', 0)
-            prev_ltp = prev_alignment.get(name, {}).get('ltp', 0)
-            if curr_ltp > 0 and prev_ltp > 0:
-                alignment[name]['trend'] = 'Bullish' if curr_ltp > prev_ltp else 'Bearish' if curr_ltp < prev_ltp else 'Flat'
-            else:
-                alignment[name]['trend'] = 'Unknown'
+
+        # Also add NIFTY's own sentiment from the main df
+        if df is not None and not df.empty:
+            nifty_cp = detect_candle_patterns(df, lookback=5)
+            def _nifty_sentiment(sub):
+                if sub is None or len(sub) < 2:
+                    return 'N/A', 0
+                fc, lc = sub.iloc[0]['close'], sub.iloc[-1]['close']
+                pct = ((lc - fc) / fc) * 100 if fc > 0 else 0
+                gc = sum(1 for _, r in sub.iterrows() if r['close'] > r['open'])
+                if pct > 0.1 and gc > len(sub) // 2:
+                    return 'Bullish', round(pct, 2)
+                elif pct < -0.1 and gc <= len(sub) // 2:
+                    return 'Bearish', round(pct, 2)
+                return 'Neutral', round(pct, 2)
+            s10, p10 = _nifty_sentiment(df.tail(10))
+            s1h, p1h = _nifty_sentiment(df.tail(60))
+            s4h, p4h = _nifty_sentiment(df.tail(240))
+            alignment['NIFTY 50'] = {
+                'ltp': df.iloc[-1]['close'], 'trend': nifty_cp['direction'],
+                'candle_pattern': nifty_cp['pattern'], 'candle_dir': nifty_cp['direction'],
+                'candles': nifty_cp.get('candles', []),
+                'bull_count': nifty_cp.get('bull_count', 0), 'bear_count': nifty_cp.get('bear_count', 0),
+                'sentiment_10m': s10, 'pct_10m': p10,
+                'sentiment_1h': s1h, 'pct_1h': p1h,
+                'sentiment_4h': s4h, 'pct_4h': p4h,
+                'day_high': df['high'].max(), 'day_low': df['low'].min(),
+                'open': df.iloc[0]['open'],
+            }
+
+        # VIX direction from alignment data
+        vix_align = alignment.get('INDIA VIX', {})
+        if vix_align.get('ltp', 0) > 0 and vix_data.get('vix', 0) == 0:
+            vix_data['vix'] = vix_align['ltp']
+            vix_data['direction'] = vix_align.get('sentiment_10m', 'Unknown')
+            if vix_align.get('sentiment_10m') == 'Bullish':
+                vix_data['direction'] = 'Rising'
+            elif vix_align.get('sentiment_10m') == 'Bearish':
+                vix_data['direction'] = 'Falling'
     except Exception:
         pass
 
@@ -3063,10 +3144,11 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         score -= 1
         reasons.append(f"Option Chain: {market_bias}")
 
-    # 6. Alignment
-    bullish_align = sum(1 for v in alignment.values() if v.get('trend') == 'Bullish')
-    bearish_align = sum(1 for v in alignment.values() if v.get('trend') == 'Bearish')
-    total_align = len(alignment) if alignment else 1
+    # 6. Alignment (use 10m sentiment for immediate direction)
+    non_vix = {k: v for k, v in alignment.items() if 'VIX' not in k}
+    bullish_align = sum(1 for v in non_vix.values() if v.get('sentiment_10m') == 'Bullish')
+    bearish_align = sum(1 for v in non_vix.values() if v.get('sentiment_10m') == 'Bearish')
+    total_align = len(non_vix) if non_vix else 1
     if bullish_align > bearish_align and bullish_align >= 2:
         score += 1
         reasons.append(f"Alignment Bullish ({bullish_align}/{total_align})")
@@ -3168,12 +3250,20 @@ def send_master_signal_telegram(result, underlying_price):
         return
     time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
 
-    # Alignment text
+    # Alignment text with candle pattern and sentiment
     align_lines = []
-    for name, data in result.get('alignment', {}).items():
-        trend = data.get('trend', 'Unknown')
-        emoji = '🟢' if trend == 'Bullish' else '🔴' if trend == 'Bearish' else '⚪'
-        align_lines.append(f"  {emoji} {name}: {trend}")
+    display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX']
+    for name in display_order:
+        data = result.get('alignment', {}).get(name)
+        if data is None:
+            continue
+        s10 = data.get('sentiment_10m', 'N/A')
+        s1h = data.get('sentiment_1h', 'N/A')
+        pat = data.get('candle_pattern', 'N/A')
+        ltp = data.get('ltp', 0)
+        emoji = '🟢' if s10 == 'Bullish' else '🔴' if s10 == 'Bearish' else '⚪'
+        ltp_str = f"₹{ltp:.0f}" if ltp > 0 else 'N/A'
+        align_lines.append(f"  {emoji} {name}: {ltp_str} | {pat} | 10m:{s10} | 1h:{s1h}")
     align_text = "\n".join(align_lines) if align_lines else "  Data unavailable"
 
     # Location
@@ -5333,18 +5423,6 @@ def main():
                             st.markdown(f"🟩 ₹{s:.0f}")
 
                     with ms_col3:
-                        st.markdown("#### 🌍 Alignment")
-                        for name, data in master.get('alignment', {}).items():
-                            trend = data.get('trend', 'Unknown')
-                            if trend == 'Bullish':
-                                st.success(f"{name}: {trend}")
-                            elif trend == 'Bearish':
-                                st.error(f"{name}: {trend}")
-                            else:
-                                st.info(f"{name}: {trend}")
-                        if not master.get('alignment'):
-                            st.info("Alignment data loading...")
-
                         st.markdown("#### 📉 VIX")
                         vix = master['vix']
                         vix_val = vix.get('vix', 0)
@@ -5363,6 +5441,106 @@ def main():
                         st.markdown("#### 📋 Confluence Factors")
                         for reason in master['reasons']:
                             st.markdown(f"✔ {reason}")
+
+                    # === FULL ALIGNMENT TABLE (below the 3-col section) ===
+                    st.markdown("---")
+                    st.markdown("## 🌍 Index & Stock Alignment - Candle Patterns & Sentiment")
+                    align_data = master.get('alignment', {})
+                    if align_data:
+                        # Candle Pattern Table
+                        st.markdown("### 🕯 Candle Patterns Across Indices")
+                        pattern_rows = []
+                        # Define display order
+                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX']
+                        for name in display_order:
+                            ad = align_data.get(name)
+                            if ad is None:
+                                continue
+                            pat_emoji = '🟢' if ad.get('candle_dir') == 'Bullish' else '🔴' if ad.get('candle_dir') == 'Bearish' else '🟡'
+                            pattern_rows.append({
+                                'Index': name,
+                                'LTP': f"₹{ad['ltp']:.2f}" if ad.get('ltp', 0) > 0 else 'N/A',
+                                'Candle': f"{pat_emoji} {ad.get('candle_pattern', 'N/A')}",
+                                'Direction': ad.get('candle_dir', 'N/A'),
+                                'Bull/Bear (5)': f"{ad.get('bull_count', '-')}/{ad.get('bear_count', '-')}",
+                                'Day H': f"₹{ad['day_high']:.0f}" if ad.get('day_high') else '-',
+                                'Day L': f"₹{ad['day_low']:.0f}" if ad.get('day_low') else '-',
+                            })
+                        if pattern_rows:
+                            pat_df = pd.DataFrame(pattern_rows)
+                            def _style_pat(row):
+                                d = row['Direction']
+                                if d == 'Bullish':
+                                    return ['background-color:#00ff8815;color:white'] * len(row)
+                                elif d == 'Bearish':
+                                    return ['background-color:#ff444415;color:white'] * len(row)
+                                return [''] * len(row)
+                            st.dataframe(pat_df.style.apply(_style_pat, axis=1), use_container_width=True, hide_index=True)
+
+                        # Multi-timeframe Sentiment Table
+                        st.markdown("### 📊 Multi-Timeframe Sentiment (Price Action)")
+                        sent_rows = []
+                        for name in display_order:
+                            ad = align_data.get(name)
+                            if ad is None:
+                                continue
+                            def _sent_emoji(s):
+                                return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '🟡'
+                            s10 = ad.get('sentiment_10m', 'N/A')
+                            s1h = ad.get('sentiment_1h', 'N/A')
+                            s4h = ad.get('sentiment_4h', 'N/A')
+                            sent_rows.append({
+                                'Index': name,
+                                'LTP': f"₹{ad['ltp']:.2f}" if ad.get('ltp', 0) > 0 else 'N/A',
+                                '10 Min': f"{_sent_emoji(s10)} {s10} ({ad.get('pct_10m', 0):+.2f}%)" if s10 != 'N/A' else 'N/A',
+                                '1 Hour': f"{_sent_emoji(s1h)} {s1h} ({ad.get('pct_1h', 0):+.2f}%)" if s1h != 'N/A' else 'N/A',
+                                '4 Hours': f"{_sent_emoji(s4h)} {s4h} ({ad.get('pct_4h', 0):+.2f}%)" if s4h != 'N/A' else 'N/A',
+                                'Trend': ad.get('trend', 'N/A'),
+                            })
+                        if sent_rows:
+                            sent_df = pd.DataFrame(sent_rows)
+                            def _style_sent(row):
+                                t = row['Trend']
+                                if t == 'Bullish':
+                                    return ['background-color:#00ff8815;color:white'] * len(row)
+                                elif t == 'Bearish':
+                                    return ['background-color:#ff444415;color:white'] * len(row)
+                                return [''] * len(row)
+                            st.dataframe(sent_df.style.apply(_style_sent, axis=1), use_container_width=True, hide_index=True)
+
+                        # Summary
+                        non_vix_align = {k: v for k, v in align_data.items() if 'VIX' not in k}
+                        bull_10m = sum(1 for v in non_vix_align.values() if v.get('sentiment_10m') == 'Bullish')
+                        bear_10m = sum(1 for v in non_vix_align.values() if v.get('sentiment_10m') == 'Bearish')
+                        bull_1h = sum(1 for v in non_vix_align.values() if v.get('sentiment_1h') == 'Bullish')
+                        bear_1h = sum(1 for v in non_vix_align.values() if v.get('sentiment_1h') == 'Bearish')
+                        total_idx = len(non_vix_align)
+                        sum_col1, sum_col2, sum_col3 = st.columns(3)
+                        with sum_col1:
+                            if bull_10m > bear_10m:
+                                st.success(f"10m: Bullish ({bull_10m}/{total_idx})")
+                            elif bear_10m > bull_10m:
+                                st.error(f"10m: Bearish ({bear_10m}/{total_idx})")
+                            else:
+                                st.warning(f"10m: Mixed ({bull_10m}B/{bear_10m}R)")
+                        with sum_col2:
+                            if bull_1h > bear_1h:
+                                st.success(f"1h: Bullish ({bull_1h}/{total_idx})")
+                            elif bear_1h > bull_1h:
+                                st.error(f"1h: Bearish ({bear_1h}/{total_idx})")
+                            else:
+                                st.warning(f"1h: Mixed ({bull_1h}B/{bear_1h}R)")
+                        with sum_col3:
+                            bull_4h = sum(1 for v in non_vix_align.values() if v.get('sentiment_4h') == 'Bullish')
+                            bear_4h = sum(1 for v in non_vix_align.values() if v.get('sentiment_4h') == 'Bearish')
+                            if bull_4h > bear_4h:
+                                st.success(f"4h: Bullish ({bull_4h}/{total_idx})")
+                            elif bear_4h > bull_4h:
+                                st.error(f"4h: Bearish ({bear_4h}/{total_idx})")
+                            else:
+                                st.warning(f"4h: Mixed ({bull_4h}B/{bear_4h}R)")
+                    else:
+                        st.info("Alignment data loading... will appear on next refresh.")
                 else:
                     st.info("Generating master signal... waiting for data.")
             else:
