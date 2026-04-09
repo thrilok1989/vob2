@@ -2939,6 +2939,11 @@ def fetch_alignment_data(api):
                 prev_ltp = adf.iloc[-2]['close'] if len(adf) >= 2 else ltp
                 trend = 'Bullish' if ltp > prev_ltp else 'Bearish' if ltp < prev_ltp else 'Flat'
 
+                # % change series from day open for line chart
+                day_open = adf.iloc[0]['open']
+                pct_series_time = adf['datetime'].tolist()
+                pct_series_vals = [((c - day_open) / day_open) * 100 if day_open > 0 else 0 for c in adf['close'].tolist()]
+
                 alignment[name] = {
                     'ltp': ltp, 'trend': trend,
                     'candle_pattern': cp['pattern'], 'candle_dir': cp['direction'],
@@ -2949,6 +2954,8 @@ def fetch_alignment_data(api):
                     'sentiment_4h': s_4h, 'pct_4h': pct_4h,
                     'day_high': adf['high'].max(), 'day_low': adf['low'].min(),
                     'open': adf.iloc[0]['open'],
+                    'pct_series_time': pct_series_time,
+                    'pct_series_vals': pct_series_vals,
                 }
             else:
                 alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
@@ -3048,6 +3055,9 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
             s10, p10 = _nifty_sentiment(df.tail(10))
             s1h, p1h = _nifty_sentiment(df.tail(60))
             s4h, p4h = _nifty_sentiment(df.tail(240))
+            nifty_day_open = df.iloc[0]['open']
+            nifty_pct_time = df['datetime'].tolist()
+            nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df['close'].tolist()]
             alignment['NIFTY 50'] = {
                 'ltp': df.iloc[-1]['close'], 'trend': nifty_cp['direction'],
                 'candle_pattern': nifty_cp['pattern'], 'candle_dir': nifty_cp['direction'],
@@ -3057,7 +3067,9 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
                 'sentiment_1h': s1h, 'pct_1h': p1h,
                 'sentiment_4h': s4h, 'pct_4h': p4h,
                 'day_high': df['high'].max(), 'day_low': df['low'].min(),
-                'open': df.iloc[0]['open'],
+                'open': nifty_day_open,
+                'pct_series_time': nifty_pct_time,
+                'pct_series_vals': nifty_pct_vals,
             }
 
         # VIX direction from alignment data
@@ -5539,6 +5551,47 @@ def main():
                                 st.error(f"4h: Bearish ({bear_4h}/{total_idx})")
                             else:
                                 st.warning(f"4h: Mixed ({bull_4h}B/{bear_4h}R)")
+                        # === % Change from Open - Line Chart ===
+                        st.markdown("### 📈 Price Action - % Change from Open (Today)")
+                        fig_pct = go.Figure()
+                        line_colors = {
+                            'NIFTY 50': '#FFD700',
+                            'SENSEX': '#FF6B6B',
+                            'BANKNIFTY': '#00BFFF',
+                            'NIFTY IT': '#FF69B4',
+                            'RELIANCE': '#00FF7F',
+                            'ICICIBANK': '#FFA500',
+                            'INDIA VIX': '#FF4444',
+                        }
+                        for name in display_order:
+                            ad = align_data.get(name)
+                            if ad is None:
+                                continue
+                            pct_time = ad.get('pct_series_time', [])
+                            pct_vals = ad.get('pct_series_vals', [])
+                            if pct_time and pct_vals:
+                                line_width = 3 if name == 'NIFTY 50' else 2
+                                dash = 'dot' if name == 'INDIA VIX' else None
+                                fig_pct.add_trace(go.Scatter(
+                                    x=pct_time, y=pct_vals,
+                                    mode='lines',
+                                    name=name,
+                                    line=dict(color=line_colors.get(name, '#888'), width=line_width, dash=dash),
+                                ))
+                        fig_pct.add_hline(y=0, line_dash="solid", line_color="white", line_width=1.5)
+                        fig_pct.update_layout(
+                            title='All Indices & Stocks - % Change from Day Open',
+                            template='plotly_dark',
+                            height=450,
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='% Change', zeroline=True, zerolinecolor='white', zerolinewidth=2,
+                                       ticksuffix='%'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+                            hovermode='x unified',
+                        )
+                        st.plotly_chart(fig_pct, use_container_width=True)
                     else:
                         st.info("Alignment data loading... will appear on next refresh.")
                 else:
