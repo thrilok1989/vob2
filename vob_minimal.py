@@ -2709,6 +2709,493 @@ def send_option_chain_signal(sa_result, underlying_price):
     except Exception:
         pass
 
+def detect_candle_patterns(df, lookback=5):
+    """Detect candlestick patterns from last few candles."""
+    if df is None or len(df) < lookback:
+        return {'pattern': 'Insufficient Data', 'direction': 'Neutral', 'details': {}}
+    recent = df.tail(lookback).copy()
+    last = recent.iloc[-1]
+    prev = recent.iloc[-2] if len(recent) >= 2 else None
+
+    body = abs(last['close'] - last['open'])
+    total_range = last['high'] - last['low']
+    body_ratio = body / total_range if total_range > 0 else 0
+    is_green = last['close'] > last['open']
+    upper_wick = last['high'] - max(last['close'], last['open'])
+    lower_wick = min(last['close'], last['open']) - last['low']
+
+    pattern = 'No Pattern'
+    direction = 'Neutral'
+
+    # Hammer: small body at top, long lower wick (>2x body)
+    if lower_wick > body * 2 and upper_wick < body * 0.5 and body_ratio < 0.4:
+        pattern = 'Hammer'
+        direction = 'Bullish'
+    # Inverted Hammer / Shooting Star
+    elif upper_wick > body * 2 and lower_wick < body * 0.5 and body_ratio < 0.4:
+        pattern = 'Shooting Star' if not is_green else 'Inverted Hammer'
+        direction = 'Bearish' if not is_green else 'Bullish'
+    # Doji: very small body
+    elif body_ratio < 0.1 and total_range > 0:
+        pattern = 'Doji'
+        direction = 'Indecision'
+    # Engulfing patterns
+    elif prev is not None:
+        prev_body = abs(prev['close'] - prev['open'])
+        prev_green = prev['close'] > prev['open']
+        if is_green and not prev_green and body > prev_body and last['close'] > prev['open'] and last['open'] < prev['close']:
+            pattern = 'Bullish Engulfing'
+            direction = 'Bullish'
+        elif not is_green and prev_green and body > prev_body and last['close'] < prev['open'] and last['open'] > prev['close']:
+            pattern = 'Bearish Engulfing'
+            direction = 'Bearish'
+        # Strong candle: large body ratio
+        elif body_ratio >= 0.6:
+            pattern = 'Strong Green Candle' if is_green else 'Strong Red Candle'
+            direction = 'Bullish' if is_green else 'Bearish'
+
+    if pattern == 'No Pattern' and body_ratio >= 0.6:
+        pattern = 'Strong Green Candle' if is_green else 'Strong Red Candle'
+        direction = 'Bullish' if is_green else 'Bearish'
+
+    return {
+        'pattern': pattern, 'direction': direction,
+        'details': {
+            'body_ratio': round(body_ratio, 2), 'is_green': is_green,
+            'close': last['close'], 'open': last['open'],
+            'high': last['high'], 'low': last['low'],
+        }
+    }
+
+def detect_order_blocks(df, lookback=20):
+    """Detect bullish and bearish order blocks."""
+    if df is None or len(df) < lookback:
+        return {'bullish_ob': None, 'bearish_ob': None}
+    recent = df.tail(lookback).copy()
+    bullish_ob = None
+    bearish_ob = None
+
+    for i in range(1, len(recent) - 2):
+        curr = recent.iloc[i]
+        nxt = recent.iloc[i + 1]
+        nxt2 = recent.iloc[i + 2] if i + 2 < len(recent) else None
+        # Bullish OB: last red candle before strong up move
+        is_red = curr['close'] < curr['open']
+        if is_red and nxt['close'] > nxt['open']:
+            up_move = nxt['close'] - curr['low']
+            avg_range = recent['high'].mean() - recent['low'].mean()
+            if up_move > avg_range * 1.5:
+                bullish_ob = {'low': curr['low'], 'high': curr['high'],
+                              'time': recent.index[i] if hasattr(recent.index[i], 'strftime') else i}
+        # Bearish OB: last green candle before strong down move
+        is_green = curr['close'] > curr['open']
+        if is_green and nxt['close'] < nxt['open']:
+            down_move = curr['high'] - nxt['close']
+            avg_range = recent['high'].mean() - recent['low'].mean()
+            if down_move > avg_range * 1.5:
+                bearish_ob = {'low': curr['low'], 'high': curr['high'],
+                              'time': recent.index[i] if hasattr(recent.index[i], 'strftime') else i}
+
+    return {'bullish_ob': bullish_ob, 'bearish_ob': bearish_ob}
+
+def detect_volume_spike(df, lookback=5):
+    """Check if current candle has volume spike vs recent average."""
+    if df is None or len(df) < lookback + 1:
+        return {'spike': False, 'ratio': 0, 'label': 'Insufficient Data'}
+    current_vol = df.iloc[-1]['volume']
+    avg_vol = df.tail(lookback + 1).iloc[:-1]['volume'].mean()
+    ratio = current_vol / avg_vol if avg_vol > 0 else 0
+    if ratio >= 2.0:
+        label = 'HIGH (Spike)'
+    elif ratio >= 1.3:
+        label = 'Above Avg'
+    else:
+        label = 'Normal'
+    return {'spike': ratio >= 1.5, 'ratio': round(ratio, 2), 'label': label}
+
+def get_candle_location(price, support_levels, resistance_levels, gex_data, ob_data):
+    """Determine where the current candle is relative to key levels."""
+    locations = []
+    # Check near support
+    for s in support_levels:
+        if abs(price - s) / price * 100 < 0.15:
+            locations.append(f"Near Support ₹{s:.0f}")
+    # Check near resistance
+    for r in resistance_levels:
+        if abs(price - r) / price * 100 < 0.15:
+            locations.append(f"Near Resistance ₹{r:.0f}")
+    # Check GEX levels
+    if gex_data:
+        if gex_data.get('gex_magnet') and abs(price - gex_data['gex_magnet']) / price * 100 < 0.2:
+            locations.append(f"Near GEX Magnet ₹{gex_data['gex_magnet']:.0f}")
+        if gex_data.get('gex_repeller') and abs(price - gex_data['gex_repeller']) / price * 100 < 0.2:
+            locations.append(f"Near GEX Repeller ₹{gex_data['gex_repeller']:.0f}")
+        if gex_data.get('gamma_flip_level') and abs(price - gex_data['gamma_flip_level']) / price * 100 < 0.15:
+            locations.append(f"Near Gamma Flip ₹{gex_data['gamma_flip_level']:.0f}")
+    # Check order blocks
+    if ob_data:
+        if ob_data.get('bullish_ob') and ob_data['bullish_ob']['low'] <= price <= ob_data['bullish_ob']['high']:
+            locations.append("Inside Bullish OB")
+        if ob_data.get('bearish_ob') and ob_data['bearish_ob']['low'] <= price <= ob_data['bearish_ob']['high']:
+            locations.append("Inside Bearish OB")
+    return locations if locations else ["Middle (No key level)"]
+
+def fetch_alignment_data(api):
+    """Fetch LTP for BANKNIFTY, NIFTY IT, RELIANCE, ICICI for alignment check."""
+    # Dhan security IDs: BANKNIFTY=25, NIFTY IT=30 (approx), RELIANCE=2885, ICICIBANK=4963
+    alignment = {}
+    tickers = [
+        ('BANKNIFTY', '25', 'IDX_I'),
+        ('NIFTY IT', '30', 'IDX_I'),
+        ('RELIANCE', '2885', 'NSE_EQ'),
+        ('ICICIBANK', '4963', 'NSE_EQ'),
+    ]
+    for name, sec_id, seg in tickers:
+        try:
+            resp = api.get_ltp_data(sec_id, seg)
+            if resp and 'data' in resp:
+                data = resp['data']
+                if isinstance(data, dict):
+                    for seg_key, items in data.items():
+                        if items:
+                            item = items[0] if isinstance(items, list) else items
+                            alignment[name] = {'ltp': item.get('last_price', 0)}
+                            break
+        except Exception:
+            alignment[name] = {'ltp': 0}
+    return alignment
+
+def fetch_vix_data(api):
+    """Fetch India VIX data via Dhan API."""
+    try:
+        resp = api.get_ltp_data("26", "IDX_I")  # India VIX security ID=26
+        if resp and 'data' in resp:
+            data = resp['data']
+            if isinstance(data, dict):
+                for seg_key, items in data.items():
+                    if items:
+                        item = items[0] if isinstance(items, list) else items
+                        return {'vix': item.get('last_price', 0)}
+    except Exception:
+        pass
+    return {'vix': 0}
+
+def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_price, api):
+    """Generate comprehensive trading signal using all available data."""
+    if df is None or df.empty or sa_result is None:
+        return None
+
+    # 1. Candle Pattern (last 5 candles)
+    candle = detect_candle_patterns(df, lookback=5)
+
+    # 2. Order Blocks
+    ob = detect_order_blocks(df, lookback=20)
+
+    # 3. Volume Analysis
+    vol = detect_volume_spike(df, lookback=5)
+
+    # 4. Key levels from existing app data
+    support_levels = [float(r['Strike']) for _, r in sa_result['top_support'].iterrows()] if not sa_result['top_support'].empty else []
+    resistance_levels = [float(r['Strike']) for _, r in sa_result['top_resistance'].iterrows()] if not sa_result['top_resistance'].empty else []
+
+    # 5. Candle location
+    location = get_candle_location(underlying_price, support_levels, resistance_levels, gex_data, ob)
+
+    # 6. VIX (with session state caching)
+    vix_data = {'vix': 0, 'direction': 'Unknown'}
+    try:
+        if 'vix_history' not in st.session_state:
+            st.session_state.vix_history = []
+        vix_resp = fetch_vix_data(api)
+        vix_val = vix_resp.get('vix', 0)
+        if vix_val > 0:
+            st.session_state.vix_history.append(vix_val)
+            if len(st.session_state.vix_history) > 50:
+                st.session_state.vix_history = st.session_state.vix_history[-50:]
+            if len(st.session_state.vix_history) >= 2:
+                vix_dir = 'Rising' if st.session_state.vix_history[-1] > st.session_state.vix_history[0] else 'Falling'
+            else:
+                vix_dir = 'Unknown'
+            vix_data = {'vix': vix_val, 'direction': vix_dir}
+    except Exception:
+        pass
+
+    # 7. Index Alignment (with caching)
+    alignment = {}
+    try:
+        if 'alignment_data' not in st.session_state:
+            st.session_state.alignment_data = {}
+            st.session_state.alignment_last_fetch = None
+        ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        should_fetch = st.session_state.alignment_last_fetch is None or \
+            (ist_now - st.session_state.alignment_last_fetch).total_seconds() > 60
+        if should_fetch:
+            alignment = fetch_alignment_data(api)
+            if alignment:
+                # Store previous for trend
+                st.session_state.alignment_prev = st.session_state.alignment_data.copy()
+                st.session_state.alignment_data = alignment
+                st.session_state.alignment_last_fetch = ist_now
+        alignment = st.session_state.alignment_data
+        prev_alignment = getattr(st.session_state, 'alignment_prev', {})
+        for name in alignment:
+            curr_ltp = alignment[name].get('ltp', 0)
+            prev_ltp = prev_alignment.get(name, {}).get('ltp', 0)
+            if curr_ltp > 0 and prev_ltp > 0:
+                alignment[name]['trend'] = 'Bullish' if curr_ltp > prev_ltp else 'Bearish' if curr_ltp < prev_ltp else 'Flat'
+            else:
+                alignment[name]['trend'] = 'Unknown'
+    except Exception:
+        pass
+
+    # === EXISTING APP DATA ===
+    market_bias = sa_result.get('market_bias', 'Neutral')
+    app_confidence = sa_result.get('confidence', 50)
+
+    # GEX data
+    net_gex = gex_data.get('total_gex', 0) if gex_data else 0
+    gamma_flip = gex_data.get('gamma_flip_level') if gex_data else None
+    gex_magnet = gex_data.get('gex_magnet') if gex_data else None
+    gex_repeller = gex_data.get('gex_repeller') if gex_data else None
+    gex_signal = gex_data.get('gex_signal', '') if gex_data else ''
+    gex_interpretation = gex_data.get('gex_interpretation', '') if gex_data else ''
+    market_mode = 'TREND' if net_gex < 0 else 'RANGE'
+
+    # ATM GEX
+    atm_gex = 0
+    if gex_data and 'gex_df' in gex_data:
+        gex_df = gex_data['gex_df']
+        atm_rows = gex_df[gex_df['Zone'] == 'ATM'] if 'Zone' in gex_df.columns else pd.DataFrame()
+        if not atm_rows.empty:
+            atm_gex = atm_rows.iloc[0].get('Net_GEX', 0)
+
+    above_gamma_flip = underlying_price > gamma_flip if gamma_flip else None
+
+    # PCR × GEX Confluence
+    pcr_gex_badge = confluence_data[0] if confluence_data else ''
+    pcr_gex_signal = confluence_data[1] if confluence_data and len(confluence_data) > 1 else ''
+
+    # === CONFLUENCE SCORING ===
+    score = 0
+    reasons = []
+
+    # 1. Candle pattern
+    if candle['direction'] == 'Bullish':
+        score += 1
+        reasons.append(f"Bullish {candle['pattern']}")
+    elif candle['direction'] == 'Bearish':
+        score -= 1
+        reasons.append(f"Bearish {candle['pattern']}")
+
+    # 2. Volume spike
+    if vol['spike']:
+        score += 1 if candle['direction'] == 'Bullish' else -1 if candle['direction'] == 'Bearish' else 0
+        reasons.append(f"Volume Spike ({vol['ratio']}x)")
+
+    # 3. Order Block
+    near_bullish_ob = any('Bullish OB' in loc for loc in location)
+    near_bearish_ob = any('Bearish OB' in loc for loc in location)
+    if near_bullish_ob:
+        score += 1
+        reasons.append("At Bullish Order Block")
+    elif near_bearish_ob:
+        score -= 1
+        reasons.append("At Bearish Order Block")
+
+    # 4. GEX confirmation
+    if net_gex < 0 and candle['direction'] == 'Bullish' and above_gamma_flip:
+        score += 1
+        reasons.append("GEX Trend + Above Gamma Flip")
+    elif net_gex < 0 and candle['direction'] == 'Bearish' and not above_gamma_flip:
+        score -= 1
+        reasons.append("GEX Trend + Below Gamma Flip")
+    elif net_gex > 0:
+        reasons.append("GEX Range Mode (pinning)")
+
+    # 5. PCR / Option chain confirmation
+    if 'Bullish' in market_bias:
+        score += 1
+        reasons.append(f"Option Chain: {market_bias}")
+    elif 'Bearish' in market_bias:
+        score -= 1
+        reasons.append(f"Option Chain: {market_bias}")
+
+    # 6. Alignment
+    bullish_align = sum(1 for v in alignment.values() if v.get('trend') == 'Bullish')
+    bearish_align = sum(1 for v in alignment.values() if v.get('trend') == 'Bearish')
+    total_align = len(alignment) if alignment else 1
+    if bullish_align > bearish_align and bullish_align >= 2:
+        score += 1
+        reasons.append(f"Alignment Bullish ({bullish_align}/{total_align})")
+    elif bearish_align > bullish_align and bearish_align >= 2:
+        score -= 1
+        reasons.append(f"Alignment Bearish ({bearish_align}/{total_align})")
+
+    # 7. VIX
+    vix_dir = vix_data.get('direction', 'Unknown')
+    if vix_dir == 'Falling' and score > 0:
+        score += 1
+        reasons.append("VIX Falling (Aligned)")
+    elif vix_dir == 'Rising' and score < 0:
+        score += -1  # more bearish
+        reasons.append("VIX Rising (Aligned)")
+    elif vix_dir == 'Rising' and score > 0:
+        reasons.append("VIX Rising (Opposite)")
+    elif vix_dir == 'Falling' and score < 0:
+        reasons.append("VIX Falling (Opposite)")
+
+    # === DETERMINE SIGNAL ===
+    abs_score = abs(score)
+    near_support = any('Support' in loc for loc in location)
+    near_resistance = any('Resistance' in loc for loc in location)
+    breakout_zones = not sa_result['breakout_zones'].empty
+    breakdown_zones = not sa_result['breakdown_zones'].empty
+
+    if breakout_zones and vol['spike'] and candle['direction'] == 'Bullish' and net_gex < 0:
+        signal = '🚀 BREAKOUT'
+        trade_type = 'STRONG BUY'
+    elif breakdown_zones and vol['spike'] and candle['direction'] == 'Bearish' and net_gex < 0:
+        signal = '💥 BREAKDOWN'
+        trade_type = 'STRONG SELL'
+    elif score >= 5:
+        signal = '🟩 PUT SUPPORT' if near_support else '🟢 STRONG BUY'
+        trade_type = 'STRONG BUY'
+    elif score >= 3:
+        signal = '🟩 PUT SUPPORT' if near_support else '🟢 BUY'
+        trade_type = 'STRONG BUY' if near_support else 'SCALP BUY'
+    elif score <= -5:
+        signal = '🟥 CALL CAPPING' if near_resistance else '🔴 STRONG SELL'
+        trade_type = 'STRONG SELL'
+    elif score <= -3:
+        signal = '🟥 CALL CAPPING' if near_resistance else '🔴 SELL'
+        trade_type = 'STRONG SELL' if near_resistance else 'SCALP SELL'
+    elif net_gex > 0 and abs_score < 3:
+        signal = '⚖️ RANGE'
+        trade_type = 'RANGE'
+    else:
+        signal = '⚪ NO TRADE'
+        trade_type = 'NO TRADE'
+
+    # Confidence
+    confidence = min(95, max(10, 30 + abs_score * 10))
+    if vol['spike']:
+        confidence += 5
+    if vix_dir in ['Falling', 'Rising'] and 'Aligned' in str(reasons):
+        confidence += 5
+    confidence = min(95, confidence)
+
+    # Strength label
+    if abs_score >= 6:
+        strength = 'STRONG'
+    elif abs_score >= 4:
+        strength = 'MODERATE'
+    else:
+        strength = 'NO TRADE' if abs_score < 3 else 'WEAK'
+
+    return {
+        'candle': candle,
+        'volume': vol,
+        'order_blocks': ob,
+        'location': location,
+        'vix': vix_data,
+        'alignment': alignment,
+        'gex': {
+            'net_gex': net_gex, 'atm_gex': atm_gex,
+            'gamma_flip': gamma_flip, 'magnet': gex_magnet,
+            'repeller': gex_repeller, 'market_mode': market_mode,
+            'signal': gex_signal, 'interpretation': gex_interpretation,
+            'above_flip': above_gamma_flip,
+        },
+        'pcr_gex': {'badge': pcr_gex_badge, 'signal': pcr_gex_signal},
+        'support_levels': support_levels,
+        'resistance_levels': resistance_levels,
+        'signal': signal,
+        'trade_type': trade_type,
+        'score': score,
+        'abs_score': abs_score,
+        'strength': strength,
+        'confidence': confidence,
+        'reasons': reasons,
+        'market_bias': market_bias,
+    }
+
+def send_master_signal_telegram(result, underlying_price):
+    """Send master signal to Telegram."""
+    if result is None:
+        return
+    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
+
+    # Alignment text
+    align_lines = []
+    for name, data in result.get('alignment', {}).items():
+        trend = data.get('trend', 'Unknown')
+        emoji = '🟢' if trend == 'Bullish' else '🔴' if trend == 'Bearish' else '⚪'
+        align_lines.append(f"  {emoji} {name}: {trend}")
+    align_text = "\n".join(align_lines) if align_lines else "  Data unavailable"
+
+    # Location
+    loc_text = ", ".join(result['location'])
+
+    # Reasons
+    reason_text = "\n".join([f"  ✔ {r}" for r in result['reasons']])
+
+    gex = result['gex']
+    vix = result['vix']
+
+    # Signal color
+    if 'BUY' in result['trade_type'] or 'BREAKOUT' in result['signal']:
+        signal_emoji = "🟢"
+    elif 'SELL' in result['trade_type'] or 'BREAKDOWN' in result['signal']:
+        signal_emoji = "🔴"
+    else:
+        signal_emoji = "🟡"
+
+    res_text = ", ".join([f"₹{r:.0f}" for r in result['resistance_levels'][:3]]) if result['resistance_levels'] else "None"
+    sup_text = ", ".join([f"₹{s:.0f}" for s in result['support_levels'][:3]]) if result['support_levels'] else "None"
+
+    message = f"""{signal_emoji} <b>MASTER TRADING SIGNAL</b> {signal_emoji}
+🕐 {time_str} | Spot: ₹{underlying_price:.2f}
+
+━━━ SIGNAL: <b>{result['signal']}</b> ━━━
+📊 Trade: <b>{result['trade_type']}</b>
+🎯 Confluence: <b>{result['abs_score']}/7 ({result['strength']})</b>
+📈 Confidence: <b>{result['confidence']}%</b>
+
+<b>🕯 Candle:</b> {result['candle']['pattern']} ({result['candle']['direction']})
+<b>📍 Location:</b> {loc_text}
+<b>📊 Volume:</b> {result['volume']['label']} ({result['volume']['ratio']}x)
+
+<b>🟥 Resistance:</b> {res_text}
+<b>🟩 Support:</b> {sup_text}
+
+<b>🔮 GEX:</b>
+  Net: {gex['net_gex']:+.1f}L | ATM: {gex['atm_gex']:+.1f}L
+  Gamma Flip: {'₹' + str(int(gex['gamma_flip'])) if gex['gamma_flip'] else 'N/A'} ({'Above' if gex['above_flip'] else 'Below' if gex['above_flip'] is not None else 'N/A'})
+  Magnet: {'₹' + str(int(gex['magnet'])) if gex['magnet'] else 'N/A'}
+  Repeller: {'₹' + str(int(gex['repeller'])) if gex['repeller'] else 'N/A'}
+  Mode: {gex['market_mode']}
+
+<b>📊 PCR×GEX:</b> {result['pcr_gex']['badge']}
+
+<b>🟢 Order Blocks:</b>
+  Bullish OB: {'₹' + str(int(result['order_blocks']['bullish_ob']['low'])) + '-' + str(int(result['order_blocks']['bullish_ob']['high'])) if result['order_blocks'].get('bullish_ob') else 'None'}
+  Bearish OB: {'₹' + str(int(result['order_blocks']['bearish_ob']['low'])) + '-' + str(int(result['order_blocks']['bearish_ob']['high'])) if result['order_blocks'].get('bearish_ob') else 'None'}
+
+<b>🌍 Alignment:</b>
+{align_text}
+
+<b>📉 VIX:</b> {vix.get('vix', 'N/A')} ({vix.get('direction', 'Unknown')})
+
+<b>📋 CONFLUENCE FACTORS:</b>
+{reason_text}
+
+⚠️ <i>Auto-generated signal. Manual verification required.</i>"""
+
+    try:
+        send_telegram_message_sync(message)
+    except Exception:
+        pass
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -3577,6 +4064,7 @@ def main():
                             st.session_state.last_chain_signal_time = ist_now
                         except Exception:
                             pass
+                    st.session_state._sa_result = sa_result
                     analysis_df = sa_result['analysis_df']
                     # Market Bias Banner
                     bias = sa_result['market_bias']
@@ -4248,6 +4736,7 @@ def main():
             if df_summary is not None and underlying_price:
                 gex_data = calculate_dealer_gex(df_summary, underlying_price)
                 if gex_data:
+                    st.session_state._gex_data = gex_data
                     gex_df = gex_data['gex_df']
                     st.session_state.gex_last_valid_data = gex_data
                     check_gex_alert(gex_data, df_summary, underlying_price)
@@ -4277,6 +4766,7 @@ def main():
                     if not atm_data.empty:
                         atm_pcr = atm_data.iloc[0].get('PCR', 1.0)
                         confluence_badge, confluence_signal, confluence_strength = calculate_pcr_gex_confluence(atm_pcr, gex_data)
+                        st.session_state._confluence = (confluence_badge, confluence_signal, confluence_strength)
                         conf_col1, conf_col2 = st.columns([1, 3])
                         with conf_col1:
                             if "BULL" in confluence_badge:
@@ -4682,6 +5172,132 @@ def main():
             file_name=f"nifty_options_summary_{option_data['expiry']}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
             mime="text/csv"
         )
+
+    # === MASTER TRADING SIGNAL ===
+    if option_data and option_data.get('underlying') and not df.empty:
+        st.markdown("---")
+        st.markdown("## 🎯 Master Trading Signal")
+        try:
+            _sa = getattr(st.session_state, '_sa_result', None)
+            _gex = getattr(st.session_state, '_gex_data', None)
+            _conf = getattr(st.session_state, '_confluence', None)
+            if _sa:
+                master = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
+                if master:
+                    # Send Telegram (with cooldown)
+                    if 'last_master_signal_time' not in st.session_state:
+                        st.session_state.last_master_signal_time = None
+                    _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                    _should_send = st.session_state.last_master_signal_time is None or \
+                        (_ist_now - st.session_state.last_master_signal_time).total_seconds() > 300
+                    if _should_send:
+                        try:
+                            send_master_signal_telegram(master, option_data['underlying'])
+                            st.session_state.last_master_signal_time = _ist_now
+                        except Exception:
+                            pass
+
+                    # Signal Banner
+                    if 'BUY' in master['trade_type'] or 'BREAKOUT' in master['signal']:
+                        sig_color = '#00ff88'
+                    elif 'SELL' in master['trade_type'] or 'BREAKDOWN' in master['signal']:
+                        sig_color = '#ff4444'
+                    else:
+                        sig_color = '#FFD700'
+                    st.markdown(f"""
+                    <div style="background:{sig_color}20;padding:25px;border-radius:15px;border:3px solid {sig_color};text-align:center;margin-bottom:15px;">
+                        <h1 style="color:{sig_color};margin:0;font-size:2.5em;">{master['signal']}</h1>
+                        <h2 style="color:white;margin:5px 0;">{master['trade_type']}</h2>
+                        <h3 style="color:{sig_color};margin:5px 0;">Confluence: {master['abs_score']}/7 ({master['strength']}) | Confidence: {master['confidence']}%</h3>
+                        <div style="background:#33333380;border-radius:10px;height:14px;margin:10px auto;max-width:500px;">
+                            <div style="background:{sig_color};border-radius:10px;height:14px;width:{master['confidence']}%;"></div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                    # Details in columns
+                    ms_col1, ms_col2, ms_col3 = st.columns(3)
+                    with ms_col1:
+                        st.markdown("#### 🕯 Candle & Volume")
+                        st.markdown(f"**Pattern:** {master['candle']['pattern']} ({master['candle']['direction']})")
+                        st.markdown(f"**Location:** {', '.join(master['location'])}")
+                        vol_color = '#00ff88' if master['volume']['spike'] else '#888888'
+                        st.markdown(f"**Volume:** <span style='color:{vol_color}'>{master['volume']['label']} ({master['volume']['ratio']}x)</span>", unsafe_allow_html=True)
+                        st.markdown("#### 🟢 Order Blocks")
+                        ob = master['order_blocks']
+                        if ob.get('bullish_ob'):
+                            st.success(f"Bullish OB: ₹{ob['bullish_ob']['low']:.0f} - ₹{ob['bullish_ob']['high']:.0f}")
+                        else:
+                            st.info("No Bullish OB detected")
+                        if ob.get('bearish_ob'):
+                            st.error(f"Bearish OB: ₹{ob['bearish_ob']['low']:.0f} - ₹{ob['bearish_ob']['high']:.0f}")
+                        else:
+                            st.info("No Bearish OB detected")
+
+                    with ms_col2:
+                        st.markdown("#### 🔮 GEX (from app)")
+                        gex = master['gex']
+                        gex_items = [
+                            ("Net GEX", f"{gex['net_gex']:+.1f}L"),
+                            ("ATM GEX", f"{gex['atm_gex']:+.1f}L"),
+                            ("Gamma Flip", f"₹{gex['gamma_flip']:.0f}" if gex['gamma_flip'] else "N/A"),
+                            ("Magnet", f"₹{gex['magnet']:.0f}" if gex['magnet'] else "N/A"),
+                            ("Repeller", f"₹{gex['repeller']:.0f}" if gex['repeller'] else "N/A"),
+                            ("Market Mode", gex['market_mode']),
+                        ]
+                        for label, val in gex_items:
+                            st.markdown(f"**{label}:** {val}")
+                        if gex['above_flip'] is not None:
+                            if gex['above_flip']:
+                                st.success("Above Gamma Flip (Bullish)")
+                            else:
+                                st.error("Below Gamma Flip (Bearish)")
+                        st.markdown(f"#### 📊 PCR × GEX")
+                        st.markdown(f"**{master['pcr_gex']['badge']}**")
+
+                        st.markdown("#### 🟥 Resistance / 🟩 Support")
+                        for r in master['resistance_levels'][:3]:
+                            st.markdown(f"🟥 ₹{r:.0f}")
+                        for s in master['support_levels'][:3]:
+                            st.markdown(f"🟩 ₹{s:.0f}")
+
+                    with ms_col3:
+                        st.markdown("#### 🌍 Alignment")
+                        for name, data in master.get('alignment', {}).items():
+                            trend = data.get('trend', 'Unknown')
+                            if trend == 'Bullish':
+                                st.success(f"{name}: {trend}")
+                            elif trend == 'Bearish':
+                                st.error(f"{name}: {trend}")
+                            else:
+                                st.info(f"{name}: {trend}")
+                        if not master.get('alignment'):
+                            st.info("Alignment data loading...")
+
+                        st.markdown("#### 📉 VIX")
+                        vix = master['vix']
+                        vix_val = vix.get('vix', 0)
+                        vix_dir = vix.get('direction', 'Unknown')
+                        if vix_val > 0:
+                            vix_aligned = ('Aligned' in str(master['reasons']))
+                            if vix_dir == 'Falling':
+                                st.success(f"VIX: {vix_val:.2f} ({vix_dir}) {'- Aligned' if vix_aligned else '- Opposite'}")
+                            elif vix_dir == 'Rising':
+                                st.error(f"VIX: {vix_val:.2f} ({vix_dir}) {'- Aligned' if vix_aligned else '- Opposite'}")
+                            else:
+                                st.info(f"VIX: {vix_val:.2f} ({vix_dir})")
+                        else:
+                            st.info("VIX data loading...")
+
+                        st.markdown("#### 📋 Confluence Factors")
+                        for reason in master['reasons']:
+                            st.markdown(f"✔ {reason}")
+                else:
+                    st.info("Generating master signal... waiting for data.")
+            else:
+                st.info("Master signal requires deep analysis data. Please wait...")
+        except Exception as e:
+            st.warning(f"Master signal unavailable: {str(e)}")
 
     if show_analytics:
         st.markdown("---")
