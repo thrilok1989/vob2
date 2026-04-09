@@ -2617,6 +2617,98 @@ def analyze_strike_activity(df_summary, underlying_price):
         'total_pe_chg': total_pe_chg,
     }
 
+def send_option_chain_signal(sa_result, underlying_price):
+    """Send comprehensive option chain analysis signal to Telegram."""
+    if sa_result is None:
+        return
+    bias = sa_result['market_bias']
+    conf = sa_result['confidence']
+    analysis_df = sa_result['analysis_df']
+
+    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
+
+    # Active signals detection
+    active_signals = []
+    # Call capping
+    capping = analysis_df[(analysis_df['Call_Class'] == 'Strong Resistance') & (analysis_df['Call_Activity'] == 'Writing (Resistance)')]
+    for _, r in capping.iterrows():
+        active_signals.append(f"🟥 CALL CAPPING ACTIVE at ₹{r['Strike']:.0f} (OI: {r['CE_OI']/100000:.1f}L, ChgOI: +{r['CE_ChgOI']/1000:.0f}K)")
+    # Put support
+    support = analysis_df[(analysis_df['Put_Class'] == 'Strong Support') & (analysis_df['Put_Activity'] == 'Writing (Support)')]
+    for _, r in support.iterrows():
+        active_signals.append(f"🟩 PUT SUPPORT STRONG at ₹{r['Strike']:.0f} (OI: {r['PE_OI']/100000:.1f}L, ChgOI: +{r['PE_ChgOI']/1000:.0f}K)")
+    # Breakout
+    breakout = analysis_df[analysis_df['Call_Class'] == 'Breakout Zone']
+    for _, r in breakout.iterrows():
+        active_signals.append(f"🚀 BREAKOUT LOADING at ₹{r['Strike']:.0f} (CE OI unwinding: {r['CE_ChgOI']/1000:.0f}K)")
+    # Breakdown
+    breakdown = analysis_df[analysis_df['Put_Class'] == 'Breakdown Zone']
+    for _, r in breakdown.iterrows():
+        active_signals.append(f"💥 BREAKDOWN LOADING at ₹{r['Strike']:.0f} (PE OI unwinding: {r['PE_ChgOI']/1000:.0f}K)")
+    # Trapped writers
+    trapped_ce = analysis_df[analysis_df['Call_Trapped']]
+    for _, r in trapped_ce.iterrows():
+        active_signals.append(f"⚠️ TRAPPED CALL WRITERS at ₹{r['Strike']:.0f}")
+    trapped_pe = analysis_df[analysis_df['Put_Trapped']]
+    for _, r in trapped_pe.iterrows():
+        active_signals.append(f"⚠️ TRAPPED PUT WRITERS at ₹{r['Strike']:.0f}")
+
+    # Market condition
+    if 'Bullish' in bias:
+        market_emoji = "🟢"
+        condition = "BULLISH"
+    elif 'Bearish' in bias:
+        market_emoji = "🔴"
+        condition = "BEARISH"
+    else:
+        market_emoji = "🟡"
+        condition = "SIDEWAYS"
+
+    # Top resistance
+    res_lines = []
+    for _, r in sa_result['top_resistance'].iterrows():
+        res_lines.append(f"  🟥 ₹{r['Strike']:.0f} | {r['Call_Strength']} | OI: {r['CE_OI']/100000:.1f}L | {r['Call_Activity']}")
+    # Top support
+    sup_lines = []
+    for _, r in sa_result['top_support'].iterrows():
+        sup_lines.append(f"  🟩 ₹{r['Strike']:.0f} | {r['Put_Strength']} | OI: {r['PE_OI']/100000:.1f}L | {r['Put_Activity']}")
+
+    # Breakout/Breakdown levels
+    breakout_lvl = f"₹{breakout.iloc[0]['Strike']:.0f}" if not breakout.empty else "None"
+    breakdown_lvl = f"₹{breakdown.iloc[0]['Strike']:.0f}" if not breakdown.empty else "None"
+
+    signals_text = "\n".join(active_signals) if active_signals else "  No active signals"
+    res_text = "\n".join(res_lines) if res_lines else "  None identified"
+    sup_text = "\n".join(sup_lines) if sup_lines else "  None identified"
+
+    message = f"""📊 <b>OPTION CHAIN DEEP ANALYSIS</b> 📊
+🕐 {time_str} | Spot: ₹{underlying_price:.2f}
+
+━━━ {market_emoji} MARKET CONDITION: <b>{condition}</b> ━━━
+📈 Confidence: <b>{conf}%</b>
+{'▓' * (conf // 5)}{'░' * (20 - conf // 5)}
+
+<b>🟥 CALL CAPPING / RESISTANCE:</b>
+{res_text}
+
+<b>🟩 PUT SUPPORT LEVELS:</b>
+{sup_text}
+
+<b>⚡ ACTIVE SIGNALS:</b>
+{signals_text}
+
+<b>🚀 Breakout Level:</b> {breakout_lvl}
+<b>💥 Breakdown Level:</b> {breakdown_lvl}
+
+<b>📋 BIAS REASONING:</b>
+{"".join([f"• {s}" + chr(10) for s in sa_result['bias_signals']])}
+⚠️ <i>Auto-generated. Manual verification required.</i>"""
+
+    try:
+        send_telegram_message_sync(message)
+    except Exception:
+        pass
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -3473,6 +3565,18 @@ def main():
             if sa_df_summary is not None and sa_underlying:
                 sa_result = analyze_strike_activity(sa_df_summary, sa_underlying)
                 if sa_result:
+                    # Send Telegram signal (with cooldown to avoid spam)
+                    if 'last_chain_signal_time' not in st.session_state:
+                        st.session_state.last_chain_signal_time = None
+                    ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                    should_send = st.session_state.last_chain_signal_time is None or \
+                        (ist_now - st.session_state.last_chain_signal_time).total_seconds() > 300
+                    if should_send:
+                        try:
+                            send_option_chain_signal(sa_result, sa_underlying)
+                            st.session_state.last_chain_signal_time = ist_now
+                        except Exception:
+                            pass
                     analysis_df = sa_result['analysis_df']
                     # Market Bias Banner
                     bias = sa_result['market_bias']
@@ -3655,7 +3759,8 @@ def main():
                     end_idx = min(len(df_summary), atm_pos + 3)
                     pcr_extract_cols = ['Strike', 'Zone', 'PCR', 'PCR_Signal',
                                                                    'openInterest_CE', 'openInterest_PE']
-                    for _chg_col in ['changeinOpenInterest_CE', 'changeinOpenInterest_PE']:
+                    for _chg_col in ['changeinOpenInterest_CE', 'changeinOpenInterest_PE',
+                                      'lastPrice_CE', 'lastPrice_PE']:
                         if _chg_col in df_summary.columns:
                             pcr_extract_cols.append(_chg_col)
                     pcr_df = df_summary.iloc[start_idx:end_idx][pcr_extract_cols].copy()
@@ -3705,6 +3810,8 @@ def main():
                                 strike_label = str(int(row['Strike']))
                                 oi_entry[f'{strike_label}_CE'] = int(row.get('openInterest_CE', 0) or 0)
                                 oi_entry[f'{strike_label}_PE'] = int(row.get('openInterest_PE', 0) or 0)
+                                oi_entry[f'{strike_label}_CE_LTP'] = float(row.get('lastPrice_CE', 0) or 0)
+                                oi_entry[f'{strike_label}_PE_LTP'] = float(row.get('lastPrice_PE', 0) or 0)
                                 chgoi_entry[f'{strike_label}_CE'] = int(row.get('changeinOpenInterest_CE', 0) or 0)
                                 chgoi_entry[f'{strike_label}_PE'] = int(row.get('changeinOpenInterest_PE', 0) or 0)
                             st.session_state.oi_history.append(oi_entry)
@@ -3938,6 +4045,39 @@ def main():
                                         st.markdown(f'<div style="background:#aa664440;padding:8px;border-radius:8px;border-left:4px solid #aa6644;"><b style="color:#aa6644;">WEAK RESISTANCE</b> | CE {current_ce:.1f}L vs PE {current_pe:.1f}L | Diff: {oi_diff_lakhs:.1f}L | Ratio: {ce_pe_ratio:.1f}x</div>', unsafe_allow_html=True)
                                 else:
                                     st.warning("Balanced (CE = PE)")
+                                # Long/Short Building/Covering analysis based on OI + LTP trend
+                                ce_ltp_col = f'{strike}_CE_LTP'
+                                pe_ltp_col = f'{strike}_PE_LTP'
+                                ce_has_ltp = ce_ltp_col in oi_history_df.columns and len(oi_history_df) >= 3
+                                pe_has_ltp = pe_ltp_col in oi_history_df.columns and len(oi_history_df) >= 3
+                                if ce_has_ltp:
+                                    ce_ltp_first = oi_history_df[ce_ltp_col].iloc[0]
+                                    ce_ltp_last = oi_history_df[ce_ltp_col].iloc[-1]
+                                    ce_ltp_change = ce_ltp_last - ce_ltp_first
+                                    ce_ltp_pct = (ce_ltp_change / ce_ltp_first * 100) if ce_ltp_first > 0 else 0
+                                    # CE: OI↑+Price↑=Long Building, OI↑+Price↓=Short Building, OI↓+Price↑=Short Covering, OI↓+Price↓=Long Unwinding
+                                    if ce_change > 0 and ce_ltp_change > 0:
+                                        st.markdown(f'<div style="background:#ff880040;padding:6px;border-radius:6px;border-left:3px solid #ff8800;font-size:13px;"><b style="color:#ff8800;">CE: LONG BUILDING</b> | OI +{ce_pct:.1f}% | LTP +{ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                                    elif ce_change > 0 and ce_ltp_change <= 0:
+                                        st.markdown(f'<div style="background:#ff444440;padding:6px;border-radius:6px;border-left:3px solid #ff4444;font-size:13px;"><b style="color:#ff4444;">CE: SHORT BUILDING</b> | OI +{ce_pct:.1f}% | LTP {ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                                    elif ce_change < 0 and ce_ltp_change > 0:
+                                        st.markdown(f'<div style="background:#00ff8840;padding:6px;border-radius:6px;border-left:3px solid #00ff88;font-size:13px;"><b style="color:#00ff88;">CE: SHORT COVERING</b> | OI {ce_pct:.1f}% | LTP +{ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                                    elif ce_change < 0 and ce_ltp_change <= 0:
+                                        st.markdown(f'<div style="background:#88888840;padding:6px;border-radius:6px;border-left:3px solid #888888;font-size:13px;"><b style="color:#888888;">CE: LONG UNWINDING</b> | OI {ce_pct:.1f}% | LTP {ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                                if pe_has_ltp:
+                                    pe_ltp_first = oi_history_df[pe_ltp_col].iloc[0]
+                                    pe_ltp_last = oi_history_df[pe_ltp_col].iloc[-1]
+                                    pe_ltp_change = pe_ltp_last - pe_ltp_first
+                                    pe_ltp_pct = (pe_ltp_change / pe_ltp_first * 100) if pe_ltp_first > 0 else 0
+                                    # PE: OI↑+Price↑=Long Building, OI↑+Price↓=Short Building, OI↓+Price↓=Short Covering, OI↓+Price↑=Long Unwinding
+                                    if pe_change > 0 and pe_ltp_change > 0:
+                                        st.markdown(f'<div style="background:#ff444440;padding:6px;border-radius:6px;border-left:3px solid #ff4444;font-size:13px;"><b style="color:#ff4444;">PE: LONG BUILDING</b> | OI +{pe_pct:.1f}% | LTP +{pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                                    elif pe_change > 0 and pe_ltp_change <= 0:
+                                        st.markdown(f'<div style="background:#00ff8840;padding:6px;border-radius:6px;border-left:3px solid #00ff88;font-size:13px;"><b style="color:#00ff88;">PE: SHORT BUILDING</b> | OI +{pe_pct:.1f}% | LTP {pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                                    elif pe_change < 0 and pe_ltp_change < 0:
+                                        st.markdown(f'<div style="background:#00cc6640;padding:6px;border-radius:6px;border-left:3px solid #00cc66;font-size:13px;"><b style="color:#00cc66;">PE: SHORT COVERING</b> | OI {pe_pct:.1f}% | LTP {pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                                    elif pe_change < 0 and pe_ltp_change >= 0:
+                                        st.markdown(f'<div style="background:#88888840;padding:6px;border-radius:6px;border-left:3px solid #888888;font-size:13px;"><b style="color:#888888;">PE: LONG UNWINDING</b> | OI {pe_pct:.1f}% | LTP +{pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
                             else:
                                 oi_diff_lakhs = abs(current_pe - current_ce)
                                 if current_pe > current_ce:
