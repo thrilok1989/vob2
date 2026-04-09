@@ -2252,13 +2252,13 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     bias_cols = [col for col in display_cols if '_Bias' in col or col in ['DeltaExp', 'GammaExp', 'PCR_Signal']]
 
     styled_df = df_display.style\
-        .applymap(color_bias, subset=bias_cols)\
-        .applymap(color_pcr, subset=['PCR'] if 'PCR' in display_cols else [])\
-        .applymap(color_pressure, subset=['BidAskPressure'] if 'BidAskPressure' in display_cols else [])\
-        .applymap(color_verdict, subset=['Verdict'] if 'Verdict' in display_cols else [])\
-        .applymap(color_entry, subset=['Operator_Entry'] if 'Operator_Entry' in display_cols else [])\
-        .applymap(color_fakereal, subset=['FakeReal'] if 'FakeReal' in display_cols else [])\
-        .applymap(color_score, subset=['BiasScore'] if 'BiasScore' in display_cols else [])\
+        .map(color_bias, subset=bias_cols)\
+        .map(color_pcr, subset=['PCR'] if 'PCR' in display_cols else [])\
+        .map(color_pressure, subset=['BidAskPressure'] if 'BidAskPressure' in display_cols else [])\
+        .map(color_verdict, subset=['Verdict'] if 'Verdict' in display_cols else [])\
+        .map(color_entry, subset=['Operator_Entry'] if 'Operator_Entry' in display_cols else [])\
+        .map(color_fakereal, subset=['FakeReal'] if 'FakeReal' in display_cols else [])\
+        .map(color_score, subset=['BiasScore'] if 'BiasScore' in display_cols else [])\
         .apply(highlight_atm_row, axis=1)
 
     sr_data = []
@@ -3082,7 +3082,7 @@ def main():
                             return 'background-color: #ff444440; color: white'
                         else:
                             return 'background-color: #FFD70040; color: white'
-                    styled_poc = poc_df.style.applymap(style_poc_signal, subset=['Signal'])
+                    styled_poc = poc_df.style.map(style_poc_signal, subset=['Signal'])
                     st.dataframe(styled_poc, use_container_width=True, hide_index=True)
                     st.markdown("""
                     **POC Interpretation:**
@@ -3498,7 +3498,7 @@ def main():
                                     return ''
                             except:
                                 return ''
-                        styled_gex = gex_display.style.applymap(color_gex, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
+                        styled_gex = gex_display.style.map(color_gex, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
                         st.dataframe(styled_gex, use_container_width=True, hide_index=True)
                         st.markdown("""
                         **GEX Interpretation:**
@@ -3672,7 +3672,7 @@ def main():
                         st.markdown("### Current GEX Values")
                         gex_display = gex_df[['Strike', 'Zone', 'Call_GEX', 'Put_GEX', 'Net_GEX']].copy()
                         gex_display['Strike'] = gex_display['Strike'].apply(lambda x: f"₹{x:.0f}")
-                        styled_gex_table = gex_display.style.applymap(color_gex, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
+                        styled_gex_table = gex_display.style.map(color_gex, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
                         st.dataframe(styled_gex_table, use_container_width=True, hide_index=True)
                         gex_info1, gex_info2 = st.columns([3, 1])
                         with gex_info1:
