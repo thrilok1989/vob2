@@ -2387,6 +2387,236 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
         for col, (label, val) in zip(st.columns(4), metrics):
             col.metric(label, val)
 
+def analyze_strike_activity(df_summary, underlying_price):
+    """Comprehensive option chain analysis: Call/Put activity, support/resistance, market bias."""
+    if df_summary is None or df_summary.empty or 'Zone' not in df_summary.columns:
+        return None
+
+    atm_idx = df_summary[df_summary['Zone'] == 'ATM'].index
+    if len(atm_idx) == 0:
+        return None
+    atm_pos = df_summary.index.get_loc(atm_idx[0])
+    start_idx = max(0, atm_pos - 5)
+    end_idx = min(len(df_summary), atm_pos + 6)
+    near_atm = df_summary.iloc[start_idx:end_idx].copy()
+
+    # Compute median OI for "high OI" threshold
+    median_ce_oi = near_atm['openInterest_CE'].median() if 'openInterest_CE' in near_atm.columns else 0
+    median_pe_oi = near_atm['openInterest_PE'].median() if 'openInterest_PE' in near_atm.columns else 0
+
+    strike_analysis = []
+    for _, row in near_atm.iterrows():
+        strike = row['Strike']
+        zone = row.get('Zone', '')
+
+        ce_oi = row.get('openInterest_CE', 0) or 0
+        pe_oi = row.get('openInterest_PE', 0) or 0
+        ce_chg_oi = row.get('changeinOpenInterest_CE', 0) or 0
+        pe_chg_oi = row.get('changeinOpenInterest_PE', 0) or 0
+        ce_ltp = row.get('lastPrice_CE', 0) or 0
+        pe_ltp = row.get('lastPrice_PE', 0) or 0
+        ce_vol = row.get('totalTradedVolume_CE', 0) or 0
+        pe_vol = row.get('totalTradedVolume_PE', 0) or 0
+        ce_iv = row.get('impliedVolatility_CE', 0) or 0
+        pe_iv = row.get('impliedVolatility_PE', 0) or 0
+
+        # --- CALL SIDE ---
+        ce_high_oi = ce_oi > median_ce_oi * 1.2
+        ce_oi_rising = ce_chg_oi > 0
+        ce_oi_falling = ce_chg_oi < 0
+        price_below_strike = underlying_price < strike
+
+        # Call Writer Activity
+        call_writing = ce_high_oi and ce_oi_rising
+        call_capping = call_writing and price_below_strike
+
+        # Call Buyer Activity
+        ce_long_buildup = ce_oi_rising and ce_ltp > 0 and ce_vol > 0
+        ce_short_covering = ce_oi_falling and ce_ltp > 0
+
+        # Call Classification
+        if ce_high_oi and ce_oi_rising and price_below_strike:
+            call_class = "Strong Resistance"
+            call_strength = "Strong"
+        elif ce_oi_falling and not price_below_strike:
+            call_class = "Breakout Zone"
+            call_strength = "Breaking"
+        elif ce_high_oi and not ce_oi_rising:
+            call_class = "Weak Resistance"
+            call_strength = "Weak"
+        elif ce_oi_rising:
+            call_class = "Moderate Resistance"
+            call_strength = "Moderate"
+        else:
+            call_class = "Weak Resistance"
+            call_strength = "Weak"
+
+        # Call activity label
+        if ce_short_covering:
+            call_activity = "Short Covering"
+        elif call_writing:
+            call_activity = "Writing (Resistance)"
+        elif ce_long_buildup:
+            call_activity = "Long Build-up"
+        else:
+            call_activity = "Low Activity"
+
+        # --- PUT SIDE ---
+        pe_high_oi = pe_oi > median_pe_oi * 1.2
+        pe_oi_rising = pe_chg_oi > 0
+        pe_oi_falling = pe_chg_oi < 0
+        price_above_strike = underlying_price > strike
+
+        # Put Writer Activity
+        put_writing = pe_high_oi and pe_oi_rising
+        put_support = put_writing and price_above_strike
+
+        # Put Buyer Activity
+        pe_long_buildup = pe_oi_rising and pe_ltp > 0 and pe_vol > 0
+        pe_long_unwinding = pe_oi_falling and pe_ltp > 0
+
+        # Put Classification
+        if pe_high_oi and pe_oi_rising and price_above_strike:
+            put_class = "Strong Support"
+            put_strength = "Strong"
+        elif pe_oi_falling and not price_above_strike:
+            put_class = "Breakdown Zone"
+            put_strength = "Breaking"
+        elif pe_high_oi and not pe_oi_rising:
+            put_class = "Weak Support"
+            put_strength = "Weak"
+        elif pe_oi_rising:
+            put_class = "Moderate Support"
+            put_strength = "Moderate"
+        else:
+            put_class = "Weak Support"
+            put_strength = "Weak"
+
+        # Put activity label
+        if pe_long_unwinding:
+            put_activity = "Long Unwinding"
+        elif put_writing:
+            put_activity = "Writing (Support)"
+        elif pe_long_buildup:
+            put_activity = "Long Build-up (Bearish)"
+        else:
+            put_activity = "Low Activity"
+
+        # Trapped writers detection
+        call_trapped = ce_high_oi and ce_oi_falling and not price_below_strike  # price went above, writers trapped
+        put_trapped = pe_high_oi and pe_oi_falling and price_below_strike  # price went below, writers trapped
+
+        strike_analysis.append({
+            'Strike': strike, 'Zone': zone,
+            'CE_OI': ce_oi, 'CE_ChgOI': ce_chg_oi, 'CE_LTP': ce_ltp, 'CE_Vol': ce_vol, 'CE_IV': ce_iv,
+            'PE_OI': pe_oi, 'PE_ChgOI': pe_chg_oi, 'PE_LTP': pe_ltp, 'PE_Vol': pe_vol, 'PE_IV': pe_iv,
+            'Call_Class': call_class, 'Call_Strength': call_strength, 'Call_Activity': call_activity,
+            'Put_Class': put_class, 'Put_Strength': put_strength, 'Put_Activity': put_activity,
+            'Call_Trapped': call_trapped, 'Put_Trapped': put_trapped,
+        })
+
+    analysis_df = pd.DataFrame(strike_analysis)
+
+    # Top 3 Resistance (Call side) - sort by CE OI descending, prefer strong
+    strength_order = {'Strong': 0, 'Moderate': 1, 'Weak': 2, 'Breaking': 3}
+    res_df = analysis_df[analysis_df['Strike'] >= underlying_price].copy()
+    res_df['_sort'] = res_df['Call_Strength'].map(strength_order).fillna(3)
+    res_df = res_df.sort_values(['_sort', 'CE_OI'], ascending=[True, False]).head(3)
+    top_resistance = res_df[['Strike', 'Call_Class', 'Call_Strength', 'CE_OI', 'CE_ChgOI', 'Call_Activity']].copy()
+
+    # Top 3 Support (Put side) - sort by PE OI descending, prefer strong
+    sup_df = analysis_df[analysis_df['Strike'] <= underlying_price].copy()
+    sup_df['_sort'] = sup_df['Put_Strength'].map(strength_order).fillna(3)
+    sup_df = sup_df.sort_values(['_sort', 'PE_OI'], ascending=[True, False]).head(3)
+    top_support = sup_df[['Strike', 'Put_Class', 'Put_Strength', 'PE_OI', 'PE_ChgOI', 'Put_Activity']].copy()
+
+    # Trapped writers
+    trapped_call_writers = analysis_df[analysis_df['Call_Trapped']][['Strike', 'CE_OI', 'CE_ChgOI']].copy()
+    trapped_put_writers = analysis_df[analysis_df['Put_Trapped']][['Strike', 'PE_OI', 'PE_ChgOI']].copy()
+
+    # Breakout / Breakdown zones
+    breakout_zones = analysis_df[analysis_df['Call_Class'] == 'Breakout Zone'][['Strike', 'CE_OI', 'CE_ChgOI']].copy()
+    breakdown_zones = analysis_df[analysis_df['Put_Class'] == 'Breakdown Zone'][['Strike', 'PE_OI', 'PE_ChgOI']].copy()
+
+    # Market Interpretation
+    total_ce_chg = analysis_df['CE_ChgOI'].sum()
+    total_pe_chg = analysis_df['PE_ChgOI'].sum()
+    strong_res_count = len(analysis_df[analysis_df['Call_Class'] == 'Strong Resistance'])
+    strong_sup_count = len(analysis_df[analysis_df['Put_Class'] == 'Strong Support'])
+    breakout_count = len(breakout_zones)
+    breakdown_count = len(breakdown_zones)
+    call_unwinding = total_ce_chg < 0
+    put_unwinding = total_pe_chg < 0
+    call_building = total_ce_chg > 0
+    put_building = total_pe_chg > 0
+
+    # Confidence scoring
+    confidence = 50
+    bias_signals = []
+
+    if call_unwinding and put_building:
+        market_bias = "Bullish"
+        confidence += 20
+        bias_signals.append("Call OI unwinding + Put writing increasing")
+    elif call_building and put_unwinding:
+        market_bias = "Bearish"
+        confidence += 20
+        bias_signals.append("Call writing increasing + Put OI unwinding")
+    elif strong_res_count > 0 and strong_sup_count > 0:
+        market_bias = "Sideways"
+        confidence += 10
+        bias_signals.append("Strong resistance above + Strong support below")
+    elif breakout_count > 0 and strong_sup_count > 0:
+        market_bias = "Bullish (Breakout)"
+        confidence += 25
+        bias_signals.append("Call writers trapped + Put support strong")
+    elif breakdown_count > 0 and strong_res_count > 0:
+        market_bias = "Bearish (Breakdown)"
+        confidence += 25
+        bias_signals.append("Put writers trapped + Call resistance strong")
+    elif put_building and call_building:
+        if total_pe_chg > total_ce_chg:
+            market_bias = "Mildly Bullish"
+            confidence += 10
+            bias_signals.append("Both building but PE OI > CE OI change")
+        else:
+            market_bias = "Mildly Bearish"
+            confidence += 10
+            bias_signals.append("Both building but CE OI > PE OI change")
+    else:
+        market_bias = "Neutral"
+        bias_signals.append("No clear directional signal")
+
+    if len(trapped_call_writers) > 0:
+        confidence += 10
+        bias_signals.append(f"{len(trapped_call_writers)} trapped call writer(s)")
+    if len(trapped_put_writers) > 0:
+        confidence += 10
+        bias_signals.append(f"{len(trapped_put_writers)} trapped put writer(s)")
+    if strong_sup_count >= 2:
+        confidence += 5
+        bias_signals.append(f"{strong_sup_count} strong support levels")
+    if strong_res_count >= 2:
+        confidence += 5
+        bias_signals.append(f"{strong_res_count} strong resistance levels")
+
+    confidence = min(confidence, 95)
+
+    return {
+        'analysis_df': analysis_df,
+        'top_resistance': top_resistance,
+        'top_support': top_support,
+        'trapped_call_writers': trapped_call_writers,
+        'trapped_put_writers': trapped_put_writers,
+        'breakout_zones': breakout_zones,
+        'breakdown_zones': breakdown_zones,
+        'market_bias': market_bias,
+        'confidence': confidence,
+        'bias_signals': bias_signals,
+        'total_ce_chg': total_ce_chg,
+        'total_pe_chg': total_pe_chg,
+    }
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -3235,6 +3465,150 @@ def main():
                         st.info("No levels identified")
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
+        st.markdown("---")
+        st.markdown("## 🔍 Option Chain Deep Analysis (ATM ± 5)")
+        try:
+            sa_df_summary = option_data.get('df_summary')
+            sa_underlying = option_data.get('underlying')
+            if sa_df_summary is not None and sa_underlying:
+                sa_result = analyze_strike_activity(sa_df_summary, sa_underlying)
+                if sa_result:
+                    analysis_df = sa_result['analysis_df']
+                    # Market Bias Banner
+                    bias = sa_result['market_bias']
+                    conf = sa_result['confidence']
+                    if 'Bullish' in bias:
+                        bias_color = '#00ff88'
+                    elif 'Bearish' in bias:
+                        bias_color = '#ff4444'
+                    else:
+                        bias_color = '#FFD700'
+                    st.markdown(f"""
+                    <div style="background:{bias_color}20;padding:20px;border-radius:12px;border:2px solid {bias_color};text-align:center;margin-bottom:15px;">
+                        <h2 style="color:{bias_color};margin:0;">Market Bias: {bias}</h2>
+                        <h3 style="color:white;margin:5px 0;">Confidence: {conf}%</h3>
+                        <div style="background:#33333380;border-radius:10px;height:12px;margin:8px auto;max-width:400px;">
+                            <div style="background:{bias_color};border-radius:10px;height:12px;width:{conf}%;"></div>
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    # Bias signals
+                    for sig in sa_result['bias_signals']:
+                        st.caption(f"• {sig}")
+                    # Top Resistance & Support
+                    sa_col1, sa_col2 = st.columns(2)
+                    with sa_col1:
+                        st.markdown("### 🔴 Top 3 Resistance Levels (Call Side)")
+                        if not sa_result['top_resistance'].empty:
+                            res_display = sa_result['top_resistance'].copy()
+                            res_display['Strike'] = res_display['Strike'].apply(lambda x: f"₹{x:.0f}")
+                            res_display['CE_OI'] = (res_display['CE_OI'] / 100000).round(2).astype(str) + 'L'
+                            res_display['CE_ChgOI'] = (res_display['CE_ChgOI'] / 1000).round(1).astype(str) + 'K'
+                            res_display.columns = ['Strike', 'Classification', 'Strength', 'OI', 'ChgOI', 'Activity']
+                            def style_res(row):
+                                s = row['Strength']
+                                if s == 'Strong':
+                                    return ['background-color:#ff444440;color:white'] * len(row)
+                                elif s == 'Breaking':
+                                    return ['background-color:#FFD70040;color:white'] * len(row)
+                                return [''] * len(row)
+                            styled_res = res_display.style.apply(style_res, axis=1)
+                            st.dataframe(styled_res, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No resistance levels found")
+                    with sa_col2:
+                        st.markdown("### 🟢 Top 3 Support Levels (Put Side)")
+                        if not sa_result['top_support'].empty:
+                            sup_display = sa_result['top_support'].copy()
+                            sup_display['Strike'] = sup_display['Strike'].apply(lambda x: f"₹{x:.0f}")
+                            sup_display['PE_OI'] = (sup_display['PE_OI'] / 100000).round(2).astype(str) + 'L'
+                            sup_display['PE_ChgOI'] = (sup_display['PE_ChgOI'] / 1000).round(1).astype(str) + 'K'
+                            sup_display.columns = ['Strike', 'Classification', 'Strength', 'OI', 'ChgOI', 'Activity']
+                            def style_sup(row):
+                                s = row['Strength']
+                                if s == 'Strong':
+                                    return ['background-color:#00ff8840;color:white'] * len(row)
+                                elif s == 'Breaking':
+                                    return ['background-color:#FFD70040;color:white'] * len(row)
+                                return [''] * len(row)
+                            styled_sup = sup_display.style.apply(style_sup, axis=1)
+                            st.dataframe(styled_sup, use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No support levels found")
+                    # Call Capping & Put Support Zones
+                    st.markdown("### 📊 Strike-wise Call & Put Classification")
+                    class_display = analysis_df[['Strike', 'Zone', 'Call_Class', 'Call_Activity', 'Put_Class', 'Put_Activity']].copy()
+                    class_display['Strike'] = class_display['Strike'].apply(lambda x: f"₹{x:.0f}")
+                    def style_class(row):
+                        styles = [''] * len(row)
+                        call_idx = class_display.columns.get_loc('Call_Class')
+                        put_idx = class_display.columns.get_loc('Put_Class')
+                        if 'Strong' in str(row.iloc[call_idx]):
+                            styles[call_idx] = 'background-color:#ff444440;color:white;font-weight:bold'
+                        elif 'Breakout' in str(row.iloc[call_idx]):
+                            styles[call_idx] = 'background-color:#FFD70040;color:white;font-weight:bold'
+                        if 'Strong' in str(row.iloc[put_idx]):
+                            styles[put_idx] = 'background-color:#00ff8840;color:white;font-weight:bold'
+                        elif 'Breakdown' in str(row.iloc[put_idx]):
+                            styles[put_idx] = 'background-color:#FFD70040;color:white;font-weight:bold'
+                        return styles
+                    styled_class = class_display.style.apply(style_class, axis=1)
+                    st.dataframe(styled_class, use_container_width=True, hide_index=True)
+                    # Trapped Writers & Breakout/Breakdown
+                    trap_col1, trap_col2 = st.columns(2)
+                    with trap_col1:
+                        st.markdown("### ⚠️ Trapped Call Writers")
+                        if not sa_result['trapped_call_writers'].empty:
+                            tc = sa_result['trapped_call_writers'].copy()
+                            tc['Strike'] = tc['Strike'].apply(lambda x: f"₹{x:.0f}")
+                            tc['CE_OI'] = (tc['CE_OI'] / 100000).round(2).astype(str) + 'L'
+                            tc['CE_ChgOI'] = (tc['CE_ChgOI'] / 1000).round(1).astype(str) + 'K'
+                            tc.columns = ['Strike', 'OI', 'ChgOI']
+                            st.dataframe(tc, use_container_width=True, hide_index=True)
+                            st.caption("Price above strike + OI falling = writers buying back (bullish)")
+                        else:
+                            st.success("No trapped call writers")
+                    with trap_col2:
+                        st.markdown("### ⚠️ Trapped Put Writers")
+                        if not sa_result['trapped_put_writers'].empty:
+                            tp = sa_result['trapped_put_writers'].copy()
+                            tp['Strike'] = tp['Strike'].apply(lambda x: f"₹{x:.0f}")
+                            tp['PE_OI'] = (tp['PE_OI'] / 100000).round(2).astype(str) + 'L'
+                            tp['PE_ChgOI'] = (tp['PE_ChgOI'] / 1000).round(1).astype(str) + 'K'
+                            tp.columns = ['Strike', 'OI', 'ChgOI']
+                            st.dataframe(tp, use_container_width=True, hide_index=True)
+                            st.caption("Price below strike + OI falling = writers buying back (bearish)")
+                        else:
+                            st.success("No trapped put writers")
+                    bk_col1, bk_col2 = st.columns(2)
+                    with bk_col1:
+                        st.markdown("### 🚀 Breakout Zones")
+                        if not sa_result['breakout_zones'].empty:
+                            bz = sa_result['breakout_zones'].copy()
+                            bz['Strike'] = bz['Strike'].apply(lambda x: f"₹{x:.0f}")
+                            bz['CE_OI'] = (bz['CE_OI'] / 100000).round(2).astype(str) + 'L'
+                            bz['CE_ChgOI'] = (bz['CE_ChgOI'] / 1000).round(1).astype(str) + 'K'
+                            bz.columns = ['Strike', 'OI', 'ChgOI']
+                            st.dataframe(bz, use_container_width=True, hide_index=True)
+                            st.caption("Call OI falling + price rising = resistance breaking")
+                        else:
+                            st.info("No breakout zones detected")
+                    with bk_col2:
+                        st.markdown("### 💥 Breakdown Zones")
+                        if not sa_result['breakdown_zones'].empty:
+                            bd = sa_result['breakdown_zones'].copy()
+                            bd['Strike'] = bd['Strike'].apply(lambda x: f"₹{x:.0f}")
+                            bd['PE_OI'] = (bd['PE_OI'] / 100000).round(2).astype(str) + 'L'
+                            bd['PE_ChgOI'] = (bd['PE_ChgOI'] / 1000).round(1).astype(str) + 'K'
+                            bd.columns = ['Strike', 'OI', 'ChgOI']
+                            st.dataframe(bd, use_container_width=True, hide_index=True)
+                            st.caption("Put OI falling + price falling = support breaking")
+                        else:
+                            st.info("No breakdown zones detected")
+                else:
+                    st.warning("Unable to analyze option chain. Check data.")
+        except Exception as e:
+            st.warning(f"Deep analysis unavailable: {str(e)}")
         st.markdown("---")
         st.markdown("## 📊 PCR Analysis - Time Series (ATM ± 2)")
         def create_pcr_chart(history_df, col_name, color, title_prefix):
