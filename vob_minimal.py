@@ -2412,7 +2412,11 @@ def main():
 
     for key, default in [('pcr_history', []), ('pcr_last_valid_data', None),
                           ('gex_history', []), ('gex_last_valid_data', None),
-                          ('last_gex_alert', None), ('gex_current_strikes', [])]:
+                          ('last_gex_alert', None), ('gex_current_strikes', []),
+                          ('oi_history', []), ('oi_last_valid_data', None),
+                          ('oi_current_strikes', []),
+                          ('chgoi_history', []), ('chgoi_last_valid_data', None),
+                          ('chgoi_current_strikes', [])]:
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -3277,8 +3281,12 @@ def main():
                     atm_pos = df_summary.index.get_loc(atm_idx[0])
                     start_idx = max(0, atm_pos - 2)
                     end_idx = min(len(df_summary), atm_pos + 3)
-                    pcr_df = df_summary.iloc[start_idx:end_idx][['Strike', 'Zone', 'PCR', 'PCR_Signal',
-                                                                   'openInterest_CE', 'openInterest_PE']].copy()
+                    pcr_extract_cols = ['Strike', 'Zone', 'PCR', 'PCR_Signal',
+                                                                   'openInterest_CE', 'openInterest_PE']
+                    for _chg_col in ['changeinOpenInterest_CE', 'changeinOpenInterest_PE']:
+                        if _chg_col in df_summary.columns:
+                            pcr_extract_cols.append(_chg_col)
+                    pcr_df = df_summary.iloc[start_idx:end_idx][pcr_extract_cols].copy()
                     if not pcr_df.empty:
                         pcr_data_available = True
                         st.session_state.pcr_last_valid_data = pcr_df.copy()
@@ -3318,6 +3326,25 @@ def main():
                                     db.upsert_pcr_history(pcr_records)
                             except Exception:
                                 pass
+                            # Collect OI history for ATM ± 2 strikes
+                            oi_entry = {'time': current_time}
+                            chgoi_entry = {'time': current_time}
+                            for _, row in pcr_df.iterrows():
+                                strike_label = str(int(row['Strike']))
+                                oi_entry[f'{strike_label}_CE'] = int(row.get('openInterest_CE', 0) or 0)
+                                oi_entry[f'{strike_label}_PE'] = int(row.get('openInterest_PE', 0) or 0)
+                                chgoi_entry[f'{strike_label}_CE'] = int(row.get('changeinOpenInterest_CE', 0) or 0)
+                                chgoi_entry[f'{strike_label}_PE'] = int(row.get('changeinOpenInterest_PE', 0) or 0)
+                            st.session_state.oi_history.append(oi_entry)
+                            st.session_state.oi_last_valid_data = pcr_df.copy()
+                            st.session_state.oi_current_strikes = [int(s) for s in current_strikes]
+                            if len(st.session_state.oi_history) > 200:
+                                st.session_state.oi_history = st.session_state.oi_history[-200:]
+                            st.session_state.chgoi_history.append(chgoi_entry)
+                            st.session_state.chgoi_last_valid_data = pcr_df.copy()
+                            st.session_state.chgoi_current_strikes = [int(s) for s in current_strikes]
+                            if len(st.session_state.chgoi_history) > 200:
+                                st.session_state.chgoi_history = st.session_state.chgoi_history[-200:]
             except Exception as e:
                 st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
         if len(st.session_state.pcr_history) > 0:
@@ -3378,6 +3405,282 @@ def main():
                 st.warning(f"Error displaying PCR charts: {str(e)}")
         else:
             st.info("📊 PCR history will build up as the app refreshes. Please wait for data collection...")
+        st.markdown("---")
+        st.markdown("## 📊 OI Analysis - Time Series (ATM ± 2)")
+        if len(st.session_state.oi_history) > 0:
+            try:
+                oi_history_df = pd.DataFrame(st.session_state.oi_history)
+                oi_strikes = st.session_state.oi_current_strikes or []
+                if not oi_strikes and st.session_state.oi_last_valid_data is not None:
+                    oi_strikes = [int(s) for s in st.session_state.oi_last_valid_data['Strike'].tolist()]
+                oi_strikes = sorted(oi_strikes)
+                zone_df_oi = pcr_df if pcr_df is not None else st.session_state.oi_last_valid_data
+                oi_zone_info = {}
+                if zone_df_oi is not None:
+                    for _, row in zone_df_oi.iterrows():
+                        oi_zone_info[int(row['Strike'])] = row['Zone']
+                oi_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                oi_colors_ce = ['#ff6666', '#ff9999', '#ffcc00', '#66bbff', '#3399ff']
+                oi_colors_pe = ['#cc44cc', '#aa66aa', '#ff8800', '#44dd88', '#22bb66']
+                if len(oi_strikes) >= 3:
+                    oi_col1, oi_col2 = st.columns(2)
+                    # Combined OI chart - all strikes CE vs PE
+                    with oi_col1:
+                        fig_ce = go.Figure()
+                        for i, strike in enumerate(oi_strikes):
+                            ce_col = f'{strike}_CE'
+                            if ce_col in oi_history_df.columns:
+                                label = oi_position_labels[i] if i < len(oi_position_labels) else f'Strike {i}'
+                                fig_ce.add_trace(go.Scatter(
+                                    x=oi_history_df['time'],
+                                    y=oi_history_df[ce_col] / 100000,
+                                    mode='lines+markers',
+                                    name=f'₹{strike} ({label})',
+                                    line=dict(width=2),
+                                    marker=dict(size=3),
+                                ))
+                        fig_ce.update_layout(
+                            title='Call OI (ATM ± 2)',
+                            template='plotly_dark',
+                            height=350,
+                            margin=dict(l=10, r=10, t=50, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='OI (Lakhs)'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st.plotly_chart(fig_ce, use_container_width=True)
+                    with oi_col2:
+                        fig_pe = go.Figure()
+                        for i, strike in enumerate(oi_strikes):
+                            pe_col = f'{strike}_PE'
+                            if pe_col in oi_history_df.columns:
+                                label = oi_position_labels[i] if i < len(oi_position_labels) else f'Strike {i}'
+                                fig_pe.add_trace(go.Scatter(
+                                    x=oi_history_df['time'],
+                                    y=oi_history_df[pe_col] / 100000,
+                                    mode='lines+markers',
+                                    name=f'₹{strike} ({label})',
+                                    line=dict(width=2),
+                                    marker=dict(size=3),
+                                ))
+                        fig_pe.update_layout(
+                            title='Put OI (ATM ± 2)',
+                            template='plotly_dark',
+                            height=350,
+                            margin=dict(l=10, r=10, t=50, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='OI (Lakhs)'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st.plotly_chart(fig_pe, use_container_width=True)
+                    # Per-strike CE vs PE comparison charts
+                    st.markdown("### Per-Strike Call vs Put OI")
+                    oi_strike_cols = st.columns(min(len(oi_strikes), 5))
+                    for i, strike in enumerate(oi_strikes):
+                        if i >= len(oi_strike_cols):
+                            break
+                        ce_col = f'{strike}_CE'
+                        pe_col = f'{strike}_PE'
+                        with oi_strike_cols[i]:
+                            label = oi_position_labels[i] if i < len(oi_position_labels) else f'Strike {i}'
+                            fig_strike = go.Figure()
+                            if ce_col in oi_history_df.columns:
+                                fig_strike.add_trace(go.Scatter(
+                                    x=oi_history_df['time'],
+                                    y=oi_history_df[ce_col] / 100000,
+                                    mode='lines+markers',
+                                    name='Call OI',
+                                    line=dict(color='#ff4444', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            if pe_col in oi_history_df.columns:
+                                fig_strike.add_trace(go.Scatter(
+                                    x=oi_history_df['time'],
+                                    y=oi_history_df[pe_col] / 100000,
+                                    mode='lines+markers',
+                                    name='Put OI',
+                                    line=dict(color='#00cc66', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            current_ce = oi_history_df[ce_col].iloc[-1] / 100000 if ce_col in oi_history_df.columns and len(oi_history_df) > 0 else 0
+                            current_pe = oi_history_df[pe_col].iloc[-1] / 100000 if pe_col in oi_history_df.columns and len(oi_history_df) > 0 else 0
+                            fig_strike.update_layout(
+                                title=f'{label}<br>₹{strike}<br>CE: {current_ce:.1f}L | PE: {current_pe:.1f}L',
+                                template='plotly_dark',
+                                height=280,
+                                showlegend=True,
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                                margin=dict(l=10, r=10, t=80, b=30),
+                                xaxis=dict(tickformat='%H:%M', title=''),
+                                yaxis=dict(title='OI (L)'),
+                                plot_bgcolor='#1e1e1e',
+                                paper_bgcolor='#1e1e1e'
+                            )
+                            st.plotly_chart(fig_strike, use_container_width=True)
+                            if current_ce > current_pe:
+                                st.error(f"Bearish (CE > PE)")
+                            elif current_pe > current_ce:
+                                st.success(f"Bullish (PE > CE)")
+                            else:
+                                st.warning("Neutral")
+                else:
+                    st.info("Waiting for ATM ± 2 strike data...")
+                oi_info1, oi_info2 = st.columns([3, 1])
+                with oi_info1:
+                    st.caption(f"📈 {len(st.session_state.oi_history)} data points | OI values in Lakhs")
+                with oi_info2:
+                    if st.button("🗑️ Clear OI History"):
+                        st.session_state.oi_history = []
+                        st.session_state.oi_last_valid_data = None
+                        st.rerun()
+            except Exception as e:
+                st.warning(f"Error displaying OI charts: {str(e)}")
+        else:
+            st.info("📊 OI history will build up as the app refreshes. Please wait for data collection...")
+        st.markdown("---")
+        st.markdown("## 📊 Change in OI Analysis - Time Series (ATM ± 2)")
+        if len(st.session_state.chgoi_history) > 0:
+            try:
+                chgoi_history_df = pd.DataFrame(st.session_state.chgoi_history)
+                chgoi_strikes = st.session_state.chgoi_current_strikes or []
+                if not chgoi_strikes and st.session_state.chgoi_last_valid_data is not None:
+                    chgoi_strikes = [int(s) for s in st.session_state.chgoi_last_valid_data['Strike'].tolist()]
+                chgoi_strikes = sorted(chgoi_strikes)
+                zone_df_chgoi = pcr_df if pcr_df is not None else st.session_state.chgoi_last_valid_data
+                chgoi_zone_info = {}
+                if zone_df_chgoi is not None:
+                    for _, row in zone_df_chgoi.iterrows():
+                        chgoi_zone_info[int(row['Strike'])] = row['Zone']
+                chgoi_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                if len(chgoi_strikes) >= 3:
+                    chgoi_col1, chgoi_col2 = st.columns(2)
+                    with chgoi_col1:
+                        fig_chg_ce = go.Figure()
+                        for i, strike in enumerate(chgoi_strikes):
+                            ce_col = f'{strike}_CE'
+                            if ce_col in chgoi_history_df.columns:
+                                label = chgoi_position_labels[i] if i < len(chgoi_position_labels) else f'Strike {i}'
+                                fig_chg_ce.add_trace(go.Scatter(
+                                    x=chgoi_history_df['time'],
+                                    y=chgoi_history_df[ce_col] / 1000,
+                                    mode='lines+markers',
+                                    name=f'₹{strike} ({label})',
+                                    line=dict(width=2),
+                                    marker=dict(size=3),
+                                ))
+                        fig_chg_ce.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                        fig_chg_ce.update_layout(
+                            title='Change in Call OI (ATM ± 2)',
+                            template='plotly_dark',
+                            height=350,
+                            margin=dict(l=10, r=10, t=50, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='Chg OI (K)'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st.plotly_chart(fig_chg_ce, use_container_width=True)
+                    with chgoi_col2:
+                        fig_chg_pe = go.Figure()
+                        for i, strike in enumerate(chgoi_strikes):
+                            pe_col = f'{strike}_PE'
+                            if pe_col in chgoi_history_df.columns:
+                                label = chgoi_position_labels[i] if i < len(chgoi_position_labels) else f'Strike {i}'
+                                fig_chg_pe.add_trace(go.Scatter(
+                                    x=chgoi_history_df['time'],
+                                    y=chgoi_history_df[pe_col] / 1000,
+                                    mode='lines+markers',
+                                    name=f'₹{strike} ({label})',
+                                    line=dict(width=2),
+                                    marker=dict(size=3),
+                                ))
+                        fig_chg_pe.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                        fig_chg_pe.update_layout(
+                            title='Change in Put OI (ATM ± 2)',
+                            template='plotly_dark',
+                            height=350,
+                            margin=dict(l=10, r=10, t=50, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='Chg OI (K)'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st.plotly_chart(fig_chg_pe, use_container_width=True)
+                    # Per-strike Change OI comparison charts
+                    st.markdown("### Per-Strike Change in Call vs Put OI")
+                    chgoi_strike_cols = st.columns(min(len(chgoi_strikes), 5))
+                    for i, strike in enumerate(chgoi_strikes):
+                        if i >= len(chgoi_strike_cols):
+                            break
+                        ce_col = f'{strike}_CE'
+                        pe_col = f'{strike}_PE'
+                        with chgoi_strike_cols[i]:
+                            label = chgoi_position_labels[i] if i < len(chgoi_position_labels) else f'Strike {i}'
+                            fig_chg_strike = go.Figure()
+                            if ce_col in chgoi_history_df.columns:
+                                fig_chg_strike.add_trace(go.Scatter(
+                                    x=chgoi_history_df['time'],
+                                    y=chgoi_history_df[ce_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Call ChgOI',
+                                    line=dict(color='#ff4444', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            if pe_col in chgoi_history_df.columns:
+                                fig_chg_strike.add_trace(go.Scatter(
+                                    x=chgoi_history_df['time'],
+                                    y=chgoi_history_df[pe_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Put ChgOI',
+                                    line=dict(color='#00cc66', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            fig_chg_strike.add_hline(y=0, line_dash="dash", line_color="white", line_width=0.5)
+                            current_chg_ce = chgoi_history_df[ce_col].iloc[-1] / 1000 if ce_col in chgoi_history_df.columns and len(chgoi_history_df) > 0 else 0
+                            current_chg_pe = chgoi_history_df[pe_col].iloc[-1] / 1000 if pe_col in chgoi_history_df.columns and len(chgoi_history_df) > 0 else 0
+                            fig_chg_strike.update_layout(
+                                title=f'{label}<br>₹{strike}<br>CE: {current_chg_ce:+.1f}K | PE: {current_chg_pe:+.1f}K',
+                                template='plotly_dark',
+                                height=280,
+                                showlegend=True,
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                                margin=dict(l=10, r=10, t=80, b=30),
+                                xaxis=dict(tickformat='%H:%M', title=''),
+                                yaxis=dict(title='Chg OI (K)'),
+                                plot_bgcolor='#1e1e1e',
+                                paper_bgcolor='#1e1e1e'
+                            )
+                            st.plotly_chart(fig_chg_strike, use_container_width=True)
+                            if current_chg_ce > 0 and current_chg_pe <= 0:
+                                st.error("CE Buildup (Bearish)")
+                            elif current_chg_pe > 0 and current_chg_ce <= 0:
+                                st.success("PE Buildup (Bullish)")
+                            elif current_chg_ce > 0 and current_chg_pe > 0:
+                                st.warning("Both Building")
+                            elif current_chg_ce < 0 and current_chg_pe < 0:
+                                st.warning("Both Unwinding")
+                            else:
+                                st.info("Neutral")
+                else:
+                    st.info("Waiting for ATM ± 2 strike data...")
+                chgoi_info1, chgoi_info2 = st.columns([3, 1])
+                with chgoi_info1:
+                    st.caption(f"📈 {len(st.session_state.chgoi_history)} data points | Change in OI values in Thousands")
+                with chgoi_info2:
+                    if st.button("🗑️ Clear ChgOI History"):
+                        st.session_state.chgoi_history = []
+                        st.session_state.chgoi_last_valid_data = None
+                        st.rerun()
+            except Exception as e:
+                st.warning(f"Error displaying Change OI charts: {str(e)}")
+        else:
+            st.info("📊 Change in OI history will build up as the app refreshes. Please wait for data collection...")
         st.markdown("---")
         st.markdown("## 📊 Gamma Exposure (GEX) Analysis - Dealer Hedging Flow")
         try:
@@ -3515,6 +3818,8 @@ def main():
                     for _, row in gex_df.iterrows():
                         strike_label = str(int(row['Strike']))
                         gex_entry[strike_label] = row['Net_GEX']
+                        gex_entry[f'{strike_label}_Call'] = row.get('Call_GEX', 0)
+                        gex_entry[f'{strike_label}_Put'] = row.get('Put_GEX', 0)
                     current_gex_strikes = [int(row['Strike']) for _, row in gex_df.iterrows()]
                     st.session_state.gex_current_strikes = sorted(current_gex_strikes)
                     should_add_gex = True
@@ -3669,6 +3974,117 @@ def main():
                                         display_gex_with_signal(st, fig, current_gex)
                                 else:
                                     st.info(f"{position_labels[i]} N/A")
+                        # Combined Call GEX vs Put GEX time series
+                        st.markdown("### 📊 Call GEX vs Put GEX - Time Series (ATM ± 2)")
+                        if has_history and gex_history_df is not None:
+                            gex_pos_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                            gex_ts_col1, gex_ts_col2 = st.columns(2)
+                            with gex_ts_col1:
+                                fig_call_gex = go.Figure()
+                                for idx, strike in enumerate(current_strikes):
+                                    call_col = f'{strike}_Call'
+                                    if call_col in gex_history_df.columns:
+                                        lbl = gex_pos_labels[idx] if idx < len(gex_pos_labels) else f'Strike {idx}'
+                                        fig_call_gex.add_trace(go.Scatter(
+                                            x=gex_history_df['time'],
+                                            y=gex_history_df[call_col],
+                                            mode='lines+markers',
+                                            name=f'₹{strike} ({lbl})',
+                                            line=dict(width=2),
+                                            marker=dict(size=3),
+                                        ))
+                                fig_call_gex.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                                fig_call_gex.update_layout(
+                                    title='Call GEX by Strike (ATM ± 2)',
+                                    template='plotly_dark',
+                                    height=350,
+                                    margin=dict(l=10, r=10, t=50, b=30),
+                                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                                    yaxis=dict(title='Call GEX (Lakhs)'),
+                                    plot_bgcolor='#1e1e1e',
+                                    paper_bgcolor='#1e1e1e',
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                                )
+                                st.plotly_chart(fig_call_gex, use_container_width=True)
+                            with gex_ts_col2:
+                                fig_put_gex = go.Figure()
+                                for idx, strike in enumerate(current_strikes):
+                                    put_col = f'{strike}_Put'
+                                    if put_col in gex_history_df.columns:
+                                        lbl = gex_pos_labels[idx] if idx < len(gex_pos_labels) else f'Strike {idx}'
+                                        fig_put_gex.add_trace(go.Scatter(
+                                            x=gex_history_df['time'],
+                                            y=gex_history_df[put_col],
+                                            mode='lines+markers',
+                                            name=f'₹{strike} ({lbl})',
+                                            line=dict(width=2),
+                                            marker=dict(size=3),
+                                        ))
+                                fig_put_gex.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                                fig_put_gex.update_layout(
+                                    title='Put GEX by Strike (ATM ± 2)',
+                                    template='plotly_dark',
+                                    height=350,
+                                    margin=dict(l=10, r=10, t=50, b=30),
+                                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                                    yaxis=dict(title='Put GEX (Lakhs)'),
+                                    plot_bgcolor='#1e1e1e',
+                                    paper_bgcolor='#1e1e1e',
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                                )
+                                st.plotly_chart(fig_put_gex, use_container_width=True)
+                            # Per-strike Call GEX vs Put GEX comparison
+                            st.markdown("### Per-Strike Call GEX vs Put GEX")
+                            gex_cmp_cols = st.columns(min(len(current_strikes), 5))
+                            for idx, strike in enumerate(current_strikes):
+                                if idx >= len(gex_cmp_cols):
+                                    break
+                                call_col = f'{strike}_Call'
+                                put_col = f'{strike}_Put'
+                                with gex_cmp_cols[idx]:
+                                    lbl = gex_pos_labels[idx] if idx < len(gex_pos_labels) else f'Strike {idx}'
+                                    fig_gex_cmp = go.Figure()
+                                    if call_col in gex_history_df.columns:
+                                        fig_gex_cmp.add_trace(go.Scatter(
+                                            x=gex_history_df['time'],
+                                            y=gex_history_df[call_col],
+                                            mode='lines+markers',
+                                            name='Call GEX',
+                                            line=dict(color='#ff4444', width=2),
+                                            marker=dict(size=3),
+                                        ))
+                                    if put_col in gex_history_df.columns:
+                                        fig_gex_cmp.add_trace(go.Scatter(
+                                            x=gex_history_df['time'],
+                                            y=gex_history_df[put_col],
+                                            mode='lines+markers',
+                                            name='Put GEX',
+                                            line=dict(color='#00cc66', width=2),
+                                            marker=dict(size=3),
+                                        ))
+                                    fig_gex_cmp.add_hline(y=0, line_dash="dash", line_color="white", line_width=0.5)
+                                    cur_call_gex = gex_history_df[call_col].iloc[-1] if call_col in gex_history_df.columns and len(gex_history_df) > 0 else 0
+                                    cur_put_gex = gex_history_df[put_col].iloc[-1] if put_col in gex_history_df.columns and len(gex_history_df) > 0 else 0
+                                    fig_gex_cmp.update_layout(
+                                        title=f'{lbl}<br>₹{strike}<br>CE: {cur_call_gex:+.1f}L | PE: {cur_put_gex:+.1f}L',
+                                        template='plotly_dark',
+                                        height=280,
+                                        showlegend=True,
+                                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                                        margin=dict(l=10, r=10, t=80, b=30),
+                                        xaxis=dict(tickformat='%H:%M', title=''),
+                                        yaxis=dict(title='GEX (L)'),
+                                        plot_bgcolor='#1e1e1e',
+                                        paper_bgcolor='#1e1e1e'
+                                    )
+                                    st.plotly_chart(fig_gex_cmp, use_container_width=True)
+                                    net = cur_call_gex + cur_put_gex
+                                    if net > 5:
+                                        st.success("Pin Zone")
+                                    elif net < -5:
+                                        st.error("Accel Zone")
+                                    else:
+                                        st.warning("Neutral")
                         st.markdown("### Current GEX Values")
                         gex_display = gex_df[['Strike', 'Zone', 'Call_GEX', 'Put_GEX', 'Net_GEX']].copy()
                         gex_display['Strike'] = gex_display['Strike'].apply(lambda x: f"₹{x:.0f}")
