@@ -3165,7 +3165,6 @@ def main():
             st.error("No data available. Please check your API credentials and try again.")
 
     with col2:
-        st.header("📊 Options Analysis")
         option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
         if option_data and option_data.get('underlying'):
             underlying_price = option_data['underlying']
@@ -3193,7 +3192,6 @@ def main():
                         db.upsert_orderbook(orderbook_entries, expiry)
                 except Exception:
                     pass
-            st.info(f"**NIFTY SPOT:** {underlying_price:.2f}")
             if enable_signals and not df.empty and df_summary is not None and len(df_summary) > 0:
                 check_trading_signals(df, pivot_settings, df_summary, underlying_price, pivot_proximity)
             if df_summary is not None and len(df_summary) > 0:
