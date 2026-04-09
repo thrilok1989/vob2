@@ -2710,13 +2710,55 @@ def send_option_chain_signal(sa_result, underlying_price):
         pass
 
 def detect_candle_patterns(df, lookback=5):
-    """Detect candlestick patterns from last few candles."""
+    """Detect candlestick patterns from last few candles using Nifty price action chart."""
     if df is None or len(df) < lookback:
-        return {'pattern': 'Insufficient Data', 'direction': 'Neutral', 'details': {}}
+        return {'pattern': 'Insufficient Data', 'direction': 'Neutral', 'details': {}, 'candles': []}
     recent = df.tail(lookback).copy()
     last = recent.iloc[-1]
     prev = recent.iloc[-2] if len(recent) >= 2 else None
 
+    # Analyze each of the last candles
+    candle_list = []
+    for idx in range(len(recent)):
+        c = recent.iloc[idx]
+        c_body = abs(c['close'] - c['open'])
+        c_range = c['high'] - c['low']
+        c_body_ratio = c_body / c_range if c_range > 0 else 0
+        c_green = c['close'] > c['open']
+        c_upper = c['high'] - max(c['close'], c['open'])
+        c_lower = min(c['close'], c['open']) - c['low']
+        c_prev = recent.iloc[idx - 1] if idx > 0 else None
+
+        c_pattern = 'Normal'
+        if c_lower > c_body * 2 and c_upper < c_body * 0.5 and c_body_ratio < 0.4:
+            c_pattern = 'Hammer'
+        elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4:
+            c_pattern = 'Shooting Star' if not c_green else 'Inverted Hammer'
+        elif c_body_ratio < 0.1 and c_range > 0:
+            c_pattern = 'Doji'
+        elif c_prev is not None:
+            p_body = abs(c_prev['close'] - c_prev['open'])
+            p_green = c_prev['close'] > c_prev['open']
+            if c_green and not p_green and c_body > p_body and c['close'] > c_prev['open'] and c['open'] < c_prev['close']:
+                c_pattern = 'Bullish Engulfing'
+            elif not c_green and p_green and c_body > p_body and c['close'] < c_prev['open'] and c['open'] > c_prev['close']:
+                c_pattern = 'Bearish Engulfing'
+            elif c_body_ratio >= 0.6:
+                c_pattern = 'Strong Green' if c_green else 'Strong Red'
+        if c_pattern == 'Normal' and c_body_ratio >= 0.6:
+            c_pattern = 'Strong Green' if c_green else 'Strong Red'
+
+        candle_list.append({
+            'open': round(c['open'], 2), 'high': round(c['high'], 2),
+            'low': round(c['low'], 2), 'close': round(c['close'], 2),
+            'type': 'Bull' if c_green else 'Bear',
+            'pattern': c_pattern,
+            'body_ratio': round(c_body_ratio, 2),
+            'volume': int(c.get('volume', 0)),
+            'time': c.get('datetime', '').strftime('%H:%M') if hasattr(c.get('datetime', ''), 'strftime') else str(c.get('datetime', '')),
+        })
+
+    # Overall pattern from last candle
     body = abs(last['close'] - last['open'])
     total_range = last['high'] - last['low']
     body_ratio = body / total_range if total_range > 0 else 0
@@ -2727,19 +2769,15 @@ def detect_candle_patterns(df, lookback=5):
     pattern = 'No Pattern'
     direction = 'Neutral'
 
-    # Hammer: small body at top, long lower wick (>2x body)
     if lower_wick > body * 2 and upper_wick < body * 0.5 and body_ratio < 0.4:
         pattern = 'Hammer'
         direction = 'Bullish'
-    # Inverted Hammer / Shooting Star
     elif upper_wick > body * 2 and lower_wick < body * 0.5 and body_ratio < 0.4:
         pattern = 'Shooting Star' if not is_green else 'Inverted Hammer'
         direction = 'Bearish' if not is_green else 'Bullish'
-    # Doji: very small body
     elif body_ratio < 0.1 and total_range > 0:
         pattern = 'Doji'
         direction = 'Indecision'
-    # Engulfing patterns
     elif prev is not None:
         prev_body = abs(prev['close'] - prev['open'])
         prev_green = prev['close'] > prev['open']
@@ -2749,7 +2787,6 @@ def detect_candle_patterns(df, lookback=5):
         elif not is_green and prev_green and body > prev_body and last['close'] < prev['open'] and last['open'] > prev['close']:
             pattern = 'Bearish Engulfing'
             direction = 'Bearish'
-        # Strong candle: large body ratio
         elif body_ratio >= 0.6:
             pattern = 'Strong Green Candle' if is_green else 'Strong Red Candle'
             direction = 'Bullish' if is_green else 'Bearish'
@@ -2758,8 +2795,14 @@ def detect_candle_patterns(df, lookback=5):
         pattern = 'Strong Green Candle' if is_green else 'Strong Red Candle'
         direction = 'Bullish' if is_green else 'Bearish'
 
+    # Count bull/bear candles in last 5
+    bull_count = sum(1 for c in candle_list if c['type'] == 'Bull')
+    bear_count = sum(1 for c in candle_list if c['type'] == 'Bear')
+
     return {
         'pattern': pattern, 'direction': direction,
+        'candles': candle_list,
+        'bull_count': bull_count, 'bear_count': bear_count,
         'details': {
             'body_ratio': round(body_ratio, 2), 'is_green': is_green,
             'close': last['close'], 'open': last['open'],
@@ -5218,11 +5261,39 @@ def main():
                     # Details in columns
                     ms_col1, ms_col2, ms_col3 = st.columns(3)
                     with ms_col1:
-                        st.markdown("#### 🕯 Candle & Volume")
-                        st.markdown(f"**Pattern:** {master['candle']['pattern']} ({master['candle']['direction']})")
-                        st.markdown(f"**Location:** {', '.join(master['location'])}")
+                        st.markdown("#### 🕯 Candle Pattern (Nifty Price Action)")
+                        cd = master['candle']
+                        d = cd['details']
+                        pat_color = '#00ff88' if cd['direction'] == 'Bullish' else '#ff4444' if cd['direction'] == 'Bearish' else '#FFD700'
+                        st.markdown(f"""
+                        <div style="background:{pat_color}20;padding:10px;border-radius:8px;border-left:4px solid {pat_color};margin-bottom:8px;">
+                            <b style="color:{pat_color};font-size:16px;">{cd['pattern']}</b> <span style="color:white;">({cd['direction']})</span><br>
+                            <span style="color:#aaa;font-size:13px;">O: ₹{d['open']:.2f} | H: ₹{d['high']:.2f} | L: ₹{d['low']:.2f} | C: ₹{d['close']:.2f}</span><br>
+                            <span style="color:#aaa;font-size:12px;">Body: {d['body_ratio']*100:.0f}% | {'🟢 Bull' if d['is_green'] else '🔴 Bear'}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        # Last 5 candles breakdown
+                        st.markdown("**Last 5 Candles:**")
+                        candle_rows = []
+                        for ci, cn in enumerate(cd.get('candles', [])):
+                            candle_rows.append({
+                                '#': ci + 1,
+                                'Time': cn['time'],
+                                'Type': f"{'🟢' if cn['type'] == 'Bull' else '🔴'} {cn['type']}",
+                                'Pattern': cn['pattern'],
+                                'O': f"₹{cn['open']:.0f}",
+                                'H': f"₹{cn['high']:.0f}",
+                                'L': f"₹{cn['low']:.0f}",
+                                'C': f"₹{cn['close']:.0f}",
+                                'Vol': f"{cn['volume']:,}" if cn['volume'] else '-',
+                            })
+                        if candle_rows:
+                            st.dataframe(pd.DataFrame(candle_rows), use_container_width=True, hide_index=True, height=210)
+                        st.caption(f"Bull: {cd.get('bull_count', 0)} | Bear: {cd.get('bear_count', 0)} out of last 5")
+
+                        st.markdown(f"**📍 Location:** {', '.join(master['location'])}")
                         vol_color = '#00ff88' if master['volume']['spike'] else '#888888'
-                        st.markdown(f"**Volume:** <span style='color:{vol_color}'>{master['volume']['label']} ({master['volume']['ratio']}x)</span>", unsafe_allow_html=True)
+                        st.markdown(f"**📊 Volume:** <span style='color:{vol_color}'>{master['volume']['label']} ({master['volume']['ratio']}x)</span>", unsafe_allow_html=True)
                         st.markdown("#### 🟢 Order Blocks")
                         ob = master['order_blocks']
                         if ob.get('bullish_ob'):
