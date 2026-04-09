@@ -3519,12 +3519,37 @@ def main():
                                 paper_bgcolor='#1e1e1e'
                             )
                             st.plotly_chart(fig_strike, use_container_width=True)
-                            if current_ce > current_pe:
-                                st.error(f"Bearish (CE > PE)")
-                            elif current_pe > current_ce:
-                                st.success(f"Bullish (PE > CE)")
+                            # Analyze OI trend over time for support/resistance strength
+                            ce_series = oi_history_df[ce_col] if ce_col in oi_history_df.columns else pd.Series([0])
+                            pe_series = oi_history_df[pe_col] if pe_col in oi_history_df.columns else pd.Series([0])
+                            if len(ce_series) >= 3:
+                                ce_first, ce_last = ce_series.iloc[0], ce_series.iloc[-1]
+                                pe_first, pe_last = pe_series.iloc[0], pe_series.iloc[-1]
+                                ce_change = ce_last - ce_first
+                                pe_change = pe_last - pe_first
+                                ce_pct = (ce_change / ce_first * 100) if ce_first > 0 else 0
+                                pe_pct = (pe_change / pe_first * 100) if pe_first > 0 else 0
+                                # Support signal (PE OI trend)
+                                if pe_change > 0:
+                                    st.success(f"Support Building (PE +{pe_pct:.1f}%)")
+                                elif pe_change < 0:
+                                    st.error(f"Support Weakening (PE {pe_pct:.1f}%)")
+                                else:
+                                    st.info("Support Flat")
+                                # Resistance signal (CE OI trend)
+                                if ce_change > 0:
+                                    st.error(f"Resistance Building (CE +{ce_pct:.1f}%)")
+                                elif ce_change < 0:
+                                    st.success(f"Resistance Weakening (CE {ce_pct:.1f}%)")
+                                else:
+                                    st.info("Resistance Flat")
                             else:
-                                st.warning("Neutral")
+                                if current_ce > current_pe:
+                                    st.error("Resistance > Support")
+                                elif current_pe > current_ce:
+                                    st.success("Support > Resistance")
+                                else:
+                                    st.warning("Neutral")
                 else:
                     st.info("Waiting for ATM ± 2 strike data...")
                 oi_info1, oi_info2 = st.columns([3, 1])
