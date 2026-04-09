@@ -3818,6 +3818,8 @@ def main():
                     for _, row in gex_df.iterrows():
                         strike_label = str(int(row['Strike']))
                         gex_entry[strike_label] = row['Net_GEX']
+                        gex_entry[f'{strike_label}_Call'] = row.get('Call_GEX', 0)
+                        gex_entry[f'{strike_label}_Put'] = row.get('Put_GEX', 0)
                     current_gex_strikes = [int(row['Strike']) for _, row in gex_df.iterrows()]
                     st.session_state.gex_current_strikes = sorted(current_gex_strikes)
                     should_add_gex = True
@@ -3972,6 +3974,117 @@ def main():
                                         display_gex_with_signal(st, fig, current_gex)
                                 else:
                                     st.info(f"{position_labels[i]} N/A")
+                        # Combined Call GEX vs Put GEX time series
+                        st.markdown("### 📊 Call GEX vs Put GEX - Time Series (ATM ± 2)")
+                        if has_history and gex_history_df is not None:
+                            gex_pos_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                            gex_ts_col1, gex_ts_col2 = st.columns(2)
+                            with gex_ts_col1:
+                                fig_call_gex = go.Figure()
+                                for idx, strike in enumerate(current_strikes):
+                                    call_col = f'{strike}_Call'
+                                    if call_col in gex_history_df.columns:
+                                        lbl = gex_pos_labels[idx] if idx < len(gex_pos_labels) else f'Strike {idx}'
+                                        fig_call_gex.add_trace(go.Scatter(
+                                            x=gex_history_df['time'],
+                                            y=gex_history_df[call_col],
+                                            mode='lines+markers',
+                                            name=f'₹{strike} ({lbl})',
+                                            line=dict(width=2),
+                                            marker=dict(size=3),
+                                        ))
+                                fig_call_gex.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                                fig_call_gex.update_layout(
+                                    title='Call GEX by Strike (ATM ± 2)',
+                                    template='plotly_dark',
+                                    height=350,
+                                    margin=dict(l=10, r=10, t=50, b=30),
+                                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                                    yaxis=dict(title='Call GEX (Lakhs)'),
+                                    plot_bgcolor='#1e1e1e',
+                                    paper_bgcolor='#1e1e1e',
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                                )
+                                st.plotly_chart(fig_call_gex, use_container_width=True)
+                            with gex_ts_col2:
+                                fig_put_gex = go.Figure()
+                                for idx, strike in enumerate(current_strikes):
+                                    put_col = f'{strike}_Put'
+                                    if put_col in gex_history_df.columns:
+                                        lbl = gex_pos_labels[idx] if idx < len(gex_pos_labels) else f'Strike {idx}'
+                                        fig_put_gex.add_trace(go.Scatter(
+                                            x=gex_history_df['time'],
+                                            y=gex_history_df[put_col],
+                                            mode='lines+markers',
+                                            name=f'₹{strike} ({lbl})',
+                                            line=dict(width=2),
+                                            marker=dict(size=3),
+                                        ))
+                                fig_put_gex.add_hline(y=0, line_dash="dash", line_color="white", line_width=1)
+                                fig_put_gex.update_layout(
+                                    title='Put GEX by Strike (ATM ± 2)',
+                                    template='plotly_dark',
+                                    height=350,
+                                    margin=dict(l=10, r=10, t=50, b=30),
+                                    xaxis=dict(tickformat='%H:%M', title='Time'),
+                                    yaxis=dict(title='Put GEX (Lakhs)'),
+                                    plot_bgcolor='#1e1e1e',
+                                    paper_bgcolor='#1e1e1e',
+                                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                                )
+                                st.plotly_chart(fig_put_gex, use_container_width=True)
+                            # Per-strike Call GEX vs Put GEX comparison
+                            st.markdown("### Per-Strike Call GEX vs Put GEX")
+                            gex_cmp_cols = st.columns(min(len(current_strikes), 5))
+                            for idx, strike in enumerate(current_strikes):
+                                if idx >= len(gex_cmp_cols):
+                                    break
+                                call_col = f'{strike}_Call'
+                                put_col = f'{strike}_Put'
+                                with gex_cmp_cols[idx]:
+                                    lbl = gex_pos_labels[idx] if idx < len(gex_pos_labels) else f'Strike {idx}'
+                                    fig_gex_cmp = go.Figure()
+                                    if call_col in gex_history_df.columns:
+                                        fig_gex_cmp.add_trace(go.Scatter(
+                                            x=gex_history_df['time'],
+                                            y=gex_history_df[call_col],
+                                            mode='lines+markers',
+                                            name='Call GEX',
+                                            line=dict(color='#ff4444', width=2),
+                                            marker=dict(size=3),
+                                        ))
+                                    if put_col in gex_history_df.columns:
+                                        fig_gex_cmp.add_trace(go.Scatter(
+                                            x=gex_history_df['time'],
+                                            y=gex_history_df[put_col],
+                                            mode='lines+markers',
+                                            name='Put GEX',
+                                            line=dict(color='#00cc66', width=2),
+                                            marker=dict(size=3),
+                                        ))
+                                    fig_gex_cmp.add_hline(y=0, line_dash="dash", line_color="white", line_width=0.5)
+                                    cur_call_gex = gex_history_df[call_col].iloc[-1] if call_col in gex_history_df.columns and len(gex_history_df) > 0 else 0
+                                    cur_put_gex = gex_history_df[put_col].iloc[-1] if put_col in gex_history_df.columns and len(gex_history_df) > 0 else 0
+                                    fig_gex_cmp.update_layout(
+                                        title=f'{lbl}<br>₹{strike}<br>CE: {cur_call_gex:+.1f}L | PE: {cur_put_gex:+.1f}L',
+                                        template='plotly_dark',
+                                        height=280,
+                                        showlegend=True,
+                                        legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                                        margin=dict(l=10, r=10, t=80, b=30),
+                                        xaxis=dict(tickformat='%H:%M', title=''),
+                                        yaxis=dict(title='GEX (L)'),
+                                        plot_bgcolor='#1e1e1e',
+                                        paper_bgcolor='#1e1e1e'
+                                    )
+                                    st.plotly_chart(fig_gex_cmp, use_container_width=True)
+                                    net = cur_call_gex + cur_put_gex
+                                    if net > 5:
+                                        st.success("Pin Zone")
+                                    elif net < -5:
+                                        st.error("Accel Zone")
+                                    else:
+                                        st.warning("Neutral")
                         st.markdown("### Current GEX Values")
                         gex_display = gex_df[['Strike', 'Zone', 'Call_GEX', 'Put_GEX', 'Net_GEX']].copy()
                         gex_display['Strike'] = gex_display['Strike'].apply(lambda x: f"₹{x:.0f}")
