@@ -3519,12 +3519,59 @@ def main():
                                 paper_bgcolor='#1e1e1e'
                             )
                             st.plotly_chart(fig_strike, use_container_width=True)
-                            if current_ce > current_pe:
-                                st.error(f"Bearish (CE > PE)")
-                            elif current_pe > current_ce:
-                                st.success(f"Bullish (PE > CE)")
+                            # Analyze OI trend over time for support/resistance strength
+                            ce_series = oi_history_df[ce_col] if ce_col in oi_history_df.columns else pd.Series([0])
+                            pe_series = oi_history_df[pe_col] if pe_col in oi_history_df.columns else pd.Series([0])
+                            if len(ce_series) >= 3:
+                                ce_first, ce_last = ce_series.iloc[0], ce_series.iloc[-1]
+                                pe_first, pe_last = pe_series.iloc[0], pe_series.iloc[-1]
+                                ce_change = ce_last - ce_first
+                                pe_change = pe_last - pe_first
+                                ce_pct = (ce_change / ce_first * 100) if ce_first > 0 else 0
+                                pe_pct = (pe_change / pe_first * 100) if pe_first > 0 else 0
+                                # Support signal (PE OI trend)
+                                if pe_change > 0:
+                                    st.success(f"Support Building (PE +{pe_pct:.1f}%)")
+                                elif pe_change < 0:
+                                    st.error(f"Support Weakening (PE {pe_pct:.1f}%)")
+                                else:
+                                    st.info("Support Flat")
+                                # Resistance signal (CE OI trend)
+                                if ce_change > 0:
+                                    st.error(f"Resistance Building (CE +{ce_pct:.1f}%)")
+                                elif ce_change < 0:
+                                    st.success(f"Resistance Weakening (CE {ce_pct:.1f}%)")
+                                else:
+                                    st.info("Resistance Flat")
+                                # Overall verdict: compare CE vs PE OI difference
+                                oi_diff = (current_pe - current_ce) * 100000  # back to absolute
+                                oi_diff_lakhs = abs(current_pe - current_ce)
+                                pe_ce_ratio = current_pe / current_ce if current_ce > 0 else 0
+                                if current_pe > current_ce:
+                                    if pe_ce_ratio >= 2.0:
+                                        st.markdown(f'<div style="background:#00ff8840;padding:8px;border-radius:8px;border-left:4px solid #00ff88;"><b style="color:#00ff88;">STRONG SUPPORT</b> | PE {current_pe:.1f}L vs CE {current_ce:.1f}L | Diff: {oi_diff_lakhs:.1f}L | Ratio: {pe_ce_ratio:.1f}x</div>', unsafe_allow_html=True)
+                                    elif pe_ce_ratio >= 1.3:
+                                        st.markdown(f'<div style="background:#00cc6640;padding:8px;border-radius:8px;border-left:4px solid #00cc66;"><b style="color:#00cc66;">MODERATE SUPPORT</b> | PE {current_pe:.1f}L vs CE {current_ce:.1f}L | Diff: {oi_diff_lakhs:.1f}L | Ratio: {pe_ce_ratio:.1f}x</div>', unsafe_allow_html=True)
+                                    else:
+                                        st.markdown(f'<div style="background:#88aa4440;padding:8px;border-radius:8px;border-left:4px solid #88aa44;"><b style="color:#88aa44;">WEAK SUPPORT</b> | PE {current_pe:.1f}L vs CE {current_ce:.1f}L | Diff: {oi_diff_lakhs:.1f}L | Ratio: {pe_ce_ratio:.1f}x</div>', unsafe_allow_html=True)
+                                elif current_ce > current_pe:
+                                    ce_pe_ratio = current_ce / current_pe if current_pe > 0 else 0
+                                    if ce_pe_ratio >= 2.0:
+                                        st.markdown(f'<div style="background:#ff444440;padding:8px;border-radius:8px;border-left:4px solid #ff4444;"><b style="color:#ff4444;">STRONG RESISTANCE</b> | CE {current_ce:.1f}L vs PE {current_pe:.1f}L | Diff: {oi_diff_lakhs:.1f}L | Ratio: {ce_pe_ratio:.1f}x</div>', unsafe_allow_html=True)
+                                    elif ce_pe_ratio >= 1.3:
+                                        st.markdown(f'<div style="background:#cc444440;padding:8px;border-radius:8px;border-left:4px solid #cc4444;"><b style="color:#cc4444;">MODERATE RESISTANCE</b> | CE {current_ce:.1f}L vs PE {current_pe:.1f}L | Diff: {oi_diff_lakhs:.1f}L | Ratio: {ce_pe_ratio:.1f}x</div>', unsafe_allow_html=True)
+                                    else:
+                                        st.markdown(f'<div style="background:#aa664440;padding:8px;border-radius:8px;border-left:4px solid #aa6644;"><b style="color:#aa6644;">WEAK RESISTANCE</b> | CE {current_ce:.1f}L vs PE {current_pe:.1f}L | Diff: {oi_diff_lakhs:.1f}L | Ratio: {ce_pe_ratio:.1f}x</div>', unsafe_allow_html=True)
+                                else:
+                                    st.warning("Balanced (CE = PE)")
                             else:
-                                st.warning("Neutral")
+                                oi_diff_lakhs = abs(current_pe - current_ce)
+                                if current_pe > current_ce:
+                                    st.success(f"Support > Resistance (Diff: {oi_diff_lakhs:.1f}L)")
+                                elif current_ce > current_pe:
+                                    st.error(f"Resistance > Support (Diff: {oi_diff_lakhs:.1f}L)")
+                                else:
+                                    st.warning("Neutral")
                 else:
                     st.info("Waiting for ATM ± 2 strike data...")
                 oi_info1, oi_info2 = st.columns([3, 1])
