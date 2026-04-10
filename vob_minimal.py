@@ -3187,8 +3187,14 @@ def fetch_alignment_data(api):
                     continue
 
                 ltp = adf.iloc[-1]['close']
-                # Candle pattern detection
-                cp = detect_candle_patterns(adf, lookback=5)
+                # Candle pattern detection (5-min chart)
+                try:
+                    adf_5m = adf.set_index('datetime').resample('5min').agg({
+                        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                    }).dropna().reset_index()
+                except Exception:
+                    adf_5m = adf
+                cp = detect_candle_patterns(adf_5m, lookback=5)
 
                 # Multi-timeframe sentiment
                 def calc_sentiment(sub_df):
@@ -3269,8 +3275,14 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     if df is None or df.empty or sa_result is None:
         return None
 
-    # 1. Candle Pattern (last 5 candles)
-    candle = detect_candle_patterns(df, lookback=5)
+    # 1. Candle Pattern (last 5 candles on 5-min chart)
+    try:
+        df_5m = df.set_index('datetime').resample('5min').agg({
+            'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+        }).dropna().reset_index()
+    except Exception:
+        df_5m = df
+    candle = detect_candle_patterns(df_5m, lookback=5)
 
     # 2. Order Blocks
     ob = detect_order_blocks(df, lookback=20)
@@ -3320,9 +3332,15 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
                 st.session_state.alignment_last_fetch = ist_now
         alignment = st.session_state.alignment_data
 
-        # Also add NIFTY's own sentiment from the main df
+        # Also add NIFTY's own sentiment from the main df (5-min chart)
         if df is not None and not df.empty:
-            nifty_cp = detect_candle_patterns(df, lookback=5)
+            try:
+                nifty_5m = df.set_index('datetime').resample('5min').agg({
+                    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                }).dropna().reset_index()
+            except Exception:
+                nifty_5m = df
+            nifty_cp = detect_candle_patterns(nifty_5m, lookback=5)
             def _nifty_sentiment(sub):
                 if sub is None or len(sub) < 2:
                     return 'N/A', 0
