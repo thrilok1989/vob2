@@ -5978,6 +5978,10 @@ def main():
                     # Delta Volume Chart
                     delta_df = master.get('delta_vol_df')
                     if delta_df is not None and len(delta_df) > 0:
+                        # Filter to today only
+                        _today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+                        delta_df = delta_df[delta_df['datetime'].dt.date == _today_ist]
+                    if delta_df is not None and len(delta_df) > 0:
                         st.markdown("### 📊 Delta Volume (Buy vs Sell)")
                         fig_delta = go.Figure()
                         colors = ['#00ff88' if d > 0 else '#ff4444' for d in delta_df['delta']]
