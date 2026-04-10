@@ -1135,11 +1135,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
 {reversal_text}
 📋 <b>REVIEW:</b> {atm_strike} {opt} | SL: {stop_loss_percent}% | Manual verification required
 🕐 Time: {time_str}"""
-                try:
-                    send_telegram_message_sync(message)
-                    st.success(f"{'🟢' if is_bull else '🔴'} {'Bullish' if is_bull else 'Bearish'} signal notification sent!")
-                except Exception as e:
-                    st.error(f"Failed to send notification: {e}")
+                # Telegram disabled for reversal signals (noise reduction)
                 break
 
 def check_atm_verdict_alert(df_summary, underlying_price):
@@ -2704,10 +2700,8 @@ def send_option_chain_signal(sa_result, underlying_price):
 {"".join([f"• {s}" + chr(10) for s in sa_result['bias_signals']])}
 ⚠️ <i>Auto-generated. Manual verification required.</i>"""
 
-    try:
-        send_telegram_message_sync(message)
-    except Exception:
-        pass
+    # Telegram disabled for option chain analysis (noise reduction)
+    pass
 
 def detect_candle_patterns(df, lookback=5):
     """Detect candlestick patterns from last few candles using Nifty price action chart."""
@@ -5879,6 +5873,51 @@ def main():
                             st.session_state.last_master_signal_time = _ist_now
                         except Exception:
                             pass
+                        # Store signal in Supabase
+                        try:
+                            _align = master.get('alignment', {})
+                            _non_vix = {k: v for k, v in _align.items() if 'VIX' not in k}
+                            _bull_a = sum(1 for v in _non_vix.values() if v.get('sentiment_10m') == 'Bullish')
+                            _bear_a = sum(1 for v in _non_vix.values() if v.get('sentiment_10m') == 'Bearish')
+                            _align_sum = f"Bull:{_bull_a} Bear:{_bear_a}/{len(_non_vix)}"
+                            db.upsert_master_signal({
+                                'spot_price': option_data['underlying'],
+                                'signal': master['signal'],
+                                'trade_type': master['trade_type'],
+                                'score': master['score'],
+                                'abs_score': master['abs_score'],
+                                'strength': master['strength'],
+                                'confidence': master['confidence'],
+                                'candle_pattern': master['candle']['pattern'],
+                                'candle_direction': master['candle']['direction'],
+                                'volume_label': master['volume']['label'],
+                                'volume_ratio': master['volume']['ratio'],
+                                'location': ', '.join(master['location']),
+                                'resistance_levels': ', '.join([f"{r:.0f}" for r in master['resistance_levels'][:3]]),
+                                'support_levels': ', '.join([f"{s:.0f}" for s in master['support_levels'][:3]]),
+                                'net_gex': master['gex']['net_gex'],
+                                'atm_gex': master['gex']['atm_gex'],
+                                'gamma_flip': master['gex']['gamma_flip'],
+                                'gex_mode': master['gex']['market_mode'],
+                                'pcr_gex_badge': master['pcr_gex']['badge'],
+                                'market_bias': master['market_bias'],
+                                'vix_value': master['vix'].get('vix'),
+                                'vix_direction': master['vix'].get('direction', ''),
+                                'oi_trend_signal': master.get('oi_trend', {}).get('signal', ''),
+                                'ce_activity': master.get('oi_trend', {}).get('ce_activity', ''),
+                                'pe_activity': master.get('oi_trend', {}).get('pe_activity', ''),
+                                'support_status': master.get('oi_trend', {}).get('support_status', ''),
+                                'resistance_status': master.get('oi_trend', {}).get('resistance_status', ''),
+                                'vidya_trend': master.get('vidya', {}).get('trend', ''),
+                                'vidya_delta_pct': master.get('vidya', {}).get('delta_pct', 0),
+                                'delta_vol_trend': master.get('delta_trend', ''),
+                                'vwap': master.get('ltp_trap', {}).get('vwap'),
+                                'price_vs_vwap': master.get('ltp_trap', {}).get('price_vs_vwap', ''),
+                                'reasons': ' | '.join(master['reasons']),
+                                'alignment_summary': _align_sum,
+                            })
+                        except Exception:
+                            pass
 
                     # Signal Banner
                     if 'BUY' in master['trade_type'] or 'BREAKOUT' in master['signal']:
@@ -6292,6 +6331,100 @@ def main():
                 st.info("Master signal requires deep analysis data. Please wait...")
         except Exception as e:
             st.warning(f"Master signal unavailable: {str(e)}")
+
+    # === SIGNAL HISTORY TABLE ===
+    if option_data and option_data.get('underlying'):
+        st.markdown("---")
+        st.markdown("## 📋 Signal History (Today)")
+        try:
+            sig_hist = db.get_master_signals()
+            if not sig_hist.empty:
+                display_cols = {
+                    'timestamp': 'Time',
+                    'signal': 'Signal',
+                    'trade_type': 'Trade',
+                    'spot_price': 'Spot',
+                    'abs_score': 'Score',
+                    'strength': 'Strength',
+                    'confidence': 'Conf%',
+                    'candle_pattern': 'Candle',
+                    'candle_direction': 'Dir',
+                    'volume_label': 'Volume',
+                    'location': 'Location',
+                    'gex_mode': 'GEX Mode',
+                    'pcr_gex_badge': 'PCR×GEX',
+                    'market_bias': 'Bias',
+                    'vix_direction': 'VIX',
+                    'oi_trend_signal': 'OI Trend',
+                    'ce_activity': 'CE Activity',
+                    'pe_activity': 'PE Activity',
+                    'support_status': 'Support',
+                    'resistance_status': 'Resistance',
+                    'vidya_trend': 'VIDYA',
+                    'delta_vol_trend': 'Delta Vol',
+                    'price_vs_vwap': 'vs VWAP',
+                    'reasons': 'Confluence Factors',
+                }
+                available_cols = [c for c in display_cols.keys() if c in sig_hist.columns]
+                display_df = sig_hist[available_cols].copy()
+                display_df.rename(columns={c: display_cols[c] for c in available_cols}, inplace=True)
+                # Format time column
+                if 'Time' in display_df.columns:
+                    try:
+                        display_df['Time'] = pd.to_datetime(display_df['Time']).dt.strftime('%H:%M:%S')
+                    except Exception:
+                        pass
+                if 'Spot' in display_df.columns:
+                    display_df['Spot'] = display_df['Spot'].apply(lambda x: f"₹{x:.0f}" if pd.notna(x) else '')
+                if 'Score' in display_df.columns:
+                    display_df['Score'] = display_df['Score'].apply(lambda x: f"{x}/10" if pd.notna(x) else '')
+                if 'Conf%' in display_df.columns:
+                    display_df['Conf%'] = display_df['Conf%'].apply(lambda x: f"{x}%" if pd.notna(x) else '')
+
+                def _style_signal_row(row):
+                    trade = row.get('Trade', '')
+                    if 'BUY' in str(trade):
+                        return ['background-color:#00ff8812;color:white'] * len(row)
+                    elif 'SELL' in str(trade):
+                        return ['background-color:#ff444412;color:white'] * len(row)
+                    return [''] * len(row)
+
+                st.dataframe(
+                    display_df.style.apply(_style_signal_row, axis=1),
+                    use_container_width=True, hide_index=True,
+                    height=min(400, 50 + len(display_df) * 35)
+                )
+                st.caption(f"📊 {len(display_df)} signals today | Stored in Supabase")
+
+                # Expandable detail view
+                with st.expander("🔍 View Full Signal Details"):
+                    for idx, row in sig_hist.iterrows():
+                        ts = row.get('timestamp', '')
+                        try:
+                            ts = pd.to_datetime(ts).strftime('%H:%M:%S')
+                        except Exception:
+                            pass
+                        sig = row.get('signal', '')
+                        trade = row.get('trade_type', '')
+                        sig_clr = '#00ff88' if 'BUY' in str(trade) else '#ff4444' if 'SELL' in str(trade) else '#FFD700'
+                        st.markdown(f"""
+                        <div style="background:{sig_clr}15;padding:12px;border-radius:8px;border-left:4px solid {sig_clr};margin-bottom:10px;">
+                            <b style="color:{sig_clr};font-size:15px;">{ts} | {sig} | {trade}</b><br>
+                            <span style="color:white;">Spot: ₹{row.get('spot_price', 0):.0f} | Score: {row.get('abs_score', 0)}/10 ({row.get('strength', '')}) | Conf: {row.get('confidence', 0)}%</span><br>
+                            <span style="color:#aaa;">🕯 {row.get('candle_pattern', '')} ({row.get('candle_direction', '')}) | 📊 Vol: {row.get('volume_label', '')} ({row.get('volume_ratio', 0)}x)</span><br>
+                            <span style="color:#aaa;">📍 {row.get('location', '')}</span><br>
+                            <span style="color:#aaa;">🟥 Res: {row.get('resistance_levels', '')} | 🟩 Sup: {row.get('support_levels', '')}</span><br>
+                            <span style="color:#aaa;">🔮 GEX: Net {row.get('net_gex', 0):.1f}L | ATM {row.get('atm_gex', 0):.1f}L | {row.get('gex_mode', '')} | PCR×GEX: {row.get('pcr_gex_badge', '')}</span><br>
+                            <span style="color:#aaa;">📉 VIX: {row.get('vix_value', '')} ({row.get('vix_direction', '')})</span><br>
+                            <span style="color:#aaa;">📊 OI: {row.get('oi_trend_signal', '')} | CE: {row.get('ce_activity', '')} | PE: {row.get('pe_activity', '')} | Sup: {row.get('support_status', '')} | Res: {row.get('resistance_status', '')}</span><br>
+                            <span style="color:#aaa;">🔮 VIDYA: {row.get('vidya_trend', '')} (Δ{row.get('vidya_delta_pct', 0):+.0f}%) | Delta Vol: {row.get('delta_vol_trend', '')} | VWAP: {row.get('price_vs_vwap', '')}</span><br>
+                            <span style="color:#aaa;">📋 {row.get('reasons', '')}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+            else:
+                st.info("No signals recorded today yet. Signals are stored every 5 minutes during market hours.")
+        except Exception as e:
+            st.caption(f"Signal history loading... ({str(e)[:50]})")
 
     if show_analytics:
         st.markdown("---")
