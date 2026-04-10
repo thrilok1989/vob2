@@ -3181,6 +3181,125 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     elif vix_dir == 'Falling' and score < 0:
         reasons.append("VIX Falling (Opposite)")
 
+    # 8. OI Timeline Trend (ATM support/resistance building/breaking from oi_history)
+    oi_trend = {'atm_strike': None, 'ce_activity': 'N/A', 'pe_activity': 'N/A',
+                'support_status': 'N/A', 'resistance_status': 'N/A', 'signal': 'Neutral',
+                'ce_oi_pct': 0, 'ce_ltp_pct': 0, 'pe_oi_pct': 0, 'pe_ltp_pct': 0,
+                'ce_chgoi': 0, 'pe_chgoi': 0, 'ce_chgoi_trend': 'N/A', 'pe_chgoi_trend': 'N/A'}
+    try:
+        oi_hist = getattr(st.session_state, 'oi_history', [])
+        chgoi_hist = getattr(st.session_state, 'chgoi_history', [])
+        oi_strikes = getattr(st.session_state, 'oi_current_strikes', [])
+        if len(oi_hist) >= 3 and oi_strikes:
+            sorted_strikes = sorted(oi_strikes)
+            atm_idx = len(sorted_strikes) // 2
+            atm_s = str(sorted_strikes[atm_idx])
+            oi_trend['atm_strike'] = int(atm_s)
+            oi_df = pd.DataFrame(oi_hist)
+
+            # CE OI + LTP trend
+            ce_oi_col, pe_oi_col = f'{atm_s}_CE', f'{atm_s}_PE'
+            ce_ltp_col, pe_ltp_col = f'{atm_s}_CE_LTP', f'{atm_s}_PE_LTP'
+
+            if ce_oi_col in oi_df.columns and ce_ltp_col in oi_df.columns:
+                ce_oi_first, ce_oi_last = oi_df[ce_oi_col].iloc[0], oi_df[ce_oi_col].iloc[-1]
+                ce_oi_change = ce_oi_last - ce_oi_first
+                ce_ltp_first, ce_ltp_last = oi_df[ce_ltp_col].iloc[0], oi_df[ce_ltp_col].iloc[-1]
+                ce_ltp_change = ce_ltp_last - ce_ltp_first
+                if ce_oi_change > 0 and ce_ltp_change > 0:
+                    oi_trend['ce_activity'] = 'Long Building'
+                elif ce_oi_change > 0 and ce_ltp_change <= 0:
+                    oi_trend['ce_activity'] = 'Short Building'
+                elif ce_oi_change < 0 and ce_ltp_change > 0:
+                    oi_trend['ce_activity'] = 'Short Covering'
+                elif ce_oi_change < 0 and ce_ltp_change <= 0:
+                    oi_trend['ce_activity'] = 'Long Unwinding'
+                oi_trend['ce_oi_pct'] = round((ce_oi_change / ce_oi_first * 100) if ce_oi_first > 0 else 0, 1)
+                oi_trend['ce_ltp_pct'] = round((ce_ltp_change / ce_ltp_first * 100) if ce_ltp_first > 0 else 0, 1)
+
+            if pe_oi_col in oi_df.columns and pe_ltp_col in oi_df.columns:
+                pe_oi_first, pe_oi_last = oi_df[pe_oi_col].iloc[0], oi_df[pe_oi_col].iloc[-1]
+                pe_oi_change = pe_oi_last - pe_oi_first
+                pe_ltp_first, pe_ltp_last = oi_df[pe_ltp_col].iloc[0], oi_df[pe_ltp_col].iloc[-1]
+                pe_ltp_change = pe_ltp_last - pe_ltp_first
+                if pe_oi_change > 0 and pe_ltp_change > 0:
+                    oi_trend['pe_activity'] = 'Long Building'
+                elif pe_oi_change > 0 and pe_ltp_change <= 0:
+                    oi_trend['pe_activity'] = 'Short Building'
+                elif pe_oi_change < 0 and pe_ltp_change < 0:
+                    oi_trend['pe_activity'] = 'Short Covering'
+                elif pe_oi_change < 0 and pe_ltp_change >= 0:
+                    oi_trend['pe_activity'] = 'Long Unwinding'
+                oi_trend['pe_oi_pct'] = round((pe_oi_change / pe_oi_first * 100) if pe_oi_first > 0 else 0, 1)
+                oi_trend['pe_ltp_pct'] = round((pe_ltp_change / pe_ltp_first * 100) if pe_ltp_first > 0 else 0, 1)
+
+            # Support status (from PE activity): PE Short Building = Support Building
+            ce_act = oi_trend['ce_activity']
+            pe_act = oi_trend['pe_activity']
+            if pe_act == 'Short Building':
+                oi_trend['support_status'] = 'Building Strong'
+            elif pe_act == 'Long Building':
+                oi_trend['support_status'] = 'Building (Bearish bets rising)'
+            elif pe_act == 'Short Covering':
+                oi_trend['support_status'] = 'Breaking'
+            elif pe_act == 'Long Unwinding':
+                oi_trend['support_status'] = 'Weakening'
+
+            # Resistance status (from CE activity): CE Short Building = Resistance Building
+            if ce_act == 'Short Building':
+                oi_trend['resistance_status'] = 'Building Strong'
+            elif ce_act == 'Long Building':
+                oi_trend['resistance_status'] = 'Building (Bullish bets rising)'
+            elif ce_act == 'Short Covering':
+                oi_trend['resistance_status'] = 'Breaking'
+            elif ce_act == 'Long Unwinding':
+                oi_trend['resistance_status'] = 'Weakening'
+
+            # Overall OI trend signal
+            if pe_act == 'Short Building' and ce_act in ['Short Covering', 'Long Unwinding']:
+                oi_trend['signal'] = 'Bullish'
+            elif ce_act == 'Short Building' and pe_act in ['Short Covering', 'Long Unwinding']:
+                oi_trend['signal'] = 'Bearish'
+            elif pe_act == 'Short Building' and ce_act == 'Short Building':
+                oi_trend['signal'] = 'Range'
+            elif ce_act == 'Short Covering' and pe_act == 'Short Covering':
+                oi_trend['signal'] = 'Volatile'
+            elif pe_act == 'Short Building' or ce_act in ['Short Covering', 'Long Unwinding']:
+                oi_trend['signal'] = 'Mildly Bullish'
+            elif ce_act == 'Short Building' or pe_act in ['Short Covering', 'Long Unwinding']:
+                oi_trend['signal'] = 'Mildly Bearish'
+
+            # ChgOI trend
+            if len(chgoi_hist) >= 3:
+                chgoi_df = pd.DataFrame(chgoi_hist)
+                ce_chgoi_col, pe_chgoi_col = f'{atm_s}_CE', f'{atm_s}_PE'
+                if ce_chgoi_col in chgoi_df.columns and pe_chgoi_col in chgoi_df.columns:
+                    oi_trend['ce_chgoi'] = int(chgoi_df[ce_chgoi_col].iloc[-1])
+                    oi_trend['pe_chgoi'] = int(chgoi_df[pe_chgoi_col].iloc[-1])
+                    oi_trend['ce_chgoi_trend'] = 'Increasing' if chgoi_df[ce_chgoi_col].iloc[-1] > chgoi_df[ce_chgoi_col].iloc[0] else 'Decreasing'
+                    oi_trend['pe_chgoi_trend'] = 'Increasing' if chgoi_df[pe_chgoi_col].iloc[-1] > chgoi_df[pe_chgoi_col].iloc[0] else 'Decreasing'
+    except Exception:
+        pass
+
+    # OI Trend scoring
+    oi_sig = oi_trend.get('signal', 'Neutral')
+    if oi_sig == 'Bullish':
+        score += 1
+        reasons.append(f"OI Trend: Bullish (Sup Building + Res Breaking)")
+    elif oi_sig == 'Mildly Bullish':
+        score += 1
+        reasons.append(f"OI Trend: Mildly Bullish (Sup:{oi_trend['support_status']} | Res:{oi_trend['resistance_status']})")
+    elif oi_sig == 'Bearish':
+        score -= 1
+        reasons.append(f"OI Trend: Bearish (Res Building + Sup Breaking)")
+    elif oi_sig == 'Mildly Bearish':
+        score -= 1
+        reasons.append(f"OI Trend: Mildly Bearish (Sup:{oi_trend['support_status']} | Res:{oi_trend['resistance_status']})")
+    elif oi_sig == 'Range':
+        reasons.append("OI Trend: Range (Both Support & Resistance Building)")
+    elif oi_sig == 'Volatile':
+        reasons.append("OI Trend: Volatile (Both Covering)")
+
     # === DETERMINE SIGNAL ===
     abs_score = abs(score)
     near_support = any('Support' in loc for loc in location)
@@ -3254,6 +3373,7 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         'confidence': confidence,
         'reasons': reasons,
         'market_bias': market_bias,
+        'oi_trend': oi_trend,
     }
 
 def send_master_signal_telegram(result, underlying_price):
@@ -3303,7 +3423,7 @@ def send_master_signal_telegram(result, underlying_price):
 
 ━━━ SIGNAL: <b>{result['signal']}</b> ━━━
 📊 Trade: <b>{result['trade_type']}</b>
-🎯 Confluence: <b>{result['abs_score']}/7 ({result['strength']})</b>
+🎯 Confluence: <b>{result['abs_score']}/8 ({result['strength']})</b>
 📈 Confidence: <b>{result['confidence']}%</b>
 
 <b>🕯 Candle:</b> {result['candle']['pattern']} ({result['candle']['direction']})
@@ -3330,6 +3450,12 @@ def send_master_signal_telegram(result, underlying_price):
 {align_text}
 
 <b>📉 VIX:</b> {vix.get('vix', 'N/A')} ({vix.get('direction', 'Unknown')})
+
+<b>📊 OI TREND (ATM {result.get('oi_trend', {}).get('atm_strike', 'N/A')}):</b>
+  CE: {result.get('oi_trend', {}).get('ce_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('ce_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('ce_ltp_pct', 0):+.1f}%)
+  PE: {result.get('oi_trend', {}).get('pe_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('pe_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('pe_ltp_pct', 0):+.1f}%)
+  Support: {result.get('oi_trend', {}).get('support_status', 'N/A')} | Resistance: {result.get('oi_trend', {}).get('resistance_status', 'N/A')}
+  Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
@@ -5353,7 +5479,7 @@ def main():
                     <div style="background:{sig_color}20;padding:25px;border-radius:15px;border:3px solid {sig_color};text-align:center;margin-bottom:15px;">
                         <h1 style="color:{sig_color};margin:0;font-size:2.5em;">{master['signal']}</h1>
                         <h2 style="color:white;margin:5px 0;">{master['trade_type']}</h2>
-                        <h3 style="color:{sig_color};margin:5px 0;">Confluence: {master['abs_score']}/7 ({master['strength']}) | Confidence: {master['confidence']}%</h3>
+                        <h3 style="color:{sig_color};margin:5px 0;">Confluence: {master['abs_score']}/8 ({master['strength']}) | Confidence: {master['confidence']}%</h3>
                         <div style="background:#33333380;border-radius:10px;height:14px;margin:10px auto;max-width:500px;">
                             <div style="background:{sig_color};border-radius:10px;height:14px;width:{master['confidence']}%;"></div>
                         </div>
@@ -5453,6 +5579,55 @@ def main():
                         st.markdown("#### 📋 Confluence Factors")
                         for reason in master['reasons']:
                             st.markdown(f"✔ {reason}")
+
+                    # === OI TREND ANALYSIS (below 3-col, above alignment) ===
+                    oi_t = master.get('oi_trend', {})
+                    if oi_t.get('atm_strike'):
+                        st.markdown("---")
+                        st.markdown(f"## 📊 OI Timeline Trend Analysis (ATM: {oi_t['atm_strike']})")
+                        ot_col1, ot_col2, ot_col3 = st.columns(3)
+                        with ot_col1:
+                            st.markdown("#### CE Activity (Resistance)")
+                            ce_act = oi_t.get('ce_activity', 'N/A')
+                            ce_color = '#ff8800' if ce_act == 'Long Building' else '#ff4444' if ce_act == 'Short Building' else '#00ff88' if ce_act == 'Short Covering' else '#888888'
+                            st.markdown(f'<div style="background:{ce_color}30;padding:10px;border-radius:8px;border-left:4px solid {ce_color};"><b style="color:{ce_color};font-size:16px;">CE: {ce_act}</b><br><span style="color:#aaa;">OI: {oi_t.get("ce_oi_pct", 0):+.1f}% | LTP: {oi_t.get("ce_ltp_pct", 0):+.1f}%</span><br><span style="color:#aaa;">ChgOI: {oi_t.get("ce_chgoi", 0):,} ({oi_t.get("ce_chgoi_trend", "N/A")})</span></div>', unsafe_allow_html=True)
+                            res_status = oi_t.get('resistance_status', 'N/A')
+                            res_clr = '#ff4444' if 'Building' in res_status else '#00ff88' if res_status in ['Breaking', 'Weakening'] else '#888'
+                            st.markdown(f'<div style="margin-top:8px;padding:8px;border-radius:6px;background:{res_clr}20;border-left:3px solid {res_clr};"><b style="color:{res_clr};">Resistance: {res_status}</b></div>', unsafe_allow_html=True)
+                        with ot_col2:
+                            st.markdown("#### PE Activity (Support)")
+                            pe_act = oi_t.get('pe_activity', 'N/A')
+                            pe_color = '#ff4444' if pe_act == 'Long Building' else '#00ff88' if pe_act == 'Short Building' else '#00cc66' if pe_act == 'Short Covering' else '#888888'
+                            st.markdown(f'<div style="background:{pe_color}30;padding:10px;border-radius:8px;border-left:4px solid {pe_color};"><b style="color:{pe_color};font-size:16px;">PE: {pe_act}</b><br><span style="color:#aaa;">OI: {oi_t.get("pe_oi_pct", 0):+.1f}% | LTP: {oi_t.get("pe_ltp_pct", 0):+.1f}%</span><br><span style="color:#aaa;">ChgOI: {oi_t.get("pe_chgoi", 0):,} ({oi_t.get("pe_chgoi_trend", "N/A")})</span></div>', unsafe_allow_html=True)
+                            sup_status = oi_t.get('support_status', 'N/A')
+                            sup_clr = '#00ff88' if 'Building' in sup_status else '#ff4444' if sup_status in ['Breaking', 'Weakening'] else '#888'
+                            st.markdown(f'<div style="margin-top:8px;padding:8px;border-radius:6px;background:{sup_clr}20;border-left:3px solid {sup_clr};"><b style="color:{sup_clr};">Support: {sup_status}</b></div>', unsafe_allow_html=True)
+                        with ot_col3:
+                            st.markdown("#### OI Trend Signal")
+                            oi_sig = oi_t.get('signal', 'Neutral')
+                            if 'Bullish' in oi_sig:
+                                sig_clr = '#00ff88'
+                            elif 'Bearish' in oi_sig:
+                                sig_clr = '#ff4444'
+                            elif oi_sig == 'Range':
+                                sig_clr = '#FFD700'
+                            elif oi_sig == 'Volatile':
+                                sig_clr = '#FFA500'
+                            else:
+                                sig_clr = '#888888'
+                            st.markdown(f'<div style="background:{sig_clr}30;padding:15px;border-radius:10px;border:2px solid {sig_clr};text-align:center;"><b style="color:{sig_clr};font-size:20px;">{oi_sig.upper()}</b><br><span style="color:#aaa;">CE: {oi_t.get("ce_activity", "N/A")} | PE: {oi_t.get("pe_activity", "N/A")}</span></div>', unsafe_allow_html=True)
+                            st.markdown("")
+                            st.markdown(f"**Interpretation:**")
+                            if 'Bullish' in oi_sig:
+                                st.success("Support building + Resistance weakening/breaking = Upside expected")
+                            elif 'Bearish' in oi_sig:
+                                st.error("Resistance building + Support weakening/breaking = Downside expected")
+                            elif oi_sig == 'Range':
+                                st.warning("Both support & resistance building = Sideways/Range-bound")
+                            elif oi_sig == 'Volatile':
+                                st.warning("Both covering = High volatility expected, breakout imminent")
+                            else:
+                                st.info("Insufficient OI trend data")
 
                     # === FULL ALIGNMENT TABLE (below the 3-col section) ===
                     st.markdown("---")
