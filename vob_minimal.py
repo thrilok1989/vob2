@@ -2883,6 +2883,168 @@ def get_candle_location(price, support_levels, resistance_levels, gex_data, ob_d
             locations.append("Inside Bearish OB")
     return locations if locations else ["Middle (No key level)"]
 
+def calculate_vidya(df, length=10, momentum=20, band_distance=2.0):
+    """Calculate VIDYA indicator with trend detection (ported from Pine Script)."""
+    if df is None or df.empty or len(df) < momentum + 15:
+        return {'trend': 'Unknown', 'cross_up': False, 'cross_down': False,
+                'buy_vol': 0, 'sell_vol': 0, 'delta_pct': 0, 'smoothed_last': 0}
+    src = df['close'].values.astype(float)
+    opens = df['open'].values.astype(float)
+    n = len(src)
+    alpha = 2 / (length + 1)
+    v = np.zeros(n)
+    v[0] = src[0]
+    for i in range(1, n):
+        start = max(0, i - momentum + 1)
+        changes = np.diff(src[start:i+1])
+        if len(changes) == 0:
+            v[i] = v[i-1]
+            continue
+        pos_sum = float(np.sum(changes[changes >= 0]))
+        neg_sum = float(np.sum(-changes[changes < 0]))
+        total = pos_sum + neg_sum
+        abs_cmo = abs(100 * (pos_sum - neg_sum) / total) if total > 0 else 0
+        v[i] = alpha * abs_cmo / 100 * src[i] + (1 - alpha * abs_cmo / 100) * v[i-1]
+    vidya_smooth = pd.Series(v).rolling(15, min_periods=1).mean().values
+    prev_close = np.roll(src, 1)
+    prev_close[0] = src[0]
+    tr = np.maximum(df['high'].values.astype(float) - df['low'].values.astype(float),
+                    np.maximum(np.abs(df['high'].values.astype(float) - prev_close),
+                              np.abs(df['low'].values.astype(float) - prev_close)))
+    atr = pd.Series(tr).rolling(200, min_periods=1).mean().values
+    upper = vidya_smooth + atr * band_distance
+    lower = vidya_smooth - atr * band_distance
+    is_up = np.zeros(n, dtype=bool)
+    for i in range(1, n):
+        if src[i] > upper[i]:
+            is_up[i] = True
+        elif src[i] < lower[i]:
+            is_up[i] = False
+        else:
+            is_up[i] = is_up[i-1]
+    smoothed = np.where(is_up, lower, upper)
+    cross_up = bool(not is_up[-2] and is_up[-1]) if n > 1 else False
+    cross_down = bool(is_up[-2] and not is_up[-1]) if n > 1 else False
+    # Delta volume since last trend cross
+    buy_vol, sell_vol = 0.0, 0.0
+    vol = df['volume'].values.astype(float)
+    last_cross = 0
+    for i in range(n - 1, 0, -1):
+        if is_up[i] != is_up[i - 1]:
+            last_cross = i
+            break
+    for i in range(last_cross, n):
+        if src[i] > opens[i]:
+            buy_vol += vol[i]
+        elif src[i] < opens[i]:
+            sell_vol += vol[i]
+    avg = (buy_vol + sell_vol) / 2 if (buy_vol + sell_vol) > 0 else 1
+    delta_pct = (buy_vol - sell_vol) / avg * 100
+    return {
+        'trend': 'Bullish' if is_up[-1] else 'Bearish',
+        'smoothed_last': round(float(smoothed[-1]), 2),
+        'cross_up': cross_up, 'cross_down': cross_down,
+        'buy_vol': buy_vol, 'sell_vol': sell_vol,
+        'delta_pct': round(delta_pct, 1),
+    }
+
+def calculate_htf_sr(df):
+    """Calculate Higher Timeframe Support/Resistance from price action pivots.
+    Resamples 1-min data to 15m, 1h, 4h and finds pivot highs/lows."""
+    if df is None or df.empty or len(df) < 60:
+        return {'levels': [], 'support': [], 'resistance': []}
+    levels = []
+    timeframes = [('15m', '15min', 4), ('1h', '1h', 5), ('4h', '4h', 5)]
+    for tf_label, resample_rule, pivot_len in timeframes:
+        try:
+            ohlcv = df.set_index('datetime').resample(resample_rule).agg({
+                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+            }).dropna()
+            if len(ohlcv) < pivot_len * 2 + 1:
+                continue
+            highs = ohlcv['high'].values.astype(float)
+            lows = ohlcv['low'].values.astype(float)
+            for i in range(pivot_len, len(highs) - pivot_len):
+                if all(highs[i] >= highs[i - j] and highs[i] >= highs[i + j] for j in range(1, pivot_len + 1)):
+                    levels.append({'type': 'Resistance', 'level': float(highs[i]), 'tf': tf_label})
+            for i in range(pivot_len, len(lows) - pivot_len):
+                if all(lows[i] <= lows[i - j] and lows[i] <= lows[i + j] for j in range(1, pivot_len + 1)):
+                    levels.append({'type': 'Support', 'level': float(lows[i]), 'tf': tf_label})
+        except Exception:
+            continue
+    # Deduplicate nearby levels (within 0.05%)
+    if levels:
+        levels.sort(key=lambda x: x['level'])
+        filtered = [levels[0]]
+        tf_rank = {'4h': 3, '1h': 2, '15m': 1}
+        for lvl in levels[1:]:
+            if abs(lvl['level'] - filtered[-1]['level']) / max(filtered[-1]['level'], 1) * 100 > 0.05:
+                filtered.append(lvl)
+            elif tf_rank.get(lvl['tf'], 0) > tf_rank.get(filtered[-1]['tf'], 0):
+                filtered[-1] = lvl
+        levels = filtered
+    support = [l for l in levels if l['type'] == 'Support']
+    resistance = [l for l in levels if l['type'] == 'Resistance']
+    return {'levels': levels, 'support': support, 'resistance': resistance}
+
+def calculate_delta_volume(df):
+    """Calculate delta volume (buy vs sell) per bar and cumulative."""
+    if df is None or df.empty:
+        return None
+    rdf = df[['datetime', 'open', 'high', 'low', 'close', 'volume']].copy()
+    rdf['is_green'] = rdf['close'] > rdf['open']
+    rdf['buy_vol'] = np.where(rdf['is_green'], rdf['volume'], 0)
+    rdf['sell_vol'] = np.where(~rdf['is_green'], rdf['volume'], 0)
+    rdf['delta'] = rdf['buy_vol'] - rdf['sell_vol']
+    rdf['cum_delta'] = rdf['delta'].cumsum()
+    rdf['delta_ma'] = rdf['delta'].rolling(10, min_periods=1).mean()
+    delta_std = rdf['delta'].rolling(20, min_periods=5).std().fillna(0)
+    rdf['spike_up'] = rdf['delta'] > rdf['delta_ma'] + 1.5 * delta_std
+    rdf['spike_down'] = rdf['delta'] < rdf['delta_ma'] - 1.5 * delta_std
+    return rdf
+
+def detect_hvp(df, left_bars=15, right_bars=15, vol_filter=2.0):
+    """Detect High Volume Pivot points."""
+    if df is None or df.empty or len(df) < left_bars + right_bars + 1:
+        return {'bullish_hvp': [], 'bearish_hvp': []}
+    highs = df['high'].values.astype(float)
+    lows = df['low'].values.astype(float)
+    volumes = df['volume'].values.astype(float)
+    times = df['datetime'].tolist()
+    bullish_hvp, bearish_hvp = [], []
+    for i in range(left_bars, len(df) - right_bars):
+        vol_sum = np.sum(volumes[max(0, i - left_bars):i + right_bars + 1])
+        vol_avg = np.mean(volumes[max(0, i - 50):i + 1]) * (left_bars * 2) if i >= 5 else vol_sum
+        is_high_vol = vol_sum > vol_avg * vol_filter
+        if not is_high_vol:
+            continue
+        is_ph = all(highs[i] >= highs[i - j] and highs[i] >= highs[i + j] for j in range(1, min(left_bars, right_bars) + 1))
+        is_pl = all(lows[i] <= lows[i - j] and lows[i] <= lows[i + j] for j in range(1, min(left_bars, right_bars) + 1))
+        if is_ph:
+            bearish_hvp.append({'price': float(highs[i]), 'time': times[i], 'volume': float(vol_sum)})
+        if is_pl:
+            bullish_hvp.append({'price': float(lows[i]), 'time': times[i], 'volume': float(vol_sum)})
+    return {'bullish_hvp': bullish_hvp[-5:], 'bearish_hvp': bearish_hvp[-5:]}
+
+def detect_ltp_trap(df, delta_length=10, delta_thresh=1.5):
+    """Detect LTP Trap signals (VWAP + delta based)."""
+    if df is None or df.empty or len(df) < delta_length + 5:
+        return {'buy_trap': False, 'sell_trap': False, 'vwap': 0, 'delta_ma': 0, 'price_vs_vwap': 'N/A'}
+    tp = (df['high'] + df['low'] + df['close']) / 3
+    cum_tp_vol = (tp * df['volume']).cumsum()
+    cum_vol = df['volume'].cumsum()
+    vwap = float((cum_tp_vol / cum_vol).iloc[-1])
+    delta = df['close'] - df['open']
+    delta_ma = float(delta.ewm(span=delta_length, adjust=False).mean().iloc[-1])
+    last_close, last_open = float(df['close'].iloc[-1]), float(df['open'].iloc[-1])
+    buy_trap = last_close < last_open and last_close > vwap and delta_ma > delta_thresh
+    sell_trap = last_close > last_open and last_close < vwap and delta_ma < -delta_thresh
+    return {
+        'buy_trap': buy_trap, 'sell_trap': sell_trap,
+        'vwap': round(vwap, 2), 'delta_ma': round(delta_ma, 4),
+        'price_vs_vwap': 'Above' if last_close > vwap else 'Below',
+    }
+
 def fetch_alignment_data(api):
     """Fetch candle data for SENSEX, BANKNIFTY, NIFTY IT, RELIANCE, ICICI, VIX.
     Detect candle patterns, compute 10m/1h/4h sentiment for each."""
@@ -2939,10 +3101,14 @@ def fetch_alignment_data(api):
                 prev_ltp = adf.iloc[-2]['close'] if len(adf) >= 2 else ltp
                 trend = 'Bullish' if ltp > prev_ltp else 'Bearish' if ltp < prev_ltp else 'Flat'
 
-                # % change series from day open for line chart
-                day_open = adf.iloc[0]['open']
-                pct_series_time = adf['datetime'].tolist()
-                pct_series_vals = [((c - day_open) / day_open) * 100 if day_open > 0 else 0 for c in adf['close'].tolist()]
+                # % change series from day open for line chart (today only)
+                today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+                adf_today = adf[adf['datetime'].dt.date == today_ist]
+                if adf_today.empty:
+                    adf_today = adf  # fallback if no today data
+                day_open = adf_today.iloc[0]['open']
+                pct_series_time = adf_today['datetime'].tolist()
+                pct_series_vals = [((c - day_open) / day_open) * 100 if day_open > 0 else 0 for c in adf_today['close'].tolist()]
 
                 alignment[name] = {
                     'ltp': ltp, 'trend': trend,
@@ -3055,9 +3221,13 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
             s10, p10 = _nifty_sentiment(df.tail(10))
             s1h, p1h = _nifty_sentiment(df.tail(60))
             s4h, p4h = _nifty_sentiment(df.tail(240))
-            nifty_day_open = df.iloc[0]['open']
-            nifty_pct_time = df['datetime'].tolist()
-            nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df['close'].tolist()]
+            today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+            df_today = df[df['datetime'].dt.date == today_ist]
+            if df_today.empty:
+                df_today = df  # fallback
+            nifty_day_open = df_today.iloc[0]['open']
+            nifty_pct_time = df_today['datetime'].tolist()
+            nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df_today['close'].tolist()]
             alignment['NIFTY 50'] = {
                 'ltp': df.iloc[-1]['close'], 'trend': nifty_cp['direction'],
                 'candle_pattern': nifty_cp['pattern'], 'candle_dir': nifty_cp['direction'],
@@ -3300,6 +3470,100 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     elif oi_sig == 'Volatile':
         reasons.append("OI Trend: Volatile (Both Covering)")
 
+    # 9. VIDYA Trend (from Pine Script)
+    vidya_data = calculate_vidya(df)
+    if vidya_data['trend'] == 'Bullish' and candle['direction'] == 'Bullish':
+        score += 1
+        reasons.append(f"VIDYA Trend: Bullish (Delta: {vidya_data['delta_pct']:+.0f}%)")
+    elif vidya_data['trend'] == 'Bearish' and candle['direction'] == 'Bearish':
+        score -= 1
+        reasons.append(f"VIDYA Trend: Bearish (Delta: {vidya_data['delta_pct']:+.0f}%)")
+    elif vidya_data['trend'] != 'Unknown':
+        reasons.append(f"VIDYA Trend: {vidya_data['trend']} (Divergence from candle)")
+    if vidya_data.get('cross_up'):
+        reasons.append("VIDYA: Fresh Bullish Cross ▲")
+    elif vidya_data.get('cross_down'):
+        reasons.append("VIDYA: Fresh Bearish Cross ▼")
+
+    # 10. VOB + HTF S&R (Price Action Support/Resistance)
+    vob_blocks = getattr(st.session_state, '_vob_blocks', None)
+    htf_sr = calculate_htf_sr(df)
+    hvp_data = detect_hvp(df)
+    ltp_trap = detect_ltp_trap(df)
+    delta_vol_df = calculate_delta_volume(df)
+
+    # VOB proximity check
+    near_vob_support = False
+    near_vob_resistance = False
+    vob_support_levels = []
+    vob_resistance_levels = []
+    if vob_blocks:
+        for b in vob_blocks.get('bullish', []):
+            vob_support_levels.append(b)
+            if b['lower'] <= underlying_price <= b['upper'] * 1.002:
+                near_vob_support = True
+        for b in vob_blocks.get('bearish', []):
+            vob_resistance_levels.append(b)
+            if b['lower'] * 0.998 <= underlying_price <= b['upper']:
+                near_vob_resistance = True
+
+    # HTF S&R proximity
+    htf_support_near = [l for l in htf_sr.get('support', []) if abs(underlying_price - l['level']) / underlying_price * 100 < 0.2]
+    htf_resistance_near = [l for l in htf_sr.get('resistance', []) if abs(underlying_price - l['level']) / underlying_price * 100 < 0.2]
+
+    # Scoring: Price action S&R confirmation
+    if near_vob_support and score > 0:
+        score += 1
+        reasons.append("VOB: At Bullish Volume Zone (Support)")
+    elif near_vob_resistance and score < 0:
+        score -= 1
+        reasons.append("VOB: At Bearish Volume Zone (Resistance)")
+    elif htf_support_near and score > 0:
+        tfs = ', '.join(set(l['tf'] for l in htf_support_near))
+        score += 1
+        reasons.append(f"HTF S&R: Near Support ({tfs})")
+    elif htf_resistance_near and score < 0:
+        tfs = ', '.join(set(l['tf'] for l in htf_resistance_near))
+        score -= 1
+        reasons.append(f"HTF S&R: Near Resistance ({tfs})")
+    elif htf_support_near or htf_resistance_near or near_vob_support or near_vob_resistance:
+        parts = []
+        if near_vob_support:
+            parts.append("VOB Support")
+        if near_vob_resistance:
+            parts.append("VOB Resistance")
+        if htf_support_near:
+            parts.append(f"HTF Sup({','.join(set(l['tf'] for l in htf_support_near))})")
+        if htf_resistance_near:
+            parts.append(f"HTF Res({','.join(set(l['tf'] for l in htf_resistance_near))})")
+        reasons.append(f"Price Action S&R: {' | '.join(parts)}")
+
+    # LTP Trap signal
+    if ltp_trap.get('buy_trap'):
+        reasons.append(f"LTP Trap Buy (VWAP: ₹{ltp_trap['vwap']:.0f})")
+    elif ltp_trap.get('sell_trap'):
+        reasons.append(f"LTP Trap Sell (VWAP: ₹{ltp_trap['vwap']:.0f})")
+
+    # HVP near price
+    for hvp in hvp_data.get('bullish_hvp', []):
+        if abs(underlying_price - hvp['price']) / underlying_price * 100 < 0.15:
+            reasons.append(f"HVP Support: ₹{hvp['price']:.0f}")
+            break
+    for hvp in hvp_data.get('bearish_hvp', []):
+        if abs(underlying_price - hvp['price']) / underlying_price * 100 < 0.15:
+            reasons.append(f"HVP Resistance: ₹{hvp['price']:.0f}")
+            break
+
+    # Delta volume trend
+    delta_trend = 'Neutral'
+    if delta_vol_df is not None and len(delta_vol_df) > 0:
+        cum_delta_last = delta_vol_df['cum_delta'].iloc[-1]
+        delta_ma_last = delta_vol_df['delta_ma'].iloc[-1]
+        if cum_delta_last > 0 and delta_ma_last > 0:
+            delta_trend = 'Bullish'
+        elif cum_delta_last < 0 and delta_ma_last < 0:
+            delta_trend = 'Bearish'
+
     # === DETERMINE SIGNAL ===
     abs_score = abs(score)
     near_support = any('Support' in loc for loc in location)
@@ -3374,6 +3638,15 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         'reasons': reasons,
         'market_bias': market_bias,
         'oi_trend': oi_trend,
+        'vidya': vidya_data,
+        'htf_sr': htf_sr,
+        'vob_blocks': vob_blocks,
+        'hvp': hvp_data,
+        'ltp_trap': ltp_trap,
+        'delta_vol_df': delta_vol_df,
+        'delta_trend': delta_trend,
+        'vob_support_levels': vob_support_levels,
+        'vob_resistance_levels': vob_resistance_levels,
     }
 
 def send_master_signal_telegram(result, underlying_price):
@@ -3423,7 +3696,7 @@ def send_master_signal_telegram(result, underlying_price):
 
 ━━━ SIGNAL: <b>{result['signal']}</b> ━━━
 📊 Trade: <b>{result['trade_type']}</b>
-🎯 Confluence: <b>{result['abs_score']}/8 ({result['strength']})</b>
+🎯 Confluence: <b>{result['abs_score']}/10 ({result['strength']})</b>
 📈 Confidence: <b>{result['confidence']}%</b>
 
 <b>🕯 Candle:</b> {result['candle']['pattern']} ({result['candle']['direction']})
@@ -3456,6 +3729,9 @@ def send_master_signal_telegram(result, underlying_price):
   PE: {result.get('oi_trend', {}).get('pe_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('pe_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('pe_ltp_pct', 0):+.1f}%)
   Support: {result.get('oi_trend', {}).get('support_status', 'N/A')} | Resistance: {result.get('oi_trend', {}).get('resistance_status', 'N/A')}
   Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
+
+<b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
+<b>📊 Delta Vol:</b> {result.get('delta_trend', 'N/A')} | VWAP: ₹{result.get('ltp_trap', {}).get('vwap', 0):.0f} ({result.get('ltp_trap', {}).get('price_vs_vwap', 'N/A')})
 
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
@@ -3746,6 +4022,8 @@ def main():
                 _, vob_blocks_for_chart = vob_detector.get_sr_levels(df)
             except Exception:
                 vob_blocks_for_chart = None
+        if vob_blocks_for_chart:
+            st.session_state._vob_blocks = vob_blocks_for_chart
         poc_data_for_chart = None
         if not df.empty and len(df) > 100:
             try:
@@ -5479,7 +5757,7 @@ def main():
                     <div style="background:{sig_color}20;padding:25px;border-radius:15px;border:3px solid {sig_color};text-align:center;margin-bottom:15px;">
                         <h1 style="color:{sig_color};margin:0;font-size:2.5em;">{master['signal']}</h1>
                         <h2 style="color:white;margin:5px 0;">{master['trade_type']}</h2>
-                        <h3 style="color:{sig_color};margin:5px 0;">Confluence: {master['abs_score']}/8 ({master['strength']}) | Confidence: {master['confidence']}%</h3>
+                        <h3 style="color:{sig_color};margin:5px 0;">Confluence: {master['abs_score']}/10 ({master['strength']}) | Confidence: {master['confidence']}%</h3>
                         <div style="background:#33333380;border-radius:10px;height:14px;margin:10px auto;max-width:500px;">
                             <div style="background:{sig_color};border-radius:10px;height:14px;width:{master['confidence']}%;"></div>
                         </div>
@@ -5628,6 +5906,107 @@ def main():
                                 st.warning("Both covering = High volatility expected, breakout imminent")
                             else:
                                 st.info("Insufficient OI trend data")
+
+                    # === VOB / VIDYA / HTF S&R / DELTA VOLUME ===
+                    st.markdown("---")
+                    st.markdown("## 📊 Price Action Analysis (VOB / VIDYA / HTF S&R)")
+                    pa_col1, pa_col2, pa_col3 = st.columns(3)
+
+                    with pa_col1:
+                        st.markdown("#### 🔮 VIDYA Trend")
+                        vidya = master.get('vidya', {})
+                        v_trend = vidya.get('trend', 'Unknown')
+                        v_color = '#00ff88' if v_trend == 'Bullish' else '#ff4444' if v_trend == 'Bearish' else '#888'
+                        cross_text = ''
+                        if vidya.get('cross_up'):
+                            cross_text = ' | Fresh ▲ Cross'
+                        elif vidya.get('cross_down'):
+                            cross_text = ' | Fresh ▼ Cross'
+                        st.markdown(f'<div style="background:{v_color}30;padding:12px;border-radius:8px;border-left:4px solid {v_color};"><b style="color:{v_color};font-size:18px;">VIDYA: {v_trend}{cross_text}</b><br><span style="color:#aaa;">Smoothed: ₹{vidya.get("smoothed_last", 0):.0f} | Delta Vol: {vidya.get("delta_pct", 0):+.0f}%</span><br><span style="color:#aaa;">Buy Vol: {vidya.get("buy_vol", 0):,.0f} | Sell Vol: {vidya.get("sell_vol", 0):,.0f}</span></div>', unsafe_allow_html=True)
+
+                        st.markdown("#### 🔄 LTP Trap")
+                        trap = master.get('ltp_trap', {})
+                        if trap.get('buy_trap'):
+                            st.success(f"LTP Trap BUY detected | VWAP: ₹{trap.get('vwap', 0):.0f}")
+                        elif trap.get('sell_trap'):
+                            st.error(f"LTP Trap SELL detected | VWAP: ₹{trap.get('vwap', 0):.0f}")
+                        else:
+                            st.info(f"No LTP Trap | VWAP: ₹{trap.get('vwap', 0):.0f} | Price {trap.get('price_vs_vwap', 'N/A')}")
+
+                    with pa_col2:
+                        st.markdown("#### 🟢🔴 VOB Zones")
+                        vob_b = master.get('vob_blocks', {})
+                        if vob_b:
+                            for b in vob_b.get('bullish', [])[-3:]:
+                                st.markdown(f'<div style="background:#00ff8820;padding:6px;border-radius:6px;border-left:3px solid #00ff88;font-size:13px;margin-bottom:4px;"><b style="color:#00ff88;">Support</b> ₹{b["lower"]:.0f} - ₹{b["upper"]:.0f} | Vol: {b.get("volume", 0):,.0f}</div>', unsafe_allow_html=True)
+                            for b in vob_b.get('bearish', [])[-3:]:
+                                st.markdown(f'<div style="background:#ff444420;padding:6px;border-radius:6px;border-left:3px solid #ff4444;font-size:13px;margin-bottom:4px;"><b style="color:#ff4444;">Resistance</b> ₹{b["lower"]:.0f} - ₹{b["upper"]:.0f} | Vol: {b.get("volume", 0):,.0f}</div>', unsafe_allow_html=True)
+                        else:
+                            st.info("VOB data loading...")
+
+                        st.markdown("#### 🟢🔴 HVP (High Volume Pivots)")
+                        hvp = master.get('hvp', {})
+                        for h in hvp.get('bullish_hvp', [])[-3:]:
+                            st.markdown(f'<span style="color:#00ff88;">🟢 Support ₹{h["price"]:.0f}</span>', unsafe_allow_html=True)
+                        for h in hvp.get('bearish_hvp', [])[-3:]:
+                            st.markdown(f'<span style="color:#ff4444;">🔴 Resistance ₹{h["price"]:.0f}</span>', unsafe_allow_html=True)
+                        if not hvp.get('bullish_hvp') and not hvp.get('bearish_hvp'):
+                            st.info("No HVP detected")
+
+                    with pa_col3:
+                        st.markdown("#### 📐 HTF S&R (Price Pivots)")
+                        htf = master.get('htf_sr', {})
+                        htf_levels = htf.get('levels', [])
+                        if htf_levels:
+                            current_p = option_data['underlying']
+                            # Show nearest 3 support and 3 resistance
+                            sup_levels = sorted([l for l in htf_levels if l['type'] == 'Support' and l['level'] < current_p], key=lambda x: -x['level'])[:3]
+                            res_levels = sorted([l for l in htf_levels if l['type'] == 'Resistance' and l['level'] > current_p], key=lambda x: x['level'])[:3]
+                            for r in res_levels:
+                                st.markdown(f'<div style="background:#ff444418;padding:4px 8px;border-radius:4px;margin-bottom:3px;font-size:13px;"><b style="color:#ff4444;">R</b> ₹{r["level"]:.0f} <span style="color:#888;">({r["tf"]})</span></div>', unsafe_allow_html=True)
+                            st.markdown(f'<div style="background:#FFD70020;padding:4px 8px;border-radius:4px;margin-bottom:3px;text-align:center;"><b style="color:#FFD700;">PRICE ₹{current_p:.0f}</b></div>', unsafe_allow_html=True)
+                            for s in sup_levels:
+                                st.markdown(f'<div style="background:#00ff8818;padding:4px 8px;border-radius:4px;margin-bottom:3px;font-size:13px;"><b style="color:#00ff88;">S</b> ₹{s["level"]:.0f} <span style="color:#888;">({s["tf"]})</span></div>', unsafe_allow_html=True)
+                        else:
+                            st.info("HTF pivot data loading...")
+
+                        st.markdown(f"#### 📊 Delta Volume Trend")
+                        d_trend = master.get('delta_trend', 'Neutral')
+                        dt_clr = '#00ff88' if d_trend == 'Bullish' else '#ff4444' if d_trend == 'Bearish' else '#888'
+                        st.markdown(f'<div style="background:{dt_clr}25;padding:8px;border-radius:6px;border-left:3px solid {dt_clr};"><b style="color:{dt_clr};">{d_trend}</b></div>', unsafe_allow_html=True)
+
+                    # Delta Volume Chart
+                    delta_df = master.get('delta_vol_df')
+                    if delta_df is not None and len(delta_df) > 0:
+                        st.markdown("### 📊 Delta Volume (Buy vs Sell)")
+                        fig_delta = go.Figure()
+                        colors = ['#00ff88' if d > 0 else '#ff4444' for d in delta_df['delta']]
+                        fig_delta.add_trace(go.Bar(
+                            x=delta_df['datetime'], y=delta_df['delta'],
+                            marker_color=colors, name='Delta Volume', opacity=0.7,
+                        ))
+                        fig_delta.add_trace(go.Scatter(
+                            x=delta_df['datetime'], y=delta_df['delta_ma'],
+                            mode='lines', name='Delta MA(10)',
+                            line=dict(color='#FFD700', width=2),
+                        ))
+                        fig_delta.add_trace(go.Scatter(
+                            x=delta_df['datetime'], y=delta_df['cum_delta'],
+                            mode='lines', name='Cumulative Delta',
+                            line=dict(color='#00BFFF', width=2, dash='dot'),
+                            yaxis='y2',
+                        ))
+                        fig_delta.update_layout(
+                            template='plotly_dark', height=350,
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='Delta Volume'),
+                            yaxis2=dict(title='Cumulative Delta', overlaying='y', side='right', showgrid=False),
+                            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+                            hovermode='x unified', barmode='relative',
+                        )
+                        fig_delta.add_hline(y=0, line_dash="solid", line_color="white", line_width=1, opacity=0.5)
+                        st.plotly_chart(fig_delta, use_container_width=True)
 
                     # === FULL ALIGNMENT TABLE (below the 3-col section) ===
                     st.markdown("---")
