@@ -2710,13 +2710,55 @@ def send_option_chain_signal(sa_result, underlying_price):
         pass
 
 def detect_candle_patterns(df, lookback=5):
-    """Detect candlestick patterns from last few candles."""
+    """Detect candlestick patterns from last few candles using Nifty price action chart."""
     if df is None or len(df) < lookback:
-        return {'pattern': 'Insufficient Data', 'direction': 'Neutral', 'details': {}}
+        return {'pattern': 'Insufficient Data', 'direction': 'Neutral', 'details': {}, 'candles': []}
     recent = df.tail(lookback).copy()
     last = recent.iloc[-1]
     prev = recent.iloc[-2] if len(recent) >= 2 else None
 
+    # Analyze each of the last candles
+    candle_list = []
+    for idx in range(len(recent)):
+        c = recent.iloc[idx]
+        c_body = abs(c['close'] - c['open'])
+        c_range = c['high'] - c['low']
+        c_body_ratio = c_body / c_range if c_range > 0 else 0
+        c_green = c['close'] > c['open']
+        c_upper = c['high'] - max(c['close'], c['open'])
+        c_lower = min(c['close'], c['open']) - c['low']
+        c_prev = recent.iloc[idx - 1] if idx > 0 else None
+
+        c_pattern = 'Normal'
+        if c_lower > c_body * 2 and c_upper < c_body * 0.5 and c_body_ratio < 0.4:
+            c_pattern = 'Hammer'
+        elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4:
+            c_pattern = 'Shooting Star' if not c_green else 'Inverted Hammer'
+        elif c_body_ratio < 0.1 and c_range > 0:
+            c_pattern = 'Doji'
+        elif c_prev is not None:
+            p_body = abs(c_prev['close'] - c_prev['open'])
+            p_green = c_prev['close'] > c_prev['open']
+            if c_green and not p_green and c_body > p_body and c['close'] > c_prev['open'] and c['open'] < c_prev['close']:
+                c_pattern = 'Bullish Engulfing'
+            elif not c_green and p_green and c_body > p_body and c['close'] < c_prev['open'] and c['open'] > c_prev['close']:
+                c_pattern = 'Bearish Engulfing'
+            elif c_body_ratio >= 0.6:
+                c_pattern = 'Strong Green' if c_green else 'Strong Red'
+        if c_pattern == 'Normal' and c_body_ratio >= 0.6:
+            c_pattern = 'Strong Green' if c_green else 'Strong Red'
+
+        candle_list.append({
+            'open': round(c['open'], 2), 'high': round(c['high'], 2),
+            'low': round(c['low'], 2), 'close': round(c['close'], 2),
+            'type': 'Bull' if c_green else 'Bear',
+            'pattern': c_pattern,
+            'body_ratio': round(c_body_ratio, 2),
+            'volume': int(c.get('volume', 0)),
+            'time': c.get('datetime', '').strftime('%H:%M') if hasattr(c.get('datetime', ''), 'strftime') else str(c.get('datetime', '')),
+        })
+
+    # Overall pattern from last candle
     body = abs(last['close'] - last['open'])
     total_range = last['high'] - last['low']
     body_ratio = body / total_range if total_range > 0 else 0
@@ -2727,19 +2769,15 @@ def detect_candle_patterns(df, lookback=5):
     pattern = 'No Pattern'
     direction = 'Neutral'
 
-    # Hammer: small body at top, long lower wick (>2x body)
     if lower_wick > body * 2 and upper_wick < body * 0.5 and body_ratio < 0.4:
         pattern = 'Hammer'
         direction = 'Bullish'
-    # Inverted Hammer / Shooting Star
     elif upper_wick > body * 2 and lower_wick < body * 0.5 and body_ratio < 0.4:
         pattern = 'Shooting Star' if not is_green else 'Inverted Hammer'
         direction = 'Bearish' if not is_green else 'Bullish'
-    # Doji: very small body
     elif body_ratio < 0.1 and total_range > 0:
         pattern = 'Doji'
         direction = 'Indecision'
-    # Engulfing patterns
     elif prev is not None:
         prev_body = abs(prev['close'] - prev['open'])
         prev_green = prev['close'] > prev['open']
@@ -2749,7 +2787,6 @@ def detect_candle_patterns(df, lookback=5):
         elif not is_green and prev_green and body > prev_body and last['close'] < prev['open'] and last['open'] > prev['close']:
             pattern = 'Bearish Engulfing'
             direction = 'Bearish'
-        # Strong candle: large body ratio
         elif body_ratio >= 0.6:
             pattern = 'Strong Green Candle' if is_green else 'Strong Red Candle'
             direction = 'Bullish' if is_green else 'Bearish'
@@ -2758,8 +2795,14 @@ def detect_candle_patterns(df, lookback=5):
         pattern = 'Strong Green Candle' if is_green else 'Strong Red Candle'
         direction = 'Bullish' if is_green else 'Bearish'
 
+    # Count bull/bear candles in last 5
+    bull_count = sum(1 for c in candle_list if c['type'] == 'Bull')
+    bear_count = sum(1 for c in candle_list if c['type'] == 'Bear')
+
     return {
         'pattern': pattern, 'direction': direction,
+        'candles': candle_list,
+        'bull_count': bull_count, 'bear_count': bear_count,
         'details': {
             'body_ratio': round(body_ratio, 2), 'is_green': is_green,
             'close': last['close'], 'open': last['open'],
@@ -2841,28 +2884,87 @@ def get_candle_location(price, support_levels, resistance_levels, gex_data, ob_d
     return locations if locations else ["Middle (No key level)"]
 
 def fetch_alignment_data(api):
-    """Fetch LTP for BANKNIFTY, NIFTY IT, RELIANCE, ICICI for alignment check."""
-    # Dhan security IDs: BANKNIFTY=25, NIFTY IT=30 (approx), RELIANCE=2885, ICICIBANK=4963
-    alignment = {}
+    """Fetch candle data for SENSEX, BANKNIFTY, NIFTY IT, RELIANCE, ICICI, VIX.
+    Detect candle patterns, compute 10m/1h/4h sentiment for each."""
+    # Dhan security IDs
     tickers = [
-        ('BANKNIFTY', '25', 'IDX_I'),
-        ('NIFTY IT', '30', 'IDX_I'),
-        ('RELIANCE', '2885', 'NSE_EQ'),
-        ('ICICIBANK', '4963', 'NSE_EQ'),
+        ('SENSEX', '51', 'BSE_EQ', 'INDEX'),
+        ('BANKNIFTY', '25', 'IDX_I', 'INDEX'),
+        ('NIFTY IT', '30', 'IDX_I', 'INDEX'),
+        ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY'),
+        ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY'),
+        ('INDIA VIX', '26', 'IDX_I', 'INDEX'),
     ]
-    for name, sec_id, seg in tickers:
+    alignment = {}
+    for name, sec_id, seg, inst in tickers:
         try:
-            resp = api.get_ltp_data(sec_id, seg)
-            if resp and 'data' in resp:
-                data = resp['data']
-                if isinstance(data, dict):
-                    for seg_key, items in data.items():
-                        if items:
-                            item = items[0] if isinstance(items, list) else items
-                            alignment[name] = {'ltp': item.get('last_price', 0)}
-                            break
+            # Fetch 1-min candle data (last 1 day)
+            data = api.get_intraday_data(security_id=sec_id, exchange_segment=seg, instrument=inst, interval="1", days_back=1)
+            if data and 'open' in data:
+                adf = process_candle_data(data, "1")
+                if adf.empty:
+                    alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
+                                       'candle_dir': 'N/A', 'candles': [],
+                                       'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
+                    continue
+
+                ltp = adf.iloc[-1]['close']
+                # Candle pattern detection
+                cp = detect_candle_patterns(adf, lookback=5)
+
+                # Multi-timeframe sentiment
+                def calc_sentiment(sub_df):
+                    if sub_df is None or len(sub_df) < 2:
+                        return 'N/A', 0
+                    first_close = sub_df.iloc[0]['close']
+                    last_close = sub_df.iloc[-1]['close']
+                    pct = ((last_close - first_close) / first_close) * 100 if first_close > 0 else 0
+                    green_count = sum(1 for _, r in sub_df.iterrows() if r['close'] > r['open'])
+                    bear_count = len(sub_df) - green_count
+                    if pct > 0.1 and green_count > bear_count:
+                        return 'Bullish', round(pct, 2)
+                    elif pct < -0.1 and bear_count > green_count:
+                        return 'Bearish', round(pct, 2)
+                    else:
+                        return 'Neutral', round(pct, 2)
+
+                # Last 10 minutes
+                s_10m, pct_10m = calc_sentiment(adf.tail(10))
+                # Last 60 minutes (1 hour)
+                s_1h, pct_1h = calc_sentiment(adf.tail(60))
+                # Last 240 minutes (4 hours)
+                s_4h, pct_4h = calc_sentiment(adf.tail(240))
+
+                # Overall trend from LTP
+                prev_ltp = adf.iloc[-2]['close'] if len(adf) >= 2 else ltp
+                trend = 'Bullish' if ltp > prev_ltp else 'Bearish' if ltp < prev_ltp else 'Flat'
+
+                # % change series from day open for line chart
+                day_open = adf.iloc[0]['open']
+                pct_series_time = adf['datetime'].tolist()
+                pct_series_vals = [((c - day_open) / day_open) * 100 if day_open > 0 else 0 for c in adf['close'].tolist()]
+
+                alignment[name] = {
+                    'ltp': ltp, 'trend': trend,
+                    'candle_pattern': cp['pattern'], 'candle_dir': cp['direction'],
+                    'candles': cp.get('candles', []),
+                    'bull_count': cp.get('bull_count', 0), 'bear_count': cp.get('bear_count', 0),
+                    'sentiment_10m': s_10m, 'pct_10m': pct_10m,
+                    'sentiment_1h': s_1h, 'pct_1h': pct_1h,
+                    'sentiment_4h': s_4h, 'pct_4h': pct_4h,
+                    'day_high': adf['high'].max(), 'day_low': adf['low'].min(),
+                    'open': adf.iloc[0]['open'],
+                    'pct_series_time': pct_series_time,
+                    'pct_series_vals': pct_series_vals,
+                }
+            else:
+                alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
+                                   'candle_dir': 'N/A', 'candles': [],
+                                   'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
         except Exception:
-            alignment[name] = {'ltp': 0}
+            alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
+                               'candle_dir': 'N/A', 'candles': [],
+                               'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
     return alignment
 
 def fetch_vix_data(api):
@@ -2920,7 +3022,7 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     except Exception:
         pass
 
-    # 7. Index Alignment (with caching)
+    # 7. Index & Stock Alignment (with caching - fetch every 120s to reduce API calls)
     alignment = {}
     try:
         if 'alignment_data' not in st.session_state:
@@ -2928,23 +3030,57 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
             st.session_state.alignment_last_fetch = None
         ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
         should_fetch = st.session_state.alignment_last_fetch is None or \
-            (ist_now - st.session_state.alignment_last_fetch).total_seconds() > 60
+            (ist_now - st.session_state.alignment_last_fetch).total_seconds() > 120
         if should_fetch:
             alignment = fetch_alignment_data(api)
             if alignment:
-                # Store previous for trend
-                st.session_state.alignment_prev = st.session_state.alignment_data.copy()
                 st.session_state.alignment_data = alignment
                 st.session_state.alignment_last_fetch = ist_now
         alignment = st.session_state.alignment_data
-        prev_alignment = getattr(st.session_state, 'alignment_prev', {})
-        for name in alignment:
-            curr_ltp = alignment[name].get('ltp', 0)
-            prev_ltp = prev_alignment.get(name, {}).get('ltp', 0)
-            if curr_ltp > 0 and prev_ltp > 0:
-                alignment[name]['trend'] = 'Bullish' if curr_ltp > prev_ltp else 'Bearish' if curr_ltp < prev_ltp else 'Flat'
-            else:
-                alignment[name]['trend'] = 'Unknown'
+
+        # Also add NIFTY's own sentiment from the main df
+        if df is not None and not df.empty:
+            nifty_cp = detect_candle_patterns(df, lookback=5)
+            def _nifty_sentiment(sub):
+                if sub is None or len(sub) < 2:
+                    return 'N/A', 0
+                fc, lc = sub.iloc[0]['close'], sub.iloc[-1]['close']
+                pct = ((lc - fc) / fc) * 100 if fc > 0 else 0
+                gc = sum(1 for _, r in sub.iterrows() if r['close'] > r['open'])
+                if pct > 0.1 and gc > len(sub) // 2:
+                    return 'Bullish', round(pct, 2)
+                elif pct < -0.1 and gc <= len(sub) // 2:
+                    return 'Bearish', round(pct, 2)
+                return 'Neutral', round(pct, 2)
+            s10, p10 = _nifty_sentiment(df.tail(10))
+            s1h, p1h = _nifty_sentiment(df.tail(60))
+            s4h, p4h = _nifty_sentiment(df.tail(240))
+            nifty_day_open = df.iloc[0]['open']
+            nifty_pct_time = df['datetime'].tolist()
+            nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df['close'].tolist()]
+            alignment['NIFTY 50'] = {
+                'ltp': df.iloc[-1]['close'], 'trend': nifty_cp['direction'],
+                'candle_pattern': nifty_cp['pattern'], 'candle_dir': nifty_cp['direction'],
+                'candles': nifty_cp.get('candles', []),
+                'bull_count': nifty_cp.get('bull_count', 0), 'bear_count': nifty_cp.get('bear_count', 0),
+                'sentiment_10m': s10, 'pct_10m': p10,
+                'sentiment_1h': s1h, 'pct_1h': p1h,
+                'sentiment_4h': s4h, 'pct_4h': p4h,
+                'day_high': df['high'].max(), 'day_low': df['low'].min(),
+                'open': nifty_day_open,
+                'pct_series_time': nifty_pct_time,
+                'pct_series_vals': nifty_pct_vals,
+            }
+
+        # VIX direction from alignment data
+        vix_align = alignment.get('INDIA VIX', {})
+        if vix_align.get('ltp', 0) > 0 and vix_data.get('vix', 0) == 0:
+            vix_data['vix'] = vix_align['ltp']
+            vix_data['direction'] = vix_align.get('sentiment_10m', 'Unknown')
+            if vix_align.get('sentiment_10m') == 'Bullish':
+                vix_data['direction'] = 'Rising'
+            elif vix_align.get('sentiment_10m') == 'Bearish':
+                vix_data['direction'] = 'Falling'
     except Exception:
         pass
 
@@ -3020,10 +3156,11 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         score -= 1
         reasons.append(f"Option Chain: {market_bias}")
 
-    # 6. Alignment
-    bullish_align = sum(1 for v in alignment.values() if v.get('trend') == 'Bullish')
-    bearish_align = sum(1 for v in alignment.values() if v.get('trend') == 'Bearish')
-    total_align = len(alignment) if alignment else 1
+    # 6. Alignment (use 10m sentiment for immediate direction)
+    non_vix = {k: v for k, v in alignment.items() if 'VIX' not in k}
+    bullish_align = sum(1 for v in non_vix.values() if v.get('sentiment_10m') == 'Bullish')
+    bearish_align = sum(1 for v in non_vix.values() if v.get('sentiment_10m') == 'Bearish')
+    total_align = len(non_vix) if non_vix else 1
     if bullish_align > bearish_align and bullish_align >= 2:
         score += 1
         reasons.append(f"Alignment Bullish ({bullish_align}/{total_align})")
@@ -3043,6 +3180,125 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         reasons.append("VIX Rising (Opposite)")
     elif vix_dir == 'Falling' and score < 0:
         reasons.append("VIX Falling (Opposite)")
+
+    # 8. OI Timeline Trend (ATM support/resistance building/breaking from oi_history)
+    oi_trend = {'atm_strike': None, 'ce_activity': 'N/A', 'pe_activity': 'N/A',
+                'support_status': 'N/A', 'resistance_status': 'N/A', 'signal': 'Neutral',
+                'ce_oi_pct': 0, 'ce_ltp_pct': 0, 'pe_oi_pct': 0, 'pe_ltp_pct': 0,
+                'ce_chgoi': 0, 'pe_chgoi': 0, 'ce_chgoi_trend': 'N/A', 'pe_chgoi_trend': 'N/A'}
+    try:
+        oi_hist = getattr(st.session_state, 'oi_history', [])
+        chgoi_hist = getattr(st.session_state, 'chgoi_history', [])
+        oi_strikes = getattr(st.session_state, 'oi_current_strikes', [])
+        if len(oi_hist) >= 3 and oi_strikes:
+            sorted_strikes = sorted(oi_strikes)
+            atm_idx = len(sorted_strikes) // 2
+            atm_s = str(sorted_strikes[atm_idx])
+            oi_trend['atm_strike'] = int(atm_s)
+            oi_df = pd.DataFrame(oi_hist)
+
+            # CE OI + LTP trend
+            ce_oi_col, pe_oi_col = f'{atm_s}_CE', f'{atm_s}_PE'
+            ce_ltp_col, pe_ltp_col = f'{atm_s}_CE_LTP', f'{atm_s}_PE_LTP'
+
+            if ce_oi_col in oi_df.columns and ce_ltp_col in oi_df.columns:
+                ce_oi_first, ce_oi_last = oi_df[ce_oi_col].iloc[0], oi_df[ce_oi_col].iloc[-1]
+                ce_oi_change = ce_oi_last - ce_oi_first
+                ce_ltp_first, ce_ltp_last = oi_df[ce_ltp_col].iloc[0], oi_df[ce_ltp_col].iloc[-1]
+                ce_ltp_change = ce_ltp_last - ce_ltp_first
+                if ce_oi_change > 0 and ce_ltp_change > 0:
+                    oi_trend['ce_activity'] = 'Long Building'
+                elif ce_oi_change > 0 and ce_ltp_change <= 0:
+                    oi_trend['ce_activity'] = 'Short Building'
+                elif ce_oi_change < 0 and ce_ltp_change > 0:
+                    oi_trend['ce_activity'] = 'Short Covering'
+                elif ce_oi_change < 0 and ce_ltp_change <= 0:
+                    oi_trend['ce_activity'] = 'Long Unwinding'
+                oi_trend['ce_oi_pct'] = round((ce_oi_change / ce_oi_first * 100) if ce_oi_first > 0 else 0, 1)
+                oi_trend['ce_ltp_pct'] = round((ce_ltp_change / ce_ltp_first * 100) if ce_ltp_first > 0 else 0, 1)
+
+            if pe_oi_col in oi_df.columns and pe_ltp_col in oi_df.columns:
+                pe_oi_first, pe_oi_last = oi_df[pe_oi_col].iloc[0], oi_df[pe_oi_col].iloc[-1]
+                pe_oi_change = pe_oi_last - pe_oi_first
+                pe_ltp_first, pe_ltp_last = oi_df[pe_ltp_col].iloc[0], oi_df[pe_ltp_col].iloc[-1]
+                pe_ltp_change = pe_ltp_last - pe_ltp_first
+                if pe_oi_change > 0 and pe_ltp_change > 0:
+                    oi_trend['pe_activity'] = 'Long Building'
+                elif pe_oi_change > 0 and pe_ltp_change <= 0:
+                    oi_trend['pe_activity'] = 'Short Building'
+                elif pe_oi_change < 0 and pe_ltp_change < 0:
+                    oi_trend['pe_activity'] = 'Short Covering'
+                elif pe_oi_change < 0 and pe_ltp_change >= 0:
+                    oi_trend['pe_activity'] = 'Long Unwinding'
+                oi_trend['pe_oi_pct'] = round((pe_oi_change / pe_oi_first * 100) if pe_oi_first > 0 else 0, 1)
+                oi_trend['pe_ltp_pct'] = round((pe_ltp_change / pe_ltp_first * 100) if pe_ltp_first > 0 else 0, 1)
+
+            # Support status (from PE activity): PE Short Building = Support Building
+            ce_act = oi_trend['ce_activity']
+            pe_act = oi_trend['pe_activity']
+            if pe_act == 'Short Building':
+                oi_trend['support_status'] = 'Building Strong'
+            elif pe_act == 'Long Building':
+                oi_trend['support_status'] = 'Building (Bearish bets rising)'
+            elif pe_act == 'Short Covering':
+                oi_trend['support_status'] = 'Breaking'
+            elif pe_act == 'Long Unwinding':
+                oi_trend['support_status'] = 'Weakening'
+
+            # Resistance status (from CE activity): CE Short Building = Resistance Building
+            if ce_act == 'Short Building':
+                oi_trend['resistance_status'] = 'Building Strong'
+            elif ce_act == 'Long Building':
+                oi_trend['resistance_status'] = 'Building (Bullish bets rising)'
+            elif ce_act == 'Short Covering':
+                oi_trend['resistance_status'] = 'Breaking'
+            elif ce_act == 'Long Unwinding':
+                oi_trend['resistance_status'] = 'Weakening'
+
+            # Overall OI trend signal
+            if pe_act == 'Short Building' and ce_act in ['Short Covering', 'Long Unwinding']:
+                oi_trend['signal'] = 'Bullish'
+            elif ce_act == 'Short Building' and pe_act in ['Short Covering', 'Long Unwinding']:
+                oi_trend['signal'] = 'Bearish'
+            elif pe_act == 'Short Building' and ce_act == 'Short Building':
+                oi_trend['signal'] = 'Range'
+            elif ce_act == 'Short Covering' and pe_act == 'Short Covering':
+                oi_trend['signal'] = 'Volatile'
+            elif pe_act == 'Short Building' or ce_act in ['Short Covering', 'Long Unwinding']:
+                oi_trend['signal'] = 'Mildly Bullish'
+            elif ce_act == 'Short Building' or pe_act in ['Short Covering', 'Long Unwinding']:
+                oi_trend['signal'] = 'Mildly Bearish'
+
+            # ChgOI trend
+            if len(chgoi_hist) >= 3:
+                chgoi_df = pd.DataFrame(chgoi_hist)
+                ce_chgoi_col, pe_chgoi_col = f'{atm_s}_CE', f'{atm_s}_PE'
+                if ce_chgoi_col in chgoi_df.columns and pe_chgoi_col in chgoi_df.columns:
+                    oi_trend['ce_chgoi'] = int(chgoi_df[ce_chgoi_col].iloc[-1])
+                    oi_trend['pe_chgoi'] = int(chgoi_df[pe_chgoi_col].iloc[-1])
+                    oi_trend['ce_chgoi_trend'] = 'Increasing' if chgoi_df[ce_chgoi_col].iloc[-1] > chgoi_df[ce_chgoi_col].iloc[0] else 'Decreasing'
+                    oi_trend['pe_chgoi_trend'] = 'Increasing' if chgoi_df[pe_chgoi_col].iloc[-1] > chgoi_df[pe_chgoi_col].iloc[0] else 'Decreasing'
+    except Exception:
+        pass
+
+    # OI Trend scoring
+    oi_sig = oi_trend.get('signal', 'Neutral')
+    if oi_sig == 'Bullish':
+        score += 1
+        reasons.append(f"OI Trend: Bullish (Sup Building + Res Breaking)")
+    elif oi_sig == 'Mildly Bullish':
+        score += 1
+        reasons.append(f"OI Trend: Mildly Bullish (Sup:{oi_trend['support_status']} | Res:{oi_trend['resistance_status']})")
+    elif oi_sig == 'Bearish':
+        score -= 1
+        reasons.append(f"OI Trend: Bearish (Res Building + Sup Breaking)")
+    elif oi_sig == 'Mildly Bearish':
+        score -= 1
+        reasons.append(f"OI Trend: Mildly Bearish (Sup:{oi_trend['support_status']} | Res:{oi_trend['resistance_status']})")
+    elif oi_sig == 'Range':
+        reasons.append("OI Trend: Range (Both Support & Resistance Building)")
+    elif oi_sig == 'Volatile':
+        reasons.append("OI Trend: Volatile (Both Covering)")
 
     # === DETERMINE SIGNAL ===
     abs_score = abs(score)
@@ -3117,6 +3373,7 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         'confidence': confidence,
         'reasons': reasons,
         'market_bias': market_bias,
+        'oi_trend': oi_trend,
     }
 
 def send_master_signal_telegram(result, underlying_price):
@@ -3125,12 +3382,20 @@ def send_master_signal_telegram(result, underlying_price):
         return
     time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
 
-    # Alignment text
+    # Alignment text with candle pattern and sentiment
     align_lines = []
-    for name, data in result.get('alignment', {}).items():
-        trend = data.get('trend', 'Unknown')
-        emoji = '🟢' if trend == 'Bullish' else '🔴' if trend == 'Bearish' else '⚪'
-        align_lines.append(f"  {emoji} {name}: {trend}")
+    display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX']
+    for name in display_order:
+        data = result.get('alignment', {}).get(name)
+        if data is None:
+            continue
+        s10 = data.get('sentiment_10m', 'N/A')
+        s1h = data.get('sentiment_1h', 'N/A')
+        pat = data.get('candle_pattern', 'N/A')
+        ltp = data.get('ltp', 0)
+        emoji = '🟢' if s10 == 'Bullish' else '🔴' if s10 == 'Bearish' else '⚪'
+        ltp_str = f"₹{ltp:.0f}" if ltp > 0 else 'N/A'
+        align_lines.append(f"  {emoji} {name}: {ltp_str} | {pat} | 10m:{s10} | 1h:{s1h}")
     align_text = "\n".join(align_lines) if align_lines else "  Data unavailable"
 
     # Location
@@ -3158,7 +3423,7 @@ def send_master_signal_telegram(result, underlying_price):
 
 ━━━ SIGNAL: <b>{result['signal']}</b> ━━━
 📊 Trade: <b>{result['trade_type']}</b>
-🎯 Confluence: <b>{result['abs_score']}/7 ({result['strength']})</b>
+🎯 Confluence: <b>{result['abs_score']}/8 ({result['strength']})</b>
 📈 Confidence: <b>{result['confidence']}%</b>
 
 <b>🕯 Candle:</b> {result['candle']['pattern']} ({result['candle']['direction']})
@@ -3185,6 +3450,12 @@ def send_master_signal_telegram(result, underlying_price):
 {align_text}
 
 <b>📉 VIX:</b> {vix.get('vix', 'N/A')} ({vix.get('direction', 'Unknown')})
+
+<b>📊 OI TREND (ATM {result.get('oi_trend', {}).get('atm_strike', 'N/A')}):</b>
+  CE: {result.get('oi_trend', {}).get('ce_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('ce_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('ce_ltp_pct', 0):+.1f}%)
+  PE: {result.get('oi_trend', {}).get('pe_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('pe_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('pe_ltp_pct', 0):+.1f}%)
+  Support: {result.get('oi_trend', {}).get('support_status', 'N/A')} | Resistance: {result.get('oi_trend', {}).get('resistance_status', 'N/A')}
+  Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
@@ -5208,7 +5479,7 @@ def main():
                     <div style="background:{sig_color}20;padding:25px;border-radius:15px;border:3px solid {sig_color};text-align:center;margin-bottom:15px;">
                         <h1 style="color:{sig_color};margin:0;font-size:2.5em;">{master['signal']}</h1>
                         <h2 style="color:white;margin:5px 0;">{master['trade_type']}</h2>
-                        <h3 style="color:{sig_color};margin:5px 0;">Confluence: {master['abs_score']}/7 ({master['strength']}) | Confidence: {master['confidence']}%</h3>
+                        <h3 style="color:{sig_color};margin:5px 0;">Confluence: {master['abs_score']}/8 ({master['strength']}) | Confidence: {master['confidence']}%</h3>
                         <div style="background:#33333380;border-radius:10px;height:14px;margin:10px auto;max-width:500px;">
                             <div style="background:{sig_color};border-radius:10px;height:14px;width:{master['confidence']}%;"></div>
                         </div>
@@ -5218,11 +5489,39 @@ def main():
                     # Details in columns
                     ms_col1, ms_col2, ms_col3 = st.columns(3)
                     with ms_col1:
-                        st.markdown("#### 🕯 Candle & Volume")
-                        st.markdown(f"**Pattern:** {master['candle']['pattern']} ({master['candle']['direction']})")
-                        st.markdown(f"**Location:** {', '.join(master['location'])}")
+                        st.markdown("#### 🕯 Candle Pattern (Nifty Price Action)")
+                        cd = master['candle']
+                        d = cd['details']
+                        pat_color = '#00ff88' if cd['direction'] == 'Bullish' else '#ff4444' if cd['direction'] == 'Bearish' else '#FFD700'
+                        st.markdown(f"""
+                        <div style="background:{pat_color}20;padding:10px;border-radius:8px;border-left:4px solid {pat_color};margin-bottom:8px;">
+                            <b style="color:{pat_color};font-size:16px;">{cd['pattern']}</b> <span style="color:white;">({cd['direction']})</span><br>
+                            <span style="color:#aaa;font-size:13px;">O: ₹{d['open']:.2f} | H: ₹{d['high']:.2f} | L: ₹{d['low']:.2f} | C: ₹{d['close']:.2f}</span><br>
+                            <span style="color:#aaa;font-size:12px;">Body: {d['body_ratio']*100:.0f}% | {'🟢 Bull' if d['is_green'] else '🔴 Bear'}</span>
+                        </div>
+                        """, unsafe_allow_html=True)
+                        # Last 5 candles breakdown
+                        st.markdown("**Last 5 Candles:**")
+                        candle_rows = []
+                        for ci, cn in enumerate(cd.get('candles', [])):
+                            candle_rows.append({
+                                '#': ci + 1,
+                                'Time': cn['time'],
+                                'Type': f"{'🟢' if cn['type'] == 'Bull' else '🔴'} {cn['type']}",
+                                'Pattern': cn['pattern'],
+                                'O': f"₹{cn['open']:.0f}",
+                                'H': f"₹{cn['high']:.0f}",
+                                'L': f"₹{cn['low']:.0f}",
+                                'C': f"₹{cn['close']:.0f}",
+                                'Vol': f"{cn['volume']:,}" if cn['volume'] else '-',
+                            })
+                        if candle_rows:
+                            st.dataframe(pd.DataFrame(candle_rows), use_container_width=True, hide_index=True, height=210)
+                        st.caption(f"Bull: {cd.get('bull_count', 0)} | Bear: {cd.get('bear_count', 0)} out of last 5")
+
+                        st.markdown(f"**📍 Location:** {', '.join(master['location'])}")
                         vol_color = '#00ff88' if master['volume']['spike'] else '#888888'
-                        st.markdown(f"**Volume:** <span style='color:{vol_color}'>{master['volume']['label']} ({master['volume']['ratio']}x)</span>", unsafe_allow_html=True)
+                        st.markdown(f"**📊 Volume:** <span style='color:{vol_color}'>{master['volume']['label']} ({master['volume']['ratio']}x)</span>", unsafe_allow_html=True)
                         st.markdown("#### 🟢 Order Blocks")
                         ob = master['order_blocks']
                         if ob.get('bullish_ob'):
@@ -5262,18 +5561,6 @@ def main():
                             st.markdown(f"🟩 ₹{s:.0f}")
 
                     with ms_col3:
-                        st.markdown("#### 🌍 Alignment")
-                        for name, data in master.get('alignment', {}).items():
-                            trend = data.get('trend', 'Unknown')
-                            if trend == 'Bullish':
-                                st.success(f"{name}: {trend}")
-                            elif trend == 'Bearish':
-                                st.error(f"{name}: {trend}")
-                            else:
-                                st.info(f"{name}: {trend}")
-                        if not master.get('alignment'):
-                            st.info("Alignment data loading...")
-
                         st.markdown("#### 📉 VIX")
                         vix = master['vix']
                         vix_val = vix.get('vix', 0)
@@ -5292,6 +5579,196 @@ def main():
                         st.markdown("#### 📋 Confluence Factors")
                         for reason in master['reasons']:
                             st.markdown(f"✔ {reason}")
+
+                    # === OI TREND ANALYSIS (below 3-col, above alignment) ===
+                    oi_t = master.get('oi_trend', {})
+                    if oi_t.get('atm_strike'):
+                        st.markdown("---")
+                        st.markdown(f"## 📊 OI Timeline Trend Analysis (ATM: {oi_t['atm_strike']})")
+                        ot_col1, ot_col2, ot_col3 = st.columns(3)
+                        with ot_col1:
+                            st.markdown("#### CE Activity (Resistance)")
+                            ce_act = oi_t.get('ce_activity', 'N/A')
+                            ce_color = '#ff8800' if ce_act == 'Long Building' else '#ff4444' if ce_act == 'Short Building' else '#00ff88' if ce_act == 'Short Covering' else '#888888'
+                            st.markdown(f'<div style="background:{ce_color}30;padding:10px;border-radius:8px;border-left:4px solid {ce_color};"><b style="color:{ce_color};font-size:16px;">CE: {ce_act}</b><br><span style="color:#aaa;">OI: {oi_t.get("ce_oi_pct", 0):+.1f}% | LTP: {oi_t.get("ce_ltp_pct", 0):+.1f}%</span><br><span style="color:#aaa;">ChgOI: {oi_t.get("ce_chgoi", 0):,} ({oi_t.get("ce_chgoi_trend", "N/A")})</span></div>', unsafe_allow_html=True)
+                            res_status = oi_t.get('resistance_status', 'N/A')
+                            res_clr = '#ff4444' if 'Building' in res_status else '#00ff88' if res_status in ['Breaking', 'Weakening'] else '#888'
+                            st.markdown(f'<div style="margin-top:8px;padding:8px;border-radius:6px;background:{res_clr}20;border-left:3px solid {res_clr};"><b style="color:{res_clr};">Resistance: {res_status}</b></div>', unsafe_allow_html=True)
+                        with ot_col2:
+                            st.markdown("#### PE Activity (Support)")
+                            pe_act = oi_t.get('pe_activity', 'N/A')
+                            pe_color = '#ff4444' if pe_act == 'Long Building' else '#00ff88' if pe_act == 'Short Building' else '#00cc66' if pe_act == 'Short Covering' else '#888888'
+                            st.markdown(f'<div style="background:{pe_color}30;padding:10px;border-radius:8px;border-left:4px solid {pe_color};"><b style="color:{pe_color};font-size:16px;">PE: {pe_act}</b><br><span style="color:#aaa;">OI: {oi_t.get("pe_oi_pct", 0):+.1f}% | LTP: {oi_t.get("pe_ltp_pct", 0):+.1f}%</span><br><span style="color:#aaa;">ChgOI: {oi_t.get("pe_chgoi", 0):,} ({oi_t.get("pe_chgoi_trend", "N/A")})</span></div>', unsafe_allow_html=True)
+                            sup_status = oi_t.get('support_status', 'N/A')
+                            sup_clr = '#00ff88' if 'Building' in sup_status else '#ff4444' if sup_status in ['Breaking', 'Weakening'] else '#888'
+                            st.markdown(f'<div style="margin-top:8px;padding:8px;border-radius:6px;background:{sup_clr}20;border-left:3px solid {sup_clr};"><b style="color:{sup_clr};">Support: {sup_status}</b></div>', unsafe_allow_html=True)
+                        with ot_col3:
+                            st.markdown("#### OI Trend Signal")
+                            oi_sig = oi_t.get('signal', 'Neutral')
+                            if 'Bullish' in oi_sig:
+                                sig_clr = '#00ff88'
+                            elif 'Bearish' in oi_sig:
+                                sig_clr = '#ff4444'
+                            elif oi_sig == 'Range':
+                                sig_clr = '#FFD700'
+                            elif oi_sig == 'Volatile':
+                                sig_clr = '#FFA500'
+                            else:
+                                sig_clr = '#888888'
+                            st.markdown(f'<div style="background:{sig_clr}30;padding:15px;border-radius:10px;border:2px solid {sig_clr};text-align:center;"><b style="color:{sig_clr};font-size:20px;">{oi_sig.upper()}</b><br><span style="color:#aaa;">CE: {oi_t.get("ce_activity", "N/A")} | PE: {oi_t.get("pe_activity", "N/A")}</span></div>', unsafe_allow_html=True)
+                            st.markdown("")
+                            st.markdown(f"**Interpretation:**")
+                            if 'Bullish' in oi_sig:
+                                st.success("Support building + Resistance weakening/breaking = Upside expected")
+                            elif 'Bearish' in oi_sig:
+                                st.error("Resistance building + Support weakening/breaking = Downside expected")
+                            elif oi_sig == 'Range':
+                                st.warning("Both support & resistance building = Sideways/Range-bound")
+                            elif oi_sig == 'Volatile':
+                                st.warning("Both covering = High volatility expected, breakout imminent")
+                            else:
+                                st.info("Insufficient OI trend data")
+
+                    # === FULL ALIGNMENT TABLE (below the 3-col section) ===
+                    st.markdown("---")
+                    st.markdown("## 🌍 Index & Stock Alignment - Candle Patterns & Sentiment")
+                    align_data = master.get('alignment', {})
+                    if align_data:
+                        # Candle Pattern Table
+                        st.markdown("### 🕯 Candle Patterns Across Indices")
+                        pattern_rows = []
+                        # Define display order
+                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX']
+                        for name in display_order:
+                            ad = align_data.get(name)
+                            if ad is None:
+                                continue
+                            pat_emoji = '🟢' if ad.get('candle_dir') == 'Bullish' else '🔴' if ad.get('candle_dir') == 'Bearish' else '🟡'
+                            pattern_rows.append({
+                                'Index': name,
+                                'LTP': f"₹{ad['ltp']:.2f}" if ad.get('ltp', 0) > 0 else 'N/A',
+                                'Candle': f"{pat_emoji} {ad.get('candle_pattern', 'N/A')}",
+                                'Direction': ad.get('candle_dir', 'N/A'),
+                                'Bull/Bear (5)': f"{ad.get('bull_count', '-')}/{ad.get('bear_count', '-')}",
+                                'Day H': f"₹{ad['day_high']:.0f}" if ad.get('day_high') else '-',
+                                'Day L': f"₹{ad['day_low']:.0f}" if ad.get('day_low') else '-',
+                            })
+                        if pattern_rows:
+                            pat_df = pd.DataFrame(pattern_rows)
+                            def _style_pat(row):
+                                d = row['Direction']
+                                if d == 'Bullish':
+                                    return ['background-color:#00ff8815;color:white'] * len(row)
+                                elif d == 'Bearish':
+                                    return ['background-color:#ff444415;color:white'] * len(row)
+                                return [''] * len(row)
+                            st.dataframe(pat_df.style.apply(_style_pat, axis=1), use_container_width=True, hide_index=True)
+
+                        # Multi-timeframe Sentiment Table
+                        st.markdown("### 📊 Multi-Timeframe Sentiment (Price Action)")
+                        sent_rows = []
+                        for name in display_order:
+                            ad = align_data.get(name)
+                            if ad is None:
+                                continue
+                            def _sent_emoji(s):
+                                return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '🟡'
+                            s10 = ad.get('sentiment_10m', 'N/A')
+                            s1h = ad.get('sentiment_1h', 'N/A')
+                            s4h = ad.get('sentiment_4h', 'N/A')
+                            sent_rows.append({
+                                'Index': name,
+                                'LTP': f"₹{ad['ltp']:.2f}" if ad.get('ltp', 0) > 0 else 'N/A',
+                                '10 Min': f"{_sent_emoji(s10)} {s10} ({ad.get('pct_10m', 0):+.2f}%)" if s10 != 'N/A' else 'N/A',
+                                '1 Hour': f"{_sent_emoji(s1h)} {s1h} ({ad.get('pct_1h', 0):+.2f}%)" if s1h != 'N/A' else 'N/A',
+                                '4 Hours': f"{_sent_emoji(s4h)} {s4h} ({ad.get('pct_4h', 0):+.2f}%)" if s4h != 'N/A' else 'N/A',
+                                'Trend': ad.get('trend', 'N/A'),
+                            })
+                        if sent_rows:
+                            sent_df = pd.DataFrame(sent_rows)
+                            def _style_sent(row):
+                                t = row['Trend']
+                                if t == 'Bullish':
+                                    return ['background-color:#00ff8815;color:white'] * len(row)
+                                elif t == 'Bearish':
+                                    return ['background-color:#ff444415;color:white'] * len(row)
+                                return [''] * len(row)
+                            st.dataframe(sent_df.style.apply(_style_sent, axis=1), use_container_width=True, hide_index=True)
+
+                        # Summary
+                        non_vix_align = {k: v for k, v in align_data.items() if 'VIX' not in k}
+                        bull_10m = sum(1 for v in non_vix_align.values() if v.get('sentiment_10m') == 'Bullish')
+                        bear_10m = sum(1 for v in non_vix_align.values() if v.get('sentiment_10m') == 'Bearish')
+                        bull_1h = sum(1 for v in non_vix_align.values() if v.get('sentiment_1h') == 'Bullish')
+                        bear_1h = sum(1 for v in non_vix_align.values() if v.get('sentiment_1h') == 'Bearish')
+                        total_idx = len(non_vix_align)
+                        sum_col1, sum_col2, sum_col3 = st.columns(3)
+                        with sum_col1:
+                            if bull_10m > bear_10m:
+                                st.success(f"10m: Bullish ({bull_10m}/{total_idx})")
+                            elif bear_10m > bull_10m:
+                                st.error(f"10m: Bearish ({bear_10m}/{total_idx})")
+                            else:
+                                st.warning(f"10m: Mixed ({bull_10m}B/{bear_10m}R)")
+                        with sum_col2:
+                            if bull_1h > bear_1h:
+                                st.success(f"1h: Bullish ({bull_1h}/{total_idx})")
+                            elif bear_1h > bull_1h:
+                                st.error(f"1h: Bearish ({bear_1h}/{total_idx})")
+                            else:
+                                st.warning(f"1h: Mixed ({bull_1h}B/{bear_1h}R)")
+                        with sum_col3:
+                            bull_4h = sum(1 for v in non_vix_align.values() if v.get('sentiment_4h') == 'Bullish')
+                            bear_4h = sum(1 for v in non_vix_align.values() if v.get('sentiment_4h') == 'Bearish')
+                            if bull_4h > bear_4h:
+                                st.success(f"4h: Bullish ({bull_4h}/{total_idx})")
+                            elif bear_4h > bull_4h:
+                                st.error(f"4h: Bearish ({bear_4h}/{total_idx})")
+                            else:
+                                st.warning(f"4h: Mixed ({bull_4h}B/{bear_4h}R)")
+                        # === % Change from Open - Line Chart ===
+                        st.markdown("### 📈 Price Action - % Change from Open (Today)")
+                        fig_pct = go.Figure()
+                        line_colors = {
+                            'NIFTY 50': '#FFD700',
+                            'SENSEX': '#FF6B6B',
+                            'BANKNIFTY': '#00BFFF',
+                            'NIFTY IT': '#FF69B4',
+                            'RELIANCE': '#00FF7F',
+                            'ICICIBANK': '#FFA500',
+                            'INDIA VIX': '#FF4444',
+                        }
+                        for name in display_order:
+                            ad = align_data.get(name)
+                            if ad is None:
+                                continue
+                            pct_time = ad.get('pct_series_time', [])
+                            pct_vals = ad.get('pct_series_vals', [])
+                            if pct_time and pct_vals:
+                                line_width = 3 if name == 'NIFTY 50' else 2
+                                dash = 'dot' if name == 'INDIA VIX' else None
+                                fig_pct.add_trace(go.Scatter(
+                                    x=pct_time, y=pct_vals,
+                                    mode='lines',
+                                    name=name,
+                                    line=dict(color=line_colors.get(name, '#888'), width=line_width, dash=dash),
+                                ))
+                        fig_pct.add_hline(y=0, line_dash="solid", line_color="white", line_width=1.5)
+                        fig_pct.update_layout(
+                            title='All Indices & Stocks - % Change from Day Open',
+                            template='plotly_dark',
+                            height=450,
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='% Change', zeroline=True, zerolinecolor='white', zerolinewidth=2,
+                                       ticksuffix='%'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
+                            hovermode='x unified',
+                        )
+                        st.plotly_chart(fig_pct, use_container_width=True)
+                    else:
+                        st.info("Alignment data loading... will appear on next refresh.")
                 else:
                     st.info("Generating master signal... waiting for data.")
             else:
