@@ -453,6 +453,61 @@ class SupabaseDB:
             return q.order('timestamp', desc=False).execute()
         return self._safe_query('alerts_history', query, {'trading_day': trading_day})
 
+    # ── Master Signal History ──
+    def upsert_master_signal(self, signal_data):
+        """Store master trading signal with all details."""
+        now = datetime.now(IST)
+        record = {
+            'timestamp': now.isoformat(),
+            'trading_day': now.date().isoformat(),
+            'spot_price': float(signal_data.get('spot_price', 0)),
+            'signal': signal_data.get('signal', ''),
+            'trade_type': signal_data.get('trade_type', ''),
+            'score': int(signal_data.get('score', 0)),
+            'abs_score': int(signal_data.get('abs_score', 0)),
+            'strength': signal_data.get('strength', ''),
+            'confidence': int(signal_data.get('confidence', 0)),
+            'candle_pattern': signal_data.get('candle_pattern', ''),
+            'candle_direction': signal_data.get('candle_direction', ''),
+            'volume_label': signal_data.get('volume_label', ''),
+            'volume_ratio': float(signal_data.get('volume_ratio', 0)),
+            'location': signal_data.get('location', ''),
+            'resistance_levels': signal_data.get('resistance_levels', ''),
+            'support_levels': signal_data.get('support_levels', ''),
+            'net_gex': float(signal_data.get('net_gex', 0)),
+            'atm_gex': float(signal_data.get('atm_gex', 0)),
+            'gamma_flip': float(signal_data.get('gamma_flip', 0)) if signal_data.get('gamma_flip') else None,
+            'gex_mode': signal_data.get('gex_mode', ''),
+            'pcr_gex_badge': signal_data.get('pcr_gex_badge', ''),
+            'market_bias': signal_data.get('market_bias', ''),
+            'vix_value': float(signal_data.get('vix_value', 0)) if signal_data.get('vix_value') else None,
+            'vix_direction': signal_data.get('vix_direction', ''),
+            'oi_trend_signal': signal_data.get('oi_trend_signal', ''),
+            'ce_activity': signal_data.get('ce_activity', ''),
+            'pe_activity': signal_data.get('pe_activity', ''),
+            'support_status': signal_data.get('support_status', ''),
+            'resistance_status': signal_data.get('resistance_status', ''),
+            'vidya_trend': signal_data.get('vidya_trend', ''),
+            'vidya_delta_pct': float(signal_data.get('vidya_delta_pct', 0)),
+            'delta_vol_trend': signal_data.get('delta_vol_trend', ''),
+            'vwap': float(signal_data.get('vwap', 0)) if signal_data.get('vwap') else None,
+            'price_vs_vwap': signal_data.get('price_vs_vwap', ''),
+            'reasons': signal_data.get('reasons', ''),
+            'alignment_summary': signal_data.get('alignment_summary', ''),
+            'data_source': 'master_signal',
+            'update_time': datetime.now(pytz.UTC).isoformat()
+        }
+        self._safe_upsert('master_signals', [record], 'timestamp,trading_day')
+
+    def get_master_signals(self, trading_day=None):
+        if trading_day is None:
+            trading_day = datetime.now(IST).date().isoformat()
+        def query():
+            return self.client.table('master_signals').select('*') \
+                .eq('trading_day', trading_day) \
+                .order('timestamp', desc=True).execute()
+        return self._safe_query('master_signals', query, {'trading_day': trading_day})
+
     # ── Max Pain History ──
     def upsert_max_pain(self, expiry, max_pain_strike, underlying_price=None):
         now = datetime.now(IST)
