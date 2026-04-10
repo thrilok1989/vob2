@@ -6332,6 +6332,138 @@ def main():
         except Exception as e:
             st.warning(f"Master signal unavailable: {str(e)}")
 
+    # === CANDLE PATTERN TIMELINE (5-min chart) ===
+    if not df.empty and len(df) > 10:
+        st.markdown("---")
+        st.markdown("## 🕯 Candle Pattern Timeline (5-min Chart)")
+        try:
+            # Resample to 5-min
+            df_5m_all = df.set_index('datetime').resample('5min').agg({
+                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+            }).dropna().reset_index()
+            # Filter today only
+            _today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+            df_5m_all = df_5m_all[df_5m_all['datetime'].dt.date == _today_ist]
+            if len(df_5m_all) >= 3:
+                pattern_rows = []
+                for i in range(2, len(df_5m_all)):
+                    # Get last 3 candles up to index i for pattern detection
+                    window = df_5m_all.iloc[max(0, i - 4):i + 1].copy().reset_index(drop=True)
+                    c = window.iloc[-1]
+                    c_body = abs(c['close'] - c['open'])
+                    c_range = c['high'] - c['low']
+                    c_body_ratio = c_body / c_range if c_range > 0 else 0
+                    c_green = c['close'] > c['open']
+                    c_upper = c['high'] - max(c['close'], c['open'])
+                    c_lower = min(c['close'], c['open']) - c['low']
+                    p = window.iloc[-2] if len(window) >= 2 else None
+                    p2 = window.iloc[-3] if len(window) >= 3 else None
+
+                    pat = 'Normal'
+                    direction = 'Neutral'
+
+                    # 1-candle patterns
+                    if c_lower > c_body * 2 and c_upper < c_body * 0.5 and c_body_ratio < 0.4:
+                        pat, direction = 'Hammer', 'Bullish'
+                    elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4 and c_green:
+                        pat, direction = 'Inverted Hammer', 'Bullish'
+                    elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4 and not c_green:
+                        pat, direction = 'Shooting Star', 'Bearish'
+                    elif c_body_ratio >= 0.95 and c_range > 0:
+                        pat = 'Bull Marubozu' if c_green else 'Bear Marubozu'
+                        direction = 'Bullish' if c_green else 'Bearish'
+                    elif c_body_ratio < 0.1 and c_range > 0:
+                        pat, direction = 'Doji', 'Indecision'
+                    elif c_body_ratio < 0.35 and c_upper > c_body and c_lower > c_body and c_range > 0:
+                        pat, direction = 'Spinning Top', 'Indecision'
+                    elif p is not None:
+                        p_body = abs(p['close'] - p['open'])
+                        p_green = p['close'] > p['open']
+                        p_range = p['high'] - p['low']
+                        p_body_ratio = p_body / p_range if p_range > 0 else 0
+                        if c_green and not p_green and c_body > p_body and c['close'] > p['open'] and c['open'] < p['close']:
+                            pat, direction = 'Bullish Engulfing', 'Bullish'
+                        elif not c_green and p_green and c_body > p_body and c['close'] < p['open'] and c['open'] > p['close']:
+                            pat, direction = 'Bearish Engulfing', 'Bearish'
+                        elif c_body < p_body * 0.6 and not p_green and c_green and min(c['open'], c['close']) > min(p['open'], p['close']) and max(c['open'], c['close']) < max(p['open'], p['close']):
+                            pat, direction = 'Bullish Harami', 'Bullish'
+                        elif c_body < p_body * 0.6 and p_green and not c_green and min(c['open'], c['close']) > min(p['open'], p['close']) and max(c['open'], c['close']) < max(p['open'], p['close']):
+                            pat, direction = 'Bearish Harami', 'Bearish'
+                        elif c_green and not p_green and c['open'] < p['low'] and c['close'] > (p['open'] + p['close']) / 2 and c['close'] < p['open']:
+                            pat, direction = 'Piercing Line', 'Bullish'
+                        elif not c_green and p_green and c['open'] > p['high'] and c['close'] < (p['open'] + p['close']) / 2 and c['close'] > p['open']:
+                            pat, direction = 'Dark Cloud Cover', 'Bearish'
+                        elif c_green and not p_green and abs(c['low'] - p['low']) / max(c_range, 0.01) < 0.05:
+                            pat, direction = 'Tweezer Bottom', 'Bullish'
+                        elif not c_green and p_green and abs(c['high'] - p['high']) / max(p_range, 0.01) < 0.05:
+                            pat, direction = 'Tweezer Top', 'Bearish'
+                        elif p2 is not None:
+                            p2_body = abs(p2['close'] - p2['open'])
+                            p2_green = p2['close'] > p2['open']
+                            p2_range = p2['high'] - p2['low']
+                            if not p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio < 0.3 and c_green and c_body_ratio > 0.5 and c['close'] > (p2['open'] + p2['close']) / 2:
+                                pat, direction = 'Morning Star', 'Bullish'
+                            elif p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio < 0.3 and not c_green and c_body_ratio > 0.5 and c['close'] < (p2['open'] + p2['close']) / 2:
+                                pat, direction = 'Evening Star', 'Bearish'
+                            elif p2_green and p_green and c_green and p['close'] > p2['close'] and c['close'] > p['close'] and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio > 0.5 and c_body_ratio > 0.5:
+                                pat, direction = 'Three White Soldiers', 'Bullish'
+                            elif not p2_green and not p_green and not c_green and p['close'] < p2['close'] and c['close'] < p['close'] and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio > 0.5 and c_body_ratio > 0.5:
+                                pat, direction = 'Three Black Crows', 'Bearish'
+                    if pat != 'Normal':
+                        time_str = c['datetime'].strftime('%H:%M') if hasattr(c['datetime'], 'strftime') else str(c['datetime'])
+                        pat_emoji = '🟢' if direction == 'Bullish' else '🔴' if direction == 'Bearish' else '🟡'
+                        pattern_rows.append({
+                            'Time': time_str,
+                            'Pattern': f"{pat_emoji} {pat}",
+                            'Direction': direction,
+                            'Open': f"₹{c['open']:.2f}",
+                            'High': f"₹{c['high']:.2f}",
+                            'Low': f"₹{c['low']:.2f}",
+                            'Close': f"₹{c['close']:.2f}",
+                            'Body%': f"{c_body_ratio * 100:.0f}%",
+                            'Volume': f"{int(c['volume']):,}" if c['volume'] else '-',
+                        })
+
+                if pattern_rows:
+                    pat_timeline_df = pd.DataFrame(pattern_rows)
+                    # Reverse so latest is on top
+                    pat_timeline_df = pat_timeline_df.iloc[::-1].reset_index(drop=True)
+
+                    # Summary counts
+                    bull_pats = sum(1 for r in pattern_rows if r['Direction'] == 'Bullish')
+                    bear_pats = sum(1 for r in pattern_rows if r['Direction'] == 'Bearish')
+                    neutral_pats = sum(1 for r in pattern_rows if r['Direction'] not in ['Bullish', 'Bearish'])
+                    pt_col1, pt_col2, pt_col3, pt_col4 = st.columns(4)
+                    with pt_col1:
+                        st.metric("Total Patterns", len(pattern_rows))
+                    with pt_col2:
+                        st.metric("🟢 Bullish", bull_pats)
+                    with pt_col3:
+                        st.metric("🔴 Bearish", bear_pats)
+                    with pt_col4:
+                        st.metric("🟡 Indecision", neutral_pats)
+
+                    def _style_pattern_row(row):
+                        d = row.get('Direction', '')
+                        if d == 'Bullish':
+                            return ['background-color:#00ff8812;color:white'] * len(row)
+                        elif d == 'Bearish':
+                            return ['background-color:#ff444412;color:white'] * len(row)
+                        return ['background-color:#FFD70008;color:white'] * len(row)
+
+                    st.dataframe(
+                        pat_timeline_df.style.apply(_style_pattern_row, axis=1),
+                        use_container_width=True, hide_index=True,
+                        height=min(500, 50 + len(pat_timeline_df) * 35)
+                    )
+                    st.caption(f"🕯 Patterns detected from today's 5-min chart | {len(pattern_rows)} patterns found")
+                else:
+                    st.info("No significant candle patterns detected yet on 5-min chart.")
+            else:
+                st.info("Waiting for 5-min candle data to build up...")
+        except Exception as e:
+            st.caption(f"Pattern timeline loading... ({str(e)[:50]})")
+
     # === SIGNAL HISTORY TABLE ===
     if option_data and option_data.get('underlying'):
         st.markdown("---")
