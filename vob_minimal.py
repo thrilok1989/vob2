@@ -1135,11 +1135,7 @@ def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_
 {reversal_text}
 📋 <b>REVIEW:</b> {atm_strike} {opt} | SL: {stop_loss_percent}% | Manual verification required
 🕐 Time: {time_str}"""
-                try:
-                    send_telegram_message_sync(message)
-                    st.success(f"{'🟢' if is_bull else '🔴'} {'Bullish' if is_bull else 'Bearish'} signal notification sent!")
-                except Exception as e:
-                    st.error(f"Failed to send notification: {e}")
+                # Telegram disabled for reversal signals (noise reduction)
                 break
 
 def check_atm_verdict_alert(df_summary, underlying_price):
@@ -2704,10 +2700,8 @@ def send_option_chain_signal(sa_result, underlying_price):
 {"".join([f"• {s}" + chr(10) for s in sa_result['bias_signals']])}
 ⚠️ <i>Auto-generated. Manual verification required.</i>"""
 
-    try:
-        send_telegram_message_sync(message)
-    except Exception:
-        pass
+    # Telegram disabled for option chain analysis (noise reduction)
+    pass
 
 def detect_candle_patterns(df, lookback=5):
     """Detect candlestick patterns from last few candles using Nifty price action chart."""
