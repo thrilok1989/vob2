@@ -2726,65 +2726,57 @@ def detect_candle_patterns(df, lookback=5):
         c_prev2 = recent.iloc[idx - 2] if idx > 1 else None
 
         c_pattern = 'Normal'
-        # Hammer (bull at support)
-        if c_lower > c_body * 2 and c_upper < c_body * 0.5 and c_body_ratio < 0.4:
-            c_pattern = 'Hammer'
-        # Shooting Star / Inverted Hammer
-        elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4:
-            c_pattern = 'Shooting Star' if not c_green else 'Inverted Hammer'
-        # Marubozu (no wicks, full body)
-        elif c_body_ratio >= 0.95 and c_range > 0:
-            c_pattern = 'Bull Marubozu' if c_green else 'Bear Marubozu'
-        # Doji
-        elif c_body_ratio < 0.1 and c_range > 0:
-            c_pattern = 'Doji'
-        # Spinning Top (small body, long wicks both sides)
-        elif c_body_ratio < 0.35 and c_upper > c_body and c_lower > c_body and c_range > 0:
-            c_pattern = 'Spinning Top'
-        elif c_prev is not None:
+        # Check multi-candle patterns FIRST (higher significance)
+        # 3-candle patterns
+        if c_prev is not None and c_prev2 is not None:
             p_body = abs(c_prev['close'] - c_prev['open'])
             p_green = c_prev['close'] > c_prev['open']
             p_range = c_prev['high'] - c_prev['low']
-            # Bullish Engulfing
+            p_body_ratio = p_body / p_range if p_range > 0 else 0
+            p2_body = abs(c_prev2['close'] - c_prev2['open'])
+            p2_green = c_prev2['close'] > c_prev2['open']
+            p2_range = c_prev2['high'] - c_prev2['low']
+            if not p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio < 0.3 and c_green and c_body_ratio > 0.5 and c['close'] > (c_prev2['open'] + c_prev2['close']) / 2:
+                c_pattern = 'Morning Star'
+            elif p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio < 0.3 and not c_green and c_body_ratio > 0.5 and c['close'] < (c_prev2['open'] + c_prev2['close']) / 2:
+                c_pattern = 'Evening Star'
+            elif p2_green and p_green and c_green and c_prev['close'] > c_prev2['close'] and c['close'] > c_prev['close'] and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio > 0.5 and c_body_ratio > 0.5:
+                c_pattern = 'Three White Soldiers'
+            elif not p2_green and not p_green and not c_green and c_prev['close'] < c_prev2['close'] and c['close'] < c_prev['close'] and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio > 0.5 and c_body_ratio > 0.5:
+                c_pattern = 'Three Black Crows'
+        # 2-candle patterns
+        if c_pattern == 'Normal' and c_prev is not None:
+            p_body = abs(c_prev['close'] - c_prev['open'])
+            p_green = c_prev['close'] > c_prev['open']
+            p_range = c_prev['high'] - c_prev['low']
             if c_green and not p_green and c_body > p_body and c['close'] > c_prev['open'] and c['open'] < c_prev['close']:
                 c_pattern = 'Bullish Engulfing'
-            # Bearish Engulfing
             elif not c_green and p_green and c_body > p_body and c['close'] < c_prev['open'] and c['open'] > c_prev['close']:
                 c_pattern = 'Bearish Engulfing'
-            # Harami (inside bar) - current body inside prev body
-            elif c_body < p_body * 0.6 and min(c['open'], c['close']) > min(c_prev['open'], c_prev['close']) and max(c['open'], c['close']) < max(c_prev['open'], c_prev['close']):
-                c_pattern = 'Bullish Harami' if not p_green and c_green else 'Bearish Harami' if p_green and not c_green else 'Harami'
-            # Piercing Line (bull: prev red, curr green opens below prev low, closes above prev midpoint)
+            elif c_body < p_body * 0.6 and not p_green and c_green and min(c['open'], c['close']) > min(c_prev['open'], c_prev['close']) and max(c['open'], c['close']) < max(c_prev['open'], c_prev['close']):
+                c_pattern = 'Bullish Harami'
+            elif c_body < p_body * 0.6 and p_green and not c_green and min(c['open'], c['close']) > min(c_prev['open'], c_prev['close']) and max(c['open'], c['close']) < max(c_prev['open'], c_prev['close']):
+                c_pattern = 'Bearish Harami'
             elif c_green and not p_green and c['open'] < c_prev['low'] and c['close'] > (c_prev['open'] + c_prev['close']) / 2 and c['close'] < c_prev['open']:
                 c_pattern = 'Piercing Line'
-            # Dark Cloud Cover (bear: prev green, curr red opens above prev high, closes below prev midpoint)
             elif not c_green and p_green and c['open'] > c_prev['high'] and c['close'] < (c_prev['open'] + c_prev['close']) / 2 and c['close'] > c_prev['open']:
                 c_pattern = 'Dark Cloud Cover'
-            # Tweezer Bottom (equal lows, first red second green)
             elif c_green and not p_green and abs(c['low'] - c_prev['low']) / max(c_range, 0.01) < 0.05:
                 c_pattern = 'Tweezer Bottom'
-            # Tweezer Top (equal highs, first green second red)
             elif not c_green and p_green and abs(c['high'] - c_prev['high']) / max(p_range, 0.01) < 0.05:
                 c_pattern = 'Tweezer Top'
-            # Morning Star (3-candle: big red, small body/doji, big green)
-            elif c_prev2 is not None:
-                p2_body = abs(c_prev2['close'] - c_prev2['open'])
-                p2_green = c_prev2['close'] > c_prev2['open']
-                p2_range = c_prev2['high'] - c_prev2['low']
-                p_body_ratio = p_body / p_range if p_range > 0 else 0
-                if not p2_green and p2_body / p2_range > 0.5 if p2_range > 0 else False:
-                    if p_body_ratio < 0.3 and c_green and c_body / c_range > 0.5 if c_range > 0 else False:
-                        if c['close'] > (c_prev2['open'] + c_prev2['close']) / 2:
-                            c_pattern = 'Morning Star'
-                # Evening Star (3-candle: big green, small body/doji, big red)
-                if c_pattern == 'Normal' and p2_green and p2_body / p2_range > 0.5 if p2_range > 0 else False:
-                    if p_body_ratio < 0.3 and not c_green and c_body / c_range > 0.5 if c_range > 0 else False:
-                        if c['close'] < (c_prev2['open'] + c_prev2['close']) / 2:
-                            c_pattern = 'Evening Star'
-            if c_pattern == 'Normal' and c_body_ratio >= 0.6:
-                c_pattern = 'Strong Green' if c_green else 'Strong Red'
-        if c_pattern == 'Normal' and c_body_ratio >= 0.6:
-            c_pattern = 'Strong Green' if c_green else 'Strong Red'
+        # 1-candle patterns (lowest priority)
+        if c_pattern == 'Normal':
+            if c_lower > c_body * 2 and c_upper < c_body * 0.5 and c_body_ratio < 0.4:
+                c_pattern = 'Hammer'
+            elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4:
+                c_pattern = 'Shooting Star' if not c_green else 'Inverted Hammer'
+            elif c_body_ratio >= 0.95 and c_range > 0:
+                c_pattern = 'Bull Marubozu' if c_green else 'Bear Marubozu'
+            elif c_body_ratio < 0.1 and c_range > 0:
+                c_pattern = 'Doji'
+            elif c_body_ratio < 0.35 and c_upper > c_body and c_lower > c_body and c_range > 0:
+                c_pattern = 'Spinning Top'
 
         candle_list.append({
             'open': round(c['open'], 2), 'high': round(c['high'], 2),
@@ -2807,99 +2799,66 @@ def detect_candle_patterns(df, lookback=5):
     pattern = 'No Pattern'
     direction = 'Neutral'
 
-    # Hammer (bullish at support)
-    if lower_wick > body * 2 and upper_wick < body * 0.5 and body_ratio < 0.4:
-        pattern = 'Hammer'
-        direction = 'Bullish'
-    # Inverted Hammer (bullish at support)
-    elif upper_wick > body * 2 and lower_wick < body * 0.5 and body_ratio < 0.4 and is_green:
-        pattern = 'Inverted Hammer'
-        direction = 'Bullish'
-    # Shooting Star (bearish at resistance)
-    elif upper_wick > body * 2 and lower_wick < body * 0.5 and body_ratio < 0.4 and not is_green:
-        pattern = 'Shooting Star'
-        direction = 'Bearish'
-    # Marubozu (strong momentum, no wicks)
-    elif body_ratio >= 0.95 and total_range > 0:
-        pattern = 'Bull Marubozu' if is_green else 'Bear Marubozu'
-        direction = 'Bullish' if is_green else 'Bearish'
-    # Doji (indecision)
-    elif body_ratio < 0.1 and total_range > 0:
-        pattern = 'Doji'
-        direction = 'Indecision'
-    # Spinning Top (indecision, small body, wicks both sides)
-    elif body_ratio < 0.35 and upper_wick > body and lower_wick > body and total_range > 0:
-        pattern = 'Spinning Top'
-        direction = 'Indecision'
-    elif prev is not None:
+    # Check multi-candle patterns FIRST (higher significance)
+    # 3-candle patterns
+    if prev is not None and prev2 is not None:
         prev_body = abs(prev['close'] - prev['open'])
         prev_green = prev['close'] > prev['open']
         prev_range = prev['high'] - prev['low']
         prev_body_ratio = prev_body / prev_range if prev_range > 0 else 0
+        p2_body = abs(prev2['close'] - prev2['open'])
+        p2_green = prev2['close'] > prev2['open']
+        p2_range = prev2['high'] - prev2['low']
+        if not p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and prev_body_ratio < 0.3 and is_green and body_ratio > 0.5:
+            if last['close'] > (prev2['open'] + prev2['close']) / 2:
+                pattern, direction = 'Morning Star', 'Bullish'
+        if pattern == 'No Pattern' and p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and prev_body_ratio < 0.3 and not is_green and body_ratio > 0.5:
+            if last['close'] < (prev2['open'] + prev2['close']) / 2:
+                pattern, direction = 'Evening Star', 'Bearish'
+        if pattern == 'No Pattern' and p2_green and prev_green and is_green and prev['close'] > prev2['close'] and last['close'] > prev['close']:
+            if (p2_body / p2_range > 0.5 if p2_range > 0 else False) and prev_body_ratio > 0.5 and body_ratio > 0.5:
+                pattern, direction = 'Three White Soldiers', 'Bullish'
+        if pattern == 'No Pattern' and not p2_green and not prev_green and not is_green and prev['close'] < prev2['close'] and last['close'] < prev['close']:
+            if (p2_body / p2_range > 0.5 if p2_range > 0 else False) and prev_body_ratio > 0.5 and body_ratio > 0.5:
+                pattern, direction = 'Three Black Crows', 'Bearish'
 
-        # Bullish Engulfing (bull at support)
+    # 2-candle patterns
+    if pattern == 'No Pattern' and prev is not None:
+        prev_body = abs(prev['close'] - prev['open'])
+        prev_green = prev['close'] > prev['open']
+        prev_range = prev['high'] - prev['low']
         if is_green and not prev_green and body > prev_body and last['close'] > prev['open'] and last['open'] < prev['close']:
-            pattern = 'Bullish Engulfing'
-            direction = 'Bullish'
-        # Bearish Engulfing (bear at resistance)
+            pattern, direction = 'Bullish Engulfing', 'Bullish'
         elif not is_green and prev_green and body > prev_body and last['close'] < prev['open'] and last['open'] > prev['close']:
-            pattern = 'Bearish Engulfing'
-            direction = 'Bearish'
-        # Bullish Harami (bull at support: prev big red, curr small green inside)
+            pattern, direction = 'Bearish Engulfing', 'Bearish'
         elif body < prev_body * 0.6 and not prev_green and is_green and min(last['open'], last['close']) > min(prev['open'], prev['close']) and max(last['open'], last['close']) < max(prev['open'], prev['close']):
-            pattern = 'Bullish Harami'
-            direction = 'Bullish'
-        # Bearish Harami (bear at resistance: prev big green, curr small red inside)
+            pattern, direction = 'Bullish Harami', 'Bullish'
         elif body < prev_body * 0.6 and prev_green and not is_green and min(last['open'], last['close']) > min(prev['open'], prev['close']) and max(last['open'], last['close']) < max(prev['open'], prev['close']):
-            pattern = 'Bearish Harami'
-            direction = 'Bearish'
-        # Piercing Line (bull at support: prev red, curr green opens below prev low, closes above midpoint)
+            pattern, direction = 'Bearish Harami', 'Bearish'
         elif is_green and not prev_green and last['open'] < prev['low'] and last['close'] > (prev['open'] + prev['close']) / 2 and last['close'] < prev['open']:
-            pattern = 'Piercing Line'
-            direction = 'Bullish'
-        # Dark Cloud Cover (bear at resistance: prev green, curr red opens above prev high, closes below midpoint)
+            pattern, direction = 'Piercing Line', 'Bullish'
         elif not is_green and prev_green and last['open'] > prev['high'] and last['close'] < (prev['open'] + prev['close']) / 2 and last['close'] > prev['open']:
-            pattern = 'Dark Cloud Cover'
-            direction = 'Bearish'
-        # Tweezer Bottom (bull at support: equal lows, first red second green)
+            pattern, direction = 'Dark Cloud Cover', 'Bearish'
         elif is_green and not prev_green and abs(last['low'] - prev['low']) / max(total_range, 0.01) < 0.05:
-            pattern = 'Tweezer Bottom'
-            direction = 'Bullish'
-        # Tweezer Top (bear at resistance: equal highs, first green second red)
+            pattern, direction = 'Tweezer Bottom', 'Bullish'
         elif not is_green and prev_green and abs(last['high'] - prev['high']) / max(prev_range, 0.01) < 0.05:
-            pattern = 'Tweezer Top'
-            direction = 'Bearish'
-        # 3-candle patterns
-        elif prev2 is not None:
-            p2_body = abs(prev2['close'] - prev2['open'])
-            p2_green = prev2['close'] > prev2['open']
-            p2_range = prev2['high'] - prev2['low']
-            # Morning Star (bull at support: big red → small body/doji → big green closing above mid of first)
-            if not p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and prev_body_ratio < 0.3 and is_green and body_ratio > 0.5:
-                if last['close'] > (prev2['open'] + prev2['close']) / 2:
-                    pattern = 'Morning Star'
-                    direction = 'Bullish'
-            # Evening Star (bear at resistance: big green → small body/doji → big red closing below mid of first)
-            if pattern == 'No Pattern' and p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and prev_body_ratio < 0.3 and not is_green and body_ratio > 0.5:
-                if last['close'] < (prev2['open'] + prev2['close']) / 2:
-                    pattern = 'Evening Star'
-                    direction = 'Bearish'
-            # Three White Soldiers (bull: 3 consecutive green with higher closes, decent body)
-            if pattern == 'No Pattern' and p2_green and prev_green and is_green:
-                if prev['close'] > prev2['close'] and last['close'] > prev['close']:
-                    if (p2_body / p2_range > 0.5 if p2_range > 0 else False) and prev_body_ratio > 0.5 and body_ratio > 0.5:
-                        pattern = 'Three White Soldiers'
-                        direction = 'Bullish'
-            # Three Black Crows (bear: 3 consecutive red with lower closes, decent body)
-            if pattern == 'No Pattern' and not p2_green and not prev_green and not is_green:
-                if prev['close'] < prev2['close'] and last['close'] < prev['close']:
-                    if (p2_body / p2_range > 0.5 if p2_range > 0 else False) and prev_body_ratio > 0.5 and body_ratio > 0.5:
-                        pattern = 'Three Black Crows'
-                        direction = 'Bearish'
+            pattern, direction = 'Tweezer Top', 'Bearish'
 
-        if pattern == 'No Pattern' and body_ratio >= 0.6:
-            pattern = 'Strong Green Candle' if is_green else 'Strong Red Candle'
+    # 1-candle patterns (lowest priority)
+    if pattern == 'No Pattern':
+        if lower_wick > body * 2 and upper_wick < body * 0.5 and body_ratio < 0.4:
+            pattern, direction = 'Hammer', 'Bullish'
+        elif upper_wick > body * 2 and lower_wick < body * 0.5 and body_ratio < 0.4 and is_green:
+            pattern, direction = 'Inverted Hammer', 'Bullish'
+        elif upper_wick > body * 2 and lower_wick < body * 0.5 and body_ratio < 0.4 and not is_green:
+            pattern, direction = 'Shooting Star', 'Bearish'
+        elif body_ratio >= 0.95 and total_range > 0:
+            pattern = 'Bull Marubozu' if is_green else 'Bear Marubozu'
             direction = 'Bullish' if is_green else 'Bearish'
+        elif body_ratio < 0.1 and total_range > 0:
+            pattern, direction = 'Doji', 'Indecision'
+        elif body_ratio < 0.35 and upper_wick > body and lower_wick > body and total_range > 0:
+            pattern, direction = 'Spinning Top', 'Indecision'
 
     if pattern == 'No Pattern' and body_ratio >= 0.6:
         pattern = 'Strong Green Candle' if is_green else 'Strong Red Candle'
@@ -6363,25 +6322,30 @@ def main():
                     pat = 'Normal'
                     direction = 'Neutral'
 
-                    # 1-candle patterns
-                    if c_lower > c_body * 2 and c_upper < c_body * 0.5 and c_body_ratio < 0.4:
-                        pat, direction = 'Hammer', 'Bullish'
-                    elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4 and c_green:
-                        pat, direction = 'Inverted Hammer', 'Bullish'
-                    elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4 and not c_green:
-                        pat, direction = 'Shooting Star', 'Bearish'
-                    elif c_body_ratio >= 0.95 and c_range > 0:
-                        pat = 'Bull Marubozu' if c_green else 'Bear Marubozu'
-                        direction = 'Bullish' if c_green else 'Bearish'
-                    elif c_body_ratio < 0.1 and c_range > 0:
-                        pat, direction = 'Doji', 'Indecision'
-                    elif c_body_ratio < 0.35 and c_upper > c_body and c_lower > c_body and c_range > 0:
-                        pat, direction = 'Spinning Top', 'Indecision'
-                    elif p is not None:
+                    # Check multi-candle patterns FIRST (higher significance)
+                    # 3-candle patterns
+                    if p is not None and p2 is not None:
                         p_body = abs(p['close'] - p['open'])
                         p_green = p['close'] > p['open']
                         p_range = p['high'] - p['low']
                         p_body_ratio = p_body / p_range if p_range > 0 else 0
+                        p2_body = abs(p2['close'] - p2['open'])
+                        p2_green = p2['close'] > p2['open']
+                        p2_range = p2['high'] - p2['low']
+                        if not p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio < 0.3 and c_green and c_body_ratio > 0.5 and c['close'] > (p2['open'] + p2['close']) / 2:
+                            pat, direction = 'Morning Star', 'Bullish'
+                        elif p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio < 0.3 and not c_green and c_body_ratio > 0.5 and c['close'] < (p2['open'] + p2['close']) / 2:
+                            pat, direction = 'Evening Star', 'Bearish'
+                        elif p2_green and p_green and c_green and p['close'] > p2['close'] and c['close'] > p['close'] and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio > 0.5 and c_body_ratio > 0.5:
+                            pat, direction = 'Three White Soldiers', 'Bullish'
+                        elif not p2_green and not p_green and not c_green and p['close'] < p2['close'] and c['close'] < p['close'] and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio > 0.5 and c_body_ratio > 0.5:
+                            pat, direction = 'Three Black Crows', 'Bearish'
+
+                    # 2-candle patterns
+                    if pat == 'Normal' and p is not None:
+                        p_body = abs(p['close'] - p['open'])
+                        p_green = p['close'] > p['open']
+                        p_range = p['high'] - p['low']
                         if c_green and not p_green and c_body > p_body and c['close'] > p['open'] and c['open'] < p['close']:
                             pat, direction = 'Bullish Engulfing', 'Bullish'
                         elif not c_green and p_green and c_body > p_body and c['close'] < p['open'] and c['open'] > p['close']:
@@ -6398,18 +6362,22 @@ def main():
                             pat, direction = 'Tweezer Bottom', 'Bullish'
                         elif not c_green and p_green and abs(c['high'] - p['high']) / max(p_range, 0.01) < 0.05:
                             pat, direction = 'Tweezer Top', 'Bearish'
-                        elif p2 is not None:
-                            p2_body = abs(p2['close'] - p2['open'])
-                            p2_green = p2['close'] > p2['open']
-                            p2_range = p2['high'] - p2['low']
-                            if not p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio < 0.3 and c_green and c_body_ratio > 0.5 and c['close'] > (p2['open'] + p2['close']) / 2:
-                                pat, direction = 'Morning Star', 'Bullish'
-                            elif p2_green and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio < 0.3 and not c_green and c_body_ratio > 0.5 and c['close'] < (p2['open'] + p2['close']) / 2:
-                                pat, direction = 'Evening Star', 'Bearish'
-                            elif p2_green and p_green and c_green and p['close'] > p2['close'] and c['close'] > p['close'] and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio > 0.5 and c_body_ratio > 0.5:
-                                pat, direction = 'Three White Soldiers', 'Bullish'
-                            elif not p2_green and not p_green and not c_green and p['close'] < p2['close'] and c['close'] < p['close'] and (p2_body / p2_range > 0.5 if p2_range > 0 else False) and p_body_ratio > 0.5 and c_body_ratio > 0.5:
-                                pat, direction = 'Three Black Crows', 'Bearish'
+
+                    # 1-candle patterns (lowest priority)
+                    if pat == 'Normal':
+                        if c_lower > c_body * 2 and c_upper < c_body * 0.5 and c_body_ratio < 0.4:
+                            pat, direction = 'Hammer', 'Bullish'
+                        elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4 and c_green:
+                            pat, direction = 'Inverted Hammer', 'Bullish'
+                        elif c_upper > c_body * 2 and c_lower < c_body * 0.5 and c_body_ratio < 0.4 and not c_green:
+                            pat, direction = 'Shooting Star', 'Bearish'
+                        elif c_body_ratio >= 0.95 and c_range > 0:
+                            pat = 'Bull Marubozu' if c_green else 'Bear Marubozu'
+                            direction = 'Bullish' if c_green else 'Bearish'
+                        elif c_body_ratio < 0.1 and c_range > 0:
+                            pat, direction = 'Doji', 'Indecision'
+                        elif c_body_ratio < 0.35 and c_upper > c_body and c_lower > c_body and c_range > 0:
+                            pat, direction = 'Spinning Top', 'Indecision'
                     if pat != 'Normal':
                         time_str = c['datetime'].strftime('%H:%M') if hasattr(c['datetime'], 'strftime') else str(c['datetime'])
                         pat_emoji = '🟢' if direction == 'Bullish' else '🔴' if direction == 'Bearish' else '🟡'
