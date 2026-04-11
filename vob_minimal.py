@@ -3125,6 +3125,9 @@ def fetch_alignment_data(api):
         ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY'),
         ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY'),
         ('INDIA VIX', '26', 'IDX_I', 'INDEX'),
+        ('GOLD', '119600009', 'MCX_COMM', 'FUTCOM'),
+        ('CRUDE OIL', '119600008', 'MCX_COMM', 'FUTCOM'),
+        ('USD/INR', '10093', 'CDS_FNO', 'FUTCUR'),
     ]
     alignment = {}
     for name, sec_id, seg, inst in tickers:
@@ -3744,7 +3747,7 @@ def send_master_signal_telegram(result, underlying_price):
 
     # Alignment text with candle pattern and sentiment
     align_lines = []
-    display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX']
+    display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
     for name in display_order:
         data = result.get('alignment', {}).get(name)
         if data is None:
@@ -6153,7 +6156,7 @@ def main():
                         st.markdown("### 🕯 Candle Patterns Across Indices")
                         pattern_rows = []
                         # Define display order
-                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX']
+                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
                         for name in display_order:
                             ad = align_data.get(name)
                             if ad is None:
@@ -6252,6 +6255,9 @@ def main():
                             'RELIANCE': '#00FF7F',
                             'ICICIBANK': '#FFA500',
                             'INDIA VIX': '#FF4444',
+                            'GOLD': '#DAA520',
+                            'CRUDE OIL': '#8B4513',
+                            'USD/INR': '#9370DB',
                         }
                         for name in display_order:
                             ad = align_data.get(name)
@@ -6261,7 +6267,7 @@ def main():
                             pct_vals = ad.get('pct_series_vals', [])
                             if pct_time and pct_vals:
                                 line_width = 3 if name == 'NIFTY 50' else 2
-                                dash = 'dot' if name == 'INDIA VIX' else None
+                                dash = 'dot' if name == 'INDIA VIX' else 'dashdot' if name in ('GOLD', 'CRUDE OIL', 'USD/INR') else None
                                 fig_pct.add_trace(go.Scatter(
                                     x=pct_time, y=pct_vals,
                                     mode='lines',
