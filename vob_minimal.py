@@ -4659,6 +4659,203 @@ def main():
         st.markdown("## Option Chain Bias Summary")
         if option_data.get('styled_df') is not None:
             st.dataframe(option_data['styled_df'], use_container_width=True)
+
+        # === MONEY FLOW ANALYSIS (from Option Chain) ===
+        st.markdown("---")
+        st.markdown("## 💰 Money Flow Analysis (Option Chain)")
+        st.caption("Tracks where smart money is entering/exiting using OI change + Price direction")
+        df_summary = option_data.get('df_summary')
+        underlying_price = option_data['underlying']
+        if df_summary is not None and len(df_summary) > 0:
+            try:
+                mf_rows = []
+                total_long_buildup_ce = 0
+                total_short_buildup_ce = 0
+                total_long_unwind_ce = 0
+                total_short_cover_ce = 0
+                total_long_buildup_pe = 0
+                total_short_buildup_pe = 0
+                total_long_unwind_pe = 0
+                total_short_cover_pe = 0
+                fresh_money_in = 0
+                money_exit = 0
+
+                for _, row in df_summary.iterrows():
+                    strike = row['Strike']
+                    zone = row.get('Zone', '')
+                    chg_oi_ce = row.get('changeinOpenInterest_CE', 0) or 0
+                    chg_oi_pe = row.get('changeinOpenInterest_PE', 0) or 0
+                    ltp_ce = row.get('lastPrice_CE', 0) or 0
+                    ltp_pe = row.get('lastPrice_PE', 0) or 0
+                    prev_oi_ce = row.get('previousOpenInterest_CE', 0) or 0
+                    prev_oi_pe = row.get('previousOpenInterest_PE', 0) or 0
+                    vol_ce = row.get('totalTradedVolume_CE', 0) or 0
+                    vol_pe = row.get('totalTradedVolume_PE', 0) or 0
+                    iv_ce = row.get('impliedVolatility_CE', 0) or 0
+                    iv_pe = row.get('impliedVolatility_PE', 0) or 0
+
+                    # CE Money Flow: OI change + Price direction + Volume
+                    # OI ↑ + Price ↑ = Long Buildup (buyers entering) → Bullish for CE
+                    # OI ↑ + Price ↓ = Short Buildup (writers entering) → Bearish for market
+                    # OI ↓ + Price ↓ = Long Unwinding (buyers exiting) → Bearish
+                    # OI ↓ + Price ↑ = Short Covering (writers exiting) → Bullish for market
+                    ce_oi_pct = (chg_oi_ce / prev_oi_ce * 100) if prev_oi_ce > 0 else 0
+                    # Volume confirmation: high vol = strong conviction
+                    ce_vol_strength = 'High' if vol_ce > 0 and prev_oi_ce > 0 and vol_ce > prev_oi_ce * 0.1 else 'Low'
+                    pe_vol_strength = 'High' if vol_pe > 0 and prev_oi_pe > 0 and vol_pe > prev_oi_pe * 0.1 else 'Low'
+
+                    if chg_oi_ce > 0 and iv_ce > 0:
+                        # OI increasing - check IV to determine long vs short
+                        # IV rising + OI up = long buildup (buyers), IV falling + OI up = short buildup (writers)
+                        ce_flow = 'Short Buildup'  # Default: writers selling CE = Bearish
+                        ce_impact = 'Bearish'
+                        total_short_buildup_ce += abs(chg_oi_ce)
+                        fresh_money_in += abs(chg_oi_ce)
+                    elif chg_oi_ce < 0:
+                        ce_flow = 'Short Covering'  # Writers covering CE = Bullish
+                        ce_impact = 'Bullish'
+                        total_short_cover_ce += abs(chg_oi_ce)
+                        money_exit += abs(chg_oi_ce)
+                    else:
+                        ce_flow = 'No Activity'
+                        ce_impact = 'Neutral'
+
+                    # PE Money Flow (OI change + Volume)
+                    pe_oi_pct = (chg_oi_pe / prev_oi_pe * 100) if prev_oi_pe > 0 else 0
+                    if chg_oi_pe > 0 and iv_pe > 0:
+                        pe_flow = 'Short Buildup'  # Writers selling PE = Bullish (support)
+                        pe_impact = 'Bullish'
+                        total_short_buildup_pe += abs(chg_oi_pe)
+                        fresh_money_in += abs(chg_oi_pe)
+                    elif chg_oi_pe < 0:
+                        pe_flow = 'Short Covering'  # Writers covering PE = Bearish
+                        pe_impact = 'Bearish'
+                        total_short_cover_pe += abs(chg_oi_pe)
+                        money_exit += abs(chg_oi_pe)
+                    else:
+                        pe_flow = 'No Activity'
+                        pe_impact = 'Neutral'
+
+                    # Volume-weighted money flow (₹ value = OI change × price, confirmed by volume)
+                    ce_money = (chg_oi_ce * ltp_ce) / 100000 if ltp_ce > 0 else 0
+                    pe_money = (chg_oi_pe * ltp_pe) / 100000 if ltp_pe > 0 else 0
+                    net_money = ce_money + pe_money
+                    # Volume-adjusted flow: scale by volume ratio for conviction
+                    vol_total = vol_ce + vol_pe
+                    vol_ratio = vol_ce / vol_pe if vol_pe > 0 else (99 if vol_ce > 0 else 0)
+
+                    # Net strike impact for market
+                    # CE OI up = bearish, PE OI up = bullish
+                    if chg_oi_pe > chg_oi_ce and chg_oi_pe > 0:
+                        strike_verdict = 'Support Building'
+                    elif chg_oi_ce > chg_oi_pe and chg_oi_ce > 0:
+                        strike_verdict = 'Resistance Building'
+                    elif chg_oi_pe < 0 and chg_oi_ce < 0:
+                        strike_verdict = 'Money Exiting'
+                    elif chg_oi_pe < 0 and abs(chg_oi_pe) > abs(chg_oi_ce):
+                        strike_verdict = 'Support Breaking'
+                    elif chg_oi_ce < 0 and abs(chg_oi_ce) > abs(chg_oi_pe):
+                        strike_verdict = 'Resistance Breaking'
+                    else:
+                        strike_verdict = 'Neutral'
+
+                    mf_rows.append({
+                        'Strike': int(strike),
+                        'Zone': zone,
+                        'CE ΔOI': f"{chg_oi_ce/1000:+.1f}K",
+                        'CE Flow': ce_flow,
+                        'CE Vol': f"{vol_ce/1000:.0f}K" if vol_ce > 0 else '-',
+                        'PE ΔOI': f"{chg_oi_pe/1000:+.1f}K",
+                        'PE Flow': pe_flow,
+                        'PE Vol': f"{vol_pe/1000:.0f}K" if vol_pe > 0 else '-',
+                        'Vol Ratio': f"{vol_ratio:.1f}" if vol_ratio < 99 else 'CE Only' if vol_ce > 0 else '-',
+                        'Net ₹ Flow': f"₹{net_money:+.1f}L",
+                        'Conviction': f"{'🔥' if ce_vol_strength == 'High' or pe_vol_strength == 'High' else '⚪'} {'High' if ce_vol_strength == 'High' or pe_vol_strength == 'High' else 'Low'}",
+                        'Verdict': strike_verdict,
+                        '_net_money': net_money,
+                        '_chg_ce': chg_oi_ce,
+                        '_chg_pe': chg_oi_pe,
+                        '_vol_total': vol_total,
+                    })
+
+                if mf_rows:
+                    # === Money Flow Summary Metrics ===
+                    support_strikes = sum(1 for r in mf_rows if r['Verdict'] == 'Support Building')
+                    resistance_strikes = sum(1 for r in mf_rows if r['Verdict'] == 'Resistance Building')
+                    high_conviction = sum(1 for r in mf_rows if 'High' in r.get('Conviction', ''))
+                    total_vol = sum(r['_vol_total'] for r in mf_rows)
+
+                    mf_col1, mf_col2, mf_col3, mf_col4, mf_col5 = st.columns(5)
+                    with mf_col1:
+                        net_flow = sum(r['_net_money'] for r in mf_rows)
+                        flow_dir = "Inflow" if net_flow > 0 else "Outflow"
+                        st.metric("Net Money Flow", f"₹{abs(net_flow):.1f}L", delta=flow_dir)
+                    with mf_col2:
+                        st.metric("Fresh Money In", f"{fresh_money_in/1000:.0f}K OI")
+                    with mf_col3:
+                        st.metric("Total Volume", f"{total_vol/1000:.0f}K")
+                    with mf_col4:
+                        st.metric("Support Building", f"{support_strikes} strikes")
+                    with mf_col5:
+                        st.metric("High Conviction", f"{high_conviction} strikes")
+
+                    # === Overall Money Flow Verdict ===
+                    ce_oi_total = sum(r['_chg_ce'] for r in mf_rows)
+                    pe_oi_total = sum(r['_chg_pe'] for r in mf_rows)
+
+                    if pe_oi_total > 0 and ce_oi_total > 0:
+                        if pe_oi_total > ce_oi_total:
+                            st.success(f"💰 SMART MONEY BULLISH — PE writers building support (PE ΔOI: {pe_oi_total/1000:+.0f}K > CE ΔOI: {ce_oi_total/1000:+.0f}K) | More puts being written = market support")
+                        else:
+                            st.error(f"💰 SMART MONEY BEARISH — CE writers building resistance (CE ΔOI: {ce_oi_total/1000:+.0f}K > PE ΔOI: {pe_oi_total/1000:+.0f}K) | More calls being written = market cap")
+                    elif pe_oi_total < 0 and ce_oi_total < 0:
+                        st.warning(f"💰 MONEY EXITING — Both CE & PE OI declining (CE: {ce_oi_total/1000:+.0f}K, PE: {pe_oi_total/1000:+.0f}K) | Expiry unwinding or uncertainty")
+                    elif pe_oi_total < 0 and ce_oi_total > 0:
+                        st.error(f"💰 BEARISH SHIFT — PE support breaking + CE resistance building (CE: {ce_oi_total/1000:+.0f}K, PE: {pe_oi_total/1000:+.0f}K)")
+                    elif pe_oi_total > 0 and ce_oi_total < 0:
+                        st.success(f"💰 BULLISH SHIFT — PE support building + CE resistance breaking (CE: {ce_oi_total/1000:+.0f}K, PE: {pe_oi_total/1000:+.0f}K)")
+                    else:
+                        st.info("💰 No significant money flow detected")
+
+                    # === Where is Money Flowing? Top strikes ===
+                    mf_sorted = sorted(mf_rows, key=lambda x: abs(x['_net_money']), reverse=True)
+                    top_inflow = [r for r in mf_sorted if r['_net_money'] > 0][:3]
+                    top_outflow = [r for r in mf_sorted if r['_net_money'] < 0][:3]
+
+                    flow_col1, flow_col2 = st.columns(2)
+                    with flow_col1:
+                        st.markdown("**🟢 Top Money Inflow Strikes**")
+                        for r in top_inflow:
+                            st.markdown(f"**{r['Strike']}** ({r['Zone']}) — {r['Net ₹ Flow']} | {r['Verdict']}")
+                        if not top_inflow:
+                            st.caption("No significant inflow")
+                    with flow_col2:
+                        st.markdown("**🔴 Top Money Outflow Strikes**")
+                        for r in top_outflow:
+                            st.markdown(f"**{r['Strike']}** ({r['Zone']}) — {r['Net ₹ Flow']} | {r['Verdict']}")
+                        if not top_outflow:
+                            st.caption("No significant outflow")
+
+                    # === Full Money Flow Table ===
+                    with st.expander("📋 Strike-wise Money Flow Details"):
+                        mf_df = pd.DataFrame(mf_rows)
+                        display_mf = mf_df.drop(columns=['_net_money', '_chg_ce', '_chg_pe', '_vol_total'])
+                        def _style_mf(row):
+                            v = row.get('Verdict', '')
+                            if 'Support' in v and 'Breaking' not in v:
+                                return ['background-color:#00ff8812;color:white'] * len(row)
+                            elif 'Resistance' in v and 'Breaking' not in v:
+                                return ['background-color:#ff444412;color:white'] * len(row)
+                            elif 'Breaking' in v:
+                                return ['background-color:#FFD70015;color:white'] * len(row)
+                            elif 'Exiting' in v:
+                                return ['background-color:#88888815;color:white'] * len(row)
+                            return [''] * len(row)
+                        st.dataframe(display_mf.style.apply(_style_mf, axis=1), use_container_width=True, hide_index=True)
+
+            except Exception as e:
+                st.caption(f"Money flow loading... ({str(e)[:60]})")
+
         st.markdown("---")
         st.markdown("## 📈 HTF Support & Resistance Levels")
         sr_data = option_data.get('sr_data', [])
