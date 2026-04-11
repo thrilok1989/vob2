@@ -3125,6 +3125,9 @@ def fetch_alignment_data(api):
         ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY'),
         ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY'),
         ('INDIA VIX', '26', 'IDX_I', 'INDEX'),
+        ('GOLD', '119600009', 'MCX_COMM', 'FUTCOM'),
+        ('CRUDE OIL', '119600008', 'MCX_COMM', 'FUTCOM'),
+        ('USD/INR', '10093', 'CDS_FNO', 'FUTCUR'),
     ]
     alignment = {}
     for name, sec_id, seg, inst in tickers:
@@ -3744,7 +3747,7 @@ def send_master_signal_telegram(result, underlying_price):
 
     # Alignment text with candle pattern and sentiment
     align_lines = []
-    display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX']
+    display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
     for name in display_order:
         data = result.get('alignment', {}).get(name)
         if data is None:
@@ -6153,7 +6156,7 @@ def main():
                         st.markdown("### 🕯 Candle Patterns Across Indices")
                         pattern_rows = []
                         # Define display order
-                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX']
+                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
                         for name in display_order:
                             ad = align_data.get(name)
                             if ad is None:
@@ -6252,6 +6255,9 @@ def main():
                             'RELIANCE': '#00FF7F',
                             'ICICIBANK': '#FFA500',
                             'INDIA VIX': '#FF4444',
+                            'GOLD': '#DAA520',
+                            'CRUDE OIL': '#8B4513',
+                            'USD/INR': '#9370DB',
                         }
                         for name in display_order:
                             ad = align_data.get(name)
@@ -6261,7 +6267,7 @@ def main():
                             pct_vals = ad.get('pct_series_vals', [])
                             if pct_time and pct_vals:
                                 line_width = 3 if name == 'NIFTY 50' else 2
-                                dash = 'dot' if name == 'INDIA VIX' else None
+                                dash = 'dot' if name == 'INDIA VIX' else 'dashdot' if name in ('GOLD', 'CRUDE OIL', 'USD/INR') else None
                                 fig_pct.add_trace(go.Scatter(
                                     x=pct_time, y=pct_vals,
                                     mode='lines',
@@ -6282,6 +6288,150 @@ def main():
                             hovermode='x unified',
                         )
                         st.plotly_chart(fig_pct, use_container_width=True)
+
+                        # === MARKET DRIVER ANALYSIS ===
+                        st.markdown("### 🔥 Nifty Market Driver Analysis")
+                        st.caption("Direct = moves WITH Nifty | Inverse = moves AGAINST Nifty (when inverse falls, Nifty rises)")
+
+                        # Classification
+                        direct_instruments = ['SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'GOLD']
+                        inverse_instruments = ['INDIA VIX', 'CRUDE OIL', 'USD/INR']
+
+                        nifty_data = align_data.get('NIFTY 50')
+                        nifty_10m = nifty_data.get('sentiment_10m', 'N/A') if nifty_data else 'N/A'
+                        nifty_1h = nifty_data.get('sentiment_1h', 'N/A') if nifty_data else 'N/A'
+                        nifty_pct = nifty_data.get('pct_10m', 0) if nifty_data else 0
+
+                        # Build driver table
+                        driver_rows = []
+                        direct_bull_10m = 0
+                        direct_bear_10m = 0
+                        inverse_supporting_bull = 0  # inverse bearish = supports Nifty bull
+                        inverse_supporting_bear = 0  # inverse bullish = supports Nifty bear
+                        strongest_driver = None
+                        strongest_pct = 0
+
+                        for name in display_order:
+                            if name == 'NIFTY 50':
+                                continue
+                            ad = align_data.get(name)
+                            if ad is None:
+                                continue
+                            s10 = ad.get('sentiment_10m', 'N/A')
+                            pct10 = ad.get('pct_10m', 0)
+                            s1h = ad.get('sentiment_1h', 'N/A')
+                            is_inverse = name in inverse_instruments
+                            corr_type = 'Inverse' if is_inverse else 'Direct'
+
+                            # Determine if this instrument supports Nifty bull or bear
+                            if is_inverse:
+                                if s10 == 'Bearish':
+                                    nifty_impact = 'Bullish'
+                                    inverse_supporting_bull += 1
+                                elif s10 == 'Bullish':
+                                    nifty_impact = 'Bearish'
+                                    inverse_supporting_bear += 1
+                                else:
+                                    nifty_impact = 'Neutral'
+                            else:
+                                if s10 == 'Bullish':
+                                    nifty_impact = 'Bullish'
+                                    direct_bull_10m += 1
+                                elif s10 == 'Bearish':
+                                    nifty_impact = 'Bearish'
+                                    direct_bear_10m += 1
+                                else:
+                                    nifty_impact = 'Neutral'
+
+                            # Track strongest mover
+                            if abs(pct10) > abs(strongest_pct):
+                                strongest_pct = pct10
+                                strongest_driver = name
+
+                            impact_emoji = '🟢' if nifty_impact == 'Bullish' else '🔴' if nifty_impact == 'Bearish' else '⚪'
+                            corr_emoji = '🔄' if is_inverse else '➡️'
+                            driver_rows.append({
+                                'Instrument': name,
+                                'Type': f"{corr_emoji} {corr_type}",
+                                '10m Move': f"{pct10:+.2f}%",
+                                '10m Sentiment': f"{'🟢' if s10 == 'Bullish' else '🔴' if s10 == 'Bearish' else '🟡'} {s10}",
+                                '1h Sentiment': f"{'🟢' if s1h == 'Bullish' else '🔴' if s1h == 'Bearish' else '🟡'} {s1h}",
+                                'Nifty Impact': f"{impact_emoji} {nifty_impact}",
+                            })
+
+                        if driver_rows:
+                            driver_df = pd.DataFrame(driver_rows)
+                            def _style_driver(row):
+                                impact = row.get('Nifty Impact', '')
+                                if 'Bullish' in impact:
+                                    return ['background-color:#00ff8812;color:white'] * len(row)
+                                elif 'Bearish' in impact:
+                                    return ['background-color:#ff444412;color:white'] * len(row)
+                                return [''] * len(row)
+                            st.dataframe(driver_df.style.apply(_style_driver, axis=1), use_container_width=True, hide_index=True)
+
+                        # Composite Nifty Fire Signal
+                        total_bull_support = direct_bull_10m + inverse_supporting_bull
+                        total_bear_support = direct_bear_10m + inverse_supporting_bear
+                        total_instruments = len(direct_instruments) + len(inverse_instruments)
+                        available_instruments = sum(1 for n in direct_instruments + inverse_instruments if align_data.get(n) is not None)
+
+                        st.markdown("#### 🎯 Composite Nifty Signal")
+                        fire_col1, fire_col2, fire_col3, fire_col4 = st.columns(4)
+                        with fire_col1:
+                            st.metric("Bull Drivers", f"{total_bull_support}/{available_instruments}")
+                        with fire_col2:
+                            st.metric("Bear Drivers", f"{total_bear_support}/{available_instruments}")
+                        with fire_col3:
+                            if strongest_driver:
+                                st.metric("Strongest Mover", f"{strongest_driver}", delta=f"{strongest_pct:+.2f}%")
+                        with fire_col4:
+                            nifty_pct_display = f"{nifty_pct:+.2f}%" if nifty_data else 'N/A'
+                            st.metric("NIFTY 50", nifty_pct_display)
+
+                        # Fire signal logic
+                        bull_pct = (total_bull_support / available_instruments * 100) if available_instruments > 0 else 0
+                        bear_pct = (total_bear_support / available_instruments * 100) if available_instruments > 0 else 0
+
+                        if bull_pct >= 80:
+                            st.success(f"🔥🔥🔥 NIFTY FIRE UP — {total_bull_support}/{available_instruments} instruments supporting bullish ({bull_pct:.0f}%) | Direct indices bullish + VIX/Crude/USD falling")
+                        elif bull_pct >= 60:
+                            st.success(f"🔥 NIFTY BULLISH — {total_bull_support}/{available_instruments} instruments supporting bullish ({bull_pct:.0f}%)")
+                        elif bear_pct >= 80:
+                            st.error(f"🔥🔥🔥 NIFTY FIRE DOWN — {total_bear_support}/{available_instruments} instruments supporting bearish ({bear_pct:.0f}%) | Direct indices bearish + VIX/Crude/USD rising")
+                        elif bear_pct >= 60:
+                            st.error(f"🔥 NIFTY BEARISH — {total_bear_support}/{available_instruments} instruments supporting bearish ({bear_pct:.0f}%)")
+                        else:
+                            st.warning(f"⚖️ MIXED SIGNALS — Bull: {total_bull_support} vs Bear: {total_bear_support} | No clear direction")
+
+                        # Detailed breakdown
+                        with st.expander("📋 Driver Breakdown"):
+                            bd_col1, bd_col2 = st.columns(2)
+                            with bd_col1:
+                                st.markdown("**➡️ Direct (move WITH Nifty)**")
+                                for name in direct_instruments:
+                                    ad = align_data.get(name)
+                                    if ad is None:
+                                        continue
+                                    s10 = ad.get('sentiment_10m', 'N/A')
+                                    pct = ad.get('pct_10m', 0)
+                                    emoji = '🟢' if s10 == 'Bullish' else '🔴' if s10 == 'Bearish' else '🟡'
+                                    st.markdown(f"{emoji} **{name}**: {pct:+.2f}% ({s10})")
+                            with bd_col2:
+                                st.markdown("**🔄 Inverse (move AGAINST Nifty)**")
+                                for name in inverse_instruments:
+                                    ad = align_data.get(name)
+                                    if ad is None:
+                                        continue
+                                    s10 = ad.get('sentiment_10m', 'N/A')
+                                    pct = ad.get('pct_10m', 0)
+                                    # For inverse: bearish = good for Nifty
+                                    if s10 == 'Bearish':
+                                        st.markdown(f"🟢 **{name}**: {pct:+.2f}% (Falling = Nifty Bullish)")
+                                    elif s10 == 'Bullish':
+                                        st.markdown(f"🔴 **{name}**: {pct:+.2f}% (Rising = Nifty Bearish)")
+                                    else:
+                                        st.markdown(f"🟡 **{name}**: {pct:+.2f}% (Neutral)")
                     else:
                         st.info("Alignment data loading... will appear on next refresh.")
                 else:
