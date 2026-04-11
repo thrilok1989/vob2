@@ -2027,6 +2027,9 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
 
     atm_strike = min(df['strikePrice'], key=lambda x: abs(x - underlying))
 
+    # Save ATM±4 strikes (200 pts) for money flow analysis before narrowing
+    df_atm4 = df[abs(df['strikePrice'] - atm_strike) <= 200].copy()
+    df_atm4['Zone'] = df_atm4['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
     atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]
     df = atm_plus_minus_2.copy()
 
@@ -2332,7 +2335,9 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         'bias_cols': bias_cols,
         'total_ce_change': total_ce_change,
         'total_pe_change': total_pe_change,
-        'vob_blocks': vob_blocks
+        'vob_blocks': vob_blocks,
+        'df_atm4': df_atm4,
+        'atm_strike': atm_strike,
     }
 
 def display_analytics_dashboard(db, symbol="NIFTY50"):
@@ -4662,11 +4667,12 @@ def main():
 
         # === MONEY FLOW ANALYSIS (from Option Chain) ===
         st.markdown("---")
-        st.markdown("## 💰 Money Flow Analysis (Option Chain)")
-        st.caption("Tracks where smart money is entering/exiting using OI change + Price direction")
-        df_summary = option_data.get('df_summary')
+        st.markdown("## 💰 Money Flow Analysis (ATM ±4 Strikes)")
+        st.caption("Tracks where smart money is entering/exiting using OI change + Volume + Price | ATM ±200 pts (9 strikes)")
+        df_mf_source = option_data.get('df_atm4')
         underlying_price = option_data['underlying']
-        if df_summary is not None and len(df_summary) > 0:
+        atm_strike_mf = option_data.get('atm_strike', underlying_price)
+        if df_mf_source is not None and len(df_mf_source) > 0:
             try:
                 mf_rows = []
                 total_long_buildup_ce = 0
@@ -4680,8 +4686,8 @@ def main():
                 fresh_money_in = 0
                 money_exit = 0
 
-                for _, row in df_summary.iterrows():
-                    strike = row['Strike']
+                for _, row in df_mf_source.iterrows():
+                    strike = row.get('strikePrice', 0)
                     zone = row.get('Zone', '')
                     chg_oi_ce = row.get('changeinOpenInterest_CE', 0) or 0
                     chg_oi_pe = row.get('changeinOpenInterest_PE', 0) or 0
