@@ -6341,9 +6341,10 @@ def main():
             df_5m_all = df.set_index('datetime').resample('5min').agg({
                 'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
             }).dropna().reset_index()
-            # Filter today only
-            _today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
-            df_5m_all = df_5m_all[df_5m_all['datetime'].dt.date == _today_ist]
+            # Filter to latest trading day available in chart data
+            if not df_5m_all.empty:
+                _latest_trading_day = df_5m_all['datetime'].dt.date.max()
+                df_5m_all = df_5m_all[df_5m_all['datetime'].dt.date == _latest_trading_day]
             if len(df_5m_all) >= 3:
                 pattern_rows = []
                 for i in range(2, len(df_5m_all)):
@@ -6456,7 +6457,7 @@ def main():
                         use_container_width=True, hide_index=True,
                         height=min(500, 50 + len(pat_timeline_df) * 35)
                     )
-                    st.caption(f"🕯 Patterns detected from today's 5-min chart | {len(pattern_rows)} patterns found")
+                    st.caption(f"🕯 Patterns detected from {_latest_trading_day.strftime('%d-%b-%Y')} 5-min chart | {len(pattern_rows)} patterns found")
                 else:
                     st.info("No significant candle patterns detected yet on 5-min chart.")
             else:
