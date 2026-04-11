@@ -6291,24 +6291,28 @@ def main():
         except Exception as e:
             st.warning(f"Master signal unavailable: {str(e)}")
 
-    # === CANDLE PATTERN TIMELINE (5-min chart) ===
+    # === CANDLE PATTERN TIMELINE ===
     if not df.empty and len(df) > 10:
         st.markdown("---")
-        st.markdown("## 🕯 Candle Pattern Timeline (5-min Chart)")
+        st.markdown("## 🕯 Candle Pattern Timeline")
         try:
-            # Resample to 5-min
-            df_5m_all = df.set_index('datetime').resample('5min').agg({
-                'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
-            }).dropna().reset_index()
+            # Timeframe selector
+            _pat_tf = st.radio("Timeframe", ["5 min", "1 min"], horizontal=True, key="pat_tf_radio")
+            if _pat_tf == "5 min":
+                df_pat = df.set_index('datetime').resample('5min').agg({
+                    'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+                }).dropna().reset_index()
+            else:
+                df_pat = df.copy()
             # Filter to latest trading day available in chart data
-            if not df_5m_all.empty:
-                _latest_trading_day = df_5m_all['datetime'].dt.date.max()
-                df_5m_all = df_5m_all[df_5m_all['datetime'].dt.date == _latest_trading_day]
-            if len(df_5m_all) >= 3:
+            if not df_pat.empty:
+                _latest_trading_day = df_pat['datetime'].dt.date.max()
+                df_pat = df_pat[df_pat['datetime'].dt.date == _latest_trading_day]
+            if len(df_pat) >= 3:
                 pattern_rows = []
-                for i in range(2, len(df_5m_all)):
+                for i in range(2, len(df_pat)):
                     # Get last 3 candles up to index i for pattern detection
-                    window = df_5m_all.iloc[max(0, i - 4):i + 1].copy().reset_index(drop=True)
+                    window = df_pat.iloc[max(0, i - 4):i + 1].copy().reset_index(drop=True)
                     c = window.iloc[-1]
                     c_body = abs(c['close'] - c['open'])
                     c_range = c['high'] - c['low']
@@ -6379,7 +6383,8 @@ def main():
                         elif c_body_ratio < 0.35 and c_upper > c_body and c_lower > c_body and c_range > 0:
                             pat, direction = 'Spinning Top', 'Indecision'
                     if pat != 'Normal':
-                        time_str = c['datetime'].strftime('%H:%M') if hasattr(c['datetime'], 'strftime') else str(c['datetime'])
+                        _tfmt = '%H:%M:%S' if _pat_tf == '1 min' else '%H:%M'
+                        time_str = c['datetime'].strftime(_tfmt) if hasattr(c['datetime'], 'strftime') else str(c['datetime'])
                         pat_emoji = '🟢' if direction == 'Bullish' else '🔴' if direction == 'Bearish' else '🟡'
                         pattern_rows.append({
                             'Time': time_str,
@@ -6425,11 +6430,11 @@ def main():
                         use_container_width=True, hide_index=True,
                         height=min(500, 50 + len(pat_timeline_df) * 35)
                     )
-                    st.caption(f"🕯 Patterns detected from {_latest_trading_day.strftime('%d-%b-%Y')} 5-min chart | {len(pattern_rows)} patterns found")
+                    st.caption(f"🕯 Patterns detected from {_latest_trading_day.strftime('%d-%b-%Y')} {_pat_tf} chart | {len(pattern_rows)} patterns found")
                 else:
-                    st.info("No significant candle patterns detected yet on 5-min chart.")
+                    st.info(f"No significant candle patterns detected yet on {_pat_tf} chart.")
             else:
-                st.info("Waiting for 5-min candle data to build up...")
+                st.info(f"Waiting for {_pat_tf} candle data to build up...")
         except Exception as e:
             st.caption(f"Pattern timeline loading... ({str(e)[:50]})")
 
