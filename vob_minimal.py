@@ -2030,6 +2030,9 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     # Save ATM±4 strikes (200 pts) for money flow analysis before narrowing
     df_atm4 = df[abs(df['strikePrice'] - atm_strike) <= 200].copy()
     df_atm4['Zone'] = df_atm4['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
+    # Save ATM±8 strikes (400 pts) for unwinding/parallel winding analysis
+    df_atm8 = df[abs(df['strikePrice'] - atm_strike) <= 400].copy()
+    df_atm8['Zone'] = df_atm8['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
     atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]
     df = atm_plus_minus_2.copy()
 
@@ -2337,6 +2340,7 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         'total_pe_change': total_pe_change,
         'vob_blocks': vob_blocks,
         'df_atm4': df_atm4,
+        'df_atm8': df_atm8,
         'atm_strike': atm_strike,
     }
 
@@ -3748,6 +3752,12 @@ def send_master_signal_telegram(result, underlying_price):
     """Send master signal to Telegram."""
     if result is None:
         return
+    # Skip sending if no actionable trade (RANGE mode or abs_score < 3)
+    trade_type = result.get('trade_type', '')
+    abs_score = result.get('abs_score', 0)
+    signal = result.get('signal', '')
+    if trade_type == 'RANGE' or abs_score < 3 or 'NO TRADE' in signal.upper():
+        return
     time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
 
     # Alignment text with candle pattern and sentiment
@@ -4861,6 +4871,183 @@ def main():
 
             except Exception as e:
                 st.caption(f"Money flow loading... ({str(e)[:60]})")
+
+        # === OI UNWINDING & PARALLEL WINDING (ATM ±8 Strikes) ===
+        st.markdown("---")
+        st.markdown("## 🔄 OI Unwinding & Parallel Winding (ATM ±8 Strikes)")
+        st.caption("Detects where positions are closing (unwinding) and where new positions are building simultaneously (parallel winding) | ATM ±400 pts (17 strikes)")
+        df_atm8 = option_data.get('df_atm8')
+        if df_atm8 is not None and len(df_atm8) > 0:
+            try:
+                atm_s = option_data.get('atm_strike', underlying_price)
+                unwind_rows = []
+                ce_unwinding = []
+                pe_unwinding = []
+                ce_winding = []
+                pe_winding = []
+                parallel_pairs = []
+
+                for _, row in df_atm8.iterrows():
+                    strike = row.get('strikePrice', 0)
+                    zone = row.get('Zone', '')
+                    chg_ce = row.get('changeinOpenInterest_CE', 0) or 0
+                    chg_pe = row.get('changeinOpenInterest_PE', 0) or 0
+                    oi_ce = row.get('openInterest_CE', 0) or 0
+                    oi_pe = row.get('openInterest_PE', 0) or 0
+                    prev_ce = row.get('previousOpenInterest_CE', 0) or 0
+                    prev_pe = row.get('previousOpenInterest_PE', 0) or 0
+                    vol_ce = row.get('totalTradedVolume_CE', 0) or 0
+                    vol_pe = row.get('totalTradedVolume_PE', 0) or 0
+                    ltp_ce = row.get('lastPrice_CE', 0) or 0
+                    ltp_pe = row.get('lastPrice_PE', 0) or 0
+
+                    ce_pct = (chg_ce / prev_ce * 100) if prev_ce > 0 else 0
+                    pe_pct = (chg_pe / prev_pe * 100) if prev_pe > 0 else 0
+
+                    # Classify CE activity
+                    if chg_ce < 0 and abs(chg_ce) > 1000:
+                        ce_activity = 'Unwinding'
+                        ce_unwinding.append({'strike': strike, 'chg': chg_ce, 'pct': ce_pct, 'vol': vol_ce})
+                    elif chg_ce > 0 and chg_ce > 1000:
+                        ce_activity = 'Buildup'
+                        ce_winding.append({'strike': strike, 'chg': chg_ce, 'pct': ce_pct, 'vol': vol_ce})
+                    else:
+                        ce_activity = 'Flat'
+
+                    # Classify PE activity
+                    if chg_pe < 0 and abs(chg_pe) > 1000:
+                        pe_activity = 'Unwinding'
+                        pe_unwinding.append({'strike': strike, 'chg': chg_pe, 'pct': pe_pct, 'vol': vol_pe})
+                    elif chg_pe > 0 and chg_pe > 1000:
+                        pe_activity = 'Buildup'
+                        pe_winding.append({'strike': strike, 'chg': chg_pe, 'pct': pe_pct, 'vol': vol_pe})
+                    else:
+                        pe_activity = 'Flat'
+
+                    # Detect parallel winding: one side unwinding + other side building at SAME strike
+                    parallel = ''
+                    parallel_impact = ''
+                    if ce_activity == 'Unwinding' and pe_activity == 'Buildup':
+                        parallel = 'CE Unwind + PE Buildup'
+                        parallel_impact = 'Bullish Shift'
+                        parallel_pairs.append({'strike': strike, 'type': parallel, 'impact': parallel_impact})
+                    elif pe_activity == 'Unwinding' and ce_activity == 'Buildup':
+                        parallel = 'PE Unwind + CE Buildup'
+                        parallel_impact = 'Bearish Shift'
+                        parallel_pairs.append({'strike': strike, 'type': parallel, 'impact': parallel_impact})
+                    elif ce_activity == 'Unwinding' and pe_activity == 'Unwinding':
+                        parallel = 'Both Unwinding'
+                        parallel_impact = 'Expiry Exit'
+                        parallel_pairs.append({'strike': strike, 'type': parallel, 'impact': parallel_impact})
+                    elif ce_activity == 'Buildup' and pe_activity == 'Buildup':
+                        parallel = 'Both Buildup'
+                        parallel_impact = 'High Activity'
+                        parallel_pairs.append({'strike': strike, 'type': parallel, 'impact': parallel_impact})
+
+                    # Only show strikes with activity
+                    if ce_activity != 'Flat' or pe_activity != 'Flat':
+                        ce_emoji = '🔻' if ce_activity == 'Unwinding' else '🔺' if ce_activity == 'Buildup' else '➖'
+                        pe_emoji = '🔻' if pe_activity == 'Unwinding' else '🔺' if pe_activity == 'Buildup' else '➖'
+                        par_emoji = '⚡' if parallel else ''
+                        atm_tag = ' [ATM]' if strike == atm_s else ''
+                        unwind_rows.append({
+                            'Strike': f"{int(strike)}{atm_tag}",
+                            'CE OI': f"{oi_ce/1000:.0f}K",
+                            'CE ΔOI': f"{chg_ce/1000:+.1f}K ({ce_pct:+.1f}%)",
+                            'CE': f"{ce_emoji} {ce_activity}",
+                            'CE Vol': f"{vol_ce/1000:.0f}K",
+                            'PE OI': f"{oi_pe/1000:.0f}K",
+                            'PE ΔOI': f"{chg_pe/1000:+.1f}K ({pe_pct:+.1f}%)",
+                            'PE': f"{pe_emoji} {pe_activity}",
+                            'PE Vol': f"{vol_pe/1000:.0f}K",
+                            'Parallel': f"{par_emoji} {parallel}" if parallel else '-',
+                            'Impact': parallel_impact if parallel_impact else '-',
+                            '_strike': strike,
+                        })
+
+                # === Summary metrics ===
+                uw_col1, uw_col2, uw_col3, uw_col4, uw_col5 = st.columns(5)
+                with uw_col1:
+                    st.metric("CE Unwinding", f"{len(ce_unwinding)} strikes")
+                with uw_col2:
+                    st.metric("PE Unwinding", f"{len(pe_unwinding)} strikes")
+                with uw_col3:
+                    st.metric("CE Buildup", f"{len(ce_winding)} strikes")
+                with uw_col4:
+                    st.metric("PE Buildup", f"{len(pe_winding)} strikes")
+                with uw_col5:
+                    st.metric("Parallel Activity", f"{len(parallel_pairs)} strikes")
+
+                # === Parallel Winding Signal ===
+                bull_parallel = sum(1 for p in parallel_pairs if p['impact'] == 'Bullish Shift')
+                bear_parallel = sum(1 for p in parallel_pairs if p['impact'] == 'Bearish Shift')
+                both_unwind = sum(1 for p in parallel_pairs if p['impact'] == 'Expiry Exit')
+
+                if bull_parallel > bear_parallel and bull_parallel > 0:
+                    par_strikes = ', '.join([str(int(p['strike'])) for p in parallel_pairs if p['impact'] == 'Bullish Shift'])
+                    st.success(f"⚡ BULLISH PARALLEL WINDING — CE unwinding + PE buildup at {bull_parallel} strikes ({par_strikes}) | Writers shifting from calls to puts = expecting move UP")
+                elif bear_parallel > bull_parallel and bear_parallel > 0:
+                    par_strikes = ', '.join([str(int(p['strike'])) for p in parallel_pairs if p['impact'] == 'Bearish Shift'])
+                    st.error(f"⚡ BEARISH PARALLEL WINDING — PE unwinding + CE buildup at {bear_parallel} strikes ({par_strikes}) | Writers shifting from puts to calls = expecting move DOWN")
+                elif both_unwind > 0 and bull_parallel == 0 and bear_parallel == 0:
+                    st.warning(f"⚡ MASS UNWINDING — Both CE & PE positions closing at {both_unwind} strikes | Expiry/event-driven exit, expect volatility")
+                elif len(parallel_pairs) == 0 and (len(ce_unwinding) > 0 or len(pe_unwinding) > 0):
+                    if len(ce_unwinding) > len(pe_unwinding):
+                        uw_strikes = ', '.join([str(int(u['strike'])) for u in sorted(ce_unwinding, key=lambda x: x['chg'])[:3]])
+                        st.success(f"🔄 CE UNWINDING dominant at {len(ce_unwinding)} strikes ({uw_strikes}) | Call writers exiting = resistance breaking = Bullish")
+                    elif len(pe_unwinding) > len(ce_unwinding):
+                        uw_strikes = ', '.join([str(int(u['strike'])) for u in sorted(pe_unwinding, key=lambda x: x['chg'])[:3]])
+                        st.error(f"🔄 PE UNWINDING dominant at {len(pe_unwinding)} strikes ({uw_strikes}) | Put writers exiting = support breaking = Bearish")
+                    else:
+                        st.info("🔄 Balanced unwinding across CE and PE | No clear directional bias")
+                else:
+                    st.info("No significant unwinding or parallel winding detected")
+
+                # === Detailed Unwinding Breakdown ===
+                uw_detail_col1, uw_detail_col2 = st.columns(2)
+                with uw_detail_col1:
+                    st.markdown("**🔻 CE Unwinding (Resistance Breaking)**")
+                    if ce_unwinding:
+                        for u in sorted(ce_unwinding, key=lambda x: x['chg']):
+                            st.markdown(f"**{int(u['strike'])}** — OI: {u['chg']/1000:+.1f}K ({u['pct']:+.1f}%) | Vol: {u['vol']/1000:.0f}K")
+                    else:
+                        st.caption("No CE unwinding")
+                    st.markdown("**🔺 CE Buildup (Resistance Building)**")
+                    if ce_winding:
+                        for w in sorted(ce_winding, key=lambda x: -x['chg']):
+                            st.markdown(f"**{int(w['strike'])}** — OI: {w['chg']/1000:+.1f}K ({w['pct']:+.1f}%) | Vol: {w['vol']/1000:.0f}K")
+                    else:
+                        st.caption("No CE buildup")
+                with uw_detail_col2:
+                    st.markdown("**🔻 PE Unwinding (Support Breaking)**")
+                    if pe_unwinding:
+                        for u in sorted(pe_unwinding, key=lambda x: x['chg']):
+                            st.markdown(f"**{int(u['strike'])}** — OI: {u['chg']/1000:+.1f}K ({u['pct']:+.1f}%) | Vol: {u['vol']/1000:.0f}K")
+                    else:
+                        st.caption("No PE unwinding")
+                    st.markdown("**🔺 PE Buildup (Support Building)**")
+                    if pe_winding:
+                        for w in sorted(pe_winding, key=lambda x: -x['chg']):
+                            st.markdown(f"**{int(w['strike'])}** — OI: {w['chg']/1000:+.1f}K ({w['pct']:+.1f}%) | Vol: {w['vol']/1000:.0f}K")
+                    else:
+                        st.caption("No PE buildup")
+
+                # === Full Table ===
+                if unwind_rows:
+                    with st.expander("📋 Full Strike-wise OI Activity (ATM ±8)"):
+                        uw_df = pd.DataFrame(unwind_rows).drop(columns=['_strike'])
+                        def _style_unwind(row):
+                            impact = row.get('Impact', '')
+                            if 'Bullish' in impact:
+                                return ['background-color:#00ff8812;color:white'] * len(row)
+                            elif 'Bearish' in impact:
+                                return ['background-color:#ff444412;color:white'] * len(row)
+                            elif 'Exit' in impact or 'Unwind' in str(row.get('CE', '')) + str(row.get('PE', '')):
+                                return ['background-color:#FFD70010;color:white'] * len(row)
+                            return [''] * len(row)
+                        st.dataframe(uw_df.style.apply(_style_unwind, axis=1), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.caption(f"Unwinding analysis loading... ({str(e)[:60]})")
 
         st.markdown("---")
         st.markdown("## 📈 HTF Support & Resistance Levels")
