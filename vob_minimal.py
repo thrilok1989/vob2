@@ -85,12 +85,12 @@ NIFTY_UNDERLYING_SEG = "IDX_I"
 
 @st.cache_data(ttl=300)
 def cached_pivot_calculation(df_json, pivot_settings):
-    df = pd.read_json(df_json)
+    df = pd.read_json(io.StringIO(df_json))
     return PivotIndicator.get_all_pivots(df, pivot_settings)
 
 @st.cache_data(ttl=60)
 def cached_iv_average(option_data_json):
-    df = pd.read_json(option_data_json)
+    df = pd.read_json(io.StringIO(option_data_json))
     iv_ce_avg = df['impliedVolatility_CE'].mean()
     iv_pe_avg = df['impliedVolatility_PE'].mean()
     return iv_ce_avg, iv_pe_avg
