@@ -3942,6 +3942,176 @@ def send_master_signal_telegram(result, underlying_price, option_data=None):
     except Exception:
         unwind_block = ""
 
+    # Price Action block: VIDYA (detailed), LTP Trap, VOB zones, HVP, HTF S&R, Delta Vol
+    price_action_block = ""
+    try:
+        vidya = result.get('vidya', {}) or {}
+        ltp_trap_d = result.get('ltp_trap', {}) or {}
+        vob_b = result.get('vob_blocks') or {}
+        hvp_d = result.get('hvp', {}) or {}
+        htf_sr_d = result.get('htf_sr', {}) or {}
+        delta_trend_d = result.get('delta_trend', 'N/A')
+
+        # VIDYA detailed
+        vidya_line = (
+            f"  Trend: {vidya.get('trend', 'N/A')} | Smoothed: ₹{vidya.get('smoothed_last', 0):.0f} | "
+            f"Delta Vol: {vidya.get('delta_pct', 0):+.0f}%"
+        )
+        vidya_vol = f"  Buy Vol: {int(vidya.get('buy_vol', 0)):,} | Sell Vol: {int(vidya.get('sell_vol', 0)):,}"
+
+        # LTP Trap
+        if ltp_trap_d.get('buy_trap'):
+            trap_label = "🪤 Buy Trap"
+        elif ltp_trap_d.get('sell_trap'):
+            trap_label = "🪤 Sell Trap"
+        else:
+            trap_label = "No LTP Trap"
+        ltp_line = (
+            f"  {trap_label} | VWAP: ₹{ltp_trap_d.get('vwap', 0):.0f} "
+            f"({ltp_trap_d.get('price_vs_vwap', 'N/A')})"
+        )
+
+        # VOB zones (top 3 each by volume)
+        vob_lines = []
+        for b in sorted((vob_b.get('bullish') or []), key=lambda x: -(x.get('volume', 0)))[:3]:
+            vob_lines.append(
+                f"  🟢 Support ₹{b.get('lower', 0):.0f}-₹{b.get('upper', 0):.0f} | Vol: {int(b.get('volume', 0)):,}"
+            )
+        for b in sorted((vob_b.get('bearish') or []), key=lambda x: -(x.get('volume', 0)))[:3]:
+            vob_lines.append(
+                f"  🔴 Resistance ₹{b.get('lower', 0):.0f}-₹{b.get('upper', 0):.0f} | Vol: {int(b.get('volume', 0)):,}"
+            )
+        vob_text = "\n".join(vob_lines) if vob_lines else "  None detected"
+
+        # HVP
+        hvp_lines = []
+        for h in (hvp_d.get('bullish_hvp') or [])[-3:]:
+            hvp_lines.append(f"  🟢 HVP Sup ₹{h.get('price', 0):.0f} | Vol: {int(h.get('volume', 0)):,}")
+        for h in (hvp_d.get('bearish_hvp') or [])[-3:]:
+            hvp_lines.append(f"  🔴 HVP Res ₹{h.get('price', 0):.0f} | Vol: {int(h.get('volume', 0)):,}")
+        hvp_text = "\n".join(hvp_lines) if hvp_lines else "  No HVP detected"
+
+        # HTF S&R pivots
+        htf_lines = []
+        res_near = sorted(
+            [l for l in (htf_sr_d.get('resistance') or []) if l['level'] >= underlying_price],
+            key=lambda x: x['level']
+        )[:2]
+        sup_near = sorted(
+            [l for l in (htf_sr_d.get('support') or []) if l['level'] <= underlying_price],
+            key=lambda x: -x['level']
+        )[:2]
+        for l in res_near:
+            htf_lines.append(f"  R ₹{l['level']:.0f} ({l.get('tf', '')})")
+        htf_lines.append(f"  PRICE ₹{underlying_price:.0f}")
+        for l in sup_near:
+            htf_lines.append(f"  S ₹{l['level']:.0f} ({l.get('tf', '')})")
+        htf_text = "\n".join(htf_lines)
+
+        price_action_block = f"""
+<b>🔮 VIDYA Trend:</b>
+{vidya_line}
+{vidya_vol}
+
+<b>🔄 LTP Trap:</b>
+{ltp_line}
+
+<b>🟢🔴 VOB Zones:</b>
+{vob_text}
+
+<b>🟢🔴 HVP (High Volume Pivots):</b>
+{hvp_text}
+
+<b>📐 HTF S&R (Price Pivots):</b>
+{htf_text}
+
+<b>📊 Delta Volume Trend:</b> {delta_trend_d}
+"""
+    except Exception:
+        price_action_block = ""
+
+    # Option Chain Deep Analysis block (from session-state sa_result)
+    oc_deep_block = ""
+    try:
+        sa = getattr(st.session_state, '_sa_result', None)
+        if sa is not None:
+            oc_bias = sa.get('market_bias', '')
+            oc_conf = sa.get('confidence', 0)
+            if 'Bullish' in oc_bias:
+                oc_emoji, oc_cond = '🟢', 'BULLISH'
+            elif 'Bearish' in oc_bias:
+                oc_emoji, oc_cond = '🔴', 'BEARISH'
+            else:
+                oc_emoji, oc_cond = '🟡', 'SIDEWAYS'
+
+            oc_res_lines = []
+            try:
+                for _, r in sa['top_resistance'].iterrows():
+                    oc_res_lines.append(
+                        f"  🟥 ₹{r['Strike']:.0f} | {r.get('Call_Strength', '')} | "
+                        f"OI: {r.get('CE_OI', 0)/100000:.1f}L | {r.get('Call_Activity', '')}"
+                    )
+            except Exception:
+                pass
+            oc_sup_lines = []
+            try:
+                for _, r in sa['top_support'].iterrows():
+                    oc_sup_lines.append(
+                        f"  🟩 ₹{r['Strike']:.0f} | {r.get('Put_Strength', '')} | "
+                        f"OI: {r.get('PE_OI', 0)/100000:.1f}L | {r.get('Put_Activity', '')}"
+                    )
+            except Exception:
+                pass
+
+            # Active signals
+            oc_active = []
+            try:
+                adf = sa.get('analysis_df')
+                if adf is not None:
+                    cap = adf[(adf['Call_Class'] == 'Strong Resistance') & (adf['Call_Activity'] == 'Writing (Resistance)')]
+                    for _, r in cap.iterrows():
+                        oc_active.append(f"🟥 CALL CAPPING at ₹{r['Strike']:.0f} (OI:{r['CE_OI']/100000:.1f}L)")
+                    sup = adf[(adf['Put_Class'] == 'Strong Support') & (adf['Put_Activity'] == 'Writing (Support)')]
+                    for _, r in sup.iterrows():
+                        oc_active.append(f"🟩 PUT SUPPORT at ₹{r['Strike']:.0f} (OI:{r['PE_OI']/100000:.1f}L)")
+            except Exception:
+                pass
+
+            # Breakout/Breakdown levels
+            try:
+                bout_df = sa.get('breakout_zones')
+                bdn_df = sa.get('breakdown_zones')
+                bout_lvl = f"₹{bout_df.iloc[0]['Strike']:.0f}" if bout_df is not None and not bout_df.empty else "None"
+                bdn_lvl = f"₹{bdn_df.iloc[0]['Strike']:.0f}" if bdn_df is not None and not bdn_df.empty else "None"
+            except Exception:
+                bout_lvl, bdn_lvl = "None", "None"
+
+            bias_reasoning = "\n".join([f"  • {s}" for s in sa.get('bias_signals', [])[:4]]) or "  —"
+            oc_res_text = "\n".join(oc_res_lines) if oc_res_lines else "  None"
+            oc_sup_text = "\n".join(oc_sup_lines) if oc_sup_lines else "  None"
+            oc_active_text = "\n".join(oc_active) if oc_active else "  None"
+
+            oc_deep_block = f"""
+━━━ {oc_emoji} <b>OPTION CHAIN: {oc_cond}</b> ━━━
+📈 Confidence: <b>{oc_conf}%</b>
+
+<b>🟥 CALL CAPPING / RESISTANCE:</b>
+{oc_res_text}
+
+<b>🟩 PUT SUPPORT LEVELS:</b>
+{oc_sup_text}
+
+<b>⚡ OC ACTIVE SIGNALS:</b>
+{oc_active_text}
+
+<b>🚀 Breakout:</b> {bout_lvl} | <b>💥 Breakdown:</b> {bdn_lvl}
+
+<b>📋 BIAS REASONING:</b>
+{bias_reasoning}
+"""
+    except Exception:
+        oc_deep_block = ""
+
     message = f"""{signal_emoji} <b>MASTER TRADING SIGNAL</b> {signal_emoji}
 🕐 {time_str} | Spot: ₹{underlying_price:.2f}
 
@@ -3982,8 +4152,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None):
   Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-<b>📊 Delta Vol:</b> {result.get('delta_trend', 'N/A')} | VWAP: ₹{result.get('ltp_trap', {}).get('vwap', 0):.0f} ({result.get('ltp_trap', {}).get('price_vs_vwap', 'N/A')})
-{unwind_block}
+{price_action_block}{unwind_block}{oc_deep_block}
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
 
