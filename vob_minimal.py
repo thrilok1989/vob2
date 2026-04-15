@@ -6990,14 +6990,14 @@ def main():
                         line_colors = {
                             'NIFTY 50': '#FFFFFF',   # white
                             'SENSEX':    '#8B00FF',  # violet
-                            'BANKNIFTY': '#4B0082',  # indigo
+                            'BANKNIFTY': '#8B4513',  # brown
                             'NIFTY IT':  '#1E90FF',  # blue
                             'RELIANCE':  '#00FF00',  # green
                             'ICICIBANK': '#FFFF00',  # yellow
                             'INDIA VIX': '#FFA500',  # orange
                             'USD/INR':   '#FF0000',  # red
                             'GOLD':      '#FFD700',  # gold
-                            'CRUDE OIL': '#FF007F',  # rose
+                            'CRUDE OIL': '#FF66CC',  # rose pink
                         }
                         for name in display_order:
                             ad = align_data.get(name)
