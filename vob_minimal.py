@@ -2717,6 +2717,9 @@ def send_option_chain_signal(sa_result, underlying_price):
     # Send only if there are meaningful active signals
     if not active_signals:
         return
+    # Skip sideways / neutral market conditions (noise reduction)
+    if condition == "SIDEWAYS" or ('Bullish' not in bias and 'Bearish' not in bias):
+        return
     # 5-minute cooldown to prevent spam
     now = datetime.now(pytz.timezone('Asia/Kolkata'))
     last_sent = st.session_state.get('_last_oc_signal_time')
