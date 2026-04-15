@@ -18,6 +18,11 @@ import io
 import os
 from db.supabase_client import SupabaseDB
 from indicators.money_flow_profile import calculate_money_flow_profile
+try:
+    import yfinance as yf
+    _HAS_YF = True
+except Exception:
+    _HAS_YF = False
 from indicators.volume_delta import calculate_volume_delta
 
 st.set_page_config(
@@ -2030,8 +2035,8 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     # Save ATM±4 strikes (200 pts) for money flow analysis before narrowing
     df_atm4 = df[abs(df['strikePrice'] - atm_strike) <= 200].copy()
     df_atm4['Zone'] = df_atm4['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
-    # Save ATM±8 strikes (400 pts) for unwinding/parallel winding analysis
-    df_atm8 = df[abs(df['strikePrice'] - atm_strike) <= 400].copy()
+    # Save ATM±5 strikes (250 pts) for unwinding/parallel winding analysis
+    df_atm8 = df[abs(df['strikePrice'] - atm_strike) <= 250].copy()
     df_atm8['Zone'] = df_atm8['strikePrice'].apply(lambda x: 'ATM' if x == atm_strike else 'ITM' if x < underlying else 'OTM')
     atm_plus_minus_2 = df[abs(df['strikePrice'] - atm_strike) <= 100]
     df = atm_plus_minus_2.copy()
@@ -3134,26 +3139,56 @@ def detect_ltp_trap(df, delta_length=10, delta_thresh=1.5):
         'price_vs_vwap': 'Above' if last_close > vwap else 'Below',
     }
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_yf_intraday(symbol: str, interval: str = "1m", period: str = "1d"):
+    """Fetch 1-min intraday OHLC via yfinance and convert to Dhan-style dict."""
+    if not _HAS_YF:
+        return None
+    try:
+        hist = yf.Ticker(symbol).history(period=period, interval=interval, prepost=False)
+        if hist is None or hist.empty:
+            return None
+        ist = pytz.timezone('Asia/Kolkata')
+        if hist.index.tz is None:
+            hist.index = hist.index.tz_localize('UTC').tz_convert(ist)
+        else:
+            hist.index = hist.index.tz_convert(ist)
+        return {
+            'open': hist['Open'].tolist(),
+            'high': hist['High'].tolist(),
+            'low': hist['Low'].tolist(),
+            'close': hist['Close'].tolist(),
+            'volume': hist['Volume'].fillna(0).tolist(),
+            'timestamp': [int(t.timestamp()) for t in hist.index],
+        }
+    except Exception:
+        return None
+
 def fetch_alignment_data(api):
     """Fetch candle data for SENSEX, BANKNIFTY, NIFTY IT, RELIANCE, ICICI, VIX.
     Detect candle patterns, compute 10m/1h/4h sentiment for each."""
-    # Dhan security IDs
+    # Dhan security IDs + yfinance fallback symbols for instruments Dhan can't
+    # resolve without monthly contract lookup (MCX/CDS futures, SENSEX on BSE).
     tickers = [
-        ('SENSEX', '51', 'BSE_EQ', 'INDEX'),
-        ('BANKNIFTY', '25', 'IDX_I', 'INDEX'),
-        ('NIFTY IT', '30', 'IDX_I', 'INDEX'),
-        ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY'),
-        ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY'),
-        ('INDIA VIX', '26', 'IDX_I', 'INDEX'),
-        ('GOLD', '119600009', 'MCX_COMM', 'FUTCOM'),
-        ('CRUDE OIL', '119600008', 'MCX_COMM', 'FUTCOM'),
-        ('USD/INR', '10093', 'CDS_FNO', 'FUTCUR'),
+        ('BANKNIFTY', '25', 'IDX_I', 'INDEX', None),
+        ('NIFTY IT', '30', 'IDX_I', 'INDEX', None),
+        ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY', None),
+        ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY', None),
+        ('INDIA VIX', '26', 'IDX_I', 'INDEX', None),
+        # Below: Dhan path not reliable — use yfinance
+        ('SENSEX', None, None, None, '^BSESN'),
+        ('GOLD', None, None, None, 'GC=F'),
+        ('CRUDE OIL', None, None, None, 'CL=F'),
+        ('USD/INR', None, None, None, 'INR=X'),
     ]
     alignment = {}
-    for name, sec_id, seg, inst in tickers:
+    for name, sec_id, seg, inst, yf_symbol in tickers:
         try:
             # Fetch 1-min candle data (last 1 day)
-            data = api.get_intraday_data(security_id=sec_id, exchange_segment=seg, instrument=inst, interval="1", days_back=1)
+            if yf_symbol:
+                data = _fetch_yf_intraday(yf_symbol, interval="1m", period="1d")
+            else:
+                data = api.get_intraday_data(security_id=sec_id, exchange_segment=seg, instrument=inst, interval="1", days_back=1)
             if data and 'open' in data:
                 adf = process_candle_data(data, "1")
                 if adf.empty:
@@ -3759,7 +3794,67 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         'vob_resistance_levels': vob_resistance_levels,
     }
 
-def send_master_signal_telegram(result, underlying_price):
+def compute_unwinding_summary(df_atm8):
+    """Summarise CE/PE unwinding + parallel winding from ATM±5 strikes."""
+    if df_atm8 is None or len(df_atm8) == 0:
+        return None
+    ce_unwind, pe_unwind, ce_build, pe_build = [], [], [], []
+    parallel_pairs = []
+    for _, row in df_atm8.iterrows():
+        strike = row.get('strikePrice', 0)
+        chg_ce = row.get('changeinOpenInterest_CE', 0) or 0
+        chg_pe = row.get('changeinOpenInterest_PE', 0) or 0
+        ce_act = 'Unwinding' if chg_ce < -1000 else 'Buildup' if chg_ce > 1000 else 'Flat'
+        pe_act = 'Unwinding' if chg_pe < -1000 else 'Buildup' if chg_pe > 1000 else 'Flat'
+        if ce_act == 'Unwinding':
+            ce_unwind.append({'strike': strike, 'chg': chg_ce})
+        elif ce_act == 'Buildup':
+            ce_build.append({'strike': strike, 'chg': chg_ce})
+        if pe_act == 'Unwinding':
+            pe_unwind.append({'strike': strike, 'chg': chg_pe})
+        elif pe_act == 'Buildup':
+            pe_build.append({'strike': strike, 'chg': chg_pe})
+        if ce_act == 'Unwinding' and pe_act == 'Buildup':
+            parallel_pairs.append({'strike': strike, 'type': 'CE Unwind + PE Buildup', 'impact': 'Bullish Shift'})
+        elif pe_act == 'Unwinding' and ce_act == 'Buildup':
+            parallel_pairs.append({'strike': strike, 'type': 'PE Unwind + CE Buildup', 'impact': 'Bearish Shift'})
+        elif ce_act == 'Unwinding' and pe_act == 'Unwinding':
+            parallel_pairs.append({'strike': strike, 'type': 'Both Unwinding', 'impact': 'Expiry Exit'})
+        elif ce_act == 'Buildup' and pe_act == 'Buildup':
+            parallel_pairs.append({'strike': strike, 'type': 'Both Buildup', 'impact': 'High Activity'})
+    bull_parallel = [p for p in parallel_pairs if p['impact'] == 'Bullish Shift']
+    bear_parallel = [p for p in parallel_pairs if p['impact'] == 'Bearish Shift']
+    if bull_parallel and len(bull_parallel) >= len(bear_parallel):
+        verdict = f"⚡ BULLISH PARALLEL WINDING ({len(bull_parallel)} strikes)"
+    elif bear_parallel and len(bear_parallel) > len(bull_parallel):
+        verdict = f"⚡ BEARISH PARALLEL WINDING ({len(bear_parallel)} strikes)"
+    elif len(ce_unwind) > len(pe_unwind) and len(ce_unwind) >= 2:
+        verdict = f"🔄 CE UNWINDING dominant ({len(ce_unwind)} strikes) → Bullish"
+    elif len(pe_unwind) > len(ce_unwind) and len(pe_unwind) >= 2:
+        verdict = f"🔄 PE UNWINDING dominant ({len(pe_unwind)} strikes) → Bearish"
+    else:
+        verdict = "Balanced / No strong unwinding"
+    def _top(lst, rev=False):
+        if not lst:
+            return "None"
+        sorted_lst = sorted(lst, key=lambda x: -abs(x['chg']) if rev else x['chg'])[:3]
+        return ", ".join([f"{int(l['strike'])}({l['chg']/1000:+.0f}K)" for l in sorted_lst])
+    return {
+        'ce_unwind_count': len(ce_unwind),
+        'pe_unwind_count': len(pe_unwind),
+        'ce_build_count': len(ce_build),
+        'pe_build_count': len(pe_build),
+        'parallel_count': len(parallel_pairs),
+        'bull_parallel': len(bull_parallel),
+        'bear_parallel': len(bear_parallel),
+        'ce_unwind_top': _top(ce_unwind),
+        'pe_unwind_top': _top(pe_unwind),
+        'ce_build_top': _top(ce_build, rev=True),
+        'pe_build_top': _top(pe_build, rev=True),
+        'verdict': verdict,
+    }
+
+def send_master_signal_telegram(result, underlying_price, option_data=None):
     """Send master signal to Telegram."""
     if result is None:
         return
@@ -3807,6 +3902,26 @@ def send_master_signal_telegram(result, underlying_price):
     res_text = ", ".join([f"₹{r:.0f}" for r in result['resistance_levels'][:3]]) if result['resistance_levels'] else "None"
     sup_text = ", ".join([f"₹{s:.0f}" for s in result['support_levels'][:3]]) if result['support_levels'] else "None"
 
+    # Unwinding / parallel winding summary from ATM±5 strikes
+    unwind_block = ""
+    try:
+        df_atm8 = option_data.get('df_atm8') if option_data else None
+        uw = compute_unwinding_summary(df_atm8)
+        if uw:
+            unwind_block = f"""
+<b>🔄 OI UNWINDING & PARALLEL WINDING (ATM±5):</b>
+  CE Unwind: {uw['ce_unwind_count']} strikes | PE Unwind: {uw['pe_unwind_count']} strikes
+  CE Buildup: {uw['ce_build_count']} strikes | PE Buildup: {uw['pe_build_count']} strikes
+  Parallel Activity: {uw['parallel_count']} strikes (Bull:{uw['bull_parallel']} | Bear:{uw['bear_parallel']})
+  Top CE Unwind: {uw['ce_unwind_top']}
+  Top PE Unwind: {uw['pe_unwind_top']}
+  Top CE Buildup: {uw['ce_build_top']}
+  Top PE Buildup: {uw['pe_build_top']}
+  Verdict: <b>{uw['verdict']}</b>
+"""
+    except Exception:
+        unwind_block = ""
+
     message = f"""{signal_emoji} <b>MASTER TRADING SIGNAL</b> {signal_emoji}
 🕐 {time_str} | Spot: ₹{underlying_price:.2f}
 
@@ -3848,7 +3963,7 @@ def send_master_signal_telegram(result, underlying_price):
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
 <b>📊 Delta Vol:</b> {result.get('delta_trend', 'N/A')} | VWAP: ₹{result.get('ltp_trap', {}).get('vwap', 0):.0f} ({result.get('ltp_trap', {}).get('price_vs_vwap', 'N/A')})
-
+{unwind_block}
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
 
@@ -4883,10 +4998,10 @@ def main():
             except Exception as e:
                 st.caption(f"Money flow loading... ({str(e)[:60]})")
 
-        # === OI UNWINDING & PARALLEL WINDING (ATM ±8 Strikes) ===
+        # === OI UNWINDING & PARALLEL WINDING (ATM ±5 Strikes) ===
         st.markdown("---")
-        st.markdown("## 🔄 OI Unwinding & Parallel Winding (ATM ±8 Strikes)")
-        st.caption("Detects where positions are closing (unwinding) and where new positions are building simultaneously (parallel winding) | ATM ±400 pts (17 strikes)")
+        st.markdown("## 🔄 OI Unwinding & Parallel Winding (ATM ±5 Strikes)")
+        st.caption("Detects where positions are closing (unwinding) and where new positions are building simultaneously (parallel winding) | ATM ±250 pts (11 strikes)")
         df_atm8 = option_data.get('df_atm8')
         if df_atm8 is not None and len(df_atm8) > 0:
             try:
@@ -5045,7 +5160,7 @@ def main():
 
                 # === Full Table ===
                 if unwind_rows:
-                    with st.expander("📋 Full Strike-wise OI Activity (ATM ±8)"):
+                    with st.expander("📋 Full Strike-wise OI Activity (ATM ±5)"):
                         uw_df = pd.DataFrame(unwind_rows).drop(columns=['_strike'])
                         def _style_unwind(row):
                             impact = row.get('Impact', '')
@@ -6232,7 +6347,7 @@ def main():
                         (_ist_now - st.session_state.last_master_signal_time).total_seconds() > 300
                     if _should_send:
                         try:
-                            send_master_signal_telegram(master, option_data['underlying'])
+                            send_master_signal_telegram(master, option_data['underlying'], option_data)
                             st.session_state.last_master_signal_time = _ist_now
                         except Exception:
                             pass
