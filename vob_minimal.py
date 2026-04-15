@@ -2739,6 +2739,24 @@ def send_option_chain_signal(sa_result, underlying_price, force=False):
     except Exception:
         pass
 
+    # Auto-forward to Gemini and post its analysis back to Telegram + app
+    try:
+        _ai_text, _ai_err = ai_analyze_telegram_message(message, kind="oc")
+        if _ai_text:
+            st.session_state._last_gemini_oc = {
+                'text': _ai_text,
+                'time': datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST'),
+            }
+            _ai_telegram = f"🤖 <b>GEMINI ANALYSIS — OPTION CHAIN</b>\n\n{_ai_text}"
+            try:
+                send_telegram_message_sync(_ai_telegram, force=force)
+            except Exception:
+                pass
+        elif _ai_err:
+            st.session_state._last_gemini_oc = {'text': f"⚠️ {_ai_err}", 'time': ''}
+    except Exception:
+        pass
+
 def detect_candle_patterns(df, lookback=5):
     """Detect candlestick patterns from last few candles using Nifty price action chart."""
     if df is None or len(df) < lookback:
@@ -3805,6 +3823,55 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         'vob_resistance_levels': vob_resistance_levels,
     }
 
+def ai_analyze_telegram_message(message, kind="master"):
+    """Pass a rendered telegram message through Gemini and return its analysis.
+
+    kind: "master" for master trading signal, "oc" for option chain deep analysis.
+    Returns (analysis_text, error) — analysis_text is plain text suitable to send
+    back to Telegram or display in the app.
+    """
+    model = _get_gemini_model()
+    if model is None:
+        return None, "Gemini not configured (no GEMINI_API_KEY)."
+
+    try:
+        # Strip HTML tags so Gemini sees clean text
+        import re
+        clean = re.sub(r'<[^>]+>', '', message)
+
+        if kind == "oc":
+            task = (
+                "This is an Option Chain Deep Analysis snapshot from a Nifty trading app. "
+                "Interpret what the option writers/buyers are doing right now, identify the "
+                "dominant side, and state whether the current structure favours a bounce, "
+                "breakdown, or range. Be concise."
+            )
+        else:
+            task = (
+                "This is a Nifty options Master Trading Signal snapshot. Act as an experienced "
+                "options trader and give an actionable trade plan."
+            )
+
+        prompt = f"""{task}
+
+Respond in exactly this format (plain text, no markdown headers):
+
+📍 Read: one-line summary of the current setup
+✅ Trade: entry zone | stop loss | target 1 | target 2
+⚠️ Invalidation: one line — what kills the trade
+🎯 Confidence: LOW / MEDIUM / HIGH — one-line reason
+💡 Key Risk: biggest thing that could go wrong in the next 15 minutes
+
+Keep the whole reply under 170 words. No disclaimers.
+
+SNAPSHOT:
+{clean}
+"""
+        resp = model.generate_content(prompt)
+        return (resp.text or "").strip(), None
+    except Exception as e:
+        return None, f"Gemini error: {str(e)[:200]}"
+
 @st.cache_resource
 def _get_gemini_model():
     """Initialize and cache the Gemini model."""
@@ -4298,6 +4365,24 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     try:
         send_telegram_message_sync(message, force=force)
+    except Exception:
+        pass
+
+    # Auto-forward to Gemini and post its analysis back to Telegram + app
+    try:
+        _ai_text, _ai_err = ai_analyze_telegram_message(message, kind="master")
+        if _ai_text:
+            st.session_state._last_gemini_master = {
+                'text': _ai_text,
+                'time': datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST'),
+            }
+            _ai_telegram = f"🤖 <b>GEMINI ANALYSIS — MASTER SIGNAL</b>\n\n{_ai_text}"
+            try:
+                send_telegram_message_sync(_ai_telegram, force=force)
+            except Exception:
+                pass
+        elif _ai_err:
+            st.session_state._last_gemini_master = {'text': f"⚠️ {_ai_err}", 'time': ''}
     except Exception:
         pass
 
@@ -6666,6 +6751,20 @@ def main():
             _force_send_clicked = st.button("📤 Send to Telegram", key="force_send_master", help="Force-send Master Signal + Option Chain Deep Analysis with the current scenario, bypassing all guards")
         with hdr_col3:
             _ai_explain_clicked = st.button("🤖 AI Explain", key="ai_explain_master", help="Ask Gemini to analyze the current signal and give a trade plan")
+
+        # Persistent Gemini analysis panel (auto-updated whenever telegram is sent)
+        _last_gm = st.session_state.get('_last_gemini_master')
+        _last_gm_oc = st.session_state.get('_last_gemini_oc')
+        if _last_gm or _last_gm_oc:
+            with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=True):
+                if _last_gm:
+                    st.markdown(f"**Master Signal** — {_last_gm.get('time', '')}")
+                    st.markdown(_last_gm.get('text', ''))
+                if _last_gm_oc:
+                    st.markdown("---")
+                    st.markdown(f"**Option Chain Deep Analysis** — {_last_gm_oc.get('time', '')}")
+                    st.markdown(_last_gm_oc.get('text', ''))
+
         try:
             _sa = getattr(st.session_state, '_sa_result', None)
             _gex = getattr(st.session_state, '_gex_data', None)
