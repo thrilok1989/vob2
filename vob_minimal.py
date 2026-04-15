@@ -6988,16 +6988,16 @@ def main():
                         st.markdown("### 📈 Price Action - % Change from Open (Today)")
                         fig_pct = go.Figure()
                         line_colors = {
-                            'NIFTY 50': '#FFD700',
-                            'SENSEX': '#FF6B6B',
-                            'BANKNIFTY': '#00BFFF',
-                            'NIFTY IT': '#FF69B4',
-                            'RELIANCE': '#00FF7F',
-                            'ICICIBANK': '#FFA500',
-                            'INDIA VIX': '#FF4444',
-                            'GOLD': '#DAA520',
-                            'CRUDE OIL': '#8B4513',
-                            'USD/INR': '#9370DB',
+                            'NIFTY 50': '#FFFFFF',   # white
+                            'SENSEX':    '#8B00FF',  # violet
+                            'BANKNIFTY': '#4B0082',  # indigo
+                            'NIFTY IT':  '#1E90FF',  # blue
+                            'RELIANCE':  '#00FF00',  # green
+                            'ICICIBANK': '#FFFF00',  # yellow
+                            'INDIA VIX': '#FFA500',  # orange
+                            'USD/INR':   '#FF0000',  # red
+                            'GOLD':      '#FFD700',  # gold
+                            'CRUDE OIL': '#FF007F',  # rose
                         }
                         for name in display_order:
                             ad = align_data.get(name)
