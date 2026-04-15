@@ -95,13 +95,14 @@ def cached_iv_average(option_data_json):
     iv_pe_avg = df['impliedVolatility_PE'].mean()
     return iv_ce_avg, iv_pe_avg
 
-def send_telegram_message_sync(message):
+def send_telegram_message_sync(message, force=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
-    # Only send during market hours (8:30 AM - 3:45 PM IST, weekdays)
-    _now = datetime.now(pytz.timezone('Asia/Kolkata'))
-    if _now.weekday() >= 5 or not (_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _now <= _now.replace(hour=15, minute=45, second=0, microsecond=0)):
-        return
+    # Only send during market hours (8:30 AM - 3:45 PM IST, weekdays) unless forced
+    if not force:
+        _now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        if _now.weekday() >= 5 or not (_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _now <= _now.replace(hour=15, minute=45, second=0, microsecond=0)):
+            return
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -2627,8 +2628,8 @@ def analyze_strike_activity(df_summary, underlying_price):
         'total_pe_chg': total_pe_chg,
     }
 
-def send_option_chain_signal(sa_result, underlying_price):
-    """Send comprehensive option chain analysis signal to Telegram."""
+def send_option_chain_signal(sa_result, underlying_price, force=False):
+    """Send comprehensive option chain analysis signal to Telegram. Pass force=True to bypass guards."""
     if sa_result is None:
         return
     bias = sa_result['market_bias']
@@ -2714,20 +2715,22 @@ def send_option_chain_signal(sa_result, underlying_price):
 {"".join([f"• {s}" + chr(10) for s in sa_result['bias_signals']])}
 ⚠️ <i>Auto-generated. Manual verification required.</i>"""
 
-    # Send only if there are meaningful active signals
-    if not active_signals:
-        return
-    # Skip sideways / neutral market conditions (noise reduction)
-    if condition == "SIDEWAYS" or ('Bullish' not in bias and 'Bearish' not in bias):
-        return
-    # 5-minute cooldown to prevent spam
-    now = datetime.now(pytz.timezone('Asia/Kolkata'))
-    last_sent = st.session_state.get('_last_oc_signal_time')
-    if last_sent and (now - last_sent).total_seconds() < 300:
-        return
+    if not force:
+        # Send only if there are meaningful active signals
+        if not active_signals:
+            return
+        # Skip sideways / neutral market conditions (noise reduction)
+        if condition == "SIDEWAYS" or ('Bullish' not in bias and 'Bearish' not in bias):
+            return
+        # 5-minute cooldown to prevent spam
+        now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        last_sent = st.session_state.get('_last_oc_signal_time')
+        if last_sent and (now - last_sent).total_seconds() < 300:
+            return
     try:
-        send_telegram_message_sync(message)
-        st.session_state._last_oc_signal_time = now
+        send_telegram_message_sync(message, force=force)
+        if not force:
+            st.session_state._last_oc_signal_time = datetime.now(pytz.timezone('Asia/Kolkata'))
     except Exception:
         pass
 
@@ -3857,33 +3860,34 @@ def compute_unwinding_summary(df_atm8):
         'verdict': verdict,
     }
 
-def send_master_signal_telegram(result, underlying_price, option_data=None):
-    """Send master signal to Telegram."""
+def send_master_signal_telegram(result, underlying_price, option_data=None, force=False):
+    """Send master signal to Telegram. Pass force=True to bypass all guards."""
     if result is None:
         return
-    # Skip sending if no actionable trade (RANGE mode or abs_score < 3)
     trade_type = result.get('trade_type', '')
     abs_score = result.get('abs_score', 0)
     signal = result.get('signal', '')
-    if trade_type == 'RANGE' or abs_score < 3 or 'NO TRADE' in signal.upper():
-        return
+    if not force:
+        # Skip sending if no actionable trade (RANGE mode or abs_score < 3)
+        if trade_type == 'RANGE' or abs_score < 3 or 'NO TRADE' in signal.upper():
+            return
 
-    # Location gating: only send BUY when spot is at/near support, and SELL
-    # when spot is at/near resistance. "Near" = within 30 pts AND closer to
-    # the relevant level than to the opposite level.
-    sup_levels = [s for s in (result.get('support_levels') or []) if s]
-    res_levels = [r for r in (result.get('resistance_levels') or []) if r]
-    nearest_sup = min(sup_levels, key=lambda s: abs(underlying_price - s)) if sup_levels else None
-    nearest_res = min(res_levels, key=lambda r: abs(underlying_price - r)) if res_levels else None
-    dist_sup = abs(underlying_price - nearest_sup) if nearest_sup is not None else float('inf')
-    dist_res = abs(underlying_price - nearest_res) if nearest_res is not None else float('inf')
-    PROX_PTS = 30
-    is_buy = 'BUY' in trade_type.upper() or 'BREAKOUT' in signal.upper()
-    is_sell = 'SELL' in trade_type.upper() or 'BREAKDOWN' in signal.upper()
-    if is_buy and (dist_sup > PROX_PTS or dist_sup >= dist_res):
-        return
-    if is_sell and (dist_res > PROX_PTS or dist_res >= dist_sup):
-        return
+        # Location gating: only send BUY when spot is at/near support, and SELL
+        # when spot is at/near resistance. "Near" = within 30 pts AND closer to
+        # the relevant level than to the opposite level.
+        sup_levels = [s for s in (result.get('support_levels') or []) if s]
+        res_levels = [r for r in (result.get('resistance_levels') or []) if r]
+        nearest_sup = min(sup_levels, key=lambda s: abs(underlying_price - s)) if sup_levels else None
+        nearest_res = min(res_levels, key=lambda r: abs(underlying_price - r)) if res_levels else None
+        dist_sup = abs(underlying_price - nearest_sup) if nearest_sup is not None else float('inf')
+        dist_res = abs(underlying_price - nearest_res) if nearest_res is not None else float('inf')
+        PROX_PTS = 30
+        is_buy = 'BUY' in trade_type.upper() or 'BREAKOUT' in signal.upper()
+        is_sell = 'SELL' in trade_type.upper() or 'BREAKDOWN' in signal.upper()
+        if is_buy and (dist_sup > PROX_PTS or dist_sup >= dist_res):
+            return
+        if is_sell and (dist_res > PROX_PTS or dist_res >= dist_sup):
+            return
     time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
 
     # Alignment text with candle pattern and sentiment
@@ -4193,7 +4197,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None):
 ⚠️ <i>Auto-generated signal. Manual verification required.</i>"""
 
     try:
-        send_telegram_message_sync(message)
+        send_telegram_message_sync(message, force=force)
     except Exception:
         pass
 
@@ -6555,11 +6559,25 @@ def main():
     # === MASTER TRADING SIGNAL ===
     if option_data and option_data.get('underlying') and not df.empty:
         st.markdown("---")
-        st.markdown("## 🎯 Master Trading Signal")
+        hdr_col1, hdr_col2 = st.columns([3, 1])
+        with hdr_col1:
+            st.markdown("## 🎯 Master Trading Signal")
+        with hdr_col2:
+            _force_send_clicked = st.button("📤 Send Current to Telegram", key="force_send_master", help="Force-send Master Signal + Option Chain Deep Analysis with the current scenario, bypassing all guards")
         try:
             _sa = getattr(st.session_state, '_sa_result', None)
             _gex = getattr(st.session_state, '_gex_data', None)
             _conf = getattr(st.session_state, '_confluence', None)
+            if _force_send_clicked:
+                try:
+                    _master_now = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api) if _sa else None
+                    if _master_now:
+                        send_master_signal_telegram(_master_now, option_data['underlying'], option_data, force=True)
+                    if _sa is not None:
+                        send_option_chain_signal(_sa, option_data['underlying'], force=True)
+                    st.success("✅ Sent Master Signal + Option Chain Deep Analysis to Telegram")
+                except Exception as _e:
+                    st.error(f"Failed to force-send: {_e}")
             if _sa:
                 master = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
                 if master:
