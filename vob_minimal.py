@@ -3173,13 +3173,13 @@ def fetch_alignment_data(api):
     # Dhan security IDs + yfinance fallback symbols for instruments Dhan can't
     # resolve without monthly contract lookup (MCX/CDS futures, SENSEX on BSE).
     tickers = [
+        ('SENSEX', '51', 'IDX_I', 'INDEX', None),
         ('BANKNIFTY', '25', 'IDX_I', 'INDEX', None),
         ('NIFTY IT', '30', 'IDX_I', 'INDEX', None),
         ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY', None),
         ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY', None),
         ('INDIA VIX', '26', 'IDX_I', 'INDEX', None),
-        # Below: Dhan path not reliable — use yfinance
-        ('SENSEX', None, None, None, '^BSESN'),
+        # Below: Dhan requires monthly contract IDs for MCX/CDS futures, use yfinance
         ('GOLD', None, None, None, 'GC=F'),
         ('CRUDE OIL', None, None, None, 'CL=F'),
         ('USD/INR', None, None, None, 'INR=X'),
