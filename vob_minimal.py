@@ -3867,6 +3867,23 @@ def send_master_signal_telegram(result, underlying_price, option_data=None):
     signal = result.get('signal', '')
     if trade_type == 'RANGE' or abs_score < 3 or 'NO TRADE' in signal.upper():
         return
+
+    # Location gating: only send BUY when spot is at/near support, and SELL
+    # when spot is at/near resistance. "Near" = within 30 pts AND closer to
+    # the relevant level than to the opposite level.
+    sup_levels = [s for s in (result.get('support_levels') or []) if s]
+    res_levels = [r for r in (result.get('resistance_levels') or []) if r]
+    nearest_sup = min(sup_levels, key=lambda s: abs(underlying_price - s)) if sup_levels else None
+    nearest_res = min(res_levels, key=lambda r: abs(underlying_price - r)) if res_levels else None
+    dist_sup = abs(underlying_price - nearest_sup) if nearest_sup is not None else float('inf')
+    dist_res = abs(underlying_price - nearest_res) if nearest_res is not None else float('inf')
+    PROX_PTS = 30
+    is_buy = 'BUY' in trade_type.upper() or 'BREAKOUT' in signal.upper()
+    is_sell = 'SELL' in trade_type.upper() or 'BREAKDOWN' in signal.upper()
+    if is_buy and (dist_sup > PROX_PTS or dist_sup >= dist_res):
+        return
+    if is_sell and (dist_res > PROX_PTS or dist_res >= dist_sup):
+        return
     time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
 
     # Alignment text with candle pattern and sentiment
