@@ -4030,6 +4030,40 @@ def send_master_signal_telegram(result, underlying_price, option_data=None):
     except Exception:
         price_action_block = ""
 
+    # Money Flow Profile block — high-volume node ranges + sentiment
+    mf_block = ""
+    try:
+        mf = getattr(st.session_state, '_money_flow_data', None)
+        if mf and mf.get('rows'):
+            high_nodes = [r for r in mf['rows'] if r.get('node_type') == 'High']
+            high_nodes.sort(key=lambda r: -r['total_volume'])
+            top_nodes = high_nodes[:5]
+            hn_lines = []
+            for r in top_nodes:
+                sent = r.get('sentiment', 'Neutral')
+                s_emoji = '🟢' if sent == 'Bullish' else '🔴' if sent == 'Bearish' else '⚪'
+                poc_tag = ' ⭐POC' if r.get('is_poc') else ''
+                hn_lines.append(
+                    f"  {s_emoji} ₹{r['bin_low']:.0f}-₹{r['bin_high']:.0f} | "
+                    f"{sent} ({r.get('sentiment_strength', 0):.0f}%) | Vol:{r['volume_pct']:.1f}%{poc_tag}"
+                )
+            hn_text = "\n".join(hn_lines) if hn_lines else "  No high-volume nodes"
+            poc_price = mf.get('poc_price', 0)
+            vah = mf.get('value_area_high', 0)
+            val = mf.get('value_area_low', 0)
+            hi_sent_price = mf.get('highest_sentiment_price', 0)
+            hi_sent_dir = mf.get('highest_sentiment_direction', 'Neutral')
+            hi_sent_emoji = '🟢' if hi_sent_dir == 'Bullish' else '🔴' if hi_sent_dir == 'Bearish' else '⚪'
+            mf_block = f"""
+<b>💰 MONEY FLOW PROFILE:</b>
+  POC: ₹{poc_price:.0f} | Value Area: ₹{val:.0f}-₹{vah:.0f}
+  Strongest Sentiment: {hi_sent_emoji} ₹{hi_sent_price:.0f} ({hi_sent_dir})
+  <b>High Volume Nodes:</b>
+{hn_text}
+"""
+    except Exception:
+        mf_block = ""
+
     # Option Chain Deep Analysis block (from session-state sa_result)
     oc_deep_block = ""
     try:
@@ -4152,7 +4186,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None):
   Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-{price_action_block}{unwind_block}{oc_deep_block}
+{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
 
@@ -4536,6 +4570,7 @@ def main():
             except Exception as e:
                 st.caption(f"⚠️ MF Profile error: {str(e)[:80]}")
                 money_flow_data = None
+            st.session_state._money_flow_data = money_flow_data
             try:
                 volume_delta_data = calculate_volume_delta(df)
             except Exception as e:
