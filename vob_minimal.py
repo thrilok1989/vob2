@@ -2709,8 +2709,19 @@ def send_option_chain_signal(sa_result, underlying_price):
 {"".join([f"• {s}" + chr(10) for s in sa_result['bias_signals']])}
 ⚠️ <i>Auto-generated. Manual verification required.</i>"""
 
-    # Telegram disabled for option chain analysis (noise reduction)
-    pass
+    # Send only if there are meaningful active signals
+    if not active_signals:
+        return
+    # 5-minute cooldown to prevent spam
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    last_sent = st.session_state.get('_last_oc_signal_time')
+    if last_sent and (now - last_sent).total_seconds() < 300:
+        return
+    try:
+        send_telegram_message_sync(message)
+        st.session_state._last_oc_signal_time = now
+    except Exception:
+        pass
 
 def detect_candle_patterns(df, lookback=5):
     """Detect candlestick patterns from last few candles using Nifty price action chart."""
