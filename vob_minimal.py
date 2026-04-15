@@ -85,12 +85,12 @@ NIFTY_UNDERLYING_SEG = "IDX_I"
 
 @st.cache_data(ttl=300)
 def cached_pivot_calculation(df_json, pivot_settings):
-    df = pd.read_json(df_json)
+    df = pd.read_json(io.StringIO(df_json))
     return PivotIndicator.get_all_pivots(df, pivot_settings)
 
 @st.cache_data(ttl=60)
 def cached_iv_average(option_data_json):
-    df = pd.read_json(option_data_json)
+    df = pd.read_json(io.StringIO(option_data_json))
     iv_ce_avg = df['impliedVolatility_CE'].mean()
     iv_pe_avg = df['impliedVolatility_PE'].mean()
     return iv_ce_avg, iv_pe_avg
@@ -3173,13 +3173,13 @@ def fetch_alignment_data(api):
     # Dhan security IDs + yfinance fallback symbols for instruments Dhan can't
     # resolve without monthly contract lookup (MCX/CDS futures, SENSEX on BSE).
     tickers = [
+        ('SENSEX', '51', 'IDX_I', 'INDEX', None),
         ('BANKNIFTY', '25', 'IDX_I', 'INDEX', None),
         ('NIFTY IT', '30', 'IDX_I', 'INDEX', None),
         ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY', None),
         ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY', None),
         ('INDIA VIX', '26', 'IDX_I', 'INDEX', None),
-        # Below: Dhan path not reliable — use yfinance
-        ('SENSEX', None, None, None, '^BSESN'),
+        # Below: Dhan requires monthly contract IDs for MCX/CDS futures, use yfinance
         ('GOLD', None, None, None, 'GC=F'),
         ('CRUDE OIL', None, None, None, 'CL=F'),
         ('USD/INR', None, None, None, 'INR=X'),
@@ -6988,16 +6988,16 @@ def main():
                         st.markdown("### 📈 Price Action - % Change from Open (Today)")
                         fig_pct = go.Figure()
                         line_colors = {
-                            'NIFTY 50': '#FFD700',
-                            'SENSEX': '#FF6B6B',
-                            'BANKNIFTY': '#00BFFF',
-                            'NIFTY IT': '#FF69B4',
-                            'RELIANCE': '#00FF7F',
-                            'ICICIBANK': '#FFA500',
-                            'INDIA VIX': '#FF4444',
-                            'GOLD': '#DAA520',
-                            'CRUDE OIL': '#8B4513',
-                            'USD/INR': '#9370DB',
+                            'NIFTY 50': '#FFFFFF',   # white
+                            'SENSEX':    '#8B00FF',  # violet
+                            'BANKNIFTY': '#8B4513',  # brown
+                            'NIFTY IT':  '#1E90FF',  # blue
+                            'RELIANCE':  '#00FF00',  # green
+                            'ICICIBANK': '#FFFF00',  # yellow
+                            'INDIA VIX': '#FFA500',  # orange
+                            'USD/INR':   '#FF0000',  # red
+                            'GOLD':      '#FFD700',  # gold
+                            'CRUDE OIL': '#FF66CC',  # rose pink
                         }
                         for name in display_order:
                             ad = align_data.get(name)
