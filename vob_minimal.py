@@ -18,6 +18,11 @@ import io
 import os
 from db.supabase_client import SupabaseDB
 from indicators.money_flow_profile import calculate_money_flow_profile
+try:
+    import yfinance as yf
+    _HAS_YF = True
+except Exception:
+    _HAS_YF = False
 from indicators.volume_delta import calculate_volume_delta
 
 st.set_page_config(
@@ -3134,26 +3139,56 @@ def detect_ltp_trap(df, delta_length=10, delta_thresh=1.5):
         'price_vs_vwap': 'Above' if last_close > vwap else 'Below',
     }
 
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_yf_intraday(symbol: str, interval: str = "1m", period: str = "1d"):
+    """Fetch 1-min intraday OHLC via yfinance and convert to Dhan-style dict."""
+    if not _HAS_YF:
+        return None
+    try:
+        hist = yf.Ticker(symbol).history(period=period, interval=interval, prepost=False)
+        if hist is None or hist.empty:
+            return None
+        ist = pytz.timezone('Asia/Kolkata')
+        if hist.index.tz is None:
+            hist.index = hist.index.tz_localize('UTC').tz_convert(ist)
+        else:
+            hist.index = hist.index.tz_convert(ist)
+        return {
+            'open': hist['Open'].tolist(),
+            'high': hist['High'].tolist(),
+            'low': hist['Low'].tolist(),
+            'close': hist['Close'].tolist(),
+            'volume': hist['Volume'].fillna(0).tolist(),
+            'timestamp': [int(t.timestamp()) for t in hist.index],
+        }
+    except Exception:
+        return None
+
 def fetch_alignment_data(api):
     """Fetch candle data for SENSEX, BANKNIFTY, NIFTY IT, RELIANCE, ICICI, VIX.
     Detect candle patterns, compute 10m/1h/4h sentiment for each."""
-    # Dhan security IDs
+    # Dhan security IDs + yfinance fallback symbols for instruments Dhan can't
+    # resolve without monthly contract lookup (MCX/CDS futures, SENSEX on BSE).
     tickers = [
-        ('SENSEX', '51', 'BSE_EQ', 'INDEX'),
-        ('BANKNIFTY', '25', 'IDX_I', 'INDEX'),
-        ('NIFTY IT', '30', 'IDX_I', 'INDEX'),
-        ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY'),
-        ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY'),
-        ('INDIA VIX', '26', 'IDX_I', 'INDEX'),
-        ('GOLD', '119600009', 'MCX_COMM', 'FUTCOM'),
-        ('CRUDE OIL', '119600008', 'MCX_COMM', 'FUTCOM'),
-        ('USD/INR', '10093', 'CDS_FNO', 'FUTCUR'),
+        ('BANKNIFTY', '25', 'IDX_I', 'INDEX', None),
+        ('NIFTY IT', '30', 'IDX_I', 'INDEX', None),
+        ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY', None),
+        ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY', None),
+        ('INDIA VIX', '26', 'IDX_I', 'INDEX', None),
+        # Below: Dhan path not reliable — use yfinance
+        ('SENSEX', None, None, None, '^BSESN'),
+        ('GOLD', None, None, None, 'GC=F'),
+        ('CRUDE OIL', None, None, None, 'CL=F'),
+        ('USD/INR', None, None, None, 'INR=X'),
     ]
     alignment = {}
-    for name, sec_id, seg, inst in tickers:
+    for name, sec_id, seg, inst, yf_symbol in tickers:
         try:
             # Fetch 1-min candle data (last 1 day)
-            data = api.get_intraday_data(security_id=sec_id, exchange_segment=seg, instrument=inst, interval="1", days_back=1)
+            if yf_symbol:
+                data = _fetch_yf_intraday(yf_symbol, interval="1m", period="1d")
+            else:
+                data = api.get_intraday_data(security_id=sec_id, exchange_segment=seg, instrument=inst, interval="1", days_back=1)
             if data and 'open' in data:
                 adf = process_candle_data(data, "1")
                 if adf.empty:
