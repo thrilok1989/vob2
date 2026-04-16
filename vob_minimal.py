@@ -3877,13 +3877,12 @@ def _get_gemini_model():
     """Initialize and cache the Gemini model."""
     if not _HAS_GEMINI:
         return None
-    api_key = None
-    try:
-        api_key = st.secrets.get("GEMINI_API_KEY")
-    except Exception:
-        api_key = None
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
-        api_key = os.environ.get("GEMINI_API_KEY")
+        try:
+            api_key = st.secrets["GEMINI_API_KEY"]
+        except Exception:
+            api_key = None
     if not api_key:
         return None
     try:
