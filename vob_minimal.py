@@ -75,6 +75,7 @@ try:
     DHAN_ACCESS_TOKEN = st.secrets.get("DHAN_ACCESS_TOKEN", "") or st.secrets.get("dhan", {}).get("access_token", "")
     supabase_url = st.secrets.get("supabase", {}).get("url", "")
     supabase_key = st.secrets.get("supabase", {}).get("anon_key", "")
+    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
     try:
         TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "") or getattr(st.secrets, "TELEGRAM_BOT_TOKEN", "")
         TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "") or getattr(st.secrets, "TELEGRAM_CHAT_ID", "")
@@ -83,7 +84,7 @@ try:
     except:
         TELEGRAM_BOT_TOKEN = TELEGRAM_CHAT_ID = ""
 except Exception:
-    DHAN_CLIENT_ID = DHAN_ACCESS_TOKEN = supabase_url = supabase_key = TELEGRAM_BOT_TOKEN = TELEGRAM_CHAT_ID = ""
+    DHAN_CLIENT_ID = DHAN_ACCESS_TOKEN = supabase_url = supabase_key = TELEGRAM_BOT_TOKEN = TELEGRAM_CHAT_ID = GEMINI_API_KEY = ""
 
 NIFTY_UNDERLYING_SCRIP = 13
 NIFTY_UNDERLYING_SEG = "IDX_I"
@@ -3877,16 +3878,10 @@ def _get_gemini_model():
     """Initialize and cache the Gemini model."""
     if not _HAS_GEMINI:
         return None
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        try:
-            api_key = st.secrets["GEMINI_API_KEY"]
-        except Exception:
-            api_key = None
-    if not api_key:
+    if not GEMINI_API_KEY:
         return None
     try:
-        genai.configure(api_key=api_key)
+        genai.configure(api_key=GEMINI_API_KEY)
         return genai.GenerativeModel("gemini-2.0-flash")
     except Exception:
         return None
