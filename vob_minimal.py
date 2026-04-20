@@ -3303,10 +3303,10 @@ def fetch_vix_data(api):
         if resp and 'data' in resp:
             data = resp['data']
             if isinstance(data, dict):
-                for seg_key, items in data.items():
-                    if items:
-                        item = items[0] if isinstance(items, list) else items
-                        return {'vix': item.get('last_price', 0)}
+                for seg_key, seg_data in data.items():
+                    if isinstance(seg_data, dict):
+                        for sid, price_data in seg_data.items():
+                            return {'vix': price_data.get('last_price', 0)}
     except Exception:
         pass
     return {'vix': 0}
