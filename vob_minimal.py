@@ -2066,6 +2066,82 @@ def get_instrument_capping_analysis(config):
         capping_strikes.sort(key=lambda x: x['oi_l'], reverse=True)
         support_strikes.sort(key=lambda x: x['oi_l'], reverse=True)
 
+        # --- OI Timeline Trend (ATM ±1 strikes, snapshot-based) ---
+        oi_trend_data = {}
+        try:
+            for offset, label in [(-config['strike_gap'], 'ATM-1'), (0, 'ATM'), (config['strike_gap'], 'ATM+1')]:
+                target = atm_strike + offset
+                closest = min(df['strikePrice'], key=lambda x: abs(x - target))
+                row = df[df['strikePrice'] == closest].iloc[0]
+                ce_chgoi   = row.get('changeinOpenInterest_CE', 0) or 0
+                pe_chgoi   = row.get('changeinOpenInterest_PE', 0) or 0
+                ce_prev_oi = row.get('previousOpenInterest_CE', 0) or 1
+                pe_prev_oi = row.get('previousOpenInterest_PE', 0) or 1
+                ce_oi      = row.get('openInterest_CE', 0) or 0
+                pe_oi      = row.get('openInterest_PE', 0) or 0
+                ce_ltp     = row.get('lastPrice_CE', 0) or 0
+                pe_ltp     = row.get('lastPrice_PE', 0) or 0
+
+                ce_oi_pct  = round(ce_chgoi / ce_prev_oi * 100, 1) if ce_prev_oi > 0 else 0
+                pe_oi_pct  = round(pe_chgoi / pe_prev_oi * 100, 1) if pe_prev_oi > 0 else 0
+
+                # Classify activity from OI direction + price-to-strike relationship
+                price_below_strike = underlying < closest
+                price_above_strike = underlying > closest
+                ce_activity = (
+                    'Short Building'  if ce_chgoi > 0 and price_below_strike else
+                    'Long Building'   if ce_chgoi > 0 and not price_below_strike else
+                    'Short Covering'  if ce_chgoi < 0 and not price_below_strike else
+                    'Long Unwinding'  if ce_chgoi < 0 else 'Neutral'
+                )
+                pe_activity = (
+                    'Short Building'  if pe_chgoi > 0 and price_above_strike else
+                    'Long Building'   if pe_chgoi > 0 and not price_above_strike else
+                    'Short Covering'  if pe_chgoi < 0 and price_below_strike else
+                    'Long Unwinding'  if pe_chgoi < 0 else 'Neutral'
+                )
+
+                # Support / Resistance status
+                resistance_status = (
+                    'Building Strong' if ce_activity == 'Short Building' else
+                    'Breaking'        if ce_activity == 'Short Covering' else
+                    'Weakening'       if ce_activity == 'Long Unwinding' else
+                    'Building (Bulls)' if ce_activity == 'Long Building' else 'Neutral'
+                )
+                support_status = (
+                    'Building Strong' if pe_activity == 'Short Building' else
+                    'Breaking'        if pe_activity == 'Short Covering' else
+                    'Weakening'       if pe_activity == 'Long Unwinding' else
+                    'Building (Bears)' if pe_activity == 'Long Building' else 'Neutral'
+                )
+
+                # Overall OI trend signal
+                if pe_activity == 'Short Building' and ce_activity in ('Short Covering', 'Long Unwinding'):
+                    signal = 'BULLISH'
+                elif ce_activity == 'Short Building' and pe_activity in ('Short Covering', 'Long Unwinding'):
+                    signal = 'BEARISH'
+                elif pe_activity == 'Short Building' and ce_activity == 'Short Building':
+                    signal = 'RANGE'
+                elif ce_activity == 'Short Covering' and pe_activity == 'Short Covering':
+                    signal = 'VOLATILE'
+                elif pe_activity == 'Short Building':
+                    signal = 'MILDLY BULLISH'
+                elif ce_activity == 'Short Building':
+                    signal = 'MILDLY BEARISH'
+                else:
+                    signal = 'NEUTRAL'
+
+                oi_trend_data[label] = {
+                    'strike': closest, 'ce_oi_pct': ce_oi_pct, 'pe_oi_pct': pe_oi_pct,
+                    'ce_chgoi': ce_chgoi, 'pe_chgoi': pe_chgoi,
+                    'ce_oi': ce_oi, 'pe_oi': pe_oi, 'ce_ltp': ce_ltp, 'pe_ltp': pe_ltp,
+                    'ce_activity': ce_activity, 'pe_activity': pe_activity,
+                    'resistance_status': resistance_status, 'support_status': support_status,
+                    'signal': signal,
+                }
+        except Exception:
+            pass
+
         # --- Deep analysis (ATM ±5 strikes) via analyze_strike_activity ---
         deep_sa = None
         try:
@@ -2091,6 +2167,7 @@ def get_instrument_capping_analysis(config):
             'capping': capping_strikes[:3],
             'support': support_strikes[:3],
             'deep': deep_sa,
+            'oi_trend': oi_trend_data,
         }
     except Exception as e:
         return {'error': str(e)}
@@ -7794,7 +7871,7 @@ def main():
     _deep_tab_labels = ['NIFTY 50'] + [cfg['name'] for cfg in INSTRUMENT_CONFIGS.values()]
     _deep_tabs = st.tabs(_deep_tab_labels)
 
-    def _render_deep_analysis(tab, inst_name, deep, underlying):
+    def _render_deep_analysis(tab, inst_name, deep, underlying, oi_trend=None):
         with tab:
             if deep is None:
                 st.warning(f"Deep analysis unavailable for {inst_name}")
@@ -7951,20 +8028,140 @@ def main():
                 else:
                     st.info("No breakout/breakdown zones")
 
-    # NIFTY tab — use existing sa_result
+            # OI Timeline Trend Analysis — ATM ±1
+            if oi_trend:
+                st.markdown("---")
+                st.markdown("📈 **OI Timeline Trend Analysis (ATM ±1)**")
+                st.caption("Derived from day's changeinOpenInterest vs previousOpenInterest (snapshot-based)")
+                _ot_cols = st.columns(3)
+                _sig_colors = {
+                    'BULLISH': '#00ff88', 'MILDLY BULLISH': '#90EE90',
+                    'BEARISH': '#ff4444', 'MILDLY BEARISH': '#ff8888',
+                    'RANGE': '#FFD700', 'VOLATILE': '#FF8C00', 'NEUTRAL': '#aaaaaa',
+                }
+                _act_icons = {
+                    'Short Building': '📈 Short Building',
+                    'Short Covering': '📉 Short Covering',
+                    'Long Building':  '🟢 Long Building',
+                    'Long Unwinding': '🔻 Long Unwinding',
+                    'Neutral': '⚪ Neutral',
+                }
+                for _ci, _lbl in enumerate(['ATM-1', 'ATM', 'ATM+1']):
+                    td = oi_trend.get(_lbl)
+                    if not td:
+                        continue
+                    with _ot_cols[_ci]:
+                        _sig = td['signal']
+                        _sc  = _sig_colors.get(_sig, '#aaaaaa')
+                        st.markdown(
+                            f"<b>{_lbl} — ₹{td['strike']:.0f}</b><br>"
+                            f"<span style='color:{_sc};font-weight:bold'>{_sig}</span>",
+                            unsafe_allow_html=True
+                        )
+                        # CE block
+                        st.markdown(f"**CE (Resistance)**")
+                        ce_rows = {
+                            'Activity': _act_icons.get(td['ce_activity'], td['ce_activity']),
+                            'OI Δ%': f"{td['ce_oi_pct']:+.1f}%",
+                            'ChgOI': f"{td['ce_chgoi']/1000:+.0f}K ({'↑' if td['ce_chgoi'] > 0 else '↓'})",
+                            'OI': f"{td['ce_oi']/100000:.1f}L",
+                            'Status': td['resistance_status'],
+                        }
+                        for k, v in ce_rows.items():
+                            st.markdown(f"<small>{k}: **{v}**</small>", unsafe_allow_html=True)
+                        # PE block
+                        st.markdown(f"**PE (Support)**")
+                        pe_rows = {
+                            'Activity': _act_icons.get(td['pe_activity'], td['pe_activity']),
+                            'OI Δ%': f"{td['pe_oi_pct']:+.1f}%",
+                            'ChgOI': f"{td['pe_chgoi']/1000:+.0f}K ({'↑' if td['pe_chgoi'] > 0 else '↓'})",
+                            'OI': f"{td['pe_oi']/100000:.1f}L",
+                            'Status': td['support_status'],
+                        }
+                        for k, v in pe_rows.items():
+                            st.markdown(f"<small>{k}: **{v}**</small>", unsafe_allow_html=True)
+
+    # NIFTY tab — use existing sa_result + build OI trend from session_state oi_history
     _nifty_deep = None
+    _nifty_oi_trend = {}
     try:
         _nifty_deep = sa_result
+        # Build NIFTY OI trend from session_state history (same as master signal logic)
+        _oi_hist = getattr(st.session_state, 'oi_history', [])
+        _oi_strikes = getattr(st.session_state, 'oi_current_strikes', [])
+        _chgoi_hist = getattr(st.session_state, 'chgoi_history', [])
+        if len(_oi_hist) >= 3 and _oi_strikes:
+            _sorted_s = sorted(_oi_strikes)
+            _atm_idx  = len(_sorted_s) // 2
+            for _off, _lbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+                _si = _atm_idx + _off
+                if 0 <= _si < len(_sorted_s):
+                    _s = str(_sorted_s[_si])
+                    _odf = pd.DataFrame(_oi_hist)
+                    _ce_c, _pe_c = f'{_s}_CE', f'{_s}_PE'
+                    _ce_ltp_c, _pe_ltp_c = f'{_s}_CE_LTP', f'{_s}_PE_LTP'
+                    _td = {'strike': int(_s), 'ce_oi_pct': 0, 'pe_oi_pct': 0,
+                           'ce_chgoi': 0, 'pe_chgoi': 0, 'ce_oi': 0, 'pe_oi': 0,
+                           'ce_ltp': 0, 'pe_ltp': 0, 'ce_activity': 'N/A', 'pe_activity': 'N/A',
+                           'resistance_status': 'N/A', 'support_status': 'N/A', 'signal': 'NEUTRAL'}
+                    if _ce_c in _odf.columns:
+                        _f, _l = _odf[_ce_c].iloc[0], _odf[_ce_c].iloc[-1]
+                        _td['ce_oi_pct'] = round((_l - _f) / _f * 100, 1) if _f > 0 else 0
+                        _td['ce_oi'] = _l * 100000
+                        _ce_ltp_f = _odf[_ce_ltp_c].iloc[0] if _ce_ltp_c in _odf.columns else 0
+                        _ce_ltp_l = _odf[_ce_ltp_c].iloc[-1] if _ce_ltp_c in _odf.columns else 0
+                        _td['ce_ltp'] = _ce_ltp_l
+                        _oi_up = (_l - _f) > 0; _ltp_up = (_ce_ltp_l - _ce_ltp_f) > 0
+                        _td['ce_activity'] = ('Long Building' if _oi_up and _ltp_up else
+                                              'Short Building' if _oi_up else
+                                              'Short Covering' if not _oi_up and _ltp_up else 'Long Unwinding')
+                    if _pe_c in _odf.columns:
+                        _f, _l = _odf[_pe_c].iloc[0], _odf[_pe_c].iloc[-1]
+                        _td['pe_oi_pct'] = round((_l - _f) / _f * 100, 1) if _f > 0 else 0
+                        _td['pe_oi'] = _l * 100000
+                        _pe_ltp_f = _odf[_pe_ltp_c].iloc[0] if _pe_ltp_c in _odf.columns else 0
+                        _pe_ltp_l = _odf[_pe_ltp_c].iloc[-1] if _pe_ltp_c in _odf.columns else 0
+                        _td['pe_ltp'] = _pe_ltp_l
+                        _oi_up = (_l - _f) > 0; _ltp_up = (_pe_ltp_l - _pe_ltp_f) > 0
+                        _td['pe_activity'] = ('Long Building' if _oi_up and _ltp_up else
+                                              'Short Building' if _oi_up else
+                                              'Short Covering' if not _oi_up and _ltp_up else 'Long Unwinding')
+                    if len(_chgoi_hist) >= 3:
+                        _cdf = pd.DataFrame(_chgoi_hist)
+                        if _ce_c in _cdf.columns: _td['ce_chgoi'] = int(_cdf[_ce_c].iloc[-1] * 1000)
+                        if _pe_c in _cdf.columns: _td['pe_chgoi'] = int(_cdf[_pe_c].iloc[-1] * 1000)
+                    # Resistance / Support status
+                    _ce_act, _pe_act = _td['ce_activity'], _td['pe_activity']
+                    _td['resistance_status'] = ('Building Strong' if _ce_act == 'Short Building' else
+                                                'Breaking' if _ce_act == 'Short Covering' else
+                                                'Weakening' if _ce_act == 'Long Unwinding' else 'Building (Bulls)')
+                    _td['support_status'] = ('Building Strong' if _pe_act == 'Short Building' else
+                                             'Breaking' if _pe_act == 'Short Covering' else
+                                             'Weakening' if _pe_act == 'Long Unwinding' else 'Building (Bears)')
+                    if _pe_act == 'Short Building' and _ce_act in ('Short Covering', 'Long Unwinding'):
+                        _td['signal'] = 'BULLISH'
+                    elif _ce_act == 'Short Building' and _pe_act in ('Short Covering', 'Long Unwinding'):
+                        _td['signal'] = 'BEARISH'
+                    elif _pe_act == 'Short Building' and _ce_act == 'Short Building':
+                        _td['signal'] = 'RANGE'
+                    elif _ce_act == 'Short Covering' and _pe_act == 'Short Covering':
+                        _td['signal'] = 'VOLATILE'
+                    elif _pe_act == 'Short Building':
+                        _td['signal'] = 'MILDLY BULLISH'
+                    elif _ce_act == 'Short Building':
+                        _td['signal'] = 'MILDLY BEARISH'
+                    _nifty_oi_trend[_lbl] = _td
     except Exception:
         pass
-    _render_deep_analysis(_deep_tabs[0], 'NIFTY 50', _nifty_deep, None)
+    _render_deep_analysis(_deep_tabs[0], 'NIFTY 50', _nifty_deep, None, _nifty_oi_trend)
 
     # Other instruments
     for _ti, (inst_key, cfg) in enumerate(INSTRUMENT_CONFIGS.items()):
         _res = _mi_data.get(inst_key)
         _deep = _res.get('deep') if _res and 'error' not in _res else None
         _underlying = _res.get('underlying') if _res else None
-        _render_deep_analysis(_deep_tabs[_ti + 1], cfg['name'], _deep, _underlying)
+        _oi_tr = _res.get('oi_trend') if _res and 'error' not in _res else None
+        _render_deep_analysis(_deep_tabs[_ti + 1], cfg['name'], _deep, _underlying, _oi_tr)
 
     # === CANDLE PATTERN TIMELINE ===
     if not df.empty and len(df) > 10:
