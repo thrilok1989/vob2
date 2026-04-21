@@ -3205,7 +3205,7 @@ def fetch_alignment_data(api):
         ('NIFTY IT', '30', 'IDX_I', 'INDEX', None),
         ('RELIANCE', '2885', 'NSE_EQ', 'EQUITY', None),
         ('ICICIBANK', '4963', 'NSE_EQ', 'EQUITY', None),
-        ('INDIA VIX', '26', 'IDX_I', 'INDEX', None),
+        ('INDIA VIX', None, None, None, '^INDIAVIX'),
         # Below: Dhan requires monthly contract IDs for MCX/CDS futures, use yfinance
         ('GOLD', None, None, None, 'GC=F'),
         ('CRUDE OIL', None, None, None, 'CL=F'),
@@ -3297,16 +3297,12 @@ def fetch_alignment_data(api):
     return alignment
 
 def fetch_vix_data(api):
-    """Fetch India VIX data via Dhan API."""
+    """Fetch India VIX data via yfinance (Dhan does not expose VIX intraday)."""
     try:
-        resp = api.get_ltp_data("26", "IDX_I")  # India VIX security ID=26
-        if resp and 'data' in resp:
-            data = resp['data']
-            if isinstance(data, dict):
-                for seg_key, seg_data in data.items():
-                    if isinstance(seg_data, dict):
-                        for sid, price_data in seg_data.items():
-                            return {'vix': price_data.get('last_price', 0)}
+        if _HAS_YF:
+            data = _fetch_yf_intraday('^INDIAVIX', interval='1m', period='1d')
+            if data and data.get('close'):
+                return {'vix': data['close'][-1]}
     except Exception:
         pass
     return {'vix': 0}
@@ -7245,11 +7241,15 @@ def main():
                                     line=dict(color=line_colors.get(name, '#888'), width=line_width, dash=dash),
                                 ))
                         fig_pct.add_hline(y=0, line_dash="solid", line_color="white", line_width=1.5)
+                        _ist = pytz.timezone('Asia/Kolkata')
+                        _today = datetime.now(_ist).date()
+                        _x_start = _ist.localize(datetime(_today.year, _today.month, _today.day, 8, 30))
+                        _x_end = _ist.localize(datetime(_today.year, _today.month, _today.day, 15, 45))
                         fig_pct.update_layout(
                             title='All Indices & Stocks - % Change from Day Open',
                             template='plotly_dark',
                             height=450,
-                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            xaxis=dict(tickformat='%H:%M', title='Time', range=[_x_start, _x_end]),
                             yaxis=dict(title='% Change', zeroline=True, zerolinecolor='white', zerolinewidth=2,
                                        ticksuffix='%'),
                             plot_bgcolor='#1e1e1e',
