@@ -3170,12 +3170,12 @@ def detect_ltp_trap(df, delta_length=10, delta_thresh=1.5):
     }
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _fetch_yf_intraday(symbol: str, interval: str = "1m", period: str = "1d"):
+def _fetch_yf_intraday(symbol: str, interval: str = "1m", period: str = "1d", prepost: bool = True):
     """Fetch 1-min intraday OHLC via yfinance and convert to Dhan-style dict."""
     if not _HAS_YF:
         return None
     try:
-        hist = yf.Ticker(symbol).history(period=period, interval=interval, prepost=False)
+        hist = yf.Ticker(symbol).history(period=period, interval=interval, prepost=prepost)
         if hist is None or hist.empty:
             return None
         ist = pytz.timezone('Asia/Kolkata')
@@ -3200,6 +3200,7 @@ def fetch_alignment_data(api):
     # Dhan security IDs + yfinance fallback symbols for instruments Dhan can't
     # resolve without monthly contract lookup (MCX/CDS futures, SENSEX on BSE).
     tickers = [
+        ('NIFTY 50', '13', 'IDX_I', 'INDEX', None),
         ('SENSEX', '51', 'IDX_I', 'INDEX', None),
         ('BANKNIFTY', '25', 'IDX_I', 'INDEX', None),
         ('NIFTY IT', '30', 'IDX_I', 'INDEX', None),
@@ -3392,13 +3393,20 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
             s10, p10 = _nifty_sentiment(df.tail(10))
             s1h, p1h = _nifty_sentiment(df.tail(60))
             s4h, p4h = _nifty_sentiment(df.tail(240))
-            today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
-            df_today = df[df['datetime'].dt.date == today_ist]
-            if df_today.empty:
-                df_today = df  # fallback
-            nifty_day_open = df_today.iloc[0]['open']
-            nifty_pct_time = df_today['datetime'].tolist()
-            nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df_today['close'].tolist()]
+            # Use 1-min pct_series from fetch_alignment_data (NIFTY 50 now included there)
+            # so the chart line has the same granularity as all other instruments.
+            nifty_align_1m = alignment.get('NIFTY 50', {})
+            nifty_pct_time = nifty_align_1m.get('pct_series_time', [])
+            nifty_pct_vals = nifty_align_1m.get('pct_series_vals', [])
+            if not nifty_pct_time:
+                # fallback: compute from main df if 1-min data not available
+                today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+                df_today = df[df['datetime'].dt.date == today_ist]
+                if df_today.empty:
+                    df_today = df
+                nifty_day_open = df_today.iloc[0]['open']
+                nifty_pct_time = df_today['datetime'].tolist()
+                nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df_today['close'].tolist()]
             alignment['NIFTY 50'] = {
                 'ltp': df.iloc[-1]['close'], 'trend': nifty_cp['direction'],
                 'candle_pattern': nifty_cp['pattern'], 'candle_dir': nifty_cp['direction'],
@@ -3408,7 +3416,7 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
                 'sentiment_1h': s1h, 'pct_1h': p1h,
                 'sentiment_4h': s4h, 'pct_4h': p4h,
                 'day_high': df['high'].max(), 'day_low': df['low'].min(),
-                'open': nifty_day_open,
+                'open': nifty_align_1m.get('open', df.iloc[0]['open']),
                 'pct_series_time': nifty_pct_time,
                 'pct_series_vals': nifty_pct_vals,
             }
@@ -7216,7 +7224,7 @@ def main():
                         line_colors = {
                             'NIFTY 50': '#FFFFFF',   # white
                             'SENSEX':    '#8B00FF',  # violet
-                            'BANKNIFTY': '#8B4513',  # brown
+                            'BANKNIFTY': '#FF69B4',  # pink
                             'NIFTY IT':  '#1E90FF',  # blue
                             'RELIANCE':  '#00FF00',  # green
                             'ICICIBANK': '#FFFF00',  # yellow
@@ -7233,11 +7241,14 @@ def main():
                             pct_vals = ad.get('pct_series_vals', [])
                             if pct_time and pct_vals:
                                 line_width = 3 if name == 'NIFTY 50' else 2
+                                inverse_instruments = {'INDIA VIX', 'CRUDE OIL', 'USD/INR'}
                                 dash = 'dot' if name == 'INDIA VIX' else 'dashdot' if name in ('GOLD', 'CRUDE OIL', 'USD/INR') else None
+                                plot_vals = [-v for v in pct_vals] if name in inverse_instruments else pct_vals
+                                display_name = f"{name} (inv)" if name in inverse_instruments else name
                                 fig_pct.add_trace(go.Scatter(
-                                    x=pct_time, y=pct_vals,
+                                    x=pct_time, y=plot_vals,
                                     mode='lines',
-                                    name=name,
+                                    name=display_name,
                                     line=dict(color=line_colors.get(name, '#888'), width=line_width, dash=dash),
                                 ))
                         fig_pct.add_hline(y=0, line_dash="solid", line_color="white", line_width=1.5)
