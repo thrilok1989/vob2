@@ -89,6 +89,15 @@ except Exception:
 NIFTY_UNDERLYING_SCRIP = 13
 NIFTY_UNDERLYING_SEG = "IDX_I"
 
+# Instrument configs for multi-instrument capping/OI/volume monitor
+INSTRUMENT_CONFIGS = {
+    'SENSEX':    {'scrip': 51,   'seg': 'IDX_I',  'lot': 10,  'strike_gap': 100, 'atm_strikes': 4, 'name': 'SENSEX'},
+    'BANKNIFTY': {'scrip': 25,   'seg': 'IDX_I',  'lot': 15,  'strike_gap': 100, 'atm_strikes': 4, 'name': 'BANK NIFTY'},
+    'RELIANCE':  {'scrip': 2885, 'seg': 'NSE_EQ', 'lot': 250, 'strike_gap': 20,  'atm_strikes': 4, 'name': 'RELIANCE'},
+    'ICICIBANK': {'scrip': 4963, 'seg': 'NSE_EQ', 'lot': 700, 'strike_gap': 10,  'atm_strikes': 4, 'name': 'ICICI BANK'},
+    'INFOSYS':   {'scrip': 1594, 'seg': 'NSE_EQ', 'lot': 400, 'strike_gap': 25,  'atm_strikes': 4, 'name': 'INFOSYS'},
+}
+
 @st.cache_data(ttl=300)
 def cached_pivot_calculation(df_json, pivot_settings):
     df = pd.read_json(io.StringIO(df_json))
@@ -1961,6 +1970,116 @@ def create_csv_download(df_summary):
     output = io.StringIO()
     df_summary.to_csv(output, index=False)
     return output.getvalue()
+
+def get_instrument_capping_analysis(config):
+    """Fetch option chain for one instrument and return compact capping/support/OI/volume summary."""
+    try:
+        expiry_data = get_dhan_expiry_list(config['scrip'], config['seg'])
+        if not expiry_data or 'data' not in expiry_data or not expiry_data['data']:
+            return None
+        expiry = expiry_data['data'][0]
+
+        oc = get_dhan_option_chain(config['scrip'], config['seg'], expiry)
+        if not oc or 'data' not in oc:
+            return None
+
+        data = oc['data']
+        underlying = data['last_price']
+        oc_data = data['oc']
+
+        calls, puts = [], []
+        for strike, sd in oc_data.items():
+            if 'ce' in sd:
+                row = sd['ce'].copy(); row['strikePrice'] = float(strike); calls.append(row)
+            if 'pe' in sd:
+                row = sd['pe'].copy(); row['strikePrice'] = float(strike); puts.append(row)
+
+        if not calls or not puts:
+            return None
+
+        df = pd.merge(
+            pd.DataFrame(calls), pd.DataFrame(puts),
+            on='strikePrice', suffixes=('_CE', '_PE')
+        ).sort_values('strikePrice')
+
+        for old, new in {'last_price': 'lastPrice', 'oi': 'openInterest',
+                         'previous_oi': 'previousOpenInterest', 'volume': 'totalTradedVolume',
+                         'iv': 'impliedVolatility'}.items():
+            for sfx in ('_CE', '_PE'):
+                if f'{old}{sfx}' in df.columns:
+                    df.rename(columns={f'{old}{sfx}': f'{new}{sfx}'}, inplace=True)
+
+        prev_ce = df['previousOpenInterest_CE'] if 'previousOpenInterest_CE' in df.columns else df['openInterest_CE']
+        prev_pe = df['previousOpenInterest_PE'] if 'previousOpenInterest_PE' in df.columns else df['openInterest_PE']
+        df['changeinOpenInterest_CE'] = df['openInterest_CE'] - prev_ce
+        df['changeinOpenInterest_PE'] = df['openInterest_PE'] - prev_pe
+
+        atm_strike = min(df['strikePrice'], key=lambda x: abs(x - underlying))
+        atm_range = config['atm_strikes'] * config['strike_gap']
+        near = df[abs(df['strikePrice'] - atm_strike) <= atm_range].copy()
+        if near.empty:
+            return None
+
+        # Thresholds
+        median_ce_oi  = near['openInterest_CE'].median() or 1
+        median_pe_oi  = near['openInterest_PE'].median() or 1
+        median_ce_vol = (near['totalTradedVolume_CE'].median() if 'totalTradedVolume_CE' in near.columns else 0) or 1
+        median_pe_vol = (near['totalTradedVolume_PE'].median() if 'totalTradedVolume_PE' in near.columns else 0) or 1
+
+        # PCR and net ΔOI
+        total_ce_oi    = near['openInterest_CE'].sum()
+        total_pe_oi    = near['openInterest_PE'].sum()
+        total_ce_chgoi = near['changeinOpenInterest_CE'].sum()
+        total_pe_chgoi = near['changeinOpenInterest_PE'].sum()
+        total_ce_vol   = near['totalTradedVolume_CE'].sum() if 'totalTradedVolume_CE' in near.columns else 0
+        total_pe_vol   = near['totalTradedVolume_PE'].sum() if 'totalTradedVolume_PE' in near.columns else 0
+        pcr = total_pe_oi / total_ce_oi if total_ce_oi > 0 else 1.0
+
+        capping_strikes, support_strikes = [], []
+        for _, row in near.iterrows():
+            strike   = row['strikePrice']
+            ce_oi    = row.get('openInterest_CE', 0) or 0
+            pe_oi    = row.get('openInterest_PE', 0) or 0
+            ce_chgoi = row.get('changeinOpenInterest_CE', 0) or 0
+            pe_chgoi = row.get('changeinOpenInterest_PE', 0) or 0
+            ce_vol   = row.get('totalTradedVolume_CE', 0) or 0
+            pe_vol   = row.get('totalTradedVolume_PE', 0) or 0
+
+            # Call capping
+            if ce_oi > median_ce_oi * 1.2 and ce_chgoi > 0 and underlying < strike:
+                ce_high_vol = ce_vol > median_ce_vol * 1.2
+                capping_strikes.append({
+                    'strike': strike, 'oi_l': ce_oi / 100000, 'chgoi_k': ce_chgoi / 1000,
+                    'vol_k': ce_vol / 1000, 'vol_confirmed': ce_high_vol,
+                    'strength': 'High Conviction' if ce_high_vol else 'Strong',
+                })
+
+            # Put support
+            if pe_oi > median_pe_oi * 1.2 and pe_chgoi > 0 and underlying > strike:
+                pe_high_vol = pe_vol > median_pe_vol * 1.2
+                support_strikes.append({
+                    'strike': strike, 'oi_l': pe_oi / 100000, 'chgoi_k': pe_chgoi / 1000,
+                    'vol_k': pe_vol / 1000, 'vol_confirmed': pe_high_vol,
+                    'strength': 'High Conviction' if pe_high_vol else 'Strong',
+                })
+
+        capping_strikes.sort(key=lambda x: x['oi_l'], reverse=True)
+        support_strikes.sort(key=lambda x: x['oi_l'], reverse=True)
+
+        return {
+            'underlying': underlying, 'expiry': expiry, 'pcr': pcr,
+            'pcr_bias': 'Bullish' if pcr > 1.2 else 'Bearish' if pcr < 0.7 else 'Neutral',
+            'total_ce_chgoi_l': total_ce_chgoi / 100000,
+            'total_pe_chgoi_l': total_pe_chgoi / 100000,
+            'total_ce_vol_k': total_ce_vol / 1000,
+            'total_pe_vol_k': total_pe_vol / 1000,
+            'oi_bias': 'Bullish' if total_pe_chgoi > total_ce_chgoi else 'Bearish',
+            'capping': capping_strikes[:3],
+            'support': support_strikes[:3],
+        }
+    except Exception as e:
+        return {'error': str(e)}
+
 
 def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
     now = datetime.now(timezone("Asia/Kolkata"))
@@ -7476,6 +7595,76 @@ def main():
                 st.info("Master signal requires deep analysis data. Please wait...")
         except Exception as e:
             st.warning(f"Master signal unavailable: {str(e)}")
+
+    # === MULTI-INSTRUMENT CAPPING / OI / VOLUME MONITOR ===
+    st.markdown("---")
+    st.markdown("## 📊 Multi-Instrument Capping · OI · Volume Monitor")
+    st.caption("SENSEX · BANK NIFTY · RELIANCE · ICICI BANK · INFOSYS — Call Capping & Put Support with Volume Confirmation (ATM ±4 strikes)")
+
+    _mi_refresh = st.button("🔄 Refresh Instrument Data", key="mi_refresh_btn")
+    if _mi_refresh or 'mi_instrument_data' not in st.session_state:
+        with st.spinner("Fetching option chains for all instruments..."):
+            st.session_state.mi_instrument_data = {
+                key: get_instrument_capping_analysis(cfg)
+                for key, cfg in INSTRUMENT_CONFIGS.items()
+            }
+
+    _mi_data = st.session_state.get('mi_instrument_data', {})
+    _mi_cols = st.columns(len(INSTRUMENT_CONFIGS))
+
+    for col_idx, (inst_key, cfg) in enumerate(INSTRUMENT_CONFIGS.items()):
+        res = _mi_data.get(inst_key)
+        with _mi_cols[col_idx]:
+            st.markdown(f"#### {cfg['name']}")
+            if res is None:
+                st.warning("No data")
+                continue
+            if 'error' in res:
+                st.error(f"Error: {res['error'][:40]}")
+                continue
+
+            # LTP + PCR
+            pcr_color = "#00ff88" if res['pcr_bias'] == 'Bullish' else "#ff4444" if res['pcr_bias'] == 'Bearish' else "#FFD700"
+            st.markdown(f"**LTP** ₹{res['underlying']:,.1f}")
+            st.markdown(
+                f"<span style='color:{pcr_color};font-weight:bold'>PCR {res['pcr']:.2f} — {res['pcr_bias']}</span>",
+                unsafe_allow_html=True
+            )
+
+            # Net ΔOI
+            ce_chg = res['total_ce_chgoi_l']
+            pe_chg = res['total_pe_chgoi_l']
+            oi_arrow = "🟢 PE>" if pe_chg > ce_chg else "🔴 CE>"
+            st.markdown(f"**ΔOI** CE {ce_chg:+.1f}L | PE {pe_chg:+.1f}L {oi_arrow}")
+
+            # Volume
+            st.markdown(f"**Vol** CE {res['total_ce_vol_k']:,.0f}K | PE {res['total_pe_vol_k']:,.0f}K")
+
+            # Capping strikes
+            st.markdown("🟥 **Capping (CE)**")
+            if res['capping']:
+                for s in res['capping']:
+                    vol_tag = "🔥" if s['vol_confirmed'] else "〰"
+                    st.markdown(
+                        f"<small>{vol_tag} **₹{s['strike']:.0f}** [{s['strength']}]<br>"
+                        f"OI {s['oi_l']:.1f}L | ΔOI +{s['chgoi_k']:.0f}K | Vol {s['vol_k']:.0f}K</small>",
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.markdown("<small style='color:#888'>No active capping</small>", unsafe_allow_html=True)
+
+            # Support strikes
+            st.markdown("🟢 **Support (PE)**")
+            if res['support']:
+                for s in res['support']:
+                    vol_tag = "🔥" if s['vol_confirmed'] else "〰"
+                    st.markdown(
+                        f"<small>{vol_tag} **₹{s['strike']:.0f}** [{s['strength']}]<br>"
+                        f"OI {s['oi_l']:.1f}L | ΔOI +{s['chgoi_k']:.0f}K | Vol {s['vol_k']:.0f}K</small>",
+                        unsafe_allow_html=True
+                    )
+            else:
+                st.markdown("<small style='color:#888'>No active support</small>", unsafe_allow_html=True)
 
     # === CANDLE PATTERN TIMELINE ===
     if not df.empty and len(df) > 10:
