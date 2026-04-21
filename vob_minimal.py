@@ -7216,7 +7216,7 @@ def main():
                         line_colors = {
                             'NIFTY 50': '#FFFFFF',   # white
                             'SENSEX':    '#8B00FF',  # violet
-                            'BANKNIFTY': '#8B4513',  # brown
+                            'BANKNIFTY': '#FF69B4',  # pink
                             'NIFTY IT':  '#1E90FF',  # blue
                             'RELIANCE':  '#00FF00',  # green
                             'ICICIBANK': '#FFFF00',  # yellow
