@@ -7233,11 +7233,14 @@ def main():
                             pct_vals = ad.get('pct_series_vals', [])
                             if pct_time and pct_vals:
                                 line_width = 3 if name == 'NIFTY 50' else 2
+                                inverse_instruments = {'INDIA VIX', 'CRUDE OIL', 'USD/INR'}
                                 dash = 'dot' if name == 'INDIA VIX' else 'dashdot' if name in ('GOLD', 'CRUDE OIL', 'USD/INR') else None
+                                plot_vals = [-v for v in pct_vals] if name in inverse_instruments else pct_vals
+                                display_name = f"{name} (inv)" if name in inverse_instruments else name
                                 fig_pct.add_trace(go.Scatter(
-                                    x=pct_time, y=pct_vals,
+                                    x=pct_time, y=plot_vals,
                                     mode='lines',
-                                    name=name,
+                                    name=display_name,
                                     line=dict(color=line_colors.get(name, '#888'), width=line_width, dash=dash),
                                 ))
                         fig_pct.add_hline(y=0, line_dash="solid", line_color="white", line_width=1.5)
