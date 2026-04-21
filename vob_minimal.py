@@ -2066,6 +2066,96 @@ def get_instrument_capping_analysis(config):
         capping_strikes.sort(key=lambda x: x['oi_l'], reverse=True)
         support_strikes.sort(key=lambda x: x['oi_l'], reverse=True)
 
+        # --- OI Timeline Trend (ATM ±1 strikes, snapshot-based) ---
+        oi_trend_data = {}
+        try:
+            for offset, label in [(-config['strike_gap'], 'ATM-1'), (0, 'ATM'), (config['strike_gap'], 'ATM+1')]:
+                target = atm_strike + offset
+                closest = min(df['strikePrice'], key=lambda x: abs(x - target))
+                row = df[df['strikePrice'] == closest].iloc[0]
+                ce_chgoi   = row.get('changeinOpenInterest_CE', 0) or 0
+                pe_chgoi   = row.get('changeinOpenInterest_PE', 0) or 0
+                ce_prev_oi = row.get('previousOpenInterest_CE', 0) or 1
+                pe_prev_oi = row.get('previousOpenInterest_PE', 0) or 1
+                ce_oi      = row.get('openInterest_CE', 0) or 0
+                pe_oi      = row.get('openInterest_PE', 0) or 0
+                ce_ltp     = row.get('lastPrice_CE', 0) or 0
+                pe_ltp     = row.get('lastPrice_PE', 0) or 0
+
+                ce_oi_pct  = round(ce_chgoi / ce_prev_oi * 100, 1) if ce_prev_oi > 0 else 0
+                pe_oi_pct  = round(pe_chgoi / pe_prev_oi * 100, 1) if pe_prev_oi > 0 else 0
+
+                # Classify activity from OI direction + price-to-strike relationship
+                price_below_strike = underlying < closest
+                price_above_strike = underlying > closest
+                ce_activity = (
+                    'Short Building'  if ce_chgoi > 0 and price_below_strike else
+                    'Long Building'   if ce_chgoi > 0 and not price_below_strike else
+                    'Short Covering'  if ce_chgoi < 0 and not price_below_strike else
+                    'Long Unwinding'  if ce_chgoi < 0 else 'Neutral'
+                )
+                pe_activity = (
+                    'Short Building'  if pe_chgoi > 0 and price_above_strike else
+                    'Long Building'   if pe_chgoi > 0 and not price_above_strike else
+                    'Short Covering'  if pe_chgoi < 0 and price_below_strike else
+                    'Long Unwinding'  if pe_chgoi < 0 else 'Neutral'
+                )
+
+                # Support / Resistance status
+                resistance_status = (
+                    'Building Strong' if ce_activity == 'Short Building' else
+                    'Breaking'        if ce_activity == 'Short Covering' else
+                    'Weakening'       if ce_activity == 'Long Unwinding' else
+                    'Building (Bulls)' if ce_activity == 'Long Building' else 'Neutral'
+                )
+                support_status = (
+                    'Building Strong' if pe_activity == 'Short Building' else
+                    'Breaking'        if pe_activity == 'Short Covering' else
+                    'Weakening'       if pe_activity == 'Long Unwinding' else
+                    'Building (Bears)' if pe_activity == 'Long Building' else 'Neutral'
+                )
+
+                # Overall OI trend signal
+                if pe_activity == 'Short Building' and ce_activity in ('Short Covering', 'Long Unwinding'):
+                    signal = 'BULLISH'
+                elif ce_activity == 'Short Building' and pe_activity in ('Short Covering', 'Long Unwinding'):
+                    signal = 'BEARISH'
+                elif pe_activity == 'Short Building' and ce_activity == 'Short Building':
+                    signal = 'RANGE'
+                elif ce_activity == 'Short Covering' and pe_activity == 'Short Covering':
+                    signal = 'VOLATILE'
+                elif pe_activity == 'Short Building':
+                    signal = 'MILDLY BULLISH'
+                elif ce_activity == 'Short Building':
+                    signal = 'MILDLY BEARISH'
+                else:
+                    signal = 'NEUTRAL'
+
+                oi_trend_data[label] = {
+                    'strike': closest, 'ce_oi_pct': ce_oi_pct, 'pe_oi_pct': pe_oi_pct,
+                    'ce_chgoi': ce_chgoi, 'pe_chgoi': pe_chgoi,
+                    'ce_oi': ce_oi, 'pe_oi': pe_oi, 'ce_ltp': ce_ltp, 'pe_ltp': pe_ltp,
+                    'ce_activity': ce_activity, 'pe_activity': pe_activity,
+                    'resistance_status': resistance_status, 'support_status': support_status,
+                    'signal': signal,
+                }
+        except Exception:
+            pass
+
+        # --- Deep analysis (ATM ±5 strikes) via analyze_strike_activity ---
+        deep_sa = None
+        try:
+            deep_range = 5 * config['strike_gap']
+            df_deep = df[abs(df['strikePrice'] - atm_strike) <= deep_range].copy()
+            df_deep = df_deep.rename(columns={'strikePrice': 'Strike'})
+            df_deep['Zone'] = df_deep['Strike'].apply(
+                lambda x: 'ATM' if x == atm_strike else ('ITM' if x < underlying else 'OTM')
+            )
+            df_deep = df_deep.sort_values('Strike', ascending=False).reset_index(drop=True)
+            deep_sa = analyze_strike_activity(df_deep, underlying)
+        except Exception:
+            pass
+
         return {
             'underlying': underlying, 'expiry': expiry, 'pcr': pcr,
             'pcr_bias': 'Bullish' if pcr > 1.2 else 'Bearish' if pcr < 0.7 else 'Neutral',
@@ -2076,6 +2166,8 @@ def get_instrument_capping_analysis(config):
             'oi_bias': 'Bullish' if total_pe_chgoi > total_ce_chgoi else 'Bearish',
             'capping': capping_strikes[:3],
             'support': support_strikes[:3],
+            'deep': deep_sa,
+            'oi_trend': oi_trend_data,
         }
     except Exception as e:
         return {'error': str(e)}
@@ -7599,7 +7691,7 @@ def main():
     # === MULTI-INSTRUMENT CAPPING / OI / VOLUME MONITOR ===
     st.markdown("---")
     st.markdown("## 📊 Multi-Instrument Capping · OI · Volume Monitor")
-    st.caption("SENSEX · BANK NIFTY · RELIANCE · ICICI BANK · INFOSYS — Call Capping & Put Support with Volume Confirmation (ATM ±4 strikes)")
+    st.caption("NIFTY · SENSEX · BANK NIFTY · RELIANCE · ICICI BANK · INFOSYS — Call Capping & Put Support with Volume Confirmation (ATM ±4 strikes)")
 
     _mi_refresh = st.button("🔄 Refresh Instrument Data", key="mi_refresh_btn")
     if _mi_refresh or 'mi_instrument_data' not in st.session_state:
@@ -7610,61 +7702,466 @@ def main():
             }
 
     _mi_data = st.session_state.get('mi_instrument_data', {})
-    _mi_cols = st.columns(len(INSTRUMENT_CONFIGS))
 
-    for col_idx, (inst_key, cfg) in enumerate(INSTRUMENT_CONFIGS.items()):
-        res = _mi_data.get(inst_key)
-        with _mi_cols[col_idx]:
-            st.markdown(f"#### {cfg['name']}")
-            if res is None:
-                st.warning("No data")
+    # --- Build NIFTY summary from already-fetched option_data ---
+    _nifty_summary = None
+    try:
+        if option_data and option_data.get('underlying') and option_data.get('df_summary') is not None:
+            _ndf = option_data['df_summary']
+            _nspot = option_data['underlying']
+            _natm = min(_ndf['Strike'], key=lambda x: abs(x - _nspot))
+            _near = _ndf[abs(_ndf['Strike'] - _natm) <= 200].copy()
+            _n_ce_oi  = _near['openInterest_CE'].sum()
+            _n_pe_oi  = _near['openInterest_PE'].sum()
+            _n_ce_chg = _near['changeinOpenInterest_CE'].sum()
+            _n_pe_chg = _near['changeinOpenInterest_PE'].sum()
+            _n_ce_vol = _near['totalTradedVolume_CE'].sum() if 'totalTradedVolume_CE' in _near.columns else 0
+            _n_pe_vol = _near['totalTradedVolume_PE'].sum() if 'totalTradedVolume_PE' in _near.columns else 0
+            _n_pcr = _n_pe_oi / _n_ce_oi if _n_ce_oi > 0 else 1.0
+
+            # Capping / support from sa_result if available
+            _n_capping, _n_support = [], []
+            try:
+                _sa = sa_result
+                if _sa and _sa.get('analysis_df') is not None:
+                    _adf = _sa['analysis_df']
+                    for _, _r in _adf.iterrows():
+                        if _r['Call_Class'] in ('High Conviction Resistance', 'Strong Resistance') and _r['Strike'] > _nspot:
+                            _n_capping.append({
+                                'strike': _r['Strike'], 'oi_l': _r['CE_OI'] / 100000,
+                                'chgoi_k': _r['CE_ChgOI'] / 1000, 'vol_k': _r['CE_Vol'] / 1000,
+                                'vol_confirmed': _r.get('CE_Vol_High', False),
+                                'strength': _r['Call_Strength'],
+                            })
+                        if _r['Put_Class'] in ('High Conviction Support', 'Strong Support') and _r['Strike'] < _nspot:
+                            _n_support.append({
+                                'strike': _r['Strike'], 'oi_l': _r['PE_OI'] / 100000,
+                                'chgoi_k': _r['PE_ChgOI'] / 1000, 'vol_k': _r['PE_Vol'] / 1000,
+                                'vol_confirmed': _r.get('PE_Vol_High', False),
+                                'strength': _r['Put_Strength'],
+                            })
+                    _n_capping.sort(key=lambda x: x['oi_l'], reverse=True)
+                    _n_support.sort(key=lambda x: x['oi_l'], reverse=True)
+            except Exception:
+                pass
+
+            _nifty_summary = {
+                'underlying': _nspot, 'pcr': _n_pcr,
+                'pcr_bias': 'Bullish' if _n_pcr > 1.2 else 'Bearish' if _n_pcr < 0.7 else 'Neutral',
+                'total_ce_chgoi_l': _n_ce_chg / 100000, 'total_pe_chgoi_l': _n_pe_chg / 100000,
+                'total_ce_vol_k': _n_ce_vol / 1000, 'total_pe_vol_k': _n_pe_vol / 1000,
+                'oi_bias': 'Bullish' if _n_pe_chg > _n_ce_chg else 'Bearish',
+                'capping': _n_capping[:3], 'support': _n_support[:3],
+            }
+    except Exception:
+        pass
+
+    # Merge NIFTY + other instruments in display order
+    _all_instruments = [('NIFTY', 'NIFTY 50', _nifty_summary)] + [
+        (k, cfg['name'], _mi_data.get(k)) for k, cfg in INSTRUMENT_CONFIGS.items()
+    ]
+
+    # ── Table 1: Summary ──────────────────────────────────────────────────────
+    st.markdown("### 📋 Instrument Summary")
+    _summary_rows = []
+    for inst_key, inst_name, res in _all_instruments:
+        if not res or 'error' in res:
+            _summary_rows.append({
+                'Instrument': inst_name, 'LTP': '—', 'PCR': '—', 'PCR Bias': '—',
+                'CE ΔOI (L)': '—', 'PE ΔOI (L)': '—', 'OI Bias': '—',
+                'CE Vol (K)': '—', 'PE Vol (K)': '—',
+            })
+            continue
+        _oi_bias_tag = '🟢 PE>' if res['total_pe_chgoi_l'] > res['total_ce_chgoi_l'] else '🔴 CE>'
+        _summary_rows.append({
+            'Instrument': inst_name,
+            'LTP': f"₹{res['underlying']:,.1f}",
+            'PCR': f"{res['pcr']:.2f}",
+            'PCR Bias': res['pcr_bias'],
+            'CE ΔOI (L)': f"{res['total_ce_chgoi_l']:+.1f}",
+            'PE ΔOI (L)': f"{res['total_pe_chgoi_l']:+.1f}",
+            'OI Bias': _oi_bias_tag,
+            'CE Vol (K)': f"{res['total_ce_vol_k']:,.0f}",
+            'PE Vol (K)': f"{res['total_pe_vol_k']:,.0f}",
+        })
+    _sum_df = pd.DataFrame(_summary_rows)
+
+    def _style_summary(row):
+        bias = row.get('PCR Bias', '')
+        oi   = row.get('OI Bias', '')
+        styles = [''] * len(row)
+        pcr_idx = _sum_df.columns.get_loc('PCR Bias')
+        oi_idx  = _sum_df.columns.get_loc('OI Bias')
+        if bias == 'Bullish':
+            styles[pcr_idx] = 'background-color:#00ff8830;color:#00ff88;font-weight:bold'
+        elif bias == 'Bearish':
+            styles[pcr_idx] = 'background-color:#ff444430;color:#ff4444;font-weight:bold'
+        else:
+            styles[pcr_idx] = 'background-color:#FFD70030;color:#FFD700;font-weight:bold'
+        if '🟢' in str(oi):
+            styles[oi_idx] = 'background-color:#00ff8830;color:#00ff88;font-weight:bold'
+        elif '🔴' in str(oi):
+            styles[oi_idx] = 'background-color:#ff444430;color:#ff4444;font-weight:bold'
+        return styles
+
+    st.dataframe(
+        _sum_df.style.apply(_style_summary, axis=1),
+        use_container_width=True, hide_index=True
+    )
+
+    # ── Table 2 & 3: Capping + Support ───────────────────────────────────────
+    _cap_tab, _sup_tab = st.tabs(["🟥 Call Capping (CE)", "🟢 Put Support (PE)"])
+
+    def _build_strike_table(all_insts, side):
+        rows = []
+        for inst_key, inst_name, res in all_insts:
+            if not res or 'error' in res:
                 continue
-            if 'error' in res:
-                st.error(f"Error: {res['error'][:40]}")
-                continue
+            strikes = res.get(side, [])
+            if not strikes:
+                rows.append({
+                    'Instrument': inst_name, 'Strike': '—', 'Strength': '—',
+                    'Vol ✓': '—', 'OI (L)': '—', 'ΔOI (K)': '—', 'Vol (K)': '—',
+                })
+            for s in strikes:
+                rows.append({
+                    'Instrument': inst_name,
+                    'Strike': f"₹{s['strike']:.0f}",
+                    'Strength': s['strength'],
+                    'Vol ✓': '🔥 Confirmed' if s['vol_confirmed'] else '〰 OI Only',
+                    'OI (L)': f"{s['oi_l']:.1f}",
+                    'ΔOI (K)': f"+{s['chgoi_k']:.0f}",
+                    'Vol (K)': f"{s['vol_k']:,.0f}",
+                })
+        return pd.DataFrame(rows) if rows else pd.DataFrame(
+            columns=['Instrument', 'Strike', 'Strength', 'Vol ✓', 'OI (L)', 'ΔOI (K)', 'Vol (K)']
+        )
 
-            # LTP + PCR
-            pcr_color = "#00ff88" if res['pcr_bias'] == 'Bullish' else "#ff4444" if res['pcr_bias'] == 'Bearish' else "#FFD700"
-            st.markdown(f"**LTP** ₹{res['underlying']:,.1f}")
-            st.markdown(
-                f"<span style='color:{pcr_color};font-weight:bold'>PCR {res['pcr']:.2f} — {res['pcr_bias']}</span>",
-                unsafe_allow_html=True
-            )
+    def _style_strike_table(df, is_capping):
+        def _row_style(row):
+            styles = [''] * len(row)
+            s_idx  = df.columns.get_loc('Strength')
+            v_idx  = df.columns.get_loc('Vol ✓')
+            strength = str(row.get('Strength', ''))
+            vol_conf = str(row.get('Vol ✓', ''))
+            if 'High Conviction' in strength:
+                base_bg = '#ff000050' if is_capping else '#00ff0050'
+                styles[s_idx] = f'background-color:{base_bg};font-weight:bold'
+            elif 'Strong' in strength:
+                base_bg = '#ff444430' if is_capping else '#00ff8830'
+                styles[s_idx] = f'background-color:{base_bg};font-weight:bold'
+            if '🔥' in vol_conf:
+                styles[v_idx] = 'background-color:#FF8C0050;color:#FF8C00;font-weight:bold'
+            return styles
+        return df.style.apply(_row_style, axis=1)
 
-            # Net ΔOI
-            ce_chg = res['total_ce_chgoi_l']
-            pe_chg = res['total_pe_chgoi_l']
-            oi_arrow = "🟢 PE>" if pe_chg > ce_chg else "🔴 CE>"
-            st.markdown(f"**ΔOI** CE {ce_chg:+.1f}L | PE {pe_chg:+.1f}L {oi_arrow}")
+    with _cap_tab:
+        _cap_df = _build_strike_table(_all_instruments, 'capping')
+        st.dataframe(_style_strike_table(_cap_df, is_capping=True), use_container_width=True, hide_index=True)
+        st.caption("High Conviction = OI > median×1.2 AND Volume > median×1.2 | 🔥 = Volume confirmed active writing above price")
 
-            # Volume
-            st.markdown(f"**Vol** CE {res['total_ce_vol_k']:,.0f}K | PE {res['total_pe_vol_k']:,.0f}K")
+    with _sup_tab:
+        _sup_df = _build_strike_table(_all_instruments, 'support')
+        st.dataframe(_style_strike_table(_sup_df, is_capping=False), use_container_width=True, hide_index=True)
+        st.caption("High Conviction = OI > median×1.2 AND Volume > median×1.2 | 🔥 = Volume confirmed active writing below price")
 
-            # Capping strikes
-            st.markdown("🟥 **Capping (CE)**")
-            if res['capping']:
-                for s in res['capping']:
-                    vol_tag = "🔥" if s['vol_confirmed'] else "〰"
-                    st.markdown(
-                        f"<small>{vol_tag} **₹{s['strike']:.0f}** [{s['strength']}]<br>"
-                        f"OI {s['oi_l']:.1f}L | ΔOI +{s['chgoi_k']:.0f}K | Vol {s['vol_k']:.0f}K</small>",
-                        unsafe_allow_html=True
+    # ── Deep Analysis per Instrument (Market Bias, Resistance, Support, Classification) ──
+    st.markdown("### 🔍 Option Chain Deep Analysis — ATM ±5 Strikes")
+
+    _deep_tab_labels = ['NIFTY 50'] + [cfg['name'] for cfg in INSTRUMENT_CONFIGS.values()]
+    _deep_tabs = st.tabs(_deep_tab_labels)
+
+    def _render_deep_analysis(tab, inst_name, deep, underlying, oi_trend=None):
+        with tab:
+            if deep is None:
+                st.warning(f"Deep analysis unavailable for {inst_name}")
+                return
+            if 'error' in deep:
+                st.error(f"Error: {deep.get('error', '')[:60]}")
+                return
+
+            bias = deep.get('market_bias', 'N/A')
+            conf = deep.get('confidence', 0)
+            signals = deep.get('bias_signals', [])
+            bias_color = '#00ff88' if 'Bullish' in bias else '#ff4444' if 'Bearish' in bias else '#FFD700'
+
+            # Bias header
+            bc1, bc2 = st.columns([2, 1])
+            with bc1:
+                st.markdown(
+                    f"<span style='font-size:1.1em;font-weight:bold;color:{bias_color}'>Market Bias: {bias}</span>",
+                    unsafe_allow_html=True
+                )
+                for sig in signals:
+                    st.markdown(f"• {sig}")
+            with bc2:
+                st.metric("Confidence", f"{conf}%")
+
+            # Top Resistance / Support side by side
+            res_col, sup_col = st.columns(2)
+            with res_col:
+                st.markdown("🔴 **Top 3 Resistance (CE)**")
+                top_res = deep.get('top_resistance')
+                if top_res is not None and not top_res.empty:
+                    _res_disp = top_res.copy()
+                    _res_disp['Strike'] = _res_disp['Strike'].apply(lambda x: f"₹{x:.0f}")
+                    _res_disp['CE_OI'] = (_res_disp['CE_OI'] / 100000).round(1).astype(str) + 'L'
+                    _res_disp['CE_ChgOI'] = (_res_disp['CE_ChgOI'] / 1000).round(0).astype(str) + 'K'
+                    _res_disp = _res_disp.rename(columns={
+                        'Call_Strength': 'Strength', 'Call_Activity': 'Activity',
+                        'CE_OI': 'OI', 'CE_ChgOI': 'ΔOI',
+                    })
+                    disp_cols = [c for c in ['Strike', 'Strength', 'OI', 'ΔOI', 'Activity'] if c in _res_disp.columns]
+
+                    def _style_res(row):
+                        s = [''] * len(row)
+                        if 'Strength' in _res_disp.columns:
+                            si = _res_disp.columns.get_loc('Strength') if 'Strength' in disp_cols else -1
+                            if si >= 0 and 'High Conviction' in str(row.iloc[si]):
+                                s[si] = 'background-color:#ff000050;font-weight:bold'
+                            elif si >= 0 and 'Strong' in str(row.iloc[si]):
+                                s[si] = 'background-color:#ff444430;font-weight:bold'
+                        return s
+
+                    st.dataframe(
+                        _res_disp[disp_cols].style.apply(_style_res, axis=1),
+                        use_container_width=True, hide_index=True
                     )
-            else:
-                st.markdown("<small style='color:#888'>No active capping</small>", unsafe_allow_html=True)
+                else:
+                    st.info("No resistance levels")
 
-            # Support strikes
-            st.markdown("🟢 **Support (PE)**")
-            if res['support']:
-                for s in res['support']:
-                    vol_tag = "🔥" if s['vol_confirmed'] else "〰"
-                    st.markdown(
-                        f"<small>{vol_tag} **₹{s['strike']:.0f}** [{s['strength']}]<br>"
-                        f"OI {s['oi_l']:.1f}L | ΔOI +{s['chgoi_k']:.0f}K | Vol {s['vol_k']:.0f}K</small>",
-                        unsafe_allow_html=True
+            with sup_col:
+                st.markdown("🟢 **Top 3 Support (PE)**")
+                top_sup = deep.get('top_support')
+                if top_sup is not None and not top_sup.empty:
+                    _sup_disp = top_sup.copy()
+                    _sup_disp['Strike'] = _sup_disp['Strike'].apply(lambda x: f"₹{x:.0f}")
+                    _sup_disp['PE_OI'] = (_sup_disp['PE_OI'] / 100000).round(1).astype(str) + 'L'
+                    _sup_disp['PE_ChgOI'] = (_sup_disp['PE_ChgOI'] / 1000).round(0).astype(str) + 'K'
+                    _sup_disp = _sup_disp.rename(columns={
+                        'Put_Strength': 'Strength', 'Put_Activity': 'Activity',
+                        'PE_OI': 'OI', 'PE_ChgOI': 'ΔOI',
+                    })
+                    disp_cols_s = [c for c in ['Strike', 'Strength', 'OI', 'ΔOI', 'Activity'] if c in _sup_disp.columns]
+
+                    def _style_sup(row):
+                        s = [''] * len(row)
+                        if 'Strength' in _sup_disp.columns:
+                            si = _sup_disp.columns.get_loc('Strength') if 'Strength' in disp_cols_s else -1
+                            if si >= 0 and 'High Conviction' in str(row.iloc[si]):
+                                s[si] = 'background-color:#00ff0050;font-weight:bold'
+                            elif si >= 0 and 'Strong' in str(row.iloc[si]):
+                                s[si] = 'background-color:#00ff8830;font-weight:bold'
+                        return s
+
+                    st.dataframe(
+                        _sup_disp[disp_cols_s].style.apply(_style_sup, axis=1),
+                        use_container_width=True, hide_index=True
                     )
+                else:
+                    st.info("No support levels")
+
+            # Strike-wise Call & Put Classification table
+            st.markdown("📊 **Strike-wise Call & Put Classification**")
+            adf = deep.get('analysis_df')
+            if adf is not None and not adf.empty:
+                _cls_cols = ['Strike', 'Zone', 'Call_Class', 'Call_Activity', 'CE_Vol', 'Put_Class', 'Put_Activity', 'PE_Vol']
+                _cls_cols = [c for c in _cls_cols if c in adf.columns]
+                _cls = adf[_cls_cols].copy()
+                _cls['Strike'] = _cls['Strike'].apply(lambda x: f"₹{x:.0f}")
+                if 'CE_Vol' in _cls.columns:
+                    _cls['CE_Vol'] = _cls['CE_Vol'].apply(lambda x: f"{x/1000:.0f}K")
+                if 'PE_Vol' in _cls.columns:
+                    _cls['PE_Vol'] = _cls['PE_Vol'].apply(lambda x: f"{x/1000:.0f}K")
+
+                _ce_vol_high = adf.get('CE_Vol_High', pd.Series([False] * len(adf))).values if 'CE_Vol_High' in adf.columns else [False] * len(adf)
+                _pe_vol_high = adf.get('PE_Vol_High', pd.Series([False] * len(adf))).values if 'PE_Vol_High' in adf.columns else [False] * len(adf)
+
+                def _style_cls(row):
+                    styles = [''] * len(row)
+                    call_i = _cls.columns.get_loc('Call_Class') if 'Call_Class' in _cls.columns else -1
+                    put_i  = _cls.columns.get_loc('Put_Class')  if 'Put_Class'  in _cls.columns else -1
+                    cevol_i = _cls.columns.get_loc('CE_Vol') if 'CE_Vol' in _cls.columns else -1
+                    pevol_i = _cls.columns.get_loc('PE_Vol') if 'PE_Vol' in _cls.columns else -1
+                    call_cls = str(row.iloc[call_i]) if call_i >= 0 else ''
+                    put_cls  = str(row.iloc[put_i])  if put_i  >= 0 else ''
+                    if 'High Conviction' in call_cls:
+                        if call_i >= 0: styles[call_i] = 'background-color:#ff000060;font-weight:bold'
+                        if cevol_i >= 0: styles[cevol_i] = 'background-color:#ff000060;font-weight:bold'
+                    elif 'Strong' in call_cls:
+                        if call_i >= 0: styles[call_i] = 'background-color:#ff444440;font-weight:bold'
+                    elif 'Breakout' in call_cls:
+                        if call_i >= 0: styles[call_i] = 'background-color:#FFD70040;font-weight:bold'
+                    if 'High Conviction' in put_cls:
+                        if put_i  >= 0: styles[put_i]  = 'background-color:#00ff0060;font-weight:bold'
+                        if pevol_i >= 0: styles[pevol_i] = 'background-color:#00ff0060;font-weight:bold'
+                    elif 'Strong' in put_cls:
+                        if put_i  >= 0: styles[put_i]  = 'background-color:#00ff8840;font-weight:bold'
+                    elif 'Breakdown' in put_cls:
+                        if put_i  >= 0: styles[put_i]  = 'background-color:#FFD70040;font-weight:bold'
+                    return styles
+
+                st.dataframe(_cls.style.apply(_style_cls, axis=1), use_container_width=True, hide_index=True)
             else:
-                st.markdown("<small style='color:#888'>No active support</small>", unsafe_allow_html=True)
+                st.info("No classification data")
+
+            # Trapped writers + Breakout/Breakdown
+            tw_col, bk_col = st.columns(2)
+            with tw_col:
+                trapped_ce = deep.get('trapped_call_writers')
+                trapped_pe = deep.get('trapped_put_writers')
+                if trapped_ce is not None and not trapped_ce.empty:
+                    st.warning(f"⚠️ {len(trapped_ce)} Trapped Call Writer(s)")
+                    _tc = trapped_ce.copy()
+                    _tc['Strike'] = _tc['Strike'].apply(lambda x: f"₹{x:.0f}")
+                    _tc['CE_OI'] = (_tc['CE_OI'] / 100000).round(1).astype(str) + 'L'
+                    st.dataframe(_tc, use_container_width=True, hide_index=True)
+                else:
+                    st.success("No trapped call writers")
+            with bk_col:
+                bz = deep.get('breakout_zones')
+                bd = deep.get('breakdown_zones')
+                if bz is not None and not bz.empty:
+                    st.success(f"🚀 Breakout Zone: ₹{bz.iloc[0]['Strike']:.0f}")
+                elif bd is not None and not bd.empty:
+                    st.error(f"💥 Breakdown Zone: ₹{bd.iloc[0]['Strike']:.0f}")
+                else:
+                    st.info("No breakout/breakdown zones")
+
+            # OI Timeline Trend Analysis — ATM ±1
+            if oi_trend:
+                st.markdown("---")
+                st.markdown("📈 **OI Timeline Trend Analysis (ATM ±1)**")
+                st.caption("Derived from day's changeinOpenInterest vs previousOpenInterest (snapshot-based)")
+                _ot_cols = st.columns(3)
+                _sig_colors = {
+                    'BULLISH': '#00ff88', 'MILDLY BULLISH': '#90EE90',
+                    'BEARISH': '#ff4444', 'MILDLY BEARISH': '#ff8888',
+                    'RANGE': '#FFD700', 'VOLATILE': '#FF8C00', 'NEUTRAL': '#aaaaaa',
+                }
+                _act_icons = {
+                    'Short Building': '📈 Short Building',
+                    'Short Covering': '📉 Short Covering',
+                    'Long Building':  '🟢 Long Building',
+                    'Long Unwinding': '🔻 Long Unwinding',
+                    'Neutral': '⚪ Neutral',
+                }
+                for _ci, _lbl in enumerate(['ATM-1', 'ATM', 'ATM+1']):
+                    td = oi_trend.get(_lbl)
+                    if not td:
+                        continue
+                    with _ot_cols[_ci]:
+                        _sig = td['signal']
+                        _sc  = _sig_colors.get(_sig, '#aaaaaa')
+                        st.markdown(
+                            f"<b>{_lbl} — ₹{td['strike']:.0f}</b><br>"
+                            f"<span style='color:{_sc};font-weight:bold'>{_sig}</span>",
+                            unsafe_allow_html=True
+                        )
+                        # CE block
+                        st.markdown(f"**CE (Resistance)**")
+                        ce_rows = {
+                            'Activity': _act_icons.get(td['ce_activity'], td['ce_activity']),
+                            'OI Δ%': f"{td['ce_oi_pct']:+.1f}%",
+                            'ChgOI': f"{td['ce_chgoi']/1000:+.0f}K ({'↑' if td['ce_chgoi'] > 0 else '↓'})",
+                            'OI': f"{td['ce_oi']/100000:.1f}L",
+                            'Status': td['resistance_status'],
+                        }
+                        for k, v in ce_rows.items():
+                            st.markdown(f"<small>{k}: **{v}**</small>", unsafe_allow_html=True)
+                        # PE block
+                        st.markdown(f"**PE (Support)**")
+                        pe_rows = {
+                            'Activity': _act_icons.get(td['pe_activity'], td['pe_activity']),
+                            'OI Δ%': f"{td['pe_oi_pct']:+.1f}%",
+                            'ChgOI': f"{td['pe_chgoi']/1000:+.0f}K ({'↑' if td['pe_chgoi'] > 0 else '↓'})",
+                            'OI': f"{td['pe_oi']/100000:.1f}L",
+                            'Status': td['support_status'],
+                        }
+                        for k, v in pe_rows.items():
+                            st.markdown(f"<small>{k}: **{v}**</small>", unsafe_allow_html=True)
+
+    # NIFTY tab — use existing sa_result + build OI trend from session_state oi_history
+    _nifty_deep = None
+    _nifty_oi_trend = {}
+    try:
+        _nifty_deep = sa_result
+        # Build NIFTY OI trend from session_state history (same as master signal logic)
+        _oi_hist = getattr(st.session_state, 'oi_history', [])
+        _oi_strikes = getattr(st.session_state, 'oi_current_strikes', [])
+        _chgoi_hist = getattr(st.session_state, 'chgoi_history', [])
+        if len(_oi_hist) >= 3 and _oi_strikes:
+            _sorted_s = sorted(_oi_strikes)
+            _atm_idx  = len(_sorted_s) // 2
+            for _off, _lbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+                _si = _atm_idx + _off
+                if 0 <= _si < len(_sorted_s):
+                    _s = str(_sorted_s[_si])
+                    _odf = pd.DataFrame(_oi_hist)
+                    _ce_c, _pe_c = f'{_s}_CE', f'{_s}_PE'
+                    _ce_ltp_c, _pe_ltp_c = f'{_s}_CE_LTP', f'{_s}_PE_LTP'
+                    _td = {'strike': int(_s), 'ce_oi_pct': 0, 'pe_oi_pct': 0,
+                           'ce_chgoi': 0, 'pe_chgoi': 0, 'ce_oi': 0, 'pe_oi': 0,
+                           'ce_ltp': 0, 'pe_ltp': 0, 'ce_activity': 'N/A', 'pe_activity': 'N/A',
+                           'resistance_status': 'N/A', 'support_status': 'N/A', 'signal': 'NEUTRAL'}
+                    if _ce_c in _odf.columns:
+                        _f, _l = _odf[_ce_c].iloc[0], _odf[_ce_c].iloc[-1]
+                        _td['ce_oi_pct'] = round((_l - _f) / _f * 100, 1) if _f > 0 else 0
+                        _td['ce_oi'] = _l * 100000
+                        _ce_ltp_f = _odf[_ce_ltp_c].iloc[0] if _ce_ltp_c in _odf.columns else 0
+                        _ce_ltp_l = _odf[_ce_ltp_c].iloc[-1] if _ce_ltp_c in _odf.columns else 0
+                        _td['ce_ltp'] = _ce_ltp_l
+                        _oi_up = (_l - _f) > 0; _ltp_up = (_ce_ltp_l - _ce_ltp_f) > 0
+                        _td['ce_activity'] = ('Long Building' if _oi_up and _ltp_up else
+                                              'Short Building' if _oi_up else
+                                              'Short Covering' if not _oi_up and _ltp_up else 'Long Unwinding')
+                    if _pe_c in _odf.columns:
+                        _f, _l = _odf[_pe_c].iloc[0], _odf[_pe_c].iloc[-1]
+                        _td['pe_oi_pct'] = round((_l - _f) / _f * 100, 1) if _f > 0 else 0
+                        _td['pe_oi'] = _l * 100000
+                        _pe_ltp_f = _odf[_pe_ltp_c].iloc[0] if _pe_ltp_c in _odf.columns else 0
+                        _pe_ltp_l = _odf[_pe_ltp_c].iloc[-1] if _pe_ltp_c in _odf.columns else 0
+                        _td['pe_ltp'] = _pe_ltp_l
+                        _oi_up = (_l - _f) > 0; _ltp_up = (_pe_ltp_l - _pe_ltp_f) > 0
+                        _td['pe_activity'] = ('Long Building' if _oi_up and _ltp_up else
+                                              'Short Building' if _oi_up else
+                                              'Short Covering' if not _oi_up and _ltp_up else 'Long Unwinding')
+                    if len(_chgoi_hist) >= 3:
+                        _cdf = pd.DataFrame(_chgoi_hist)
+                        if _ce_c in _cdf.columns: _td['ce_chgoi'] = int(_cdf[_ce_c].iloc[-1] * 1000)
+                        if _pe_c in _cdf.columns: _td['pe_chgoi'] = int(_cdf[_pe_c].iloc[-1] * 1000)
+                    # Resistance / Support status
+                    _ce_act, _pe_act = _td['ce_activity'], _td['pe_activity']
+                    _td['resistance_status'] = ('Building Strong' if _ce_act == 'Short Building' else
+                                                'Breaking' if _ce_act == 'Short Covering' else
+                                                'Weakening' if _ce_act == 'Long Unwinding' else 'Building (Bulls)')
+                    _td['support_status'] = ('Building Strong' if _pe_act == 'Short Building' else
+                                             'Breaking' if _pe_act == 'Short Covering' else
+                                             'Weakening' if _pe_act == 'Long Unwinding' else 'Building (Bears)')
+                    if _pe_act == 'Short Building' and _ce_act in ('Short Covering', 'Long Unwinding'):
+                        _td['signal'] = 'BULLISH'
+                    elif _ce_act == 'Short Building' and _pe_act in ('Short Covering', 'Long Unwinding'):
+                        _td['signal'] = 'BEARISH'
+                    elif _pe_act == 'Short Building' and _ce_act == 'Short Building':
+                        _td['signal'] = 'RANGE'
+                    elif _ce_act == 'Short Covering' and _pe_act == 'Short Covering':
+                        _td['signal'] = 'VOLATILE'
+                    elif _pe_act == 'Short Building':
+                        _td['signal'] = 'MILDLY BULLISH'
+                    elif _ce_act == 'Short Building':
+                        _td['signal'] = 'MILDLY BEARISH'
+                    _nifty_oi_trend[_lbl] = _td
+    except Exception:
+        pass
+    _render_deep_analysis(_deep_tabs[0], 'NIFTY 50', _nifty_deep, None, _nifty_oi_trend)
+
+    # Other instruments
+    for _ti, (inst_key, cfg) in enumerate(INSTRUMENT_CONFIGS.items()):
+        _res = _mi_data.get(inst_key)
+        _deep = _res.get('deep') if _res and 'error' not in _res else None
+        _underlying = _res.get('underlying') if _res else None
+        _oi_tr = _res.get('oi_trend') if _res and 'error' not in _res else None
+        _render_deep_analysis(_deep_tabs[_ti + 1], cfg['name'], _deep, _underlying, _oi_tr)
 
     # === CANDLE PATTERN TIMELINE ===
     if not df.empty and len(df) > 10:
