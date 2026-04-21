@@ -4720,7 +4720,9 @@ def main():
                           ('oi_history', []), ('oi_last_valid_data', None),
                           ('oi_current_strikes', []),
                           ('chgoi_history', []), ('chgoi_last_valid_data', None),
-                          ('chgoi_current_strikes', [])]:
+                          ('chgoi_current_strikes', []),
+                          ('vol_history', []), ('vol_last_valid_data', None),
+                          ('vol_current_strikes', [])]:
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -6182,6 +6184,7 @@ def main():
                             # Collect OI history for ATM ± 2 strikes
                             oi_entry = {'time': current_time}
                             chgoi_entry = {'time': current_time}
+                            vol_entry = {'time': current_time}
                             for _, row in pcr_df.iterrows():
                                 strike_label = str(int(row['Strike']))
                                 oi_entry[f'{strike_label}_CE'] = int(row.get('openInterest_CE', 0) or 0)
@@ -6190,6 +6193,8 @@ def main():
                                 oi_entry[f'{strike_label}_PE_LTP'] = float(row.get('lastPrice_PE', 0) or 0)
                                 chgoi_entry[f'{strike_label}_CE'] = int(row.get('changeinOpenInterest_CE', 0) or 0)
                                 chgoi_entry[f'{strike_label}_PE'] = int(row.get('changeinOpenInterest_PE', 0) or 0)
+                                vol_entry[f'{strike_label}_CE'] = int(row.get('totalTradedVolume_CE', 0) or 0)
+                                vol_entry[f'{strike_label}_PE'] = int(row.get('totalTradedVolume_PE', 0) or 0)
                             st.session_state.oi_history.append(oi_entry)
                             st.session_state.oi_last_valid_data = pcr_df.copy()
                             st.session_state.oi_current_strikes = [int(s) for s in current_strikes]
@@ -6200,6 +6205,11 @@ def main():
                             st.session_state.chgoi_current_strikes = [int(s) for s in current_strikes]
                             if len(st.session_state.chgoi_history) > 200:
                                 st.session_state.chgoi_history = st.session_state.chgoi_history[-200:]
+                            st.session_state.vol_history.append(vol_entry)
+                            st.session_state.vol_last_valid_data = pcr_df.copy()
+                            st.session_state.vol_current_strikes = [int(s) for s in current_strikes]
+                            if len(st.session_state.vol_history) > 200:
+                                st.session_state.vol_history = st.session_state.vol_history[-200:]
             except Exception as e:
                 st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
         if len(st.session_state.pcr_history) > 0:
@@ -6616,6 +6626,149 @@ def main():
                 st.warning(f"Error displaying Change OI charts: {str(e)}")
         else:
             st.info("📊 Change in OI history will build up as the app refreshes. Please wait for data collection...")
+        st.markdown("---")
+        st.markdown("## 📊 Volume Analysis - Time Series (ATM ± 2)")
+        if len(st.session_state.vol_history) > 0:
+            try:
+                vol_history_df = pd.DataFrame(st.session_state.vol_history)
+                vol_strikes = st.session_state.vol_current_strikes or []
+                if not vol_strikes and st.session_state.vol_last_valid_data is not None:
+                    vol_strikes = [int(s) for s in st.session_state.vol_last_valid_data['Strike'].tolist()]
+                vol_strikes = sorted(vol_strikes)
+                vol_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                if len(vol_strikes) >= 3:
+                    vol_col1, vol_col2 = st.columns(2)
+                    with vol_col1:
+                        fig_vol_ce = go.Figure()
+                        for i, strike in enumerate(vol_strikes):
+                            ce_col = f'{strike}_CE'
+                            if ce_col in vol_history_df.columns:
+                                label = vol_position_labels[i] if i < len(vol_position_labels) else f'Strike {i}'
+                                fig_vol_ce.add_trace(go.Scatter(
+                                    x=vol_history_df['time'],
+                                    y=vol_history_df[ce_col] / 1000,
+                                    mode='lines+markers',
+                                    name=f'₹{strike} ({label})',
+                                    line=dict(width=2),
+                                    marker=dict(size=3),
+                                ))
+                        fig_vol_ce.update_layout(
+                            title='Call Volume (ATM ± 2)',
+                            template='plotly_dark',
+                            height=350,
+                            margin=dict(l=10, r=10, t=50, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='Volume (K)'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st.plotly_chart(fig_vol_ce, use_container_width=True)
+                    with vol_col2:
+                        fig_vol_pe = go.Figure()
+                        for i, strike in enumerate(vol_strikes):
+                            pe_col = f'{strike}_PE'
+                            if pe_col in vol_history_df.columns:
+                                label = vol_position_labels[i] if i < len(vol_position_labels) else f'Strike {i}'
+                                fig_vol_pe.add_trace(go.Scatter(
+                                    x=vol_history_df['time'],
+                                    y=vol_history_df[pe_col] / 1000,
+                                    mode='lines+markers',
+                                    name=f'₹{strike} ({label})',
+                                    line=dict(width=2),
+                                    marker=dict(size=3),
+                                ))
+                        fig_vol_pe.update_layout(
+                            title='Put Volume (ATM ± 2)',
+                            template='plotly_dark',
+                            height=350,
+                            margin=dict(l=10, r=10, t=50, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='Volume (K)'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st.plotly_chart(fig_vol_pe, use_container_width=True)
+                    # Per-strike Vol CE vs Vol PE comparison charts
+                    st.markdown("### Per-Strike Call vs Put Volume")
+                    vol_strike_cols = st.columns(min(len(vol_strikes), 5))
+                    for i, strike in enumerate(vol_strikes):
+                        if i >= len(vol_strike_cols):
+                            break
+                        ce_col = f'{strike}_CE'
+                        pe_col = f'{strike}_PE'
+                        with vol_strike_cols[i]:
+                            label = vol_position_labels[i] if i < len(vol_position_labels) else f'Strike {i}'
+                            fig_vol_strike = go.Figure()
+                            if ce_col in vol_history_df.columns:
+                                fig_vol_strike.add_trace(go.Scatter(
+                                    x=vol_history_df['time'],
+                                    y=vol_history_df[ce_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Call Vol',
+                                    line=dict(color='#ff4444', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            if pe_col in vol_history_df.columns:
+                                fig_vol_strike.add_trace(go.Scatter(
+                                    x=vol_history_df['time'],
+                                    y=vol_history_df[pe_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Put Vol',
+                                    line=dict(color='#00cc66', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            current_ce_vol = vol_history_df[ce_col].iloc[-1] / 1000 if ce_col in vol_history_df.columns and len(vol_history_df) > 0 else 0
+                            current_pe_vol = vol_history_df[pe_col].iloc[-1] / 1000 if pe_col in vol_history_df.columns and len(vol_history_df) > 0 else 0
+                            # Volume trend signal
+                            ce_increasing = False
+                            pe_increasing = False
+                            if len(vol_history_df) >= 2:
+                                prev_ce = vol_history_df[ce_col].iloc[-2] / 1000 if ce_col in vol_history_df.columns else 0
+                                prev_pe = vol_history_df[pe_col].iloc[-2] / 1000 if pe_col in vol_history_df.columns else 0
+                                ce_increasing = current_ce_vol > prev_ce
+                                pe_increasing = current_pe_vol > prev_pe
+                            ce_trend = "↑" if ce_increasing else "↓"
+                            pe_trend = "↑" if pe_increasing else "↓"
+                            fig_vol_strike.update_layout(
+                                title=f'{label}<br>₹{strike}<br>CE: {current_ce_vol:.1f}K{ce_trend} | PE: {current_pe_vol:.1f}K{pe_trend}',
+                                template='plotly_dark',
+                                height=280,
+                                showlegend=True,
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                                margin=dict(l=10, r=10, t=80, b=30),
+                                xaxis=dict(tickformat='%H:%M', title=''),
+                                yaxis=dict(title='Volume (K)'),
+                                plot_bgcolor='#1e1e1e',
+                                paper_bgcolor='#1e1e1e'
+                            )
+                            st.plotly_chart(fig_vol_strike, use_container_width=True)
+                            # Signal interpretation
+                            if current_ce_vol > current_pe_vol * 1.2 and ce_increasing:
+                                st.error("Resistance Active 🔴")
+                            elif current_pe_vol > current_ce_vol * 1.2 and pe_increasing:
+                                st.success("Support Active 🟢")
+                            elif ce_increasing and not pe_increasing:
+                                st.warning("CE Vol Rising")
+                            elif pe_increasing and not ce_increasing:
+                                st.warning("PE Vol Rising")
+                            else:
+                                st.info("Balanced")
+                else:
+                    st.info("Waiting for ATM ± 2 strike data...")
+                vol_info1, vol_info2 = st.columns([3, 1])
+                with vol_info1:
+                    st.caption(f"📈 {len(st.session_state.vol_history)} data points | Volume values in Thousands (K)")
+                with vol_info2:
+                    if st.button("🗑️ Clear Vol History"):
+                        st.session_state.vol_history = []
+                        st.session_state.vol_last_valid_data = None
+                        st.rerun()
+            except Exception as e:
+                st.warning(f"Error displaying Volume charts: {str(e)}")
+        else:
+            st.info("📊 Volume history will build up as the app refreshes. Please wait for data collection...")
         st.markdown("---")
         st.markdown("## 📊 Gamma Exposure (GEX) Analysis - Dealer Hedging Flow")
         try:
