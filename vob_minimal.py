@@ -6138,8 +6138,7 @@ def main():
                     pcr_extract_cols = ['Strike', 'Zone', 'PCR', 'PCR_Signal',
                                                                    'openInterest_CE', 'openInterest_PE']
                     for _chg_col in ['changeinOpenInterest_CE', 'changeinOpenInterest_PE',
-                                      'lastPrice_CE', 'lastPrice_PE',
-                                      'totalTradedVolume_CE', 'totalTradedVolume_PE']:
+                                      'lastPrice_CE', 'lastPrice_PE']:
                         if _chg_col in df_summary.columns:
                             pcr_extract_cols.append(_chg_col)
                     pcr_df = df_summary.iloc[start_idx:end_idx][pcr_extract_cols].copy()
@@ -8078,10 +8077,11 @@ def main():
     # ── Deep Analysis per Instrument (Market Bias, Resistance, Support, Classification) ──
     st.markdown("### 🔍 Option Chain Deep Analysis — ATM ±5 Strikes")
 
-    def _render_deep_analysis(inst_name, deep, underlying, oi_trend=None):
-        st.markdown("---")
-        st.markdown(f"#### 📍 {inst_name}")
-        with st.container():
+    _deep_tab_labels = ['NIFTY 50'] + [cfg['name'] for cfg in INSTRUMENT_CONFIGS.values()]
+    _deep_tabs = st.tabs(_deep_tab_labels)
+
+    def _render_deep_analysis(tab, inst_name, deep, underlying, oi_trend=None):
+        with tab:
             if deep is None:
                 st.warning(f"Deep analysis unavailable for {inst_name}")
                 return
@@ -8409,7 +8409,7 @@ def main():
                     _nifty_oi_trend[_lbl] = _td
     except Exception:
         pass
-    _render_deep_analysis('NIFTY 50', _nifty_deep, None, _nifty_oi_trend)
+    _render_deep_analysis(_deep_tabs[0], 'NIFTY 50', _nifty_deep, None, _nifty_oi_trend)
 
     # Other instruments
     for _ti, (inst_key, cfg) in enumerate(INSTRUMENT_CONFIGS.items()):
@@ -8417,7 +8417,7 @@ def main():
         _deep = _res.get('deep') if _res and 'error' not in _res else None
         _underlying = _res.get('underlying') if _res else None
         _oi_tr = _res.get('oi_trend') if _res and 'error' not in _res else None
-        _render_deep_analysis(cfg['name'], _deep, _underlying, _oi_tr)
+        _render_deep_analysis(_deep_tabs[_ti + 1], cfg['name'], _deep, _underlying, _oi_tr)
 
     # === CANDLE PATTERN TIMELINE ===
     if not df.empty and len(df) > 10:
