@@ -3170,12 +3170,12 @@ def detect_ltp_trap(df, delta_length=10, delta_thresh=1.5):
     }
 
 @st.cache_data(ttl=60, show_spinner=False)
-def _fetch_yf_intraday(symbol: str, interval: str = "1m", period: str = "1d"):
+def _fetch_yf_intraday(symbol: str, interval: str = "1m", period: str = "1d", prepost: bool = True):
     """Fetch 1-min intraday OHLC via yfinance and convert to Dhan-style dict."""
     if not _HAS_YF:
         return None
     try:
-        hist = yf.Ticker(symbol).history(period=period, interval=interval, prepost=False)
+        hist = yf.Ticker(symbol).history(period=period, interval=interval, prepost=prepost)
         if hist is None or hist.empty:
             return None
         ist = pytz.timezone('Asia/Kolkata')
@@ -3200,6 +3200,7 @@ def fetch_alignment_data(api):
     # Dhan security IDs + yfinance fallback symbols for instruments Dhan can't
     # resolve without monthly contract lookup (MCX/CDS futures, SENSEX on BSE).
     tickers = [
+        ('NIFTY 50', '13', 'IDX_I', 'INDEX', None),
         ('SENSEX', '51', 'IDX_I', 'INDEX', None),
         ('BANKNIFTY', '25', 'IDX_I', 'INDEX', None),
         ('NIFTY IT', '30', 'IDX_I', 'INDEX', None),
@@ -3392,13 +3393,20 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
             s10, p10 = _nifty_sentiment(df.tail(10))
             s1h, p1h = _nifty_sentiment(df.tail(60))
             s4h, p4h = _nifty_sentiment(df.tail(240))
-            today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
-            df_today = df[df['datetime'].dt.date == today_ist]
-            if df_today.empty:
-                df_today = df  # fallback
-            nifty_day_open = df_today.iloc[0]['open']
-            nifty_pct_time = df_today['datetime'].tolist()
-            nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df_today['close'].tolist()]
+            # Use 1-min pct_series from fetch_alignment_data (NIFTY 50 now included there)
+            # so the chart line has the same granularity as all other instruments.
+            nifty_align_1m = alignment.get('NIFTY 50', {})
+            nifty_pct_time = nifty_align_1m.get('pct_series_time', [])
+            nifty_pct_vals = nifty_align_1m.get('pct_series_vals', [])
+            if not nifty_pct_time:
+                # fallback: compute from main df if 1-min data not available
+                today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+                df_today = df[df['datetime'].dt.date == today_ist]
+                if df_today.empty:
+                    df_today = df
+                nifty_day_open = df_today.iloc[0]['open']
+                nifty_pct_time = df_today['datetime'].tolist()
+                nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df_today['close'].tolist()]
             alignment['NIFTY 50'] = {
                 'ltp': df.iloc[-1]['close'], 'trend': nifty_cp['direction'],
                 'candle_pattern': nifty_cp['pattern'], 'candle_dir': nifty_cp['direction'],
@@ -3408,7 +3416,7 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
                 'sentiment_1h': s1h, 'pct_1h': p1h,
                 'sentiment_4h': s4h, 'pct_4h': p4h,
                 'day_high': df['high'].max(), 'day_low': df['low'].min(),
-                'open': nifty_day_open,
+                'open': nifty_align_1m.get('open', df.iloc[0]['open']),
                 'pct_series_time': nifty_pct_time,
                 'pct_series_vals': nifty_pct_vals,
             }
