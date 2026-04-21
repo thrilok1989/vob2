@@ -1971,6 +1971,61 @@ def create_csv_download(df_summary):
     df_summary.to_csv(output, index=False)
     return output.getvalue()
 
+def calculate_pcr_sr_level(pcr, reference_strike):
+    """PCR-based Support/Resistance level.
+    PCR ≤ 0.7 → Resistance offset below/above strike.
+    0.8–1.7   → Neutral.
+    PCR ≥ 1.8 → Support offset below/above strike.
+    """
+    pcr = round(pcr, 2)
+    if pcr <= 0.7:
+        # Map PCR → offset using linear interpolation between anchor points
+        anchors = [(0.3, -20), (0.4, -10), (0.5, 0), (0.6, 10), (0.7, 20)]
+        if pcr <= 0.3:
+            offset = -20
+        elif pcr >= 0.7:
+            offset = 20
+        else:
+            offset = -20
+            for i in range(len(anchors) - 1):
+                p0, o0 = anchors[i]; p1, o1 = anchors[i + 1]
+                if p0 <= pcr <= p1:
+                    offset = o0 + (pcr - p0) / (p1 - p0) * (o1 - o0)
+                    break
+        level = reference_strike + offset
+        interpretation = (
+            f"Resistance at ₹{level:.0f} (below ATM — strong cap)"  if offset < 0 else
+            f"Resistance at ₹{level:.0f} (above ATM — moderate cap)" if offset > 0 else
+            f"Resistance at ATM ₹{level:.0f}"
+        )
+        return {'type': 'Resistance 🔴', 'level': level, 'offset': offset, 'interpretation': interpretation}
+
+    elif 0.8 <= pcr <= 1.7:
+        return {'type': 'Neutral ⚪', 'level': reference_strike, 'offset': 0,
+                'interpretation': f"Neutral — no clear S/R offset (PCR {pcr:.2f})"}
+
+    else:  # pcr >= 1.8
+        anchors = [(1.8, -20), (2.0, -10), (2.5, 0), (3.0, 10), (3.5, 20)]
+        if pcr <= 1.8:
+            offset = -20
+        elif pcr >= 3.5:
+            offset = 20
+        else:
+            offset = -20
+            for i in range(len(anchors) - 1):
+                p0, o0 = anchors[i]; p1, o1 = anchors[i + 1]
+                if p0 <= pcr <= p1:
+                    offset = o0 + (pcr - p0) / (p1 - p0) * (o1 - o0)
+                    break
+        level = reference_strike + offset
+        interpretation = (
+            f"Support at ₹{level:.0f} (below ATM — strong floor)" if offset < 0 else
+            f"Support at ₹{level:.0f} (above ATM — elevated floor)" if offset > 0 else
+            f"Support at ATM ₹{level:.0f}"
+        )
+        return {'type': 'Support 🟢', 'level': level, 'offset': offset, 'interpretation': interpretation}
+
+
 def get_instrument_capping_analysis(config):
     """Fetch option chain for one instrument and return compact capping/support/OI/volume summary."""
     try:
@@ -2131,13 +2186,14 @@ def get_instrument_capping_analysis(config):
                 else:
                     signal = 'NEUTRAL'
 
+                pcr_strike = pe_oi / ce_oi if ce_oi > 0 else 1.0
                 oi_trend_data[label] = {
                     'strike': closest, 'ce_oi_pct': ce_oi_pct, 'pe_oi_pct': pe_oi_pct,
                     'ce_chgoi': ce_chgoi, 'pe_chgoi': pe_chgoi,
                     'ce_oi': ce_oi, 'pe_oi': pe_oi, 'ce_ltp': ce_ltp, 'pe_ltp': pe_ltp,
                     'ce_activity': ce_activity, 'pe_activity': pe_activity,
                     'resistance_status': resistance_status, 'support_status': support_status,
-                    'signal': signal,
+                    'signal': signal, 'pcr_strike': pcr_strike,
                 }
         except Exception:
             pass
@@ -4664,7 +4720,9 @@ def main():
                           ('oi_history', []), ('oi_last_valid_data', None),
                           ('oi_current_strikes', []),
                           ('chgoi_history', []), ('chgoi_last_valid_data', None),
-                          ('chgoi_current_strikes', [])]:
+                          ('chgoi_current_strikes', []),
+                          ('vol_history', []), ('vol_last_valid_data', None),
+                          ('vol_current_strikes', [])]:
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -6126,6 +6184,7 @@ def main():
                             # Collect OI history for ATM ± 2 strikes
                             oi_entry = {'time': current_time}
                             chgoi_entry = {'time': current_time}
+                            vol_entry = {'time': current_time}
                             for _, row in pcr_df.iterrows():
                                 strike_label = str(int(row['Strike']))
                                 oi_entry[f'{strike_label}_CE'] = int(row.get('openInterest_CE', 0) or 0)
@@ -6134,6 +6193,8 @@ def main():
                                 oi_entry[f'{strike_label}_PE_LTP'] = float(row.get('lastPrice_PE', 0) or 0)
                                 chgoi_entry[f'{strike_label}_CE'] = int(row.get('changeinOpenInterest_CE', 0) or 0)
                                 chgoi_entry[f'{strike_label}_PE'] = int(row.get('changeinOpenInterest_PE', 0) or 0)
+                                vol_entry[f'{strike_label}_CE'] = int(row.get('totalTradedVolume_CE', 0) or 0)
+                                vol_entry[f'{strike_label}_PE'] = int(row.get('totalTradedVolume_PE', 0) or 0)
                             st.session_state.oi_history.append(oi_entry)
                             st.session_state.oi_last_valid_data = pcr_df.copy()
                             st.session_state.oi_current_strikes = [int(s) for s in current_strikes]
@@ -6144,6 +6205,11 @@ def main():
                             st.session_state.chgoi_current_strikes = [int(s) for s in current_strikes]
                             if len(st.session_state.chgoi_history) > 200:
                                 st.session_state.chgoi_history = st.session_state.chgoi_history[-200:]
+                            st.session_state.vol_history.append(vol_entry)
+                            st.session_state.vol_last_valid_data = pcr_df.copy()
+                            st.session_state.vol_current_strikes = [int(s) for s in current_strikes]
+                            if len(st.session_state.vol_history) > 200:
+                                st.session_state.vol_history = st.session_state.vol_history[-200:]
             except Exception as e:
                 st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
         if len(st.session_state.pcr_history) > 0:
@@ -6560,6 +6626,149 @@ def main():
                 st.warning(f"Error displaying Change OI charts: {str(e)}")
         else:
             st.info("📊 Change in OI history will build up as the app refreshes. Please wait for data collection...")
+        st.markdown("---")
+        st.markdown("## 📊 Volume Analysis - Time Series (ATM ± 2)")
+        if len(st.session_state.vol_history) > 0:
+            try:
+                vol_history_df = pd.DataFrame(st.session_state.vol_history)
+                vol_strikes = st.session_state.vol_current_strikes or []
+                if not vol_strikes and st.session_state.vol_last_valid_data is not None:
+                    vol_strikes = [int(s) for s in st.session_state.vol_last_valid_data['Strike'].tolist()]
+                vol_strikes = sorted(vol_strikes)
+                vol_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                if len(vol_strikes) >= 3:
+                    vol_col1, vol_col2 = st.columns(2)
+                    with vol_col1:
+                        fig_vol_ce = go.Figure()
+                        for i, strike in enumerate(vol_strikes):
+                            ce_col = f'{strike}_CE'
+                            if ce_col in vol_history_df.columns:
+                                label = vol_position_labels[i] if i < len(vol_position_labels) else f'Strike {i}'
+                                fig_vol_ce.add_trace(go.Scatter(
+                                    x=vol_history_df['time'],
+                                    y=vol_history_df[ce_col] / 1000,
+                                    mode='lines+markers',
+                                    name=f'₹{strike} ({label})',
+                                    line=dict(width=2),
+                                    marker=dict(size=3),
+                                ))
+                        fig_vol_ce.update_layout(
+                            title='Call Volume (ATM ± 2)',
+                            template='plotly_dark',
+                            height=350,
+                            margin=dict(l=10, r=10, t=50, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='Volume (K)'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st.plotly_chart(fig_vol_ce, use_container_width=True)
+                    with vol_col2:
+                        fig_vol_pe = go.Figure()
+                        for i, strike in enumerate(vol_strikes):
+                            pe_col = f'{strike}_PE'
+                            if pe_col in vol_history_df.columns:
+                                label = vol_position_labels[i] if i < len(vol_position_labels) else f'Strike {i}'
+                                fig_vol_pe.add_trace(go.Scatter(
+                                    x=vol_history_df['time'],
+                                    y=vol_history_df[pe_col] / 1000,
+                                    mode='lines+markers',
+                                    name=f'₹{strike} ({label})',
+                                    line=dict(width=2),
+                                    marker=dict(size=3),
+                                ))
+                        fig_vol_pe.update_layout(
+                            title='Put Volume (ATM ± 2)',
+                            template='plotly_dark',
+                            height=350,
+                            margin=dict(l=10, r=10, t=50, b=30),
+                            xaxis=dict(tickformat='%H:%M', title='Time'),
+                            yaxis=dict(title='Volume (K)'),
+                            plot_bgcolor='#1e1e1e',
+                            paper_bgcolor='#1e1e1e',
+                            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
+                        )
+                        st.plotly_chart(fig_vol_pe, use_container_width=True)
+                    # Per-strike Vol CE vs Vol PE comparison charts
+                    st.markdown("### Per-Strike Call vs Put Volume")
+                    vol_strike_cols = st.columns(min(len(vol_strikes), 5))
+                    for i, strike in enumerate(vol_strikes):
+                        if i >= len(vol_strike_cols):
+                            break
+                        ce_col = f'{strike}_CE'
+                        pe_col = f'{strike}_PE'
+                        with vol_strike_cols[i]:
+                            label = vol_position_labels[i] if i < len(vol_position_labels) else f'Strike {i}'
+                            fig_vol_strike = go.Figure()
+                            if ce_col in vol_history_df.columns:
+                                fig_vol_strike.add_trace(go.Scatter(
+                                    x=vol_history_df['time'],
+                                    y=vol_history_df[ce_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Call Vol',
+                                    line=dict(color='#ff4444', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            if pe_col in vol_history_df.columns:
+                                fig_vol_strike.add_trace(go.Scatter(
+                                    x=vol_history_df['time'],
+                                    y=vol_history_df[pe_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Put Vol',
+                                    line=dict(color='#00cc66', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            current_ce_vol = vol_history_df[ce_col].iloc[-1] / 1000 if ce_col in vol_history_df.columns and len(vol_history_df) > 0 else 0
+                            current_pe_vol = vol_history_df[pe_col].iloc[-1] / 1000 if pe_col in vol_history_df.columns and len(vol_history_df) > 0 else 0
+                            # Volume trend signal
+                            ce_increasing = False
+                            pe_increasing = False
+                            if len(vol_history_df) >= 2:
+                                prev_ce = vol_history_df[ce_col].iloc[-2] / 1000 if ce_col in vol_history_df.columns else 0
+                                prev_pe = vol_history_df[pe_col].iloc[-2] / 1000 if pe_col in vol_history_df.columns else 0
+                                ce_increasing = current_ce_vol > prev_ce
+                                pe_increasing = current_pe_vol > prev_pe
+                            ce_trend = "↑" if ce_increasing else "↓"
+                            pe_trend = "↑" if pe_increasing else "↓"
+                            fig_vol_strike.update_layout(
+                                title=f'{label}<br>₹{strike}<br>CE: {current_ce_vol:.1f}K{ce_trend} | PE: {current_pe_vol:.1f}K{pe_trend}',
+                                template='plotly_dark',
+                                height=280,
+                                showlegend=True,
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                                margin=dict(l=10, r=10, t=80, b=30),
+                                xaxis=dict(tickformat='%H:%M', title=''),
+                                yaxis=dict(title='Volume (K)'),
+                                plot_bgcolor='#1e1e1e',
+                                paper_bgcolor='#1e1e1e'
+                            )
+                            st.plotly_chart(fig_vol_strike, use_container_width=True)
+                            # Signal interpretation
+                            if current_ce_vol > current_pe_vol * 1.2 and ce_increasing:
+                                st.error("Resistance Active 🔴")
+                            elif current_pe_vol > current_ce_vol * 1.2 and pe_increasing:
+                                st.success("Support Active 🟢")
+                            elif ce_increasing and not pe_increasing:
+                                st.warning("CE Vol Rising")
+                            elif pe_increasing and not ce_increasing:
+                                st.warning("PE Vol Rising")
+                            else:
+                                st.info("Balanced")
+                else:
+                    st.info("Waiting for ATM ± 2 strike data...")
+                vol_info1, vol_info2 = st.columns([3, 1])
+                with vol_info1:
+                    st.caption(f"📈 {len(st.session_state.vol_history)} data points | Volume values in Thousands (K)")
+                with vol_info2:
+                    if st.button("🗑️ Clear Vol History"):
+                        st.session_state.vol_history = []
+                        st.session_state.vol_last_valid_data = None
+                        st.rerun()
+            except Exception as e:
+                st.warning(f"Error displaying Volume charts: {str(e)}")
+        else:
+            st.info("📊 Volume history will build up as the app refreshes. Please wait for data collection...")
         st.markdown("---")
         st.markdown("## 📊 Gamma Exposure (GEX) Analysis - Dealer Hedging Flow")
         try:
@@ -8028,17 +8237,12 @@ def main():
                 else:
                     st.info("No breakout/breakdown zones")
 
-            # OI Timeline Trend Analysis — ATM ±1
+            # OI Timeline Trend Analysis — ATM ±1 (tabular)
             if oi_trend:
                 st.markdown("---")
                 st.markdown("📈 **OI Timeline Trend Analysis (ATM ±1)**")
-                st.caption("Derived from day's changeinOpenInterest vs previousOpenInterest (snapshot-based)")
-                _ot_cols = st.columns(3)
-                _sig_colors = {
-                    'BULLISH': '#00ff88', 'MILDLY BULLISH': '#90EE90',
-                    'BEARISH': '#ff4444', 'MILDLY BEARISH': '#ff8888',
-                    'RANGE': '#FFD700', 'VOLATILE': '#FF8C00', 'NEUTRAL': '#aaaaaa',
-                }
+                st.caption("Derived from day's changeinOpenInterest vs previousOpenInterest | OI in Lakhs · ChgOI in K contracts")
+
                 _act_icons = {
                     'Short Building': '📈 Short Building',
                     'Short Covering': '📉 Short Covering',
@@ -8046,40 +8250,84 @@ def main():
                     'Long Unwinding': '🔻 Long Unwinding',
                     'Neutral': '⚪ Neutral',
                 }
-                for _ci, _lbl in enumerate(['ATM-1', 'ATM', 'ATM+1']):
+                _sig_colors = {
+                    'BULLISH': '#00ff8850', 'MILDLY BULLISH': '#90EE9030',
+                    'BEARISH': '#ff444450', 'MILDLY BEARISH': '#ff888830',
+                    'RANGE': '#FFD70030', 'VOLATILE': '#FF8C0030', 'NEUTRAL': '',
+                }
+
+                # ── OI Activity Table ──────────────────────────────────────
+                _oi_rows = []
+                for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
                     td = oi_trend.get(_lbl)
                     if not td:
                         continue
-                    with _ot_cols[_ci]:
-                        _sig = td['signal']
-                        _sc  = _sig_colors.get(_sig, '#aaaaaa')
-                        st.markdown(
-                            f"<b>{_lbl} — ₹{td['strike']:.0f}</b><br>"
-                            f"<span style='color:{_sc};font-weight:bold'>{_sig}</span>",
-                            unsafe_allow_html=True
-                        )
-                        # CE block
-                        st.markdown(f"**CE (Resistance)**")
-                        ce_rows = {
-                            'Activity': _act_icons.get(td['ce_activity'], td['ce_activity']),
-                            'OI Δ%': f"{td['ce_oi_pct']:+.1f}%",
-                            'ChgOI': f"{td['ce_chgoi']/1000:+.0f}K ({'↑' if td['ce_chgoi'] > 0 else '↓'})",
-                            'OI': f"{td['ce_oi']/100000:.1f}L",
-                            'Status': td['resistance_status'],
-                        }
-                        for k, v in ce_rows.items():
-                            st.markdown(f"<small>{k}: **{v}**</small>", unsafe_allow_html=True)
-                        # PE block
-                        st.markdown(f"**PE (Support)**")
-                        pe_rows = {
-                            'Activity': _act_icons.get(td['pe_activity'], td['pe_activity']),
-                            'OI Δ%': f"{td['pe_oi_pct']:+.1f}%",
-                            'ChgOI': f"{td['pe_chgoi']/1000:+.0f}K ({'↑' if td['pe_chgoi'] > 0 else '↓'})",
-                            'OI': f"{td['pe_oi']/100000:.1f}L",
-                            'Status': td['support_status'],
-                        }
-                        for k, v in pe_rows.items():
-                            st.markdown(f"<small>{k}: **{v}**</small>", unsafe_allow_html=True)
+                    _oi_rows.append({
+                        'Label': _lbl,
+                        'Strike': f"₹{td['strike']:.0f}",
+                        'Signal': td['signal'],
+                        'CE Activity': _act_icons.get(td['ce_activity'], td['ce_activity']),
+                        'CE OI Δ%': f"{td['ce_oi_pct']:+.1f}%",
+                        'CE ChgOI': f"{td['ce_chgoi']/1000:+,.0f}K {'↑' if td['ce_chgoi']>0 else '↓'}",
+                        'CE OI': f"{td['ce_oi']/100000:.1f}L",
+                        'CE Status': td['resistance_status'],
+                        'PE Activity': _act_icons.get(td['pe_activity'], td['pe_activity']),
+                        'PE OI Δ%': f"{td['pe_oi_pct']:+.1f}%",
+                        'PE ChgOI': f"{td['pe_chgoi']/1000:+,.0f}K {'↑' if td['pe_chgoi']>0 else '↓'}",
+                        'PE OI': f"{td['pe_oi']/100000:.1f}L",
+                        'PE Status': td['support_status'],
+                    })
+                if _oi_rows:
+                    _oi_df = pd.DataFrame(_oi_rows)
+                    def _style_oi(row):
+                        sig = str(row.get('Signal', ''))
+                        bg = _sig_colors.get(sig, '')
+                        base = [f'background-color:{bg}' if bg else ''] * len(row)
+                        # Colour CE/PE status cells
+                        for ci, col in enumerate(_oi_df.columns):
+                            if 'CE Status' == col:
+                                base[ci] = 'background-color:#ff444430' if 'Building' in str(row.get(col,'')) else 'background-color:#FFD70030' if 'Break' in str(row.get(col,'')) else ''
+                            elif 'PE Status' == col:
+                                base[ci] = 'background-color:#00ff8830' if 'Building' in str(row.get(col,'')) else 'background-color:#FFD70030' if 'Break' in str(row.get(col,'')) else ''
+                            elif col == 'Signal':
+                                base[ci] = f'background-color:{_sig_colors.get(sig,"")};font-weight:bold' if sig in _sig_colors else 'font-weight:bold'
+                        return base
+                    st.dataframe(_oi_df.style.apply(_style_oi, axis=1), use_container_width=True, hide_index=True)
+
+                # ── PCR-based S/R Table ────────────────────────────────────
+                st.markdown("📐 **PCR-based Support / Resistance Levels**")
+                st.caption("PCR ≤0.7 → Resistance | 0.8–1.7 → Neutral | ≥1.8 → Support | Offset applied to reference strike")
+                _pcr_rows = []
+                for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
+                    td = oi_trend.get(_lbl)
+                    if not td:
+                        continue
+                    pcr_val = td.get('pcr_strike', 1.0)
+                    sr = calculate_pcr_sr_level(pcr_val, td['strike'])
+                    _pcr_rows.append({
+                        'Label': _lbl,
+                        'Strike': f"₹{td['strike']:.0f}",
+                        'PCR': f"{pcr_val:.2f}",
+                        'S/R Type': sr['type'],
+                        'S/R Level': f"₹{sr['level']:.0f}",
+                        'Offset (pts)': f"{sr['offset']:+.0f}",
+                        'Interpretation': sr['interpretation'],
+                    })
+                if _pcr_rows:
+                    _pcr_df = pd.DataFrame(_pcr_rows)
+                    def _style_pcr(row):
+                        styles = [''] * len(row)
+                        sr_idx = _pcr_df.columns.get_loc('S/R Type')
+                        lv_idx = _pcr_df.columns.get_loc('S/R Level')
+                        sr_type = str(row.iloc[sr_idx])
+                        if 'Resistance' in sr_type:
+                            styles[sr_idx] = 'background-color:#ff444450;font-weight:bold'
+                            styles[lv_idx] = 'background-color:#ff444430'
+                        elif 'Support' in sr_type:
+                            styles[sr_idx] = 'background-color:#00ff8850;font-weight:bold'
+                            styles[lv_idx] = 'background-color:#00ff8830'
+                        return styles
+                    st.dataframe(_pcr_df.style.apply(_style_pcr, axis=1), use_container_width=True, hide_index=True)
 
     # NIFTY tab — use existing sa_result + build OI trend from session_state oi_history
     _nifty_deep = None
@@ -8103,11 +8351,12 @@ def main():
                     _td = {'strike': int(_s), 'ce_oi_pct': 0, 'pe_oi_pct': 0,
                            'ce_chgoi': 0, 'pe_chgoi': 0, 'ce_oi': 0, 'pe_oi': 0,
                            'ce_ltp': 0, 'pe_ltp': 0, 'ce_activity': 'N/A', 'pe_activity': 'N/A',
-                           'resistance_status': 'N/A', 'support_status': 'N/A', 'signal': 'NEUTRAL'}
+                           'resistance_status': 'N/A', 'support_status': 'N/A',
+                           'signal': 'NEUTRAL', 'pcr_strike': 1.0}
                     if _ce_c in _odf.columns:
                         _f, _l = _odf[_ce_c].iloc[0], _odf[_ce_c].iloc[-1]
                         _td['ce_oi_pct'] = round((_l - _f) / _f * 100, 1) if _f > 0 else 0
-                        _td['ce_oi'] = _l * 100000
+                        _td['ce_oi'] = _l   # raw contracts (history stores raw ints)
                         _ce_ltp_f = _odf[_ce_ltp_c].iloc[0] if _ce_ltp_c in _odf.columns else 0
                         _ce_ltp_l = _odf[_ce_ltp_c].iloc[-1] if _ce_ltp_c in _odf.columns else 0
                         _td['ce_ltp'] = _ce_ltp_l
@@ -8118,7 +8367,7 @@ def main():
                     if _pe_c in _odf.columns:
                         _f, _l = _odf[_pe_c].iloc[0], _odf[_pe_c].iloc[-1]
                         _td['pe_oi_pct'] = round((_l - _f) / _f * 100, 1) if _f > 0 else 0
-                        _td['pe_oi'] = _l * 100000
+                        _td['pe_oi'] = _l   # raw contracts
                         _pe_ltp_f = _odf[_pe_ltp_c].iloc[0] if _pe_ltp_c in _odf.columns else 0
                         _pe_ltp_l = _odf[_pe_ltp_c].iloc[-1] if _pe_ltp_c in _odf.columns else 0
                         _td['pe_ltp'] = _pe_ltp_l
@@ -8128,8 +8377,8 @@ def main():
                                               'Short Covering' if not _oi_up and _ltp_up else 'Long Unwinding')
                     if len(_chgoi_hist) >= 3:
                         _cdf = pd.DataFrame(_chgoi_hist)
-                        if _ce_c in _cdf.columns: _td['ce_chgoi'] = int(_cdf[_ce_c].iloc[-1] * 1000)
-                        if _pe_c in _cdf.columns: _td['pe_chgoi'] = int(_cdf[_pe_c].iloc[-1] * 1000)
+                        if _ce_c in _cdf.columns: _td['ce_chgoi'] = int(_cdf[_ce_c].iloc[-1])  # raw contracts
+                        if _pe_c in _cdf.columns: _td['pe_chgoi'] = int(_cdf[_pe_c].iloc[-1])  # raw contracts
                     # Resistance / Support status
                     _ce_act, _pe_act = _td['ce_activity'], _td['pe_activity']
                     _td['resistance_status'] = ('Building Strong' if _ce_act == 'Short Building' else
@@ -8150,6 +8399,13 @@ def main():
                         _td['signal'] = 'MILDLY BULLISH'
                     elif _ce_act == 'Short Building':
                         _td['signal'] = 'MILDLY BEARISH'
+                    # Per-strike PCR from last OI history snapshot
+                    try:
+                        _ce_last = _odf[_ce_c].iloc[-1] if _ce_c in _odf.columns else 0
+                        _pe_last = _odf[_pe_c].iloc[-1] if _pe_c in _odf.columns else 0
+                        _td['pcr_strike'] = round(_pe_last / _ce_last, 2) if _ce_last > 0 else 1.0
+                    except Exception:
+                        pass
                     _nifty_oi_trend[_lbl] = _td
     except Exception:
         pass
