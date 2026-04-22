@@ -7746,13 +7746,19 @@ def main():
     # === MASTER TRADING SIGNAL ===
     if option_data and option_data.get('underlying') and not df.empty:
         st.markdown("---")
-        hdr_col1, hdr_col2, hdr_col3 = st.columns([2, 1, 1])
+        # ── Prominent Send button at the very top ──
+        _force_send_clicked = st.button(
+            "📤 Send to Telegram",
+            key="force_send_master",
+            help="Force-send Master Signal + Option Chain Deep Analysis, bypassing all guards",
+            use_container_width=True,
+            type="primary",
+        )
+        hdr_col1, hdr_col2 = st.columns([3, 1])
         with hdr_col1:
             _gemini_ok = bool(GEMINI_API_KEY) and _HAS_GEMINI
             st.markdown(f"## 🎯 Master Trading Signal {'🤖✅' if _gemini_ok else '🤖❌'}")
         with hdr_col2:
-            _force_send_clicked = st.button("📤 Send to Telegram", key="force_send_master", help="Force-send Master Signal + Option Chain Deep Analysis with the current scenario, bypassing all guards")
-        with hdr_col3:
             _ai_explain_clicked = st.button("🤖 AI Explain", key="ai_explain_master", help="Ask Gemini to analyze the current signal and give a trade plan")
 
         # Persistent Gemini analysis panel — only shown when real analysis text exists
