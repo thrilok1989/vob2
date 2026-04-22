@@ -4632,6 +4632,57 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         mf_block = ""
 
+    # OC Bias Summary block — ATM±1 from df_summary
+    oc_bias_block = ""
+    try:
+        _df_sum = (option_data or {}).get('df_summary') if option_data else None
+        if _df_sum is not None and not _df_sum.empty and 'Strike' in _df_sum.columns:
+            _strikes_sorted = sorted(_df_sum['Strike'].unique())
+            _atm_strike = None
+            if 'Zone' in _df_sum.columns:
+                _atm_rows = _df_sum[_df_sum['Zone'] == 'ATM']
+                if not _atm_rows.empty:
+                    _atm_strike = int(_atm_rows.iloc[0]['Strike'])
+            if _atm_strike is None:
+                _atm_strike = min(_strikes_sorted, key=lambda s: abs(s - underlying_price))
+            _atm_pos = _strikes_sorted.index(_atm_strike) if _atm_strike in _strikes_sorted else -1
+            _atm_range = []
+            for _off in [-1, 0, 1]:
+                _idx = _atm_pos + _off
+                if 0 <= _idx < len(_strikes_sorted):
+                    _atm_range.append(_strikes_sorted[_idx])
+            _bias_lines = []
+            def _b(val):
+                return '🟢' if val == 'Bullish' else '🔴' if val == 'Bearish' else '⚪'
+            for _sk in _atm_range:
+                _row = _df_sum[_df_sum['Strike'] == _sk]
+                if _row.empty:
+                    continue
+                _r = _row.iloc[0]
+                _g = lambda c: _r.get(c, 'N/A') if hasattr(_r, 'get') else (_r[c] if c in _r.index else 'N/A')
+                _verdict = _g('Verdict')
+                _score = _g('BiasScore')
+                _pcr = _g('PCR')
+                _v_emoji = '🔴' if 'Bear' in str(_verdict) else '🟢' if 'Bull' in str(_verdict) else '⚪'
+                _entry = _g('Operator_Entry')
+                _scalp = _g('Scalp_Moment')
+                _move = _g('FakeReal')
+                _chgoi_cmp = _g('ChgOI_Cmp')
+                _oi_cmp = _g('OI_Cmp')
+                _bias_lines.append(
+                    f"{_v_emoji} ₹{_sk:.0f} | PCR:{_pcr} | {_verdict} | Score:{_score}\n"
+                    f"  {_entry} | {_scalp} | {_move}\n"
+                    f"  ChgOI:{_b(_g('ChgOI_Bias'))} Vol:{_b(_g('Volume_Bias'))} "
+                    f"Δ:{_b(_g('Delta_Bias'))} Γ:{_b(_g('Gamma_Bias'))} θ:{_b(_g('Theta_Bias'))} "
+                    f"IV:{_b(_g('IV_Bias'))} DVP:{_b(_g('DVP_Bias'))}\n"
+                    f"  ΔExp:{_b(_g('DeltaExp'))} ΓExp:{_b(_g('GammaExp'))} Press:{_g('PressureBias')}\n"
+                    f"  ChgOI: {_chgoi_cmp} | OI: {_oi_cmp}"
+                )
+            if _bias_lines:
+                oc_bias_block = "\n<b>🔬 OC Bias (ATM±1):</b>\n" + "\n\n".join(_bias_lines) + "\n"
+    except Exception:
+        oc_bias_block = ""
+
     # Option Chain Deep Analysis block (from session-state sa_result)
     oc_deep_block = ""
     try:
@@ -4760,7 +4811,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
   Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-{pcr_sr_block}{vpfr_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+{pcr_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
 
