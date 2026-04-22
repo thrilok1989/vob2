@@ -4336,9 +4336,6 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     trade_type = result.get('trade_type', '')
     abs_score = result.get('abs_score', 0)
     signal = result.get('signal', '')
-    # Always block NO TRADE — never send regardless of force flag
-    if trade_type == 'RANGE' or abs_score < 3 or 'NO TRADE' in signal.upper() or 'NO TRADE' in trade_type.upper():
-        return
     if not force:
 
         # Location gating: only send BUY when spot is at/near support, and SELL
