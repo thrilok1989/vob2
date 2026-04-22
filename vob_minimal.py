@@ -5934,11 +5934,7 @@ def main():
                     should_send = st.session_state.last_chain_signal_time is None or \
                         (ist_now - st.session_state.last_chain_signal_time).total_seconds() > 300
                     if should_send:
-                        try:
-                            send_option_chain_signal(sa_result, sa_underlying)
-                            st.session_state.last_chain_signal_time = ist_now
-                        except Exception:
-                            pass
+                        pass  # OC deep analysis Telegram disabled — master signal only
                     st.session_state._sa_result = sa_result
                     analysis_df = sa_result['analysis_df']
                     # Market Bias Banner
@@ -7247,9 +7243,7 @@ def main():
                     _master_now = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api) if _sa else None
                     if _master_now:
                         send_master_signal_telegram(_master_now, option_data['underlying'], option_data, force=True)
-                    if _sa is not None:
-                        send_option_chain_signal(_sa, option_data['underlying'], force=True)
-                    st.success("✅ Sent Master Signal + Option Chain Deep Analysis to Telegram")
+                    st.success("✅ Sent Master Signal to Telegram")
                 except Exception as _e:
                     st.error(f"Failed to force-send: {_e}")
             if _ai_explain_clicked:
