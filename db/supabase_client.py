@@ -372,6 +372,33 @@ class SupabaseDB:
                 .order('timestamp', desc=True).limit(20).execute()
         return self._safe_query('orderbook_data', query, {'expiry': expiry})
 
+    # ── Option Chain Signal History ──
+    def upsert_oc_signal(self, record):
+        now = datetime.now(IST)
+        row = {
+            'timestamp': record.get('timestamp', now.isoformat()),
+            'trading_day': now.date().isoformat(),
+            'spot_price': float(record['spot_price']),
+            'condition': record['condition'],
+            'confidence': int(record['confidence']),
+            'resistance_strikes': json.dumps(record.get('resistance_strikes', [])),
+            'support_strikes': json.dumps(record.get('support_strikes', [])),
+            'active_signals': json.dumps(record.get('active_signals', [])),
+            'breakout_level': record.get('breakout_level'),
+            'breakdown_level': record.get('breakdown_level'),
+            'bias_reasoning': json.dumps(record.get('bias_reasoning', [])),
+        }
+        self._safe_upsert('oc_signal_history', [row], 'timestamp')
+
+    def get_oc_signals(self, trading_day=None, limit=50):
+        if trading_day is None:
+            trading_day = datetime.now(IST).date().isoformat()
+        def query():
+            return self.client.table('oc_signal_history').select('*') \
+                .eq('trading_day', trading_day) \
+                .order('timestamp', desc=True).limit(limit).execute()
+        return self._safe_query('oc_signal_history', query, {'trading_day': trading_day})
+
     # ── User Preferences (carried over) ──
     @staticmethod
     def _default_prefs():

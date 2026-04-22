@@ -24,7 +24,7 @@ try:
 except Exception:
     _HAS_YF = False
 try:
-    import google.generativeai as genai
+    from google import genai as genai
     _HAS_GEMINI = True
 except Exception:
     _HAS_GEMINI = False
@@ -75,7 +75,12 @@ try:
     DHAN_ACCESS_TOKEN = st.secrets.get("DHAN_ACCESS_TOKEN", "") or st.secrets.get("dhan", {}).get("access_token", "")
     supabase_url = st.secrets.get("supabase", {}).get("url", "")
     supabase_key = st.secrets.get("supabase", {}).get("anon_key", "")
-    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    GEMINI_API_KEY = (
+        st.secrets.get("GEMINI_API_KEY", "")
+        or st.secrets.get("gemini", {}).get("api_key", "")
+        or st.secrets.get("gemini", {}).get("GEMINI_API_KEY", "")
+        or os.environ.get("GEMINI_API_KEY", "")
+    )
     try:
         TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "") or getattr(st.secrets, "TELEGRAM_BOT_TOKEN", "")
         TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "") or getattr(st.secrets, "TELEGRAM_CHAT_ID", "")
@@ -2922,134 +2927,84 @@ def analyze_strike_activity(df_summary, underlying_price):
     }
 
 def send_option_chain_signal(sa_result, underlying_price, force=False):
-    """Send comprehensive option chain analysis signal to Telegram. Pass force=True to bypass guards."""
+    """Store option chain analysis snapshot to Supabase oc_signal_history table."""
     if sa_result is None:
         return
     bias = sa_result['market_bias']
     conf = sa_result['confidence']
     analysis_df = sa_result['analysis_df']
 
-    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
 
-    # Active signals detection
+    # Active signals
     active_signals = []
-    # Call capping — includes both High Conviction (vol confirmed) and Strong Resistance
     capping = analysis_df[
         analysis_df['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance']) &
         analysis_df['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)'])
     ]
     for _, r in capping.iterrows():
-        vol_tag = "🔥 VOL CONFIRMED" if r.get('CE_Vol_High', False) else "⚠️ Low Vol"
-        active_signals.append(f"🟥 CALL CAPPING at ₹{r['Strike']:.0f} [{vol_tag}] (OI: {r['CE_OI']/100000:.1f}L, ChgOI: +{r['CE_ChgOI']/1000:.0f}K, Vol: {r['CE_Vol']/1000:.0f}K)")
-    # Put support — includes both High Conviction (vol confirmed) and Strong Support
+        vol_tag = "VOL CONFIRMED" if r.get('CE_Vol_High', False) else "Low Vol"
+        active_signals.append(f"CALL CAPPING ₹{r['Strike']:.0f} [{vol_tag}] OI:{r['CE_OI']/100000:.1f}L ChgOI:+{r['CE_ChgOI']/1000:.0f}K")
     support = analysis_df[
         analysis_df['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
         analysis_df['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)'])
     ]
     for _, r in support.iterrows():
-        vol_tag = "🔥 VOL CONFIRMED" if r.get('PE_Vol_High', False) else "⚠️ Low Vol"
-        active_signals.append(f"🟩 PUT SUPPORT at ₹{r['Strike']:.0f} [{vol_tag}] (OI: {r['PE_OI']/100000:.1f}L, ChgOI: +{r['PE_ChgOI']/1000:.0f}K, Vol: {r['PE_Vol']/1000:.0f}K)")
-    # Breakout
+        vol_tag = "VOL CONFIRMED" if r.get('PE_Vol_High', False) else "Low Vol"
+        active_signals.append(f"PUT SUPPORT ₹{r['Strike']:.0f} [{vol_tag}] OI:{r['PE_OI']/100000:.1f}L ChgOI:+{r['PE_ChgOI']/1000:.0f}K")
     breakout = analysis_df[analysis_df['Call_Class'] == 'Breakout Zone']
     for _, r in breakout.iterrows():
-        active_signals.append(f"🚀 BREAKOUT LOADING at ₹{r['Strike']:.0f} (CE OI unwinding: {r['CE_ChgOI']/1000:.0f}K)")
-    # Breakdown
+        active_signals.append(f"BREAKOUT LOADING ₹{r['Strike']:.0f}")
     breakdown = analysis_df[analysis_df['Put_Class'] == 'Breakdown Zone']
     for _, r in breakdown.iterrows():
-        active_signals.append(f"💥 BREAKDOWN LOADING at ₹{r['Strike']:.0f} (PE OI unwinding: {r['PE_ChgOI']/1000:.0f}K)")
-    # Trapped writers
-    trapped_ce = analysis_df[analysis_df['Call_Trapped']]
-    for _, r in trapped_ce.iterrows():
-        active_signals.append(f"⚠️ TRAPPED CALL WRITERS at ₹{r['Strike']:.0f}")
-    trapped_pe = analysis_df[analysis_df['Put_Trapped']]
-    for _, r in trapped_pe.iterrows():
-        active_signals.append(f"⚠️ TRAPPED PUT WRITERS at ₹{r['Strike']:.0f}")
+        active_signals.append(f"BREAKDOWN LOADING ₹{r['Strike']:.0f}")
 
-    # Market condition
     if 'Bullish' in bias:
-        market_emoji = "🟢"
         condition = "BULLISH"
     elif 'Bearish' in bias:
-        market_emoji = "🔴"
         condition = "BEARISH"
     else:
-        market_emoji = "🟡"
         condition = "SIDEWAYS"
 
-    # Top resistance
-    res_lines = []
-    for _, r in sa_result['top_resistance'].iterrows():
-        res_lines.append(f"  🟥 ₹{r['Strike']:.0f} | {r['Call_Strength']} | OI: {r['CE_OI']/100000:.1f}L | {r['Call_Activity']}")
-    # Top support
-    sup_lines = []
-    for _, r in sa_result['top_support'].iterrows():
-        sup_lines.append(f"  🟩 ₹{r['Strike']:.0f} | {r['Put_Strength']} | OI: {r['PE_OI']/100000:.1f}L | {r['Put_Activity']}")
-
-    # Breakout/Breakdown levels
-    breakout_lvl = f"₹{breakout.iloc[0]['Strike']:.0f}" if not breakout.empty else "None"
-    breakdown_lvl = f"₹{breakdown.iloc[0]['Strike']:.0f}" if not breakdown.empty else "None"
-
-    signals_text = "\n".join(active_signals) if active_signals else "  No active signals"
-    res_text = "\n".join(res_lines) if res_lines else "  None identified"
-    sup_text = "\n".join(sup_lines) if sup_lines else "  None identified"
-
-    message = f"""📊 <b>OPTION CHAIN DEEP ANALYSIS</b> 📊
-🕐 {time_str} | Spot: ₹{underlying_price:.2f}
-
-━━━ {market_emoji} MARKET CONDITION: <b>{condition}</b> ━━━
-📈 Confidence: <b>{conf}%</b>
-{'▓' * (conf // 5)}{'░' * (20 - conf // 5)}
-
-<b>🟥 CALL CAPPING / RESISTANCE:</b>
-{res_text}
-
-<b>🟩 PUT SUPPORT LEVELS:</b>
-{sup_text}
-
-<b>⚡ ACTIVE SIGNALS:</b>
-{signals_text}
-
-<b>🚀 Breakout Level:</b> {breakout_lvl}
-<b>💥 Breakdown Level:</b> {breakdown_lvl}
-
-<b>📋 BIAS REASONING:</b>
-{"".join([f"• {s}" + chr(10) for s in sa_result['bias_signals']])}
-⚠️ <i>Auto-generated. Manual verification required.</i>"""
+    resistance_strikes = [
+        {'strike': int(r['Strike']), 'strength': r['Call_Strength'],
+         'oi_l': round(r['CE_OI']/100000, 1), 'activity': r['Call_Activity']}
+        for _, r in sa_result['top_resistance'].iterrows()
+    ]
+    support_strikes = [
+        {'strike': int(r['Strike']), 'strength': r['Put_Strength'],
+         'oi_l': round(r['PE_OI']/100000, 1), 'activity': r['Put_Activity']}
+        for _, r in sa_result['top_support'].iterrows()
+    ]
+    breakout_level = float(breakout.iloc[0]['Strike']) if not breakout.empty else None
+    breakdown_level = float(breakdown.iloc[0]['Strike']) if not breakdown.empty else None
 
     if not force:
-        # Send only if there are meaningful active signals
         if not active_signals:
             return
-        # Skip sideways / neutral market conditions (noise reduction)
-        if condition == "SIDEWAYS" or ('Bullish' not in bias and 'Bearish' not in bias):
+        if condition == "SIDEWAYS":
             return
-        # 5-minute cooldown to prevent spam
-        now = datetime.now(pytz.timezone('Asia/Kolkata'))
-        last_sent = st.session_state.get('_last_oc_signal_time')
-        if last_sent and (now - last_sent).total_seconds() < 300:
+        last_stored = st.session_state.get('_last_oc_store_time')
+        if last_stored and (now - last_stored).total_seconds() < 300:
             return
-    try:
-        send_telegram_message_sync(message, force=force)
-        if not force:
-            st.session_state._last_oc_signal_time = datetime.now(pytz.timezone('Asia/Kolkata'))
-    except Exception:
-        pass
 
-    # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
-        _ai_text, _ai_err = ai_analyze_telegram_message(message, kind="oc")
-        if _ai_text:
-            st.session_state._last_gemini_oc = {
-                'text': _ai_text,
-                'time': datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST'),
-            }
-            _ai_telegram = f"🤖 <b>GEMINI ANALYSIS — OPTION CHAIN</b>\n\n{_ai_text}"
-            try:
-                send_telegram_message_sync(_ai_telegram, force=force)
-            except Exception:
-                pass
-        elif _ai_err:
-            st.session_state._last_gemini_oc = {'text': f"⚠️ {_ai_err}", 'time': ''}
+        db = st.session_state.get('db')
+        if db:
+            db.upsert_oc_signal({
+                'timestamp': now.isoformat(),
+                'spot_price': underlying_price,
+                'condition': condition,
+                'confidence': conf,
+                'resistance_strikes': resistance_strikes,
+                'support_strikes': support_strikes,
+                'active_signals': active_signals,
+                'breakout_level': breakout_level,
+                'breakdown_level': breakdown_level,
+                'bias_reasoning': list(sa_result.get('bias_signals', [])),
+            })
+            if not force:
+                st.session_state._last_oc_store_time = now
     except Exception:
         pass
 
@@ -4134,8 +4089,8 @@ def ai_analyze_telegram_message(message, kind="master"):
     Returns (analysis_text, error) — analysis_text is plain text suitable to send
     back to Telegram or display in the app.
     """
-    model = _get_gemini_model()
-    if model is None:
+    client = _get_gemini_client()
+    if client is None:
         return None, "Gemini not configured (no GEMINI_API_KEY)."
 
     try:
@@ -4171,28 +4126,27 @@ Keep the whole reply under 170 words. No disclaimers.
 SNAPSHOT:
 {clean}
 """
-        resp = model.generate_content(prompt)
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return (resp.text or "").strip(), None
     except Exception as e:
         return None, f"Gemini error: {str(e)[:200]}"
 
 @st.cache_resource
-def _get_gemini_model():
-    """Initialize and cache the Gemini model."""
+def _get_gemini_client():
+    """Initialize and cache the Gemini client (google-genai SDK)."""
     if not _HAS_GEMINI:
         return None
     if not GEMINI_API_KEY:
         return None
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        return genai.GenerativeModel("gemini-2.0-flash")
+        return genai.Client(api_key=GEMINI_API_KEY)
     except Exception:
         return None
 
 def ai_explain_signal(master, sa_result, underlying_price, mf_data=None, unwind_summary=None):
     """Ask Gemini to explain the current master signal in plain English."""
-    model = _get_gemini_model()
-    if model is None:
+    client = _get_gemini_client()
+    if client is None:
         return None, "Gemini not configured. Add GEMINI_API_KEY to Streamlit secrets."
 
     try:
@@ -4259,7 +4213,7 @@ Respond in exactly this format (markdown):
 
 Keep the total under 180 words. No disclaimers."""
 
-        resp = model.generate_content(prompt)
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return resp.text, None
     except Exception as e:
         return None, f"Gemini error: {str(e)[:200]}"
@@ -4686,8 +4640,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 send_telegram_message_sync(_ai_telegram, force=force)
             except Exception:
                 pass
-        elif _ai_err:
-            st.session_state._last_gemini_master = {'text': f"⚠️ {_ai_err}", 'time': ''}
+        # errors (e.g. no API key) are not persisted — nothing to show
     except Exception:
         pass
 
@@ -6091,6 +6044,62 @@ def main():
                     st.warning("Unable to analyze option chain. Check data.")
         except Exception as e:
             st.warning(f"Deep analysis unavailable: {str(e)}")
+
+        # ── OC Signal History (stored in Supabase) ────────────────────────────
+        st.markdown("---")
+        st.markdown("## 🗂️ OC Signal History (Today)")
+        try:
+            _db = st.session_state.get('db')
+            if _db:
+                _oc_hist_df = _db.get_oc_signals()
+                if not _oc_hist_df.empty:
+                    _rows = []
+                    for _, _hr in _oc_hist_df.iterrows():
+                        _ts = str(_hr.get('timestamp', ''))[:19].replace('T', ' ')
+                        _res = _hr.get('resistance_strikes', '[]')
+                        _sup = _hr.get('support_strikes', '[]')
+                        try:
+                            _res = json.loads(_res) if isinstance(_res, str) else _res
+                            _sup = json.loads(_sup) if isinstance(_sup, str) else _sup
+                        except Exception:
+                            _res, _sup = [], []
+                        _res_txt = ', '.join([f"₹{x['strike']}({x['strength'][:3]})" for x in _res]) or '—'
+                        _sup_txt = ', '.join([f"₹{x['strike']}({x['strength'][:3]})" for x in _sup]) or '—'
+                        _sigs = _hr.get('active_signals', '[]')
+                        try:
+                            _sigs = json.loads(_sigs) if isinstance(_sigs, str) else _sigs
+                        except Exception:
+                            _sigs = []
+                        _rows.append({
+                            'Time': _ts,
+                            'Spot': f"₹{float(_hr['spot_price']):.0f}",
+                            'Condition': _hr.get('condition', ''),
+                            'Conf%': int(_hr.get('confidence', 0)),
+                            'Resistance': _res_txt,
+                            'Support': _sup_txt,
+                            'Breakout': f"₹{int(_hr['breakout_level'])}" if _hr.get('breakout_level') else '—',
+                            'Breakdown': f"₹{int(_hr['breakdown_level'])}" if _hr.get('breakdown_level') else '—',
+                            'Active Signals': ' | '.join(_sigs) if _sigs else '—',
+                        })
+                    _oc_disp = pd.DataFrame(_rows)
+                    def _style_oc(row):
+                        c = str(row['Condition'])
+                        if c == 'BULLISH':
+                            return ['background-color:#00ff8820'] * len(row)
+                        elif c == 'BEARISH':
+                            return ['background-color:#ff444420'] * len(row)
+                        return [''] * len(row)
+                    st.dataframe(
+                        _oc_disp.style.apply(_style_oc, axis=1),
+                        use_container_width=True, hide_index=True
+                    )
+                else:
+                    st.info("No OC signals stored yet today.")
+            else:
+                st.info("Database not connected.")
+        except Exception as _e:
+            st.warning(f"OC history unavailable: {_e}")
+
         st.markdown("---")
         st.markdown("## 📊 PCR Analysis - Time Series (ATM ± 2)")
         def create_pcr_chart(history_df, col_name, color, title_prefix):
@@ -7219,21 +7228,24 @@ def main():
         st.markdown("---")
         hdr_col1, hdr_col2, hdr_col3 = st.columns([2, 1, 1])
         with hdr_col1:
-            st.markdown("## 🎯 Master Trading Signal")
+            _gemini_ok = bool(GEMINI_API_KEY) and _HAS_GEMINI
+            st.markdown(f"## 🎯 Master Trading Signal {'🤖✅' if _gemini_ok else '🤖❌'}")
         with hdr_col2:
             _force_send_clicked = st.button("📤 Send to Telegram", key="force_send_master", help="Force-send Master Signal + Option Chain Deep Analysis with the current scenario, bypassing all guards")
         with hdr_col3:
             _ai_explain_clicked = st.button("🤖 AI Explain", key="ai_explain_master", help="Ask Gemini to analyze the current signal and give a trade plan")
 
-        # Persistent Gemini analysis panel (auto-updated whenever telegram is sent)
+        # Persistent Gemini analysis panel — only shown when real analysis text exists
         _last_gm = st.session_state.get('_last_gemini_master')
         _last_gm_oc = st.session_state.get('_last_gemini_oc')
-        if _last_gm or _last_gm_oc:
+        _gm_valid = _last_gm and _last_gm.get('time') and not str(_last_gm.get('text', '')).startswith('⚠️')
+        _gm_oc_valid = _last_gm_oc and _last_gm_oc.get('time') and not str(_last_gm_oc.get('text', '')).startswith('⚠️')
+        if _gm_valid or _gm_oc_valid:
             with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=True):
-                if _last_gm:
+                if _gm_valid:
                     st.markdown(f"**Master Signal** — {_last_gm.get('time', '')}")
                     st.markdown(_last_gm.get('text', ''))
-                if _last_gm_oc:
+                if _gm_oc_valid:
                     st.markdown("---")
                     st.markdown(f"**Option Chain Deep Analysis** — {_last_gm_oc.get('time', '')}")
                     st.markdown(_last_gm_oc.get('text', ''))
@@ -7249,7 +7261,7 @@ def main():
                         send_master_signal_telegram(_master_now, option_data['underlying'], option_data, force=True)
                     if _sa is not None:
                         send_option_chain_signal(_sa, option_data['underlying'], force=True)
-                    st.success("✅ Sent Master Signal + Option Chain Deep Analysis to Telegram")
+                    st.success("✅ Sent Master Signal to Telegram | OC snapshot saved to history")
                 except Exception as _e:
                     st.error(f"Failed to force-send: {_e}")
             if _ai_explain_clicked:
