@@ -4652,7 +4652,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 if 0 <= _idx < len(_strikes_sorted):
                     _atm_range.append(_strikes_sorted[_idx])
             def _b(val):
-                return '🟢 Bullish' if val == 'Bullish' else '🔴 Bearish' if val == 'Bearish' else '⚪ Neutral'
+                return '🟢' if val == 'Bullish' else '🔴' if val == 'Bearish' else '⚪'
+            def _esc(v):
+                return str(v).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
             _strike_blocks = []
             for _sk in _atm_range:
                 _row = _df_sum[_df_sum['Strike'] == _sk]
@@ -4666,25 +4668,25 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 _label = 'ATM+1' if _sk > _atm_strike else ('ATM-1' if _sk < _atm_strike else 'ATM  ')
                 _v_emoji = '🔴' if 'Bear' in _verdict else '🟢' if 'Bull' in _verdict else '⚪'
                 _strike_blocks.append(
-                    f"<b>{_label} ₹{_sk:.0f} | PCR: {_pcr} | {_v_emoji} {_verdict} | Score: {_score}</b>\n"
-                    f"  📌 ChgOI_Bias    : {_b(_g('ChgOI_Bias'))}\n"
-                    f"  📌 Volume_Bias   : {_b(_g('Volume_Bias'))}\n"
-                    f"  📌 Delta_Bias    : {_b(_g('Delta_Bias'))}\n"
-                    f"  📌 Gamma_Bias    : {_b(_g('Gamma_Bias'))}\n"
-                    f"  📌 Theta_Bias    : {_b(_g('Theta_Bias'))}\n"
-                    f"  📌 AskQty_Bias   : {_b(_g('AskQty_Bias'))}\n"
-                    f"  📌 BidQty_Bias   : {_b(_g('BidQty_Bias'))}\n"
-                    f"  📌 IV_Bias       : {_b(_g('IV_Bias'))}\n"
-                    f"  📌 DeltaExp      : {_b(_g('DeltaExp'))}\n"
-                    f"  📌 GammaExp      : {_b(_g('GammaExp'))}\n"
-                    f"  📌 DVP_Bias      : {_b(_g('DVP_Bias'))}\n"
-                    f"  📌 PressureBias  : {_b(_g('PressureBias'))}\n"
-                    f"  📌 BidAskPressure: {_g('BidAskPressure')}\n"
-                    f"  🎯 Operator Entry: {_g('Operator_Entry')}\n"
-                    f"  🎯 Scalp/Moment  : {_g('Scalp_Moment')}\n"
-                    f"  🎯 Fake/Real     : {_g('FakeReal')}\n"
-                    f"  📊 ChgOI Cmp     : {_g('ChgOI_Cmp')}\n"
-                    f"  📊 OI Cmp        : {_g('OI_Cmp')}"
+                    f"<b>{_label} ₹{_sk:.0f} | PCR:{_pcr} | {_v_emoji} {_verdict} | Score:{_score}</b>\n"
+                    f"  ChgOI : {_b(_g('ChgOI_Bias'))}\n"
+                    f"  Volume: {_b(_g('Volume_Bias'))}\n"
+                    f"  Delta : {_b(_g('Delta_Bias'))}\n"
+                    f"  Gamma : {_b(_g('Gamma_Bias'))}\n"
+                    f"  Theta : {_b(_g('Theta_Bias'))}\n"
+                    f"  AskQty: {_b(_g('AskQty_Bias'))}\n"
+                    f"  BidQty: {_b(_g('BidQty_Bias'))}\n"
+                    f"  IV    : {_b(_g('IV_Bias'))}\n"
+                    f"  DeltaExp: {_b(_g('DeltaExp'))}\n"
+                    f"  GammaExp: {_b(_g('GammaExp'))}\n"
+                    f"  DVP   : {_b(_g('DVP_Bias'))}\n"
+                    f"  Press : {_b(_g('PressureBias'))}\n"
+                    f"  BA Prs: {_esc(_g('BidAskPressure'))}\n"
+                    f"  Entry : {_esc(_g('Operator_Entry'))}\n"
+                    f"  Scalp : {_esc(_g('Scalp_Moment'))}\n"
+                    f"  Move  : {_esc(_g('FakeReal'))}\n"
+                    f"  ChgOI : {_esc(_g('ChgOI_Cmp'))}\n"
+                    f"  OI    : {_esc(_g('OI_Cmp'))}"
                 )
             if _strike_blocks:
                 oc_bias_block = "\n<b>🔬 OC Bias Summary (ATM±1):</b>\n" + "\n\n".join(_strike_blocks) + "\n"
