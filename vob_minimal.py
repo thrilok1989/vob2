@@ -4462,15 +4462,16 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _short_names = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
                     'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
                     'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+    def _ae(s): return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
     align_parts = []
     for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
         data = result.get('alignment', {}).get(name)
         if data is None:
             continue
-        s10 = data.get('sentiment_10m', 'N/A')
-        emoji = '🟢' if s10 == 'Bullish' else '🔴' if s10 == 'Bearish' else '⚪'
-        align_parts.append(f"{emoji}{_short_names.get(name, name)}")
-    align_text = "  " + " ".join(align_parts) if align_parts else "  Data unavailable"
+        e10 = _ae(data.get('sentiment_10m', ''))
+        e1h = _ae(data.get('sentiment_1h', ''))
+        align_parts.append(f"{_short_names.get(name,name)}:{e10}{e1h}")
+    align_text = "  " + "  ".join(align_parts) if align_parts else "  Data unavailable"
 
     # Location
     loc_text = ", ".join(result['location'])
