@@ -4505,10 +4505,6 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         htf_text = "\n".join(htf_lines)
 
         price_action_block = f"""
-<b>🔮 VIDYA Trend:</b>
-{vidya_line}
-{vidya_vol}
-
 <b>🔄 LTP Trap:</b>
 {ltp_line}
 
