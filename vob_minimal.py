@@ -75,7 +75,12 @@ try:
     DHAN_ACCESS_TOKEN = st.secrets.get("DHAN_ACCESS_TOKEN", "") or st.secrets.get("dhan", {}).get("access_token", "")
     supabase_url = st.secrets.get("supabase", {}).get("url", "")
     supabase_key = st.secrets.get("supabase", {}).get("anon_key", "")
-    GEMINI_API_KEY = st.secrets.get("GEMINI_API_KEY", "") or os.environ.get("GEMINI_API_KEY", "")
+    GEMINI_API_KEY = (
+        st.secrets.get("GEMINI_API_KEY", "")
+        or st.secrets.get("gemini", {}).get("api_key", "")
+        or st.secrets.get("gemini", {}).get("GEMINI_API_KEY", "")
+        or os.environ.get("GEMINI_API_KEY", "")
+    )
     try:
         TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "") or getattr(st.secrets, "TELEGRAM_BOT_TOKEN", "")
         TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "") or getattr(st.secrets, "TELEGRAM_CHAT_ID", "")
@@ -7224,7 +7229,8 @@ def main():
         st.markdown("---")
         hdr_col1, hdr_col2, hdr_col3 = st.columns([2, 1, 1])
         with hdr_col1:
-            st.markdown("## 🎯 Master Trading Signal")
+            _gemini_ok = bool(GEMINI_API_KEY) and _HAS_GEMINI
+            st.markdown(f"## 🎯 Master Trading Signal {'🤖✅' if _gemini_ok else '🤖❌'}")
         with hdr_col2:
             _force_send_clicked = st.button("📤 Send to Telegram", key="force_send_master", help="Force-send Master Signal + Option Chain Deep Analysis with the current scenario, bypassing all guards")
         with hdr_col3:
