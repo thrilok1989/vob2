@@ -4632,7 +4632,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         mf_block = ""
 
-    # OC Bias Summary block — ATM±1 from df_summary
+    # OC Bias Summary block — ATM±1 from df_summary (all fields per strike)
     oc_bias_block = ""
     try:
         _df_sum = (option_data or {}).get('df_summary') if option_data else None
@@ -4647,39 +4647,47 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 _atm_strike = min(_strikes_sorted, key=lambda s: abs(s - underlying_price))
             _atm_pos = _strikes_sorted.index(_atm_strike) if _atm_strike in _strikes_sorted else -1
             _atm_range = []
-            for _off in [-1, 0, 1]:
+            for _off in [1, 0, -1]:   # ATM+1, ATM, ATM-1 (highest → lowest)
                 _idx = _atm_pos + _off
                 if 0 <= _idx < len(_strikes_sorted):
                     _atm_range.append(_strikes_sorted[_idx])
-            _bias_lines = []
             def _b(val):
-                return '🟢' if val == 'Bullish' else '🔴' if val == 'Bearish' else '⚪'
+                return '🟢 Bullish' if val == 'Bullish' else '🔴 Bearish' if val == 'Bearish' else '⚪ Neutral'
+            _strike_blocks = []
             for _sk in _atm_range:
                 _row = _df_sum[_df_sum['Strike'] == _sk]
                 if _row.empty:
                     continue
                 _r = _row.iloc[0]
-                _g = lambda c: _r.get(c, 'N/A') if hasattr(_r, 'get') else (_r[c] if c in _r.index else 'N/A')
-                _verdict = _g('Verdict')
+                _g = lambda c: (_r[c] if c in _r.index else 'N/A')
+                _verdict = str(_g('Verdict'))
                 _score = _g('BiasScore')
                 _pcr = _g('PCR')
-                _v_emoji = '🔴' if 'Bear' in str(_verdict) else '🟢' if 'Bull' in str(_verdict) else '⚪'
-                _entry = _g('Operator_Entry')
-                _scalp = _g('Scalp_Moment')
-                _move = _g('FakeReal')
-                _chgoi_cmp = _g('ChgOI_Cmp')
-                _oi_cmp = _g('OI_Cmp')
-                _bias_lines.append(
-                    f"{_v_emoji} ₹{_sk:.0f} | PCR:{_pcr} | {_verdict} | Score:{_score}\n"
-                    f"  {_entry} | {_scalp} | {_move}\n"
-                    f"  ChgOI:{_b(_g('ChgOI_Bias'))} Vol:{_b(_g('Volume_Bias'))} "
-                    f"Δ:{_b(_g('Delta_Bias'))} Γ:{_b(_g('Gamma_Bias'))} θ:{_b(_g('Theta_Bias'))} "
-                    f"IV:{_b(_g('IV_Bias'))} DVP:{_b(_g('DVP_Bias'))}\n"
-                    f"  ΔExp:{_b(_g('DeltaExp'))} ΓExp:{_b(_g('GammaExp'))} Press:{_g('PressureBias')}\n"
-                    f"  ChgOI: {_chgoi_cmp} | OI: {_oi_cmp}"
+                _label = 'ATM+1' if _sk > _atm_strike else ('ATM-1' if _sk < _atm_strike else 'ATM  ')
+                _v_emoji = '🔴' if 'Bear' in _verdict else '🟢' if 'Bull' in _verdict else '⚪'
+                _strike_blocks.append(
+                    f"<b>{_label} ₹{_sk:.0f} | PCR: {_pcr} | {_v_emoji} {_verdict} | Score: {_score}</b>\n"
+                    f"  📌 ChgOI_Bias    : {_b(_g('ChgOI_Bias'))}\n"
+                    f"  📌 Volume_Bias   : {_b(_g('Volume_Bias'))}\n"
+                    f"  📌 Delta_Bias    : {_b(_g('Delta_Bias'))}\n"
+                    f"  📌 Gamma_Bias    : {_b(_g('Gamma_Bias'))}\n"
+                    f"  📌 Theta_Bias    : {_b(_g('Theta_Bias'))}\n"
+                    f"  📌 AskQty_Bias   : {_b(_g('AskQty_Bias'))}\n"
+                    f"  📌 BidQty_Bias   : {_b(_g('BidQty_Bias'))}\n"
+                    f"  📌 IV_Bias       : {_b(_g('IV_Bias'))}\n"
+                    f"  📌 DeltaExp      : {_b(_g('DeltaExp'))}\n"
+                    f"  📌 GammaExp      : {_b(_g('GammaExp'))}\n"
+                    f"  📌 DVP_Bias      : {_b(_g('DVP_Bias'))}\n"
+                    f"  📌 PressureBias  : {_b(_g('PressureBias'))}\n"
+                    f"  📌 BidAskPressure: {_g('BidAskPressure')}\n"
+                    f"  🎯 Operator Entry: {_g('Operator_Entry')}\n"
+                    f"  🎯 Scalp/Moment  : {_g('Scalp_Moment')}\n"
+                    f"  🎯 Fake/Real     : {_g('FakeReal')}\n"
+                    f"  📊 ChgOI Cmp     : {_g('ChgOI_Cmp')}\n"
+                    f"  📊 OI Cmp        : {_g('OI_Cmp')}"
                 )
-            if _bias_lines:
-                oc_bias_block = "\n<b>🔬 OC Bias (ATM±1):</b>\n" + "\n\n".join(_bias_lines) + "\n"
+            if _strike_blocks:
+                oc_bias_block = "\n<b>🔬 OC Bias Summary (ATM±1):</b>\n" + "\n\n".join(_strike_blocks) + "\n"
     except Exception:
         oc_bias_block = ""
 
