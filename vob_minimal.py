@@ -4287,9 +4287,7 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
     for _s in snapshot:
         label = _s['label']
         pcr_val = _s['pcr']
-        sr = type('SR', (), {'type': _s['type'], 'level': _s['level'], 'offset': _s['offset']})()
         sr_type = _s['type']
-        sr_type = sr['type']
         if 'Neutral' in sr_type:
             continue
         level = _s['level']
