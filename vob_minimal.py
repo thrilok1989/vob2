@@ -4459,20 +4459,18 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         vpfr_block = ""
 
-    align_lines = []
-    display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
-    for name in display_order:
+    _short_names = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
+                    'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
+                    'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+    align_parts = []
+    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
         data = result.get('alignment', {}).get(name)
         if data is None:
             continue
         s10 = data.get('sentiment_10m', 'N/A')
-        s1h = data.get('sentiment_1h', 'N/A')
-        pat = data.get('candle_pattern', 'N/A')
-        ltp = data.get('ltp', 0)
         emoji = '🟢' if s10 == 'Bullish' else '🔴' if s10 == 'Bearish' else '⚪'
-        ltp_str = f"₹{ltp:.0f}" if ltp > 0 else 'N/A'
-        align_lines.append(f"  {emoji} {name}: {ltp_str} | {pat} | 10m:{s10} | 1h:{s1h}")
-    align_text = "\n".join(align_lines) if align_lines else "  Data unavailable"
+        align_parts.append(f"{emoji}{_short_names.get(name, name)}")
+    align_text = "  " + " ".join(align_parts) if align_parts else "  Data unavailable"
 
     # Location
     loc_text = ", ".join(result['location'])
@@ -4810,9 +4808,6 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
 {pcr_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-<b>📋 CONFLUENCE FACTORS:</b>
-{reason_text}
-
 ⚠️ <i>Auto-generated signal. Manual verification required.</i>"""
 
     try:
