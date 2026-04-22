@@ -4089,7 +4089,7 @@ def ai_analyze_telegram_message(message, kind="master"):
     Returns (analysis_text, error) — analysis_text is plain text suitable to send
     back to Telegram or display in the app.
     """
-    client = _get_gemini_client()
+    client = _get_gemini_client(GEMINI_API_KEY)
     if client is None:
         return None, "Gemini not configured (no GEMINI_API_KEY)."
 
@@ -4132,20 +4132,19 @@ SNAPSHOT:
         return None, f"Gemini error: {str(e)[:200]}"
 
 @st.cache_resource
-def _get_gemini_client():
-    """Initialize and cache the Gemini client (google-genai SDK)."""
-    if not _HAS_GEMINI:
-        return None
-    if not GEMINI_API_KEY:
+def _get_gemini_client(api_key: str = ""):
+    """Initialize and cache the Gemini client (google-genai SDK).
+    Key is passed as a param so cache invalidates when the key changes."""
+    if not _HAS_GEMINI or not api_key:
         return None
     try:
-        return genai.Client(api_key=GEMINI_API_KEY)
+        return genai.Client(api_key=api_key)
     except Exception:
         return None
 
 def ai_explain_signal(master, sa_result, underlying_price, mf_data=None, unwind_summary=None):
     """Ask Gemini to explain the current master signal in plain English."""
-    client = _get_gemini_client()
+    client = _get_gemini_client(GEMINI_API_KEY)
     if client is None:
         return None, "Gemini not configured. Add GEMINI_API_KEY to Streamlit secrets."
 
