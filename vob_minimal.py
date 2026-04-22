@@ -4360,6 +4360,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             return
         if is_sell and (dist_res > PROX_PTS or dist_res >= dist_sup):
             return
+    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
     # PCR-based S/R block (ATM-1 / ATM / ATM+1)
     pcr_sr_block = ""
     pcr_sr_levels = []  # collect for proximity alert
