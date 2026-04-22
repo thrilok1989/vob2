@@ -4632,6 +4632,65 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         mf_block = ""
 
+    # OC Bias Summary block — ATM±1 from df_summary (all fields per strike)
+    oc_bias_block = ""
+    try:
+        _df_sum = (option_data or {}).get('df_summary') if option_data else None
+        if _df_sum is not None and not _df_sum.empty and 'Strike' in _df_sum.columns:
+            _strikes_sorted = sorted(_df_sum['Strike'].unique())
+            _atm_strike = None
+            if 'Zone' in _df_sum.columns:
+                _atm_rows = _df_sum[_df_sum['Zone'] == 'ATM']
+                if not _atm_rows.empty:
+                    _atm_strike = int(_atm_rows.iloc[0]['Strike'])
+            if _atm_strike is None:
+                _atm_strike = min(_strikes_sorted, key=lambda s: abs(s - underlying_price))
+            _atm_pos = _strikes_sorted.index(_atm_strike) if _atm_strike in _strikes_sorted else -1
+            _atm_range = []
+            for _off in [1, 0, -1]:   # ATM+1, ATM, ATM-1 (highest → lowest)
+                _idx = _atm_pos + _off
+                if 0 <= _idx < len(_strikes_sorted):
+                    _atm_range.append(_strikes_sorted[_idx])
+            def _b(val):
+                return '🟢 Bullish' if val == 'Bullish' else '🔴 Bearish' if val == 'Bearish' else '⚪ Neutral'
+            _strike_blocks = []
+            for _sk in _atm_range:
+                _row = _df_sum[_df_sum['Strike'] == _sk]
+                if _row.empty:
+                    continue
+                _r = _row.iloc[0]
+                _g = lambda c: (_r[c] if c in _r.index else 'N/A')
+                _verdict = str(_g('Verdict'))
+                _score = _g('BiasScore')
+                _pcr = _g('PCR')
+                _label = 'ATM+1' if _sk > _atm_strike else ('ATM-1' if _sk < _atm_strike else 'ATM  ')
+                _v_emoji = '🔴' if 'Bear' in _verdict else '🟢' if 'Bull' in _verdict else '⚪'
+                _strike_blocks.append(
+                    f"<b>{_label} ₹{_sk:.0f} | PCR: {_pcr} | {_v_emoji} {_verdict} | Score: {_score}</b>\n"
+                    f"  📌 ChgOI_Bias    : {_b(_g('ChgOI_Bias'))}\n"
+                    f"  📌 Volume_Bias   : {_b(_g('Volume_Bias'))}\n"
+                    f"  📌 Delta_Bias    : {_b(_g('Delta_Bias'))}\n"
+                    f"  📌 Gamma_Bias    : {_b(_g('Gamma_Bias'))}\n"
+                    f"  📌 Theta_Bias    : {_b(_g('Theta_Bias'))}\n"
+                    f"  📌 AskQty_Bias   : {_b(_g('AskQty_Bias'))}\n"
+                    f"  📌 BidQty_Bias   : {_b(_g('BidQty_Bias'))}\n"
+                    f"  📌 IV_Bias       : {_b(_g('IV_Bias'))}\n"
+                    f"  📌 DeltaExp      : {_b(_g('DeltaExp'))}\n"
+                    f"  📌 GammaExp      : {_b(_g('GammaExp'))}\n"
+                    f"  📌 DVP_Bias      : {_b(_g('DVP_Bias'))}\n"
+                    f"  📌 PressureBias  : {_b(_g('PressureBias'))}\n"
+                    f"  📌 BidAskPressure: {_g('BidAskPressure')}\n"
+                    f"  🎯 Operator Entry: {_g('Operator_Entry')}\n"
+                    f"  🎯 Scalp/Moment  : {_g('Scalp_Moment')}\n"
+                    f"  🎯 Fake/Real     : {_g('FakeReal')}\n"
+                    f"  📊 ChgOI Cmp     : {_g('ChgOI_Cmp')}\n"
+                    f"  📊 OI Cmp        : {_g('OI_Cmp')}"
+                )
+            if _strike_blocks:
+                oc_bias_block = "\n<b>🔬 OC Bias Summary (ATM±1):</b>\n" + "\n\n".join(_strike_blocks) + "\n"
+    except Exception:
+        oc_bias_block = ""
+
     # Option Chain Deep Analysis block (from session-state sa_result)
     oc_deep_block = ""
     try:
@@ -4760,7 +4819,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
   Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-{pcr_sr_block}{vpfr_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+{pcr_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
 
