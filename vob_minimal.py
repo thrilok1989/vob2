@@ -2000,7 +2000,7 @@ def calculate_pcr_sr_level(pcr, reference_strike):
         )
         return {'type': 'Resistance 🔴', 'level': level, 'offset': offset, 'interpretation': interpretation}
 
-    elif 0.8 <= pcr <= 1.7:
+    elif pcr <= 1.7:  # 0.71–1.7 all neutral
         return {'type': 'Neutral ⚪', 'level': reference_strike, 'offset': 0,
                 'interpretation': f"Neutral — no clear S/R offset (PCR {pcr:.2f})"}
 
