@@ -4655,8 +4655,6 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 ━━━ SIGNAL: <b>{result['signal']}</b> ━━━
 📊 Trade: <b>{result['trade_type']}</b>
-🎯 Confluence: <b>{result['abs_score']}/10 ({result['strength']})</b>
-📈 Confidence: <b>{result['confidence']}%</b>
 
 <b>🕯 Candle:</b> {result['candle']['pattern']} ({result['candle']['direction']})
 <b>📍 Location:</b> {loc_text}
