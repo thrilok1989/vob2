@@ -24,7 +24,7 @@ try:
 except Exception:
     _HAS_YF = False
 try:
-    import google.generativeai as genai
+    from google import genai as genai
     _HAS_GEMINI = True
 except Exception:
     _HAS_GEMINI = False
@@ -4089,8 +4089,8 @@ def ai_analyze_telegram_message(message, kind="master"):
     Returns (analysis_text, error) — analysis_text is plain text suitable to send
     back to Telegram or display in the app.
     """
-    model = _get_gemini_model()
-    if model is None:
+    client = _get_gemini_client()
+    if client is None:
         return None, "Gemini not configured (no GEMINI_API_KEY)."
 
     try:
@@ -4126,28 +4126,27 @@ Keep the whole reply under 170 words. No disclaimers.
 SNAPSHOT:
 {clean}
 """
-        resp = model.generate_content(prompt)
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return (resp.text or "").strip(), None
     except Exception as e:
         return None, f"Gemini error: {str(e)[:200]}"
 
 @st.cache_resource
-def _get_gemini_model():
-    """Initialize and cache the Gemini model."""
+def _get_gemini_client():
+    """Initialize and cache the Gemini client (google-genai SDK)."""
     if not _HAS_GEMINI:
         return None
     if not GEMINI_API_KEY:
         return None
     try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        return genai.GenerativeModel("gemini-2.0-flash")
+        return genai.Client(api_key=GEMINI_API_KEY)
     except Exception:
         return None
 
 def ai_explain_signal(master, sa_result, underlying_price, mf_data=None, unwind_summary=None):
     """Ask Gemini to explain the current master signal in plain English."""
-    model = _get_gemini_model()
-    if model is None:
+    client = _get_gemini_client()
+    if client is None:
         return None, "Gemini not configured. Add GEMINI_API_KEY to Streamlit secrets."
 
     try:
@@ -4214,7 +4213,7 @@ Respond in exactly this format (markdown):
 
 Keep the total under 180 words. No disclaimers."""
 
-        resp = model.generate_content(prompt)
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return resp.text, None
     except Exception as e:
         return None, f"Gemini error: {str(e)[:200]}"
