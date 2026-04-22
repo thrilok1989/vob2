@@ -4277,6 +4277,58 @@ def compute_unwinding_summary(df_atm8):
         'verdict': verdict,
     }
 
+def check_pcr_sr_proximity_alert(underlying_price, oi_trend_data, proximity_pts=5):
+    """Fire a Telegram alert when spot is within proximity_pts of any PCR S/R level.
+    Uses session_state to avoid repeat alerts for the same level."""
+    if not oi_trend_data:
+        return
+    now = pytz.timezone('Asia/Kolkata')
+    alerted = st.session_state.setdefault('_pcr_proximity_alerted', {})
+    for label in ['ATM-1', 'ATM', 'ATM+1']:
+        td = oi_trend_data.get(label)
+        if not td:
+            continue
+        pcr_val = td.get('pcr_strike', 1.0)
+        sr = calculate_pcr_sr_level(pcr_val, td['strike'])
+        sr_type = sr['type']
+        if 'Neutral' in sr_type:
+            continue
+        level = sr['level']
+        dist = abs(underlying_price - level)
+        if dist > proximity_pts:
+            # Reset alert when price moves away (>15 pts buffer)
+            if dist > 15:
+                alerted.pop(label, None)
+            continue
+        # Already alerted this level recently?
+        last_alert = alerted.get(label)
+        if last_alert and (datetime.now(pytz.timezone('Asia/Kolkata')) - last_alert).total_seconds() < 300:
+            continue
+        sr_clean = sr_type.replace('🔴', '').replace('🟢', '').replace('⚪', '').strip()
+        direction = 'above' if underlying_price < level else 'at/above'
+        if sr_clean == 'Resistance':
+            msg = (
+                f"⚠️ <b>PCR RESISTANCE ALERT</b> ⚠️\n"
+                f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
+                f"Spot ₹{underlying_price:.0f} is within {dist:.0f} pts of\n"
+                f"🔴 <b>{label} PCR Resistance ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
+                f"Price likely to <b>stall / reverse here</b>. Watch for rejection."
+            )
+        else:
+            msg = (
+                f"⚠️ <b>PCR SUPPORT ALERT</b> ⚠️\n"
+                f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
+                f"Spot ₹{underlying_price:.0f} is within {dist:.0f} pts of\n"
+                f"🟢 <b>{label} PCR Support ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
+                f"Price likely to <b>hold / bounce here</b>. Watch for reversal."
+            )
+        try:
+            send_telegram_message_sync(msg, force=True)
+            alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
+        except Exception:
+            pass
+
+
 def send_master_signal_telegram(result, underlying_price, option_data=None, force=False):
     """Send master signal to Telegram. Pass force=True to bypass all guards."""
     if result is None:
@@ -4305,9 +4357,40 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             return
         if is_sell and (dist_res > PROX_PTS or dist_res >= dist_sup):
             return
-    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
+    # PCR-based S/R block (ATM-1 / ATM / ATM+1)
+    pcr_sr_block = ""
+    pcr_sr_levels = []  # collect for proximity alert
+    try:
+        _oi_tr = option_data.get('oi_trend', {}) if option_data else {}
+        _pcr_lines = []
+        for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
+            _td = _oi_tr.get(_lbl)
+            if not _td:
+                continue
+            _pcr_val = _td.get('pcr_strike', 1.0)
+            _sr = calculate_pcr_sr_level(_pcr_val, _td['strike'])
+            _type_clean = _sr['type'].replace('🔴', '').replace('🟢', '').replace('⚪', '').strip()
+            _off = f"{_sr['offset']:+.0f}" if _sr['offset'] != 0 else "0"
+            _pcr_lines.append(
+                f"  {_lbl} ₹{_td['strike']:.0f} | PCR:{_pcr_val:.2f} | {_type_clean} ₹{_sr['level']:.0f} (offset {_off})"
+            )
+            if _type_clean in ('Resistance', 'Support'):
+                pcr_sr_levels.append({'label': _lbl, 'type': _type_clean, 'level': _sr['level'], 'pcr': _pcr_val})
+        if _pcr_lines:
+            # Summary line: ceiling / floor
+            _res_lvls = [x['level'] for x in pcr_sr_levels if x['type'] == 'Resistance']
+            _sup_lvls = [x['level'] for x in pcr_sr_levels if x['type'] == 'Support']
+            _ceiling = f"₹{min(_res_lvls):.0f}" if _res_lvls else "—"
+            _floor   = f"₹{max(_sup_lvls):.0f}" if _sup_lvls else "—"
+            pcr_sr_block = (
+                f"\n<b>📐 PCR S/R Levels:</b>\n"
+                + "\n".join(_pcr_lines)
+                + f"\n  🔴 Ceiling: {_ceiling}  |  🟢 Floor: {_floor}"
+                + "\n"
+            )
+    except Exception:
+        pcr_sr_block = ""
 
-    # Alignment text with candle pattern and sentiment
     align_lines = []
     display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
     for name in display_order:
@@ -4615,7 +4698,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
   Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+{pcr_sr_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
 
@@ -7340,6 +7423,13 @@ def main():
                             })
                         except Exception:
                             pass
+
+                    # PCR S/R proximity alert (every refresh cycle)
+                    try:
+                        _oi_tr_data = option_data.get('oi_trend', {})
+                        check_pcr_sr_proximity_alert(option_data['underlying'], _oi_tr_data)
+                    except Exception:
+                        pass
 
                     # Signal Banner
                     if 'BUY' in master['trade_type'] or 'BREAKOUT' in master['signal']:
