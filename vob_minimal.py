@@ -5167,6 +5167,17 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
+    # ── Top-of-page Send to Telegram button ──
+    _top_send_clicked = st.button(
+        "📤 Send to Telegram",
+        key="top_send_telegram",
+        help="Force-send Master Signal + Option Chain Deep Analysis to Telegram",
+        use_container_width=True,
+        type="primary",
+    )
+    if _top_send_clicked:
+        st.session_state['_top_send_triggered'] = True
+
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
     market_open = current_time.replace(hour=8, minute=30, second=0, microsecond=0)
@@ -7746,14 +7757,7 @@ def main():
     # === MASTER TRADING SIGNAL ===
     if option_data and option_data.get('underlying') and not df.empty:
         st.markdown("---")
-        # ── Prominent Send button at the very top ──
-        _force_send_clicked = st.button(
-            "📤 Send to Telegram",
-            key="force_send_master",
-            help="Force-send Master Signal + Option Chain Deep Analysis, bypassing all guards",
-            use_container_width=True,
-            type="primary",
-        )
+        _force_send_clicked = False
         hdr_col1, hdr_col2 = st.columns([3, 1])
         with hdr_col1:
             _gemini_ok = bool(GEMINI_API_KEY) and _HAS_GEMINI
@@ -7780,7 +7784,8 @@ def main():
             _sa = getattr(st.session_state, '_sa_result', None)
             _gex = getattr(st.session_state, '_gex_data', None)
             _conf = getattr(st.session_state, '_confluence', None)
-            if _force_send_clicked:
+            _do_send = _force_send_clicked or st.session_state.pop('_top_send_triggered', False)
+            if _do_send:
                 try:
                     _master_now = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api) if _sa else None
                     if _master_now:
