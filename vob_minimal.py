@@ -4336,10 +4336,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     trade_type = result.get('trade_type', '')
     abs_score = result.get('abs_score', 0)
     signal = result.get('signal', '')
+    # Always block NO TRADE — never send regardless of force flag
+    if trade_type == 'RANGE' or abs_score < 3 or 'NO TRADE' in signal.upper() or 'NO TRADE' in trade_type.upper():
+        return
     if not force:
-        # Skip sending if no actionable trade (RANGE mode or abs_score < 3)
-        if trade_type == 'RANGE' or abs_score < 3 or 'NO TRADE' in signal.upper():
-            return
 
         # Location gating: only send BUY when spot is at/near support, and SELL
         # when spot is at/near resistance. "Near" = within 30 pts AND closer to
@@ -8414,7 +8414,8 @@ def main():
                         'pcr': pcr_val, 'type': sr['type'],
                         'level': sr['level'], 'offset': sr['offset'],
                     })
-                st.session_state._pcr_sr_snapshot = _pcr_sr_snapshot
+                if inst_name == 'NIFTY 50':
+                    st.session_state._pcr_sr_snapshot = _pcr_sr_snapshot
                 if _pcr_rows:
                     _pcr_df = pd.DataFrame(_pcr_rows)
                     def _style_pcr(row):
