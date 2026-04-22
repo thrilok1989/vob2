@@ -4277,23 +4277,20 @@ def compute_unwinding_summary(df_atm8):
         'verdict': verdict,
     }
 
-def check_pcr_sr_proximity_alert(underlying_price, oi_trend_data, proximity_pts=5):
+def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
     """Fire a Telegram alert when spot is within proximity_pts of any PCR S/R level.
-    Uses session_state to avoid repeat alerts for the same level."""
-    if not oi_trend_data:
+    Uses the same _pcr_sr_snapshot stored by the UI — identical data to what's displayed."""
+    snapshot = getattr(st.session_state, '_pcr_sr_snapshot', [])
+    if not snapshot:
         return
-    now = pytz.timezone('Asia/Kolkata')
     alerted = st.session_state.setdefault('_pcr_proximity_alerted', {})
-    for label in ['ATM-1', 'ATM', 'ATM+1']:
-        td = oi_trend_data.get(label)
-        if not td:
-            continue
-        pcr_val = td.get('pcr_strike', 1.0)
-        sr = calculate_pcr_sr_level(pcr_val, td['strike'])
-        sr_type = sr['type']
+    for _s in snapshot:
+        label = _s['label']
+        pcr_val = _s['pcr']
+        sr_type = _s['type']
         if 'Neutral' in sr_type:
             continue
-        level = sr['level']
+        level = _s['level']
         dist = abs(underlying_price - level)
         if dist > proximity_pts:
             # Reset alert when price moves away (>15 pts buffer)
@@ -4361,27 +4358,21 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         if is_sell and (dist_res > PROX_PTS or dist_res >= dist_sup):
             return
     time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
-    # PCR-based S/R block (ATM-1 / ATM / ATM+1)
+    # PCR-based S/R block — taken directly from the UI snapshot (same data shown on screen)
     pcr_sr_block = ""
-    pcr_sr_levels = []  # collect for proximity alert
+    pcr_sr_levels = []
     try:
-        _oi_tr = option_data.get('oi_trend', {}) if option_data else {}
-        _pcr_lines = []
-        for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
-            _td = _oi_tr.get(_lbl)
-            if not _td:
-                continue
-            _pcr_val = _td.get('pcr_strike', 1.0)
-            _sr = calculate_pcr_sr_level(_pcr_val, _td['strike'])
-            _type_clean = _sr['type'].replace('🔴', '').replace('🟢', '').replace('⚪', '').strip()
-            _off = f"{_sr['offset']:+.0f}" if _sr['offset'] != 0 else "0"
-            _pcr_lines.append(
-                f"  {_lbl} ₹{_td['strike']:.0f} | PCR:{_pcr_val:.2f} | {_type_clean} ₹{_sr['level']:.0f} (offset {_off})"
-            )
-            if _type_clean in ('Resistance', 'Support'):
-                pcr_sr_levels.append({'label': _lbl, 'type': _type_clean, 'level': _sr['level'], 'pcr': _pcr_val})
-        if _pcr_lines:
-            # Summary line: ceiling / floor
+        _snapshot = getattr(st.session_state, '_pcr_sr_snapshot', [])
+        if _snapshot:
+            _pcr_lines = []
+            for _s in _snapshot:
+                _type_clean = _s['type'].replace('🔴', '').replace('🟢', '').replace('⚪', '').strip()
+                _off_txt = f"{_s['offset']:+.0f}" if _s['offset'] != 0 else "0"
+                _pcr_lines.append(
+                    f"  {_s['label']} ₹{_s['strike']:.0f} | PCR:{_s['pcr']:.2f} | {_type_clean} ₹{_s['level']:.0f} (offset {_off_txt})"
+                )
+                if _type_clean in ('Resistance', 'Support'):
+                    pcr_sr_levels.append({'label': _s['label'], 'type': _type_clean, 'level': _s['level'], 'pcr': _s['pcr']})
             _res_lvls = [x['level'] for x in pcr_sr_levels if x['type'] == 'Resistance']
             _sup_lvls = [x['level'] for x in pcr_sr_levels if x['type'] == 'Support']
             _ceiling = f"₹{min(_res_lvls):.0f}" if _res_lvls else "—"
@@ -7430,8 +7421,7 @@ def main():
 
                     # PCR S/R proximity alert (every refresh cycle)
                     try:
-                        _oi_tr_data = option_data.get('oi_trend', {})
-                        check_pcr_sr_proximity_alert(option_data['underlying'], _oi_tr_data)
+                        check_pcr_sr_proximity_alert(option_data['underlying'])
                     except Exception:
                         pass
 
@@ -8403,6 +8393,7 @@ def main():
                 st.markdown("📐 **PCR-based Support / Resistance Levels**")
                 st.caption("PCR ≤0.7 → Resistance | 0.8–1.7 → Neutral | ≥1.8 → Support | Offset applied to reference strike")
                 _pcr_rows = []
+                _pcr_sr_snapshot = []  # store for Telegram
                 for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
                     td = oi_trend.get(_lbl)
                     if not td:
@@ -8418,6 +8409,12 @@ def main():
                         'Offset (pts)': f"{sr['offset']:+.0f}",
                         'Interpretation': sr['interpretation'],
                     })
+                    _pcr_sr_snapshot.append({
+                        'label': _lbl, 'strike': td['strike'],
+                        'pcr': pcr_val, 'type': sr['type'],
+                        'level': sr['level'], 'offset': sr['offset'],
+                    })
+                st.session_state._pcr_sr_snapshot = _pcr_sr_snapshot
                 if _pcr_rows:
                     _pcr_df = pd.DataFrame(_pcr_rows)
                     def _style_pcr(row):
