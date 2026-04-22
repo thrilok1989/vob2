@@ -178,11 +178,10 @@ def send_telegram_photo_sync(image_bytes, force=False):
 
 def render_master_signal_image(result, underlying_price, option_data=None):
     """Render the master signal as a dark-themed PNG image using matplotlib."""
-    import matplotlib
-    matplotlib.use('Agg')
     import matplotlib.pyplot as plt
     import matplotlib.patches as mpatches
     import io
+    plt.switch_backend('Agg')  # safe to call even after matplotlib is already imported
 
     BG    = '#0d1117'
     BG2   = '#161b22'
@@ -221,7 +220,7 @@ def render_master_signal_image(result, underlying_price, option_data=None):
     def t(x, y, s, c=WHITE, sz=8, w='normal', ha='left'):
         ax.text(x, y, str(s), color=c, fontsize=sz, fontweight=w,
                 ha=ha, va='top', transform=ax.transAxes,
-                fontfamily='monospace', zorder=2, clip_on=False)
+                zorder=2, clip_on=False)
 
     def row(label, value, y, lc=GRAY, vc=WHITE, sz=8):
         t(L+0.01, y, label, c=lc, sz=sz, w='bold')
@@ -5139,8 +5138,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     try:
         _img_bytes = render_master_signal_image(result, underlying_price, option_data)
         send_telegram_photo_sync(_img_bytes, force=force)
-    except Exception:
-        pass
+    except Exception as _img_err:
+        st.warning(f"Signal image error: {_img_err}")
 
     # Send text version
     try:
