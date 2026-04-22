@@ -4462,15 +4462,35 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _short_names = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
                     'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
                     'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+    _pat_short = {
+        'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
+        'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
+        'Bullish Harami':'BullHar','Bearish Harami':'BearHar',
+        'Morning Star':'MornStar','Evening Star':'EveStar',
+        'Tweezer Top':'TwTop','Tweezer Bottom':'TwBot',
+        'Strong Green Candle':'SGC','Strong Red Candle':'SRC',
+        'Inside Bar':'InsBar','Outside Bar':'OutBar',
+        'Pin Bar':'PinBar','Marubozu':'Maru',
+    }
+    def _ae(s): return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
     align_parts = []
     for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
         data = result.get('alignment', {}).get(name)
         if data is None:
             continue
-        s10 = data.get('sentiment_10m', 'N/A')
-        emoji = '🟢' if s10 == 'Bullish' else '🔴' if s10 == 'Bearish' else '⚪'
-        align_parts.append(f"{emoji}{_short_names.get(name, name)}")
-    align_text = "  " + " ".join(align_parts) if align_parts else "  Data unavailable"
+        e10 = _ae(data.get('sentiment_10m', ''))
+        e1h = _ae(data.get('sentiment_1h', ''))
+        pat = data.get('candle_pattern', '') or ''
+        cdir = data.get('candle_dir', '') or ''
+        pat_clean = pat.strip()
+        if not pat_clean or pat_clean == 'No Pattern' or pat_clean == 'N/A':
+            pat_str = 'NP'
+        else:
+            p_short = _pat_short.get(pat_clean, pat_clean[:6])
+            p_emoji = '🟢' if cdir == 'Bullish' else '🔴' if cdir == 'Bearish' else '⚪'
+            pat_str = f"{p_short}{p_emoji}"
+        align_parts.append(f"{_short_names.get(name,name)}:{e10}{e1h}{pat_str}")
+    align_text = "  " + "  ".join(align_parts) if align_parts else "  Data unavailable"
 
     # Location
     loc_text = ", ".join(result['location'])
@@ -4795,7 +4815,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
   Bullish OB: {'₹' + str(int(result['order_blocks']['bullish_ob']['low'])) + '-' + str(int(result['order_blocks']['bullish_ob']['high'])) if result['order_blocks'].get('bullish_ob') else 'None'}
   Bearish OB: {'₹' + str(int(result['order_blocks']['bearish_ob']['low'])) + '-' + str(int(result['order_blocks']['bearish_ob']['high'])) if result['order_blocks'].get('bearish_ob') else 'None'}
 
-<b>🌍 Alignment:</b>
+<b>🌍 Alignment (10m|1h|Pattern):</b>
 {align_text}
 
 <b>📉 VIX:</b> {vix.get('vix', 'N/A')} ({vix.get('direction', 'Unknown')})
