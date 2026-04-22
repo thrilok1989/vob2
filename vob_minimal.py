@@ -554,6 +554,57 @@ class TriplePOC:
         else:
             return 'inside'
 
+def compute_vpfr(df, n_bars, n_rows=24, va_pct=70):
+    """
+    Volume Profile Fixed Range — Python port of Pine Script VPFR.
+    Distributes each candle's volume across the price bins it spans (by range overlap),
+    finds the POC (max-volume bin), then expands outward to capture va_pct% of volume
+    for VAH and VAL.
+    Returns dict: {poc, vah, val} or None if insufficient data.
+    """
+    if df is None or df.empty or len(df) < 3:
+        return None
+    recent = df.tail(n_bars)
+    top = recent['high'].max()
+    bot = recent['low'].min()
+    if top == bot:
+        return {'poc': round(top, 2), 'vah': round(top, 2), 'val': round(bot, 2)}
+    step = (top - bot) / n_rows
+    bins_lo = [bot + i * step for i in range(n_rows)]
+    bins_hi = [bot + (i + 1) * step for i in range(n_rows)]
+    vol_bins = [0.0] * n_rows
+    for _, row in recent.iterrows():
+        h, l = row['high'], row['low']
+        v = float(row.get('volume') or 1)
+        c_range = h - l
+        if c_range <= 0:
+            continue
+        for i in range(n_rows):
+            overlap = min(h, bins_hi[i]) - max(l, bins_lo[i])
+            if overlap > 0:
+                vol_bins[i] += v * (overlap / c_range)
+    poc_idx = vol_bins.index(max(vol_bins))
+    poc = (bins_lo[poc_idx] + bins_hi[poc_idx]) / 2
+    total = sum(vol_bins)
+    target = total * va_pct / 100
+    cum = vol_bins[poc_idx]
+    lo_i, hi_i = poc_idx, poc_idx
+    while cum < target:
+        can_lo = lo_i - 1 >= 0
+        can_hi = hi_i + 1 < n_rows
+        if not can_lo and not can_hi:
+            break
+        v_lo = vol_bins[lo_i - 1] if can_lo else -1
+        v_hi = vol_bins[hi_i + 1] if can_hi else -1
+        if v_hi >= v_lo:
+            hi_i += 1
+            cum += vol_bins[hi_i]
+        else:
+            lo_i -= 1
+            cum += vol_bins[lo_i]
+    return {'poc': round(poc, 2), 'vah': round(bins_hi[hi_i], 2), 'val': round(bins_lo[lo_i], 2)}
+
+
 class FutureSwing:
     def __init__(self, swing_length=30, projection_offset=10, history_samples=5, calc_type='Average'):
         self.swing_length = swing_length
@@ -3919,6 +3970,12 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     htf_sr = calculate_htf_sr(df)
     hvp_data = detect_hvp(df)
     ltp_trap = detect_ltp_trap(df)
+    # VPFR — three timeframes
+    vpfr_data = {
+        'short':  compute_vpfr(df, 30),
+        'medium': compute_vpfr(df, 60),
+        'long':   compute_vpfr(df, 180),
+    }
     delta_vol_df = calculate_delta_volume(df)
 
     # VOB proximity check
@@ -4075,6 +4132,7 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         'htf_sr': htf_sr,
         'vob_blocks': vob_blocks,
         'hvp': hvp_data,
+        'vpfr': vpfr_data,
         'ltp_trap': ltp_trap,
         'delta_vol_df': delta_vol_df,
         'delta_trend': delta_trend,
@@ -4385,6 +4443,22 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         pcr_sr_block = ""
 
+    # VPFR block
+    vpfr_block = ""
+    try:
+        _vpfr = result.get('vpfr', {}) or {}
+        _vpfr_lines = []
+        for _tf, _label, _bars in [('short', 'Short (30)', 30), ('medium', 'Medium (60)', 60), ('long', 'Long (180)', 180)]:
+            _vd = _vpfr.get(_tf)
+            if _vd:
+                _vpfr_lines.append(
+                    f"  {_label}: POC ₹{_vd['poc']:.0f} | VAH ₹{_vd['vah']:.0f} | VAL ₹{_vd['val']:.0f}"
+                )
+        if _vpfr_lines:
+            vpfr_block = "\n<b>📊 VPFR Levels:</b>\n" + "\n".join(_vpfr_lines) + "\n"
+    except Exception:
+        vpfr_block = ""
+
     align_lines = []
     display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
     for name in display_order:
@@ -4686,7 +4760,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
   Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-{pcr_sr_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+{pcr_sr_block}{vpfr_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
 
@@ -7672,6 +7746,37 @@ def main():
                         d_trend = master.get('delta_trend', 'Neutral')
                         dt_clr = '#00ff88' if d_trend == 'Bullish' else '#ff4444' if d_trend == 'Bearish' else '#888'
                         st.markdown(f'<div style="background:{dt_clr}25;padding:8px;border-radius:6px;border-left:3px solid {dt_clr};"><b style="color:{dt_clr};">{d_trend}</b></div>', unsafe_allow_html=True)
+
+                    # VPFR Table
+                    _vpfr = master.get('vpfr', {}) or {}
+                    _vpfr_rows = []
+                    for _tf, _label, _bars in [('short', 'Short', 30), ('medium', 'Medium', 60), ('long', 'Long', 180)]:
+                        _vd = _vpfr.get(_tf)
+                        if _vd:
+                            _spot = option_data['underlying']
+                            _poc, _vah, _val = _vd['poc'], _vd['vah'], _vd['val']
+                            _pos = 'Above VAH' if _spot > _vah else 'Below VAL' if _spot < _val else 'In VA'
+                            _poc_dist = _spot - _poc
+                            _vpfr_rows.append({
+                                'Timeframe': f'{_label} ({_bars})',
+                                'POC': f'₹{_poc:.0f}',
+                                'VAH': f'₹{_vah:.0f}',
+                                'VAL': f'₹{_val:.0f}',
+                                'Spot vs VA': _pos,
+                                'Dist to POC': f'{_poc_dist:+.0f}',
+                            })
+                    if _vpfr_rows:
+                        st.markdown("#### 📊 VPFR — Volume Profile Fixed Range")
+                        st.caption("POC = price magnet | VAH = resistance | VAL = support | 70% value area")
+                        _vpfr_df = pd.DataFrame(_vpfr_rows)
+                        def _style_vpfr(row):
+                            pos = str(row.get('Spot vs VA', ''))
+                            if pos == 'Above VAH':
+                                return ['background-color:#00ff8815'] * len(row)
+                            elif pos == 'Below VAL':
+                                return ['background-color:#ff444415'] * len(row)
+                            return ['background-color:#FFD70010'] * len(row)
+                        st.dataframe(_vpfr_df.style.apply(_style_vpfr, axis=1), use_container_width=True, hide_index=True)
 
                     # Delta Volume Chart
                     delta_df = master.get('delta_vol_df')
