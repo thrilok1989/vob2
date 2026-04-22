@@ -140,7 +140,312 @@ def send_telegram_message_sync(message, force=False):
     except Exception as e:
         st.error(f"Telegram notification error: {e}")
 
+
 def test_telegram_connection():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return False, "Credentials not configured"
+    try:
+        test_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
+        response = requests.get(test_url, timeout=10)
+        if response.status_code == 200:
+            return True, "Connected"
+        return False, f"Error {response.status_code}"
+    except Exception as e:
+        return False, str(e)
+
+
+def send_telegram_photo_sync(image_bytes, force=False):
+    """Send a PNG image to Telegram via sendPhoto."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    if not force:
+        _now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        if _now.weekday() >= 5 or not (_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _now <= _now.replace(hour=15, minute=45, second=0, microsecond=0)):
+            return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
+    try:
+        response = requests.post(
+            url,
+            data={"chat_id": TELEGRAM_CHAT_ID},
+            files={"photo": ("signal.png", image_bytes, "image/png")},
+            timeout=20,
+        )
+        if response.status_code != 200:
+            st.error(f"Telegram photo error: {response.status_code}")
+    except Exception as e:
+        st.error(f"Telegram photo error: {e}")
+
+
+def render_master_signal_image(result, underlying_price, option_data=None):
+    """Render the master signal as a dark-themed PNG image using matplotlib."""
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as mpatches
+    import io
+
+    BG    = '#0d1117'
+    BG2   = '#161b22'
+    GREEN = '#00e676'
+    RED   = '#ff5252'
+    YELLOW= '#ffd740'
+    CYAN  = '#40c4ff'
+    WHITE = '#e6edf3'
+    GRAY  = '#8b949e'
+    DIM   = '#30363d'
+
+    trade_type = result.get('trade_type', 'NO TRADE')
+    signal_str = result.get('signal', '⚪ NO TRADE')
+    if 'BUY' in trade_type or 'BREAKOUT' in signal_str.upper():
+        sig_clr, sig_bg = GREEN,  '#003a1e'
+    elif 'SELL' in trade_type or 'BREAKDOWN' in signal_str.upper():
+        sig_clr, sig_bg = RED,    '#3a0000'
+    else:
+        sig_clr, sig_bg = YELLOW, '#3a3000'
+
+    fig = plt.figure(figsize=(10, 17), facecolor=BG, dpi=110)
+    ax  = fig.add_axes([0, 0, 1, 1], facecolor=BG)
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
+
+    L = 0.025   # left margin
+    R = 0.975   # right edge
+    W = R - L
+
+    def box(y_top, h, color=BG2, lw=0.5):
+        ax.add_patch(mpatches.FancyBboxPatch(
+            (L, y_top - h), W, h,
+            boxstyle="round,pad=0.004",
+            facecolor=color, edgecolor=DIM, linewidth=lw,
+            transform=ax.transAxes, zorder=1, clip_on=False))
+
+    def t(x, y, s, c=WHITE, sz=8, w='normal', ha='left'):
+        ax.text(x, y, str(s), color=c, fontsize=sz, fontweight=w,
+                ha=ha, va='top', transform=ax.transAxes,
+                fontfamily='monospace', zorder=2, clip_on=False)
+
+    def row(label, value, y, lc=GRAY, vc=WHITE, sz=8):
+        t(L+0.01, y, label, c=lc, sz=sz, w='bold')
+        t(L+0.22, y, value, c=vc, sz=sz)
+
+    # ── HEADER ──────────────────────────────────────────────
+    hh = 0.075
+    box(0.995, hh, color=sig_bg)
+    ist = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST')
+    t(0.5, 0.99,  'MASTER TRADING SIGNAL',        c=sig_clr, sz=13, w='bold', ha='center')
+    t(0.5, 0.965, f'{ist}  |  Spot: ₹{underlying_price:,.2f}', c=WHITE, sz=9, ha='center')
+    t(0.5, 0.942, signal_str.replace('⚪','').replace('🟢','').replace('🔴','').strip(),
+      c=sig_clr, sz=11, w='bold', ha='center')
+
+    y = 0.995 - hh - 0.006
+
+    # ── CANDLE / VIX / VIDYA ────────────────────────────────
+    sh = 0.045
+    box(y, sh)
+    candle = result.get('candle',{}) or {}
+    vol    = result.get('volume',{}) or {}
+    vidya  = result.get('vidya', {}) or {}
+    vix_d  = result.get('vix',   {}) or {}
+    t(L+0.01, y-0.004, f"Candle: {candle.get('pattern','N/A')} ({candle.get('direction','N/A')})  Vol: {vol.get('label','N/A')} ({vol.get('ratio',0)}x)", c=GRAY, sz=8)
+    t(L+0.01, y-0.020, f"VIDYA: {vidya.get('trend','N/A')} | Delta:{vidya.get('delta_pct',0):+.0f}%   VIX: {vix_d.get('vix','N/A')} ({vix_d.get('direction','N/A')})", c=WHITE, sz=8)
+    loc = ', '.join(result.get('location', []) or [])
+    t(L+0.01, y-0.033, f"Loc: {loc[:90]}", c=CYAN, sz=7.5)
+    y -= sh + 0.005
+
+    # ── LEVELS ──────────────────────────────────────────────
+    sh = 0.055
+    box(y, sh)
+    t(L+0.01, y-0.004, 'KEY LEVELS', c=CYAN, sz=8.5, w='bold')
+    res_lvls = result.get('resistance_levels',[]) or []
+    sup_lvls = result.get('support_levels',  []) or []
+    t(L+0.01, y-0.018, 'R: ' + '  '.join(f'₹{r:,.0f}' for r in res_lvls[:5]), c=RED,   sz=8.5)
+    t(L+0.01, y-0.031, 'S: ' + '  '.join(f'₹{s:,.0f}' for s in sup_lvls[:5]), c=GREEN, sz=8.5)
+    pcr_snap = getattr(st.session_state, '_pcr_sr_snapshot', [])
+    res_p = [s['level'] for s in pcr_snap if 'Resistance' in s.get('type','')]
+    sup_p = [s['level'] for s in pcr_snap if 'Support'    in s.get('type','')]
+    ceil_ = f"₹{min(res_p):,.0f}" if res_p else '—'
+    floor_= f"₹{max(sup_p):,.0f}" if sup_p else '—'
+    t(L+0.01, y-0.044, f"PCR Ceil: {ceil_}   PCR Floor: {floor_}", c=GRAY, sz=7.5)
+    y -= sh + 0.005
+
+    # ── GEX ─────────────────────────────────────────────────
+    sh = 0.042
+    box(y, sh)
+    gex = result.get('gex',{}) or {}
+    t(L+0.01, y-0.004, 'GEX', c=CYAN, sz=8.5, w='bold')
+    flip = f"₹{int(gex.get('gamma_flip',0))}" if gex.get('gamma_flip') else 'N/A'
+    mag  = f"₹{int(gex.get('magnet',0))}"     if gex.get('magnet')     else 'N/A'
+    rep  = f"₹{int(gex.get('repeller',0))}"   if gex.get('repeller')   else 'N/A'
+    side = 'Above' if gex.get('above_flip') else 'Below' if gex.get('above_flip') is not None else 'N/A'
+    t(L+0.01, y-0.017, f"Net:{gex.get('net_gex',0):+.0f}L  ATM:{gex.get('atm_gex',0):+.0f}L  Flip:{flip}({side})  Mode:{gex.get('market_mode','N/A')}", c=WHITE, sz=8)
+    t(L+0.01, y-0.030, f"Magnet:{mag}  Repeller:{rep}  PCRxGEX: {result.get('pcr_gex',{}).get('badge','N/A')}", c=GRAY, sz=7.5)
+    y -= sh + 0.005
+
+    # ── VPFR ────────────────────────────────────────────────
+    vpfr = result.get('vpfr',{}) or {}
+    if vpfr:
+        sh = 0.058
+        box(y, sh)
+        t(L+0.01, y-0.004, 'VPFR LEVELS (POC | VAH | VAL)', c=CYAN, sz=8.5, w='bold')
+        hx = [L+0.01, L+0.18, L+0.45, L+0.65, L+0.82]
+        for hv, hc in zip(['','Timeframe','POC','VAH','VAL'], [GRAY,GRAY,GRAY,GRAY,GRAY]):
+            t(hx[['','Timeframe','POC','VAH','VAL'].index(hv)], y-0.017, hv, c=hc, sz=7, w='bold')
+        ry = y - 0.028
+        for tf, lbl in [('short','30 bars'),('medium','60 bars'),('long','180 bars')]:
+            vd = vpfr.get(tf)
+            if vd:
+                t(hx[1], ry, lbl,                  c=GRAY,   sz=7.5)
+                t(hx[2], ry, f"₹{vd['poc']:,.0f}", c=YELLOW, sz=7.5)
+                t(hx[3], ry, f"₹{vd['vah']:,.0f}", c=RED,    sz=7.5)
+                t(hx[4], ry, f"₹{vd['val']:,.0f}", c=GREEN,  sz=7.5)
+                ry -= 0.012
+        y -= sh + 0.005
+
+    # ── PCR S/R ─────────────────────────────────────────────
+    if pcr_snap:
+        sh = 0.012 * len(pcr_snap) + 0.025
+        box(y, sh)
+        t(L+0.01, y-0.004, 'PCR S/R', c=CYAN, sz=8.5, w='bold')
+        ry = y - 0.016
+        for s in pcr_snap:
+            tp = s.get('type','')
+            tc = RED if 'Res' in tp else GREEN if 'Sup' in tp else GRAY
+            off_s = f"{s['offset']:+.0f}" if s['offset'] != 0 else '0'
+            t(L+0.01, ry, f"{s['label']}  ₹{s['strike']:.0f}  PCR:{s['pcr']:.2f}  {tp.replace('🔴','').replace('🟢','').replace('⚪','').strip()}  ₹{s['level']:.0f} (off:{off_s})", c=tc, sz=7.5)
+            ry -= 0.011
+        y -= sh + 0.005
+
+    # ── OC BIAS TABLE ───────────────────────────────────────
+    df_sum = (option_data or {}).get('df_summary') if option_data else None
+    if df_sum is not None and not df_sum.empty and 'Strike' in df_sum.columns:
+        srt = sorted(df_sum['Strike'].unique())
+        atm = None
+        if 'Zone' in df_sum.columns:
+            ar = df_sum[df_sum['Zone']=='ATM']
+            if not ar.empty:
+                atm = int(ar.iloc[0]['Strike'])
+        if atm is None:
+            atm = min(srt, key=lambda s: abs(s - underlying_price))
+        ai = srt.index(atm) if atm in srt else -1
+
+        sh = 0.073
+        box(y, sh)
+        t(L+0.01, y-0.004, 'OC BIAS  (COI | V | D | G | T | Ask | Bid | IV | DEX | GEX)', c=CYAN, sz=8, w='bold')
+        hdr_x = [L+0.01,L+0.14,L+0.28,L+0.42, L+0.50,L+0.56,L+0.61,L+0.66,L+0.71,L+0.76,L+0.81,L+0.86,L+0.91]
+        for hv,hx2 in zip(['Label','Strike','Verdict','Score','COI','V','D','G','T','Ask','Bid','IV','DEX/GEX'],hdr_x):
+            t(hx2, y-0.017, hv, c=GRAY, sz=6.5, w='bold')
+        ry = y - 0.028
+        for off,lbl in [(1,'ATM+1'),(0,'ATM'),(-1,'ATM-1')]:
+            idx = ai + off
+            if not (0 <= idx < len(srt)):
+                continue
+            sk  = srt[idx]
+            row_ = df_sum[df_sum['Strike']==sk]
+            if row_.empty: continue
+            r_ = row_.iloc[0]
+            g_ = lambda c: (r_[c] if c in r_.index else 'N/A')
+            verd = str(g_('Verdict'))
+            sc   = g_('BiasScore')
+            vc   = RED if 'Bear' in verd else GREEN if 'Bull' in verd else YELLOW
+            t(hdr_x[0],  ry, lbl,           c=GRAY, sz=7)
+            t(hdr_x[1],  ry, f"₹{sk:.0f}",  c=WHITE, sz=7)
+            t(hdr_x[2],  ry, verd[:11],     c=vc,   sz=7)
+            sc_c = RED if str(sc).startswith('-') else GREEN
+            t(hdr_x[3],  ry, str(sc),       c=sc_c, sz=7)
+            for i2, bf in enumerate(['ChgOI_Bias','Volume_Bias','Delta_Bias','Gamma_Bias','Theta_Bias','AskQty_Bias','BidQty_Bias','IV_Bias','DeltaExp']):
+                bv = str(g_(bf))
+                bc2 = GREEN if bv=='Bullish' else RED if bv=='Bearish' else GRAY
+                sym = 'B' if bv=='Bullish' else 'S' if bv=='Bearish' else '-'
+                t(hdr_x[4+i2], ry, sym, c=bc2, sz=7.5, w='bold')
+            # DEX/GEX combined
+            dex = str(g_('DeltaExp')); gex2 = str(g_('GammaExp'))
+            dg_str = f"{'B' if dex=='Bullish' else 'S'}/{'B' if gex2=='Bullish' else 'S'}"
+            dg_c = GREEN if dex=='Bullish' and gex2=='Bullish' else RED if dex=='Bearish' and gex2=='Bearish' else YELLOW
+            t(hdr_x[12], ry, dg_str, c=dg_c, sz=7, w='bold')
+            # Entry/Scalp/Move below
+            entry_line = f"  Entry:{g_('Operator_Entry')}  Scalp:{g_('Scalp_Moment')}  Move:{g_('FakeReal')}  COI:{g_('ChgOI_Cmp')}  OI:{g_('OI_Cmp')}"
+            ry -= 0.011
+            t(L+0.01, ry, entry_line[:95], c=GRAY, sz=6.5)
+            ry -= 0.012
+        y -= sh + 0.005
+
+    # ── OI TREND ────────────────────────────────────────────
+    oi = result.get('oi_trend',{}) or {}
+    if oi:
+        sh = 0.038
+        box(y, sh)
+        t(L+0.01, y-0.004, 'OI TREND', c=CYAN, sz=8.5, w='bold')
+        oi_sig = oi.get('signal','N/A')
+        oi_c   = GREEN if 'Bull' in oi_sig else RED if 'Bear' in oi_sig else YELLOW
+        t(L+0.01, y-0.017, f"CE:{oi.get('ce_activity','N/A')} (OI:{oi.get('ce_oi_pct',0):+.1f}%)  PE:{oi.get('pe_activity','N/A')} (OI:{oi.get('pe_oi_pct',0):+.1f}%)", c=WHITE, sz=8)
+        t(L+0.01, y-0.029, f"Signal: {oi_sig}  Sup:{oi.get('support_status','N/A')}  Res:{oi.get('resistance_status','N/A')}", c=oi_c, sz=8)
+        y -= sh + 0.005
+
+    # ── ALIGNMENT ───────────────────────────────────────────
+    alignment = result.get('alignment',{}) or {}
+    if alignment:
+        sh = 0.05
+        box(y, sh)
+        t(L+0.01, y-0.004, 'ALIGNMENT  10m | 1h | Pattern', c=CYAN, sz=8.5, w='bold')
+        SN = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
+              'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
+              'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+        PS = {'No Pattern':'NP','Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
+              'Hammer':'Ham','Shooting Star':'ShStr','Tweezer Top':'TwTop',
+              'Tweezer Bottom':'TwBot','Strong Green Candle':'SGC','Strong Red Candle':'SRC',
+              'Doji':'Doji','Inside Bar':'InsBar','Marubozu':'Maru'}
+        items = []
+        for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
+            d = alignment.get(name)
+            if not d: continue
+            s10  = d.get('sentiment_10m','')
+            s1h  = d.get('sentiment_1h', '')
+            pat  = (d.get('candle_pattern','') or '').strip()
+            cdir = d.get('candle_dir','') or ''
+            a10  = '+' if s10=='Bullish' else '-' if s10=='Bearish' else '.'
+            a1h  = '+' if s1h=='Bullish' else '-' if s1h=='Bearish' else '.'
+            c10  = GREEN if s10=='Bullish' else RED if s10=='Bearish' else GRAY
+            c1h  = GREEN if s1h=='Bullish' else RED if s1h=='Bearish' else GRAY
+            ps   = PS.get(pat, pat[:6]) if pat and pat not in ('No Pattern','N/A') else 'NP'
+            pc   = GREEN if cdir=='Bullish' else RED if cdir=='Bearish' else GRAY
+            items.append((SN.get(name,name), a10, c10, a1h, c1h, ps, pc))
+        # 2 rows of 5
+        for ri, chunk in enumerate([items[:5], items[5:]]):
+            rx = L + 0.01
+            ry = y - 0.018 - ri * 0.014
+            for nm, a10, c10, a1h, c1h, ps, pc in chunk:
+                t(rx, ry, nm+':', c=GRAY, sz=7); rx += len(nm)*0.008 + 0.012
+                t(rx, ry, a10,    c=c10,  sz=7); rx += 0.011
+                t(rx, ry, a1h,    c=c1h,  sz=7); rx += 0.011
+                t(rx, ry, ps,     c=pc,   sz=6.5); rx += max(len(ps)*0.009, 0.055)
+        y -= sh + 0.005
+
+    # ── MONEY FLOW ──────────────────────────────────────────
+    mf = getattr(st.session_state, '_money_flow_data', None)
+    if mf and mf.get('rows'):
+        sh = 0.036
+        box(y, sh)
+        poc_p  = mf.get('poc_price',0)
+        va_h   = mf.get('value_area_high',0)
+        va_l   = mf.get('value_area_low', 0)
+        hi_dir = mf.get('highest_sentiment_direction','Neutral')
+        hi_p   = mf.get('highest_sentiment_price',0)
+        mf_c   = GREEN if hi_dir=='Bullish' else RED if hi_dir=='Bearish' else YELLOW
+        t(L+0.01, y-0.004, 'MONEY FLOW', c=CYAN, sz=8.5, w='bold')
+        t(L+0.01, y-0.018, f"POC:₹{poc_p:.0f}  VA:₹{va_l:.0f}-₹{va_h:.0f}  Strongest:{hi_dir} @ ₹{hi_p:.0f}", c=mf_c, sz=8)
+        y -= sh + 0.005
+
+    # ── FOOTER ──────────────────────────────────────────────
+    t(0.5, max(y - 0.01, 0.01), 'Auto-generated signal. Manual verification required.',
+      c=GRAY, sz=7, ha='center')
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight', facecolor=BG,
+                pad_inches=0.15)
+    buf.seek(0)
+    plt.close(fig)
+    return buf.getvalue()
+
+
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return False, "Credentials not configured"
 
@@ -4830,6 +5135,14 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 {pcr_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 ⚠️ <i>Auto-generated signal. Manual verification required.</i>"""
 
+    # Send image version
+    try:
+        _img_bytes = render_master_signal_image(result, underlying_price, option_data)
+        send_telegram_photo_sync(_img_bytes, force=force)
+    except Exception:
+        pass
+
+    # Send text version
     try:
         send_telegram_message_sync(message, force=force)
     except Exception:
