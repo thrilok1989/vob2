@@ -4305,21 +4305,24 @@ def check_pcr_sr_proximity_alert(underlying_price, oi_trend_data, proximity_pts=
         if last_alert and (datetime.now(pytz.timezone('Asia/Kolkata')) - last_alert).total_seconds() < 300:
             continue
         sr_clean = sr_type.replace('🔴', '').replace('🟢', '').replace('⚪', '').strip()
-        direction = 'above' if underlying_price < level else 'at/above'
+        zone_low  = f"₹{level - proximity_pts:.0f}"
+        zone_high = f"₹{level + proximity_pts:.0f}"
         if sr_clean == 'Resistance':
             msg = (
                 f"⚠️ <b>PCR RESISTANCE ALERT</b> ⚠️\n"
                 f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
-                f"Spot ₹{underlying_price:.0f} is within {dist:.0f} pts of\n"
+                f"Spot ₹{underlying_price:.0f} entered ±5 pts zone of\n"
                 f"🔴 <b>{label} PCR Resistance ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
+                f"Zone: {zone_low} – {zone_high}\n"
                 f"Price likely to <b>stall / reverse here</b>. Watch for rejection."
             )
         else:
             msg = (
                 f"⚠️ <b>PCR SUPPORT ALERT</b> ⚠️\n"
                 f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
-                f"Spot ₹{underlying_price:.0f} is within {dist:.0f} pts of\n"
+                f"Spot ₹{underlying_price:.0f} entered ±5 pts zone of\n"
                 f"🟢 <b>{label} PCR Support ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
+                f"Zone: {zone_low} – {zone_high}\n"
                 f"Price likely to <b>hold / bounce here</b>. Watch for reversal."
             )
         try:
