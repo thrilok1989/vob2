@@ -4819,7 +4819,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
   Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-{pcr_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+{pcr_sr_block}{vpfr_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 <b>📋 CONFLUENCE FACTORS:</b>
 {reason_text}
 
@@ -4829,6 +4829,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         send_telegram_message_sync(message, force=force)
     except Exception:
         pass
+
+    # OC Bias block sent as a separate message (avoids 4096-char Telegram limit)
+    if oc_bias_block:
+        try:
+            send_telegram_message_sync(oc_bias_block.strip(), force=force)
+        except Exception:
+            pass
 
     # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
