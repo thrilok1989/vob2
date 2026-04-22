@@ -4337,6 +4337,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     abs_score = result.get('abs_score', 0)
     signal = result.get('signal', '')
     if not force:
+        if 'NO TRADE' in trade_type.upper():
+            return
 
         # Location gating: only send BUY when spot is at/near support, and SELL
         # when spot is at/near resistance. "Near" = within 30 pts AND closer to
@@ -7359,6 +7361,32 @@ def main():
                     _should_send = st.session_state.last_master_signal_time is None or \
                         (_ist_now - st.session_state.last_master_signal_time).total_seconds() > 300
                     if _should_send:
+                        # Refresh PCR S/R snapshot from current OI history so the
+                        # auto-send always has fresh data (the UI table sets it later
+                        # in the same render, so session state may be stale on first fires)
+                        try:
+                            _oi_hist_s = getattr(st.session_state, 'oi_history', [])
+                            _oi_str_s = getattr(st.session_state, 'oi_current_strikes', [])
+                            if len(_oi_hist_s) >= 3 and _oi_str_s:
+                                _sorted_ss = sorted(_oi_str_s)
+                                _atm_i = len(_sorted_ss) // 2
+                                _snap_fresh = []
+                                for _soff, _slbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+                                    _si2 = _atm_i + _soff
+                                    if 0 <= _si2 < len(_sorted_ss):
+                                        _sk = str(_sorted_ss[_si2])
+                                        _sodf = pd.DataFrame(_oi_hist_s)
+                                        _sce = _sodf[f'{_sk}_CE'].iloc[-1] if f'{_sk}_CE' in _sodf.columns else 0
+                                        _spe = _sodf[f'{_sk}_PE'].iloc[-1] if f'{_sk}_PE' in _sodf.columns else 0
+                                        _spcr = round(_spe / _sce, 2) if _sce > 0 else 1.0
+                                        _ssr = calculate_pcr_sr_level(_spcr, int(_sk))
+                                        _snap_fresh.append({'label': _slbl, 'strike': int(_sk),
+                                                            'pcr': _spcr, 'type': _ssr['type'],
+                                                            'level': _ssr['level'], 'offset': _ssr['offset']})
+                                if _snap_fresh:
+                                    st.session_state._pcr_sr_snapshot = _snap_fresh
+                        except Exception:
+                            pass
                         try:
                             send_master_signal_telegram(master, option_data['underlying'], option_data)
                             st.session_state.last_master_signal_time = _ist_now
