@@ -4636,8 +4636,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 send_telegram_message_sync(_ai_telegram, force=force)
             except Exception:
                 pass
-        elif _ai_err:
-            st.session_state._last_gemini_master = {'text': f"⚠️ {_ai_err}", 'time': ''}
+        # errors (e.g. no API key) are not persisted — nothing to show
     except Exception:
         pass
 
@@ -7231,15 +7230,17 @@ def main():
         with hdr_col3:
             _ai_explain_clicked = st.button("🤖 AI Explain", key="ai_explain_master", help="Ask Gemini to analyze the current signal and give a trade plan")
 
-        # Persistent Gemini analysis panel (auto-updated whenever telegram is sent)
+        # Persistent Gemini analysis panel — only shown when real analysis text exists
         _last_gm = st.session_state.get('_last_gemini_master')
         _last_gm_oc = st.session_state.get('_last_gemini_oc')
-        if _last_gm or _last_gm_oc:
+        _gm_valid = _last_gm and _last_gm.get('time') and not str(_last_gm.get('text', '')).startswith('⚠️')
+        _gm_oc_valid = _last_gm_oc and _last_gm_oc.get('time') and not str(_last_gm_oc.get('text', '')).startswith('⚠️')
+        if _gm_valid or _gm_oc_valid:
             with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=True):
-                if _last_gm:
+                if _gm_valid:
                     st.markdown(f"**Master Signal** — {_last_gm.get('time', '')}")
                     st.markdown(_last_gm.get('text', ''))
-                if _last_gm_oc:
+                if _gm_oc_valid:
                     st.markdown("---")
                     st.markdown(f"**Option Chain Deep Analysis** — {_last_gm_oc.get('time', '')}")
                     st.markdown(_last_gm_oc.get('text', ''))
