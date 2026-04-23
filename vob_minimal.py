@@ -5174,7 +5174,15 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 <b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
 {pcr_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-⚠️ <i>Auto-generated signal. Manual verification required.</i>"""
+⚠️ <i>Auto-generated signal. Manual verification required.</i>
+
+─────────────────────────────
+🤖 <b>Paste below in AI chatbot:</b>
+<code>Based on the above Nifty options signal data, answer:
+1. What is the ideal entry point and entry condition?
+2. How will price likely move in the next 10 minutes — up, down, or sideways? By how many points?
+3. What is the stop-loss and target?
+Give a short, actionable answer.</code>"""
 
     # Send image version
     try:
