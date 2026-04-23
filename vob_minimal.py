@@ -5179,10 +5179,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 ─────────────────────────────
 🤖 <b>Paste below in AI chatbot:</b>
 <code>Based on the above Nifty options signal data, answer:
-1. Where is the price UNLIKELY to go? Identify the strongest wall (call capping or put capping level) that price cannot break in the next 10 minutes.
-2. Based on that wall, what is the safest entry zone — where price will hold and reverse?
-3. Give exact entry price, stop-loss (below/above the wall), and target for the next 10 minutes.
-Give a short, direct answer.</code>"""
+1. What is the ideal entry point and entry condition?
+2. Where will price NOT go in the next 10 minutes? Identify the strongest call capping or put capping wall price cannot break — enter only near that wall.
+3. How will price move in the next 10 minutes — up, down, or sideways? By how many points?
+4. Give exact entry price, stop-loss (just beyond the wall), and target.
+Give a short, actionable answer.</code>"""
 
     # Send image version
     try:
