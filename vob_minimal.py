@@ -5140,6 +5140,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob = result.get('order_blocks', {})
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
+
+    # Part 1 — core signal (always short, always fits)
     message = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
@@ -5153,10 +5155,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📉 VIX:{vix.get('vix','N/A')} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 {_mi_bias_block}{vpfr_block}
-🤖 <code>Nifty signal above. Answer briefly:
-1. Entry point &amp; condition?
-2. Strongest capping wall price won't break in 10 min?
-3. Entry near that wall — exact price, SL, target?</code>"""
+🤖 <code>Using above data: strongest wall price won't break in 10 min? Entry near that wall — price, SL, target?</code>"""
+
+    # Part 2 — detailed blocks (OC bias, money flow, unwinding, deep OC)
+    message2 = f"📋 <b>Details — {result['signal']}</b>\n{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}".strip()
 
     # Send image version
     try:
@@ -5165,11 +5167,18 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception as _img_err:
         st.warning(f"Signal image error: {_img_err}")
 
-    # Send text version
+    # Send part 1 (core signal)
     try:
         send_telegram_message_sync(message, force=force)
     except Exception as _txt_err:
         st.warning(f"Telegram text send error: {_txt_err}")
+
+    # Send part 2 (details) only if there's content
+    if message2 and len(message2) > 40:
+        try:
+            send_telegram_message_sync(message2, force=force)
+        except Exception:
+            pass
 
     # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
