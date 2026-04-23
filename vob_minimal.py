@@ -7876,12 +7876,12 @@ def main():
                         # auto-send always has fresh data (the UI table sets it later
                         # in the same render, so session state may be stale on first fires)
                         try:
+                            _snap_fresh = []
                             _oi_hist_s = getattr(st.session_state, 'oi_history', [])
                             _oi_str_s = getattr(st.session_state, 'oi_current_strikes', [])
                             if len(_oi_hist_s) >= 3 and _oi_str_s:
                                 _sorted_ss = sorted(_oi_str_s)
                                 _atm_i = len(_sorted_ss) // 2
-                                _snap_fresh = []
                                 for _soff, _slbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
                                     _si2 = _atm_i + _soff
                                     if 0 <= _si2 < len(_sorted_ss):
@@ -7894,8 +7894,25 @@ def main():
                                         _snap_fresh.append({'label': _slbl, 'strike': int(_sk),
                                                             'pcr': _spcr, 'type': _ssr['type'],
                                                             'level': _ssr['level'], 'offset': _ssr['offset']})
-                                if _snap_fresh:
-                                    st.session_state._pcr_sr_snapshot = _snap_fresh
+                            # Fallback: compute from df_summary (always available on first load)
+                            if not _snap_fresh and option_data and option_data.get('df_summary') is not None:
+                                _dfs2 = option_data['df_summary']
+                                _und2 = option_data.get('underlying', 0)
+                                if 'PCR' in _dfs2.columns and 'Strike' in _dfs2.columns and _und2:
+                                    _slist2 = sorted(_dfs2['Strike'].unique())
+                                    _ai2 = min(range(len(_slist2)), key=lambda i: abs(_slist2[i] - _und2))
+                                    for _soff, _slbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+                                        _si2 = _ai2 + _soff
+                                        if 0 <= _si2 < len(_slist2):
+                                            _row2 = _dfs2[_dfs2['Strike'] == _slist2[_si2]]
+                                            if not _row2.empty:
+                                                _spcr2 = float(_row2['PCR'].iloc[0])
+                                                _ssr2 = calculate_pcr_sr_level(_spcr2, int(_slist2[_si2]))
+                                                _snap_fresh.append({'label': _slbl, 'strike': int(_slist2[_si2]),
+                                                                    'pcr': _spcr2, 'type': _ssr2['type'],
+                                                                    'level': _ssr2['level'], 'offset': _ssr2['offset']})
+                            if _snap_fresh:
+                                st.session_state._pcr_sr_snapshot = _snap_fresh
                         except Exception:
                             pass
                         try:
@@ -8774,12 +8791,22 @@ def main():
                     if td:
                         _pcr_strike_map[_lbl] = {'strike': td['strike'], 'pcr': td.get('pcr_strike', 1.0)}
             if not _pcr_strike_map:
-                _dfs = deep.get('df_summary') if deep else None
+                # Fallback: compute PCR from analysis_df (CE_OI/PE_OI always available)
+                # Also try df_summary (has PCR column) for NIFTY path
+                _dfs = None
+                if deep:
+                    _dfs = deep.get('df_summary')
+                    if _dfs is None or 'PCR' not in (_dfs.columns if _dfs is not None else []):
+                        _adf = deep.get('analysis_df')
+                        if _adf is not None and 'CE_OI' in _adf.columns and 'PE_OI' in _adf.columns:
+                            _dfs = _adf.copy()
+                            _dfs['PCR'] = (_dfs['PE_OI'] / _dfs['CE_OI'].replace(0, 1)).round(2)
                 if _dfs is not None and 'PCR' in _dfs.columns and 'Strike' in _dfs.columns:
                     try:
                         _und = underlying or 0
-                        _atm_s = _dfs.iloc[(_dfs['Strike'] - _und).abs().argsort()].iloc[0]['Strike'] if _und else _dfs['Strike'].median()
-                        _atm_s = float(_atm_s)
+                        if not _und and inst_name == 'NIFTY 50':
+                            _und = st.session_state.get('_last_underlying') or 0
+                        _atm_s = float(_dfs.iloc[(_dfs['Strike'] - _und).abs().argsort()].iloc[0]['Strike']) if _und else float(_dfs['Strike'].median())
                         _slist = sorted(_dfs['Strike'].unique())
                         _atm_i = min(range(len(_slist)), key=lambda i: abs(_slist[i] - _atm_s))
                         for _off, _lbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
@@ -9101,7 +9128,15 @@ def main():
                     _nifty_oi_trend[_lbl] = _td
     except Exception:
         pass
-    _render_deep_analysis(_deep_tabs[0], 'NIFTY 50', _nifty_deep, None, _nifty_oi_trend)
+    # Inject df_summary + underlying into _nifty_deep so PCR fallback works
+    if _nifty_deep is not None and option_data:
+        _nifty_deep = dict(_nifty_deep)
+        if option_data.get('df_summary') is not None:
+            _nifty_deep['df_summary'] = option_data['df_summary']
+    _nifty_underlying = option_data.get('underlying') if option_data else None
+    if _nifty_underlying:
+        st.session_state['_last_underlying'] = _nifty_underlying
+    _render_deep_analysis(_deep_tabs[0], 'NIFTY 50', _nifty_deep, _nifty_underlying, _nifty_oi_trend)
 
     # Other instruments
     for _ti, (inst_key, cfg) in enumerate(INSTRUMENT_CONFIGS.items()):
