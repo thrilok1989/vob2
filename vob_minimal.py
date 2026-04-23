@@ -4836,17 +4836,15 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         df_atm8 = option_data.get('df_atm8') if option_data else None
         uw = compute_unwinding_summary(df_atm8)
         if uw:
-            unwind_block = f"""
-<b>🔄 OI UNWINDING & PARALLEL WINDING (ATM±5):</b>
-  CE Unwind: {uw['ce_unwind_count']} strikes | PE Unwind: {uw['pe_unwind_count']} strikes
-  CE Buildup: {uw['ce_build_count']} strikes | PE Buildup: {uw['pe_build_count']} strikes
-  Parallel Activity: {uw['parallel_count']} strikes (Bull:{uw['bull_parallel']} | Bear:{uw['bear_parallel']})
-  Top CE Unwind: {uw['ce_unwind_top']}
-  Top PE Unwind: {uw['pe_unwind_top']}
-  Top CE Buildup: {uw['ce_build_top']}
-  Top PE Buildup: {uw['pe_build_top']}
-  Verdict: <b>{uw['verdict']}</b>
-"""
+            _uv = uw['verdict']
+            _uv_e = '🔴' if 'BEAR' in _uv.upper() else '🟢' if 'BULL' in _uv.upper() else '⚪'
+            unwind_block = (
+                f"\n<b>🔄 OI Wind/Unwind:</b> {_uv_e} {_uv}\n"
+                f"  CE: Unw🔴{uw['ce_unwind_count']} Bld🟢{uw['ce_build_count']} | "
+                f"PE: Unw🔴{uw['pe_unwind_count']} Bld🟢{uw['pe_build_count']} | "
+                f"Par:{uw['parallel_count']}(B{uw['bull_parallel']}|R{uw['bear_parallel']})\n"
+                f"  Top PE Unw:{uw['pe_unwind_top']} | Top CE Bld:{uw['ce_build_top']}\n"
+            )
     except Exception:
         unwind_block = ""
 
@@ -4881,14 +4879,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
         # VOB zones (top 3 each by volume)
         vob_lines = []
-        for b in sorted((vob_b.get('bullish') or []), key=lambda x: -(x.get('volume', 0)))[:3]:
-            vob_lines.append(
-                f"  🟢 Support ₹{b.get('lower', 0):.0f}-₹{b.get('upper', 0):.0f} | Vol: {int(b.get('volume', 0)):,}"
-            )
-        for b in sorted((vob_b.get('bearish') or []), key=lambda x: -(x.get('volume', 0)))[:3]:
-            vob_lines.append(
-                f"  🔴 Resistance ₹{b.get('lower', 0):.0f}-₹{b.get('upper', 0):.0f} | Vol: {int(b.get('volume', 0)):,}"
-            )
+        for b in sorted((vob_b.get('bullish') or []), key=lambda x: -(x.get('volume', 0)))[:2]:
+            vob_lines.append(f"  🟢 ₹{b.get('lower', 0):.0f}-{b.get('upper', 0):.0f}")
+        for b in sorted((vob_b.get('bearish') or []), key=lambda x: -(x.get('volume', 0)))[:2]:
+            vob_lines.append(f"  🔴 ₹{b.get('lower', 0):.0f}-{b.get('upper', 0):.0f}")
         vob_text = "\n".join(vob_lines) if vob_lines else "  None detected"
 
         # HVP
@@ -5135,55 +5129,29 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         pass
     _mi_bias_block = ("\n<b>🌐 Index/Stock Bias:</b> " + "  ".join(_mi_parts) + "\n") if _mi_parts else ""
 
-    message = f"""{signal_emoji} <b>MASTER TRADING SIGNAL</b> {signal_emoji}
-🕐 {time_str} | Spot: ₹{underlying_price:.2f}
+    _oit = result.get('oi_trend', {})
+    _vid = result.get('vidya', {})
+    _ob = result.get('order_blocks', {})
+    _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
+    _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
-━━━ SIGNAL: <b>{result['signal']}</b> ━━━
-📊 Trade: <b>{result['trade_type']}</b>
+    # Part 1 — core signal (always short, always fits)
+    message = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
+🕐 {time_str} | ₹{underlying_price:.0f}
 
-<b>🕯 Candle:</b> {result['candle']['pattern']} ({result['candle']['direction']})
-<b>📍 Location:</b> {loc_text}
-<b>📊 Volume:</b> {result['volume']['label']} ({result['volume']['ratio']}x)
+🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x
+📍 {loc_text}
+🟥 R: {res_text} | 🟩 S: {sup_text}
+{pcr_sr_block}
+🔮 GEX: {gex['net_gex']:+.0f}L | Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'} | Mode:{gex['market_mode']}
+📊 PCR×GEX: {result['pcr_gex']['badge']}
+📉 VIX:{vix.get('vix','N/A')} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
+📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
+{_mi_bias_block}{vpfr_block}
+🤖 <code>Using above data: strongest wall price won't break in 10 min? Entry near that wall — price, SL, target?</code>"""
 
-<b>🟥 Resistance:</b> {res_text}
-<b>🟩 Support:</b> {sup_text}
-
-<b>🔮 GEX:</b>
-  Net: {gex['net_gex']:+.1f}L | ATM: {gex['atm_gex']:+.1f}L
-  Gamma Flip: {'₹' + str(int(gex['gamma_flip'])) if gex['gamma_flip'] else 'N/A'} ({'Above' if gex['above_flip'] else 'Below' if gex['above_flip'] is not None else 'N/A'})
-  Magnet: {'₹' + str(int(gex['magnet'])) if gex['magnet'] else 'N/A'}
-  Repeller: {'₹' + str(int(gex['repeller'])) if gex['repeller'] else 'N/A'}
-  Mode: {gex['market_mode']}
-
-<b>📊 PCR×GEX:</b> {result['pcr_gex']['badge']}
-
-<b>🟢 Order Blocks:</b>
-  Bullish OB: {'₹' + str(int(result['order_blocks']['bullish_ob']['low'])) + '-' + str(int(result['order_blocks']['bullish_ob']['high'])) if result['order_blocks'].get('bullish_ob') else 'None'}
-  Bearish OB: {'₹' + str(int(result['order_blocks']['bearish_ob']['low'])) + '-' + str(int(result['order_blocks']['bearish_ob']['high'])) if result['order_blocks'].get('bearish_ob') else 'None'}
-
-<b>🌍 Alignment (10m|1h|Pattern):</b>
-{align_text}
-{_mi_bias_block}
-<b>📉 VIX:</b> {vix.get('vix', 'N/A')} ({vix.get('direction', 'Unknown')})
-
-<b>📊 OI TREND (ATM {result.get('oi_trend', {}).get('atm_strike', 'N/A')}):</b>
-  CE: {result.get('oi_trend', {}).get('ce_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('ce_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('ce_ltp_pct', 0):+.1f}%)
-  PE: {result.get('oi_trend', {}).get('pe_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('pe_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('pe_ltp_pct', 0):+.1f}%)
-  Support: {result.get('oi_trend', {}).get('support_status', 'N/A')} | Resistance: {result.get('oi_trend', {}).get('resistance_status', 'N/A')}
-  Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
-
-<b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-{pcr_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-⚠️ <i>Auto-generated signal. Manual verification required.</i>
-
-─────────────────────────────
-🤖 <b>Paste below in AI chatbot:</b>
-<code>Based on the above Nifty options signal data, answer:
-1. What is the ideal entry point and entry condition?
-2. Where will price NOT go in the next 10 minutes? Identify the strongest call capping or put capping wall price cannot break — enter only near that wall.
-3. How will price move in the next 10 minutes — up, down, or sideways? By how many points?
-4. Give exact entry price, stop-loss (just beyond the wall), and target.
-Give a short, actionable answer.</code>"""
+    # Part 2 — detailed blocks (OC bias, money flow, unwinding, deep OC)
+    message2 = f"📋 <b>Details — {result['signal']}</b>\n{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}".strip()
 
     # Send image version
     try:
@@ -5192,11 +5160,18 @@ Give a short, actionable answer.</code>"""
     except Exception as _img_err:
         st.warning(f"Signal image error: {_img_err}")
 
-    # Send text version
+    # Send part 1 (core signal)
     try:
         send_telegram_message_sync(message, force=force)
     except Exception as _txt_err:
         st.warning(f"Telegram text send error: {_txt_err}")
+
+    # Send part 2 (details) only if there's content
+    if message2 and len(message2) > 40:
+        try:
+            send_telegram_message_sync(message2, force=force)
+        except Exception:
+            pass
 
     # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
