@@ -5135,50 +5135,25 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         pass
     _mi_bias_block = ("\n<b>🌐 Index/Stock Bias:</b> " + "  ".join(_mi_parts) + "\n") if _mi_parts else ""
 
-    message = f"""{signal_emoji} <b>MASTER TRADING SIGNAL</b> {signal_emoji}
-🕐 {time_str} | Spot: ₹{underlying_price:.2f}
+    _oit = result.get('oi_trend', {})
+    _vid = result.get('vidya', {})
+    _ob = result.get('order_blocks', {})
+    _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
+    _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
+    message = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
+🕐 {time_str} | ₹{underlying_price:.0f}
 
-━━━ SIGNAL: <b>{result['signal']}</b> ━━━
-📊 Trade: <b>{result['trade_type']}</b>
-
-<b>🕯 Candle:</b> {result['candle']['pattern']} ({result['candle']['direction']})
-<b>📍 Location:</b> {loc_text}
-<b>📊 Volume:</b> {result['volume']['label']} ({result['volume']['ratio']}x)
-
-<b>🟥 Resistance:</b> {res_text}
-<b>🟩 Support:</b> {sup_text}
-
-<b>🔮 GEX:</b>
-  Net: {gex['net_gex']:+.1f}L | ATM: {gex['atm_gex']:+.1f}L
-  Gamma Flip: {'₹' + str(int(gex['gamma_flip'])) if gex['gamma_flip'] else 'N/A'} ({'Above' if gex['above_flip'] else 'Below' if gex['above_flip'] is not None else 'N/A'})
-  Magnet: {'₹' + str(int(gex['magnet'])) if gex['magnet'] else 'N/A'}
-  Repeller: {'₹' + str(int(gex['repeller'])) if gex['repeller'] else 'N/A'}
-  Mode: {gex['market_mode']}
-
-<b>📊 PCR×GEX:</b> {result['pcr_gex']['badge']}
-
-<b>🟢 Order Blocks:</b>
-  Bullish OB: {'₹' + str(int(result['order_blocks']['bullish_ob']['low'])) + '-' + str(int(result['order_blocks']['bullish_ob']['high'])) if result['order_blocks'].get('bullish_ob') else 'None'}
-  Bearish OB: {'₹' + str(int(result['order_blocks']['bearish_ob']['low'])) + '-' + str(int(result['order_blocks']['bearish_ob']['high'])) if result['order_blocks'].get('bearish_ob') else 'None'}
-
-<b>🌍 Alignment (10m|1h|Pattern):</b>
-{align_text}
-{_mi_bias_block}
-<b>📉 VIX:</b> {vix.get('vix', 'N/A')} ({vix.get('direction', 'Unknown')})
-
-<b>📊 OI TREND (ATM {result.get('oi_trend', {}).get('atm_strike', 'N/A')}):</b>
-  CE: {result.get('oi_trend', {}).get('ce_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('ce_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('ce_ltp_pct', 0):+.1f}%)
-  PE: {result.get('oi_trend', {}).get('pe_activity', 'N/A')} (OI:{result.get('oi_trend', {}).get('pe_oi_pct', 0):+.1f}% LTP:{result.get('oi_trend', {}).get('pe_ltp_pct', 0):+.1f}%)
-  Support: {result.get('oi_trend', {}).get('support_status', 'N/A')} | Resistance: {result.get('oi_trend', {}).get('resistance_status', 'N/A')}
-  Signal: {result.get('oi_trend', {}).get('signal', 'Neutral')}
-
-<b>🔮 VIDYA:</b> {result.get('vidya', {}).get('trend', 'N/A')} | Delta: {result.get('vidya', {}).get('delta_pct', 0):+.0f}%{' | ▲ Cross' if result.get('vidya', {}).get('cross_up') else ' | ▼ Cross' if result.get('vidya', {}).get('cross_down') else ''}
-{pcr_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-⚠️ <i>Auto-generated signal. Manual verification required.</i>
-
-─────────────────────────────
-🤖 <b>Paste below in AI chatbot:</b>
-<code>Nifty signal above. Answer briefly:
+🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x
+📍 {loc_text}
+🟥 R: {res_text} | 🟩 S: {sup_text}
+{pcr_sr_block}
+🔮 GEX: {gex['net_gex']:+.0f}L | Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'} | Mode:{gex['market_mode']}
+📊 PCR×GEX: {result['pcr_gex']['badge']}
+🟢 OB Bull:{_ob_b} Bear:{_ob_r}
+📉 VIX:{vix.get('vix','N/A')} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
+📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
+{_mi_bias_block}{vpfr_block}
+🤖 <code>Nifty signal above. Answer briefly:
 1. Entry point &amp; condition?
 2. Strongest capping wall price won't break in 10 min?
 3. Entry near that wall — exact price, SL, target?</code>"""
