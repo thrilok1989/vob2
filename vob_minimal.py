@@ -5150,7 +5150,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 {_mi_bias_block}{vpfr_block}"""
 
     # Part 2 — detailed blocks + AI prompt at the end
-    _ai_prompt = "\n🤖 <code>Using above data: strongest wall price won't break in 10 min? Entry near that wall — price, SL, target?</code>"
+    _ai_prompt = """
+🤖 <code>Based on the above Nifty options signal data, answer:
+1. What is the ideal entry point and entry condition?
+2. Where will price NOT go in the next 10 minutes? Identify the strongest call capping or put capping wall price cannot break — enter only near that wall.
+3. How will price move in the next 10 minutes — up, down, or sideways? By how many points?
+4. Give exact entry price, stop-loss (just beyond the wall), and target.
+Give a short, actionable answer.</code>"""
     message2 = f"📋 <b>Details — {result['signal']}</b>\n{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}{_ai_prompt}".strip()
 
     # Send image version
