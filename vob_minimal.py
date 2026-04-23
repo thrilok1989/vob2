@@ -3306,7 +3306,7 @@ def send_option_chain_signal(sa_result, underlying_price, force=False):
     ]
     for _, r in support.iterrows():
         vol_tag = "VOL CONFIRMED" if r.get('PE_Vol_High', False) else "Low Vol"
-        active_signals.append(f"PUT SUPPORT ₹{r['Strike']:.0f} [{vol_tag}] OI:{r['PE_OI']/100000:.1f}L ChgOI:+{r['PE_ChgOI']/1000:.0f}K")
+        active_signals.append(f"PUT CAPPING ₹{r['Strike']:.0f} [{vol_tag}] OI:{r['PE_OI']/100000:.1f}L ChgOI:+{r['PE_ChgOI']/1000:.0f}K")
     breakout = analysis_df[analysis_df['Call_Class'] == 'Breakout Zone']
     for _, r in breakout.iterrows():
         active_signals.append(f"BREAKOUT LOADING ₹{r['Strike']:.0f}")
@@ -4358,6 +4358,16 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     abs_score = abs(score)
     near_support = any('Support' in loc for loc in location)
     near_resistance = any('Resistance' in loc for loc in location)
+
+    # Boost near_support/near_resistance from direct OC writing detection so
+    # PUT CAPPING and CALL CAPPING fire even when price proximity check misses
+    _adf = sa_result.get('analysis_df')
+    if _adf is not None:
+        if not near_resistance and _adf.get('Call_Capping_Confirmed', pd.Series([False])).any():
+            near_resistance = True
+        if not near_support and _adf.get('Put_Support_Confirmed', pd.Series([False])).any():
+            near_support = True
+
     breakout_zones = not sa_result['breakout_zones'].empty
     breakdown_zones = not sa_result['breakdown_zones'].empty
 
@@ -4368,23 +4378,23 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         signal = '💥 BREAKDOWN'
         trade_type = 'STRONG SELL'
     elif score >= 5:
-        _sup_vol = near_support and sa_result.get('analysis_df') is not None and \
-            sa_result['analysis_df'].get('Put_Support_Confirmed', pd.Series([False])).any()
-        signal = ('🟩 PUT SUPPORT 🔥' if _sup_vol else '🟩 PUT SUPPORT') if near_support else '🟢 STRONG BUY'
+        _sup_vol = near_support and _adf is not None and \
+            _adf.get('Put_Support_Confirmed', pd.Series([False])).any()
+        signal = ('🟩 PUT CAPPING 🔥' if _sup_vol else '🟩 PUT CAPPING') if near_support else '🟢 STRONG BUY'
         trade_type = 'STRONG BUY'
     elif score >= 3:
-        _sup_vol = near_support and sa_result.get('analysis_df') is not None and \
-            sa_result['analysis_df'].get('Put_Support_Confirmed', pd.Series([False])).any()
-        signal = ('🟩 PUT SUPPORT 🔥' if _sup_vol else '🟩 PUT SUPPORT') if near_support else '🟢 BUY'
+        _sup_vol = near_support and _adf is not None and \
+            _adf.get('Put_Support_Confirmed', pd.Series([False])).any()
+        signal = ('🟩 PUT CAPPING 🔥' if _sup_vol else '🟩 PUT CAPPING') if near_support else '🟢 BUY'
         trade_type = 'STRONG BUY' if near_support else 'SCALP BUY'
     elif score <= -5:
-        _cap_vol = near_resistance and sa_result.get('analysis_df') is not None and \
-            sa_result['analysis_df'].get('Call_Capping_Confirmed', pd.Series([False])).any()
+        _cap_vol = near_resistance and _adf is not None and \
+            _adf.get('Call_Capping_Confirmed', pd.Series([False])).any()
         signal = ('🟥 CALL CAPPING 🔥' if _cap_vol else '🟥 CALL CAPPING') if near_resistance else '🔴 STRONG SELL'
         trade_type = 'STRONG SELL'
     elif score <= -3:
-        _cap_vol = near_resistance and sa_result.get('analysis_df') is not None and \
-            sa_result['analysis_df'].get('Call_Capping_Confirmed', pd.Series([False])).any()
+        _cap_vol = near_resistance and _adf is not None and \
+            _adf.get('Call_Capping_Confirmed', pd.Series([False])).any()
         signal = ('🟥 CALL CAPPING 🔥' if _cap_vol else '🟥 CALL CAPPING') if near_resistance else '🔴 SELL'
         trade_type = 'STRONG SELL' if near_resistance else 'SCALP SELL'
     elif net_gex > 0 and abs_score < 3:
@@ -5058,7 +5068,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                     ]
                     for _, r in sup.iterrows():
                         vol_tag = "🔥" if r.get('PE_Vol_High', False) else ""
-                        oc_active.append(f"🟩 PUT SUPPORT {vol_tag} at ₹{r['Strike']:.0f} (OI:{r['PE_OI']/100000:.1f}L, Vol:{r['PE_Vol']/1000:.0f}K)")
+                        oc_active.append(f"🟩 PUT CAPPING {vol_tag} at ₹{r['Strike']:.0f} (OI:{r['PE_OI']/100000:.1f}L, Vol:{r['PE_Vol']/1000:.0f}K)")
             except Exception:
                 pass
 
@@ -5083,7 +5093,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 <b>🟥 CALL CAPPING / RESISTANCE:</b>
 {oc_res_text}
 
-<b>🟩 PUT SUPPORT LEVELS:</b>
+<b>🟩 PUT CAPPING LEVELS:</b>
 {oc_sup_text}
 
 <b>⚡ OC ACTIVE SIGNALS:</b>
@@ -6518,7 +6528,7 @@ def main():
                             st.dataframe(styled_sup, use_container_width=True, hide_index=True)
                         else:
                             st.info("No support levels found")
-                    # Call Capping & Put Support Zones
+                    # Call Capping & Put Capping Zones
                     st.markdown("### 📊 Strike-wise Call & Put Classification")
                     class_display = analysis_df[['Strike', 'Zone', 'Call_Class', 'Call_Activity', 'CE_Vol', 'Put_Class', 'Put_Activity', 'PE_Vol']].copy()
                     class_display['Strike'] = class_display['Strike'].apply(lambda x: f"₹{x:.0f}")
@@ -8538,7 +8548,7 @@ def main():
     # === MULTI-INSTRUMENT CAPPING / OI / VOLUME MONITOR ===
     st.markdown("---")
     st.markdown("## 📊 Multi-Instrument Capping · OI · Volume Monitor")
-    st.caption("NIFTY · SENSEX · BANK NIFTY · RELIANCE · ICICI BANK · INFOSYS — Call Capping & Put Support with Volume Confirmation (ATM ±4 strikes)")
+    st.caption("NIFTY · SENSEX · BANK NIFTY · RELIANCE · ICICI BANK · INFOSYS — Call Capping & Put Capping with Volume Confirmation (ATM ±4 strikes)")
 
     _mi_refresh = st.button("🔄 Refresh Instrument Data", key="mi_refresh_btn")
     if _mi_refresh or 'mi_instrument_data' not in st.session_state:
@@ -8657,7 +8667,7 @@ def main():
     )
 
     # ── Table 2 & 3: Capping + Support ───────────────────────────────────────
-    _cap_tab, _sup_tab = st.tabs(["🟥 Call Capping (CE)", "🟢 Put Support (PE)"])
+    _cap_tab, _sup_tab = st.tabs(["🟥 Call Capping (CE)", "🟢 Put Capping (PE)"])
 
     def _build_strike_table(all_insts, side):
         rows = []
