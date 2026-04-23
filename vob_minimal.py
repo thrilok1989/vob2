@@ -5094,38 +5094,32 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         oc_deep_block = ""
 
     # Multi-instrument bias block
-    _mi_bias_block = ""
+    _mi_short = {'SENSEX': 'SENX', 'BANKNIFTY': 'BNF',
+                 'RELIANCE': 'REL', 'ICICIBANK': 'ICICI', 'INFOSYS': 'INFO'}
+    def _bias_emoji(b):
+        b = str(b)
+        return '🟢' if 'Bullish' in b else '🔴' if 'Bearish' in b else '⚪'
+    _mi_parts = []
     try:
-        _mi_short = {
-            'SENSEX': 'SENX', 'BANKNIFTY': 'BNF',
-            'RELIANCE': 'REL', 'ICICIBANK': 'ICICI', 'INFOSYS': 'INFO',
-        }
-        def _bias_emoji(b):
-            b = str(b)
-            if 'Bullish' in b: return '🟢'
-            if 'Bearish' in b: return '🔴'
-            return '⚪'
-        _mi_state = st.session_state.get('mi_instrument_data', {})
-        _sa_bias = getattr(st.session_state, '_sa_result', None)
-        _mi_parts = []
-        # NIFTY 50 first
+        _sa_bias = st.session_state.get('_sa_result') or getattr(st.session_state, '_sa_result', None)
         if _sa_bias:
-            _nb = _sa_bias.get('market_bias', 'N/A')
-            _mi_parts.append(f"N50:{_bias_emoji(_nb)}")
-        # Other instruments
-        for _ikey, _cfg in INSTRUMENT_CONFIGS.items():
-            _res = _mi_state.get(_ikey)
+            _mi_parts.append(f"N50:{_bias_emoji(_sa_bias.get('market_bias', ''))}")
+    except Exception:
+        _mi_parts.append("N50:⚪")
+    try:
+        _mi_state = st.session_state.get('mi_instrument_data') or {}
+        for _ikey in INSTRUMENT_CONFIGS:
             _sn = _mi_short.get(_ikey, _ikey[:5])
-            if _res and 'error' not in _res:
-                _deep = _res.get('deep') or {}
-                _b = _deep.get('market_bias', 'N/A')
-                _mi_parts.append(f"{_sn}:{_bias_emoji(_b)}")
-            else:
+            try:
+                _res = _mi_state.get(_ikey) or {}
+                _deep = _res.get('deep') or {} if 'error' not in _res else {}
+                _b = _deep.get('market_bias', '') if _deep else ''
+                _mi_parts.append(f"{_sn}:{_bias_emoji(_b) if _b else '⚫'}")
+            except Exception:
                 _mi_parts.append(f"{_sn}:⚫")
-        if _mi_parts:
-            _mi_bias_block = "\n<b>🌐 Index/Stock Bias:</b> " + "  ".join(_mi_parts) + "\n"
-    except Exception as _mbe:
-        _mi_bias_block = f"\n<b>🌐 Index/Stock Bias:</b> (error: {str(_mbe)[:60]})\n"
+    except Exception:
+        pass
+    _mi_bias_block = ("\n<b>🌐 Index/Stock Bias:</b> " + "  ".join(_mi_parts) + "\n") if _mi_parts else ""
 
     message = f"""{signal_emoji} <b>MASTER TRADING SIGNAL</b> {signal_emoji}
 🕐 {time_str} | Spot: ₹{underlying_price:.2f}
