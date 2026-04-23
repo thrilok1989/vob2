@@ -5124,8 +5124,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 _mi_parts.append(f"{_sn}:⚫")
         if _mi_parts:
             _mi_bias_block = "\n<b>🌐 Index/Stock Bias:</b> " + "  ".join(_mi_parts) + "\n"
-    except Exception:
-        _mi_bias_block = ""
+    except Exception as _mbe:
+        _mi_bias_block = f"\n<b>🌐 Index/Stock Bias:</b> (error: {str(_mbe)[:60]})\n"
 
     message = f"""{signal_emoji} <b>MASTER TRADING SIGNAL</b> {signal_emoji}
 🕐 {time_str} | Spot: ₹{underlying_price:.2f}
@@ -5178,8 +5178,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     # Send text version
     try:
         send_telegram_message_sync(message, force=force)
-    except Exception:
-        pass
+    except Exception as _txt_err:
+        st.warning(f"Telegram text send error: {_txt_err}")
 
     # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
