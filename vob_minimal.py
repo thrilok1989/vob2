@@ -5093,6 +5093,40 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         oc_deep_block = ""
 
+    # Multi-instrument bias block
+    _mi_bias_block = ""
+    try:
+        _mi_short = {
+            'SENSEX': 'SENX', 'BANKNIFTY': 'BNF',
+            'RELIANCE': 'REL', 'ICICIBANK': 'ICICI', 'INFOSYS': 'INFO',
+        }
+        def _bias_emoji(b):
+            b = str(b)
+            if 'Bullish' in b: return '🟢'
+            if 'Bearish' in b: return '🔴'
+            return '⚪'
+        _mi_state = st.session_state.get('mi_instrument_data', {})
+        _sa_bias = getattr(st.session_state, '_sa_result', None)
+        _mi_parts = []
+        # NIFTY 50 first
+        if _sa_bias:
+            _nb = _sa_bias.get('market_bias', 'N/A')
+            _mi_parts.append(f"N50:{_bias_emoji(_nb)}")
+        # Other instruments
+        for _ikey, _cfg in INSTRUMENT_CONFIGS.items():
+            _res = _mi_state.get(_ikey)
+            _sn = _mi_short.get(_ikey, _ikey[:5])
+            if _res and 'error' not in _res:
+                _deep = _res.get('deep') or {}
+                _b = _deep.get('market_bias', 'N/A')
+                _mi_parts.append(f"{_sn}:{_bias_emoji(_b)}")
+            else:
+                _mi_parts.append(f"{_sn}:⚫")
+        if _mi_parts:
+            _mi_bias_block = "\n<b>🌐 Index/Stock Bias:</b> " + "  ".join(_mi_parts) + "\n"
+    except Exception:
+        _mi_bias_block = ""
+
     message = f"""{signal_emoji} <b>MASTER TRADING SIGNAL</b> {signal_emoji}
 🕐 {time_str} | Spot: ₹{underlying_price:.2f}
 
@@ -5121,7 +5155,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 <b>🌍 Alignment (10m|1h|Pattern):</b>
 {align_text}
-
+{_mi_bias_block}
 <b>📉 VIX:</b> {vix.get('vix', 'N/A')} ({vix.get('direction', 'Unknown')})
 
 <b>📊 OI TREND (ATM {result.get('oi_trend', {}).get('atm_strike', 'N/A')}):</b>
