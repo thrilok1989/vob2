@@ -4368,10 +4368,14 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         signal = '💥 BREAKDOWN'
         trade_type = 'STRONG SELL'
     elif score >= 5:
-        signal = '🟩 PUT SUPPORT' if near_support else '🟢 STRONG BUY'
+        _sup_vol = near_support and sa_result.get('analysis_df') is not None and \
+            sa_result['analysis_df'].get('Put_Support_Confirmed', pd.Series([False])).any()
+        signal = ('🟩 PUT SUPPORT 🔥' if _sup_vol else '🟩 PUT SUPPORT') if near_support else '🟢 STRONG BUY'
         trade_type = 'STRONG BUY'
     elif score >= 3:
-        signal = '🟩 PUT SUPPORT' if near_support else '🟢 BUY'
+        _sup_vol = near_support and sa_result.get('analysis_df') is not None and \
+            sa_result['analysis_df'].get('Put_Support_Confirmed', pd.Series([False])).any()
+        signal = ('🟩 PUT SUPPORT 🔥' if _sup_vol else '🟩 PUT SUPPORT') if near_support else '🟢 BUY'
         trade_type = 'STRONG BUY' if near_support else 'SCALP BUY'
     elif score <= -5:
         _cap_vol = near_resistance and sa_result.get('analysis_df') is not None and \
