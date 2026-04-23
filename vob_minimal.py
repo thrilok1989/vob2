@@ -8746,6 +8746,77 @@ def main():
             with bc2:
                 st.metric("Confidence", f"{conf}%")
 
+            # ── PCR-based S/R Table — always visible, shown before Top 3 ──
+            st.markdown("📐 **PCR-based Support / Resistance Levels**")
+            st.caption("PCR ≤0.7 → Resistance | 0.8–1.7 → Neutral | ≥1.8 → Support | Offset applied to reference strike")
+            _pcr_rows = []
+            _pcr_sr_snapshot = []
+            _pcr_strike_map = {}
+            if oi_trend:
+                for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
+                    td = oi_trend.get(_lbl)
+                    if td:
+                        _pcr_strike_map[_lbl] = {'strike': td['strike'], 'pcr': td.get('pcr_strike', 1.0)}
+            if not _pcr_strike_map:
+                _dfs = deep.get('df_summary') if deep else None
+                if _dfs is not None and 'PCR' in _dfs.columns and 'Strike' in _dfs.columns:
+                    try:
+                        _und = underlying or 0
+                        _atm_s = _dfs.iloc[(_dfs['Strike'] - _und).abs().argsort()].iloc[0]['Strike'] if _und else _dfs['Strike'].median()
+                        _atm_s = float(_atm_s)
+                        _slist = sorted(_dfs['Strike'].unique())
+                        _atm_i = min(range(len(_slist)), key=lambda i: abs(_slist[i] - _atm_s))
+                        for _off, _lbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+                            _si = _atm_i + _off
+                            if 0 <= _si < len(_slist):
+                                _row = _dfs[_dfs['Strike'] == _slist[_si]]
+                                if not _row.empty:
+                                    _pcr_strike_map[_lbl] = {
+                                        'strike': float(_slist[_si]),
+                                        'pcr': float(_row['PCR'].iloc[0])
+                                    }
+                    except Exception:
+                        pass
+            for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
+                _sm = _pcr_strike_map.get(_lbl)
+                if not _sm:
+                    continue
+                pcr_val = _sm['pcr']
+                sr = calculate_pcr_sr_level(pcr_val, _sm['strike'])
+                _pcr_rows.append({
+                    'Label': _lbl,
+                    'Strike': f"₹{_sm['strike']:.0f}",
+                    'PCR': f"{pcr_val:.2f}",
+                    'S/R Type': sr['type'],
+                    'S/R Level': f"₹{sr['level']:.0f}",
+                    'Offset (pts)': f"{sr['offset']:+.0f}",
+                    'Interpretation': sr['interpretation'],
+                })
+                _pcr_sr_snapshot.append({
+                    'label': _lbl, 'strike': _sm['strike'],
+                    'pcr': pcr_val, 'type': sr['type'],
+                    'level': sr['level'], 'offset': sr['offset'],
+                })
+            if inst_name == 'NIFTY 50':
+                st.session_state._pcr_sr_snapshot = _pcr_sr_snapshot
+            if _pcr_rows:
+                _pcr_df = pd.DataFrame(_pcr_rows)
+                def _style_pcr(row):
+                    styles = [''] * len(row)
+                    sr_idx = _pcr_df.columns.get_loc('S/R Type')
+                    lv_idx = _pcr_df.columns.get_loc('S/R Level')
+                    sr_type = str(row.iloc[sr_idx])
+                    if 'Resistance' in sr_type:
+                        styles[sr_idx] = 'background-color:#ff444450;font-weight:bold'
+                        styles[lv_idx] = 'background-color:#ff444430'
+                    elif 'Support' in sr_type:
+                        styles[sr_idx] = 'background-color:#00ff8850;font-weight:bold'
+                        styles[lv_idx] = 'background-color:#00ff8830'
+                    return styles
+                st.dataframe(_pcr_df.style.apply(_style_pcr, axis=1), use_container_width=True, hide_index=True)
+            else:
+                st.info("PCR data not yet available — load option chain data first.")
+
             # Top Resistance / Support side by side
             res_col, sup_col = st.columns(2)
             with res_col:
@@ -8933,83 +9004,6 @@ def main():
                                 base[ci] = f'background-color:{_sig_colors.get(sig,"")};font-weight:bold' if sig in _sig_colors else 'font-weight:bold'
                         return base
                     st.dataframe(_oi_df.style.apply(_style_oi, axis=1), use_container_width=True, hide_index=True)
-
-            # ── PCR-based S/R Table — always visible ──────────────────────
-            st.markdown("---")
-            st.markdown("📐 **PCR-based Support / Resistance Levels**")
-            st.caption("PCR ≤0.7 → Resistance | 0.8–1.7 → Neutral | ≥1.8 → Support | Offset applied to reference strike")
-            _pcr_rows = []
-            _pcr_sr_snapshot = []
-
-            # Build strike→PCR map: prefer oi_trend (has per-strike PCR from history),
-            # fall back to df_summary from the option chain (always available)
-            _pcr_strike_map = {}
-            if oi_trend:
-                for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
-                    td = oi_trend.get(_lbl)
-                    if td:
-                        _pcr_strike_map[_lbl] = {'strike': td['strike'], 'pcr': td.get('pcr_strike', 1.0)}
-            if not _pcr_strike_map:
-                # Fallback: compute from df_summary (current snapshot)
-                _dfs = deep.get('df_summary') if deep else None
-                if _dfs is not None and 'PCR' in _dfs.columns and 'Strike' in _dfs.columns:
-                    try:
-                        _und = underlying or 0
-                        _atm_s = _dfs.iloc[(_dfs['Strike'] - _und).abs().argsort()].iloc[0]['Strike'] if _und else _dfs['Strike'].median()
-                        _atm_s = float(_atm_s)
-                        _slist = sorted(_dfs['Strike'].unique())
-                        _atm_i = min(range(len(_slist)), key=lambda i: abs(_slist[i] - _atm_s))
-                        for _off, _lbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
-                            _si = _atm_i + _off
-                            if 0 <= _si < len(_slist):
-                                _row = _dfs[_dfs['Strike'] == _slist[_si]]
-                                if not _row.empty:
-                                    _pcr_strike_map[_lbl] = {
-                                        'strike': float(_slist[_si]),
-                                        'pcr': float(_row['PCR'].iloc[0])
-                                    }
-                    except Exception:
-                        pass
-
-            for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
-                _sm = _pcr_strike_map.get(_lbl)
-                if not _sm:
-                    continue
-                pcr_val = _sm['pcr']
-                sr = calculate_pcr_sr_level(pcr_val, _sm['strike'])
-                _pcr_rows.append({
-                    'Label': _lbl,
-                    'Strike': f"₹{_sm['strike']:.0f}",
-                    'PCR': f"{pcr_val:.2f}",
-                    'S/R Type': sr['type'],
-                    'S/R Level': f"₹{sr['level']:.0f}",
-                    'Offset (pts)': f"{sr['offset']:+.0f}",
-                    'Interpretation': sr['interpretation'],
-                })
-                _pcr_sr_snapshot.append({
-                    'label': _lbl, 'strike': _sm['strike'],
-                    'pcr': pcr_val, 'type': sr['type'],
-                    'level': sr['level'], 'offset': sr['offset'],
-                })
-            if inst_name == 'NIFTY 50':
-                st.session_state._pcr_sr_snapshot = _pcr_sr_snapshot
-            if _pcr_rows:
-                _pcr_df = pd.DataFrame(_pcr_rows)
-                def _style_pcr(row):
-                    styles = [''] * len(row)
-                    sr_idx = _pcr_df.columns.get_loc('S/R Type')
-                    lv_idx = _pcr_df.columns.get_loc('S/R Level')
-                    sr_type = str(row.iloc[sr_idx])
-                    if 'Resistance' in sr_type:
-                        styles[sr_idx] = 'background-color:#ff444450;font-weight:bold'
-                        styles[lv_idx] = 'background-color:#ff444430'
-                    elif 'Support' in sr_type:
-                        styles[sr_idx] = 'background-color:#00ff8850;font-weight:bold'
-                        styles[lv_idx] = 'background-color:#00ff8830'
-                    return styles
-                st.dataframe(_pcr_df.style.apply(_style_pcr, axis=1), use_container_width=True, hide_index=True)
-            else:
-                st.info("PCR data not yet available — load option chain data first.")
 
     # NIFTY tab — use existing sa_result + build OI trend from session_state oi_history
     _nifty_deep = None
