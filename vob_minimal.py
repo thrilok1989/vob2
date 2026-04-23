@@ -5147,17 +5147,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📊 PCR×GEX: {result['pcr_gex']['badge']}
 📉 VIX:{vix.get('vix','N/A')} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
-{_mi_bias_block}{vpfr_block}"""
-
-    # Part 2 — detailed blocks + AI prompt at the end
-    _ai_prompt = """
+{_mi_bias_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 🤖 <code>Based on the above Nifty options signal data, answer:
 1. What is the ideal entry point and entry condition?
 2. Where will price NOT go in the next 10 minutes? Identify the strongest call capping or put capping wall price cannot break — enter only near that wall.
 3. How will price move in the next 10 minutes — up, down, or sideways? By how many points?
 4. Give exact entry price, stop-loss (just beyond the wall), and target.
 Give a short, actionable answer.</code>"""
-    message2 = f"📋 <b>Details — {result['signal']}</b>\n{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}{_ai_prompt}".strip()
 
     # Send image version
     try:
@@ -5166,18 +5162,11 @@ Give a short, actionable answer.</code>"""
     except Exception as _img_err:
         st.warning(f"Signal image error: {_img_err}")
 
-    # Send part 1 (core signal)
+    # Send single combined message
     try:
         send_telegram_message_sync(message, force=force)
     except Exception as _txt_err:
         st.warning(f"Telegram text send error: {_txt_err}")
-
-    # Send part 2 (details) only if there's content
-    if message2 and len(message2) > 40:
-        try:
-            send_telegram_message_sync(message2, force=force)
-        except Exception:
-            pass
 
     # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
