@@ -4776,7 +4776,12 @@ HTF S&amp;R=price chart swing highs/lows (15m/1h) | Delta Vol=net buy vs sell pr
 
 
 def compute_depth_sr(df_summary, underlying_price, n=3):
-    """Derive S/R levels from live CE+PE bid/ask order pressure near spot."""
+    """Derive S/R levels from live CE+PE bid/ask order pressure near spot.
+    Returns effective spot prices — not raw strikes — by applying a proximity
+    offset that reflects where hedging pressure starts to be felt before the strike.
+    Resistance: strike - offset (sellers hedge as price approaches from below)
+    Support:    strike + offset (buyers defend before price reaches the strike)
+    """
     if df_summary is None or df_summary.empty:
         return [], []
     levels = []
@@ -4791,8 +4796,15 @@ def compute_depth_sr(df_summary, underlying_price, n=3):
             pe_ask = float(row.get('askQty_PE', 0) or 0)
             res_score = ce_ask + pe_bid   # call sellers + put buyers = resistance
             sup_score = pe_ask + ce_bid   # put sellers + call buyers = support
+            # Proximity offset: scales with distance from spot, capped at 15 pts
+            dist = abs(strike - underlying_price)
+            offset = min(15, int(dist * 0.15))
+            # Effective price: where pressure is actually felt in the spot market
+            eff_res = strike - offset   # resistance felt below the strike
+            eff_sup = strike + offset   # support felt above the strike
             levels.append({'strike': strike, 'res': res_score, 'sup': sup_score,
-                           'ce_ask': ce_ask, 'pe_ask': pe_ask})
+                           'ce_ask': ce_ask, 'pe_ask': pe_ask,
+                           'eff_res': eff_res, 'eff_sup': eff_sup})
         except Exception:
             continue
     resistance = sorted([x for x in levels if x['strike'] >= underlying_price],
@@ -4866,7 +4878,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         def _dfmt(x, side):
             qty = x['ce_ask'] if side == 'r' else x['pe_ask']
             qty_k = f"{qty/1000:.1f}K" if qty >= 1000 else str(int(qty))
-            return f"₹{x['strike']:.0f}({qty_k})"
+            price = x.get('eff_res' if side == 'r' else 'eff_sup', x['strike'])
+            return f"₹{price:.0f}({qty_k})"
         _r_parts = [f"🔴{_dfmt(x,'r')}" for x in _res_d] if _res_d else ["—"]
         _s_parts = [f"🟢{_dfmt(x,'s')}" for x in _sup_d] if _sup_d else ["—"]
         if _res_d or _sup_d:
