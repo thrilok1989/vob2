@@ -5166,10 +5166,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Analyze ALL data above: signal/score, PCR S/R levels, GEX (flip/mode), VIX+VIDYA, OI ATM activity, multi-TF alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR (POC/VAH/VAL), OC bias per strike (COI/DVP/Press/Entry/Scalp/Move), LTP trap+VWAP, VOB zones, HVP, HTF S&R pivots, delta volume trend, money flow (POC/value area/sentiment nodes), OI winding/unwinding. Then answer:
-1. What does the combined of all above datas say about current market structure?
-2. Which is the strongest wall (call capping or put capping) price cannot break in 10 min?
-3. Ideal entry price, condition, stop-loss (just beyond the wall), and target.</code>"""
+🤖 <code>Based on ALL above data, give only:
+Entry: ₹___  |  SL: ₹___  |  Target: ₹___  |  Direction: BUY/SELL
+One line. No explanation.</code>"""
 
     # Send image version
     try:
