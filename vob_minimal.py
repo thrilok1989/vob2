@@ -1402,10 +1402,12 @@ def calculate_max_pain(df_options, spot_price):
             k = row['Strike']
             ce_oi = row.get('openInterest_CE', 0) or 0
             pe_oi = row.get('openInterest_PE', 0) or 0
-            if strike < k:
-                ce_pain += (k - strike) * ce_oi
+            # CE is ITM when expiry (strike) > option strike k
             if strike > k:
-                pe_pain += (strike - k) * pe_oi
+                ce_pain += (strike - k) * ce_oi
+            # PE is ITM when expiry (strike) < option strike k
+            if strike < k:
+                pe_pain += (k - strike) * pe_oi
         total_pain = ce_pain + pe_pain
         pain_data.append({
             'Strike': strike,
@@ -1419,7 +1421,8 @@ def calculate_max_pain(df_options, spot_price):
     if pain_df.empty:
         return None, None
 
-    max_pain_idx = pain_df['Total_Pain'].idxmax()
+    # Max pain = strike where total ITM payout is minimum (MM pay least)
+    max_pain_idx = pain_df['Total_Pain'].idxmin()
     max_pain_strike = pain_df.loc[max_pain_idx, 'Strike']
 
     return max_pain_strike, pain_df
@@ -4756,6 +4759,17 @@ Line3: CE B/A = call bid/ask qty | PE B/A = put bid/ask qty
   Bigger qty = thicker wall = harder for price to break through
   COI/OI comparison shows whether strikes are building or unwinding
 
+<b>🌐 MARKET CONTEXT</b>
+DTE=days to expiry | ⚠️Rollover=≤5 days (expiry week — PCR/GEX less reliable)
+MaxPain=strike where market makers pay least (price gravitates here near expiry)
+Straddle=ATM CE+PE last price (cost of hedging both sides; bigger=wider expected range)
+IVR=session IV rank: 🔥≥70%(IV elevated) ⚪30-70% 🧊≤30%(IV compressed)
+  IVR high = expensive options → favour selling; IVR low = favour buying
+Skew=PE(ATM-1) IV ÷ CE(ATM+1) IV: 🔴&gt;1.1=put skew(hedging/fear) 🟢&lt;0.9=call skew(greed)
+  Skew&gt;1.1 on red day = genuine fear; same skew on green day = smart hedging
+ATR14=14-candle avg true range (volatility ruler for SL sizing)
+OIVel=OI velocity 🔺=building 🔻=unwinding | big spike = fresh positioning
+
 <b>📊 OTHER BLOCKS</b>
 GEX +ve=range mode -ve=trending | Flip=gamma flip level
 VIDYA: adaptive trend | -ve%=falling +ve%=rising
@@ -4965,6 +4979,111 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             )
     except Exception:
         unwind_block = ""
+
+    # Market Context block: DTE, Max Pain, Straddle, IV Rank, IV Skew, ATR, OI Velocity
+    market_ctx_block = ""
+    try:
+        _mp = (option_data or {}).get('max_pain_strike')
+        _expiry_str = (option_data or {}).get('expiry', '')
+        _df_ctx = (option_data or {}).get('df_summary')
+
+        # DTE
+        _dte = None
+        _rollover_flag = ""
+        try:
+            if _expiry_str:
+                _exp_dt = datetime.strptime(str(_expiry_str).strip(), '%d-%b-%Y')
+                _dte = (_exp_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days
+                if _dte <= 5:
+                    _rollover_flag = " ⚠️Rollover"
+        except Exception:
+            pass
+
+        # ATM Straddle + IV Skew from df_summary
+        _straddle = None
+        _iv_skew = None
+        _atm_iv_now = None
+        try:
+            if _df_ctx is not None and not _df_ctx.empty and 'Strike' in _df_ctx.columns:
+                _sg = config.get('strike_gap', 50)
+                _atm_sk = round(underlying_price / _sg) * _sg
+                _r_atm  = _df_ctx[_df_ctx['Strike'] == _atm_sk]
+                _r_atm1 = _df_ctx[_df_ctx['Strike'] == _atm_sk + _sg]  # ATM+1 (CE skew ref)
+                _r_atm_1 = _df_ctx[_df_ctx['Strike'] == _atm_sk - _sg] # ATM-1 (PE skew ref)
+                if not _r_atm.empty:
+                    _lce = float(_r_atm.iloc[0].get('lastPrice_CE', 0) or 0)
+                    _lpe = float(_r_atm.iloc[0].get('lastPrice_PE', 0) or 0)
+                    if _lce > 0 and _lpe > 0:
+                        _straddle = _lce + _lpe
+                    _iv_ce_atm = float(_r_atm.iloc[0].get('impliedVolatility_CE', 0) or 0)
+                    _iv_pe_atm = float(_r_atm.iloc[0].get('impliedVolatility_PE', 0) or 0)
+                    if _iv_ce_atm > 0 and _iv_pe_atm > 0:
+                        _atm_iv_now = round((_iv_ce_atm + _iv_pe_atm) / 2, 1)
+                # IV Skew: ATM-1 PE IV vs ATM+1 CE IV (ratio > 1 = put skew / hedging)
+                if not _r_atm1.empty and not _r_atm_1.empty:
+                    _iv_ce1 = float(_r_atm1.iloc[0].get('impliedVolatility_CE', 0) or 0)
+                    _iv_pe1 = float(_r_atm_1.iloc[0].get('impliedVolatility_PE', 0) or 0)
+                    if _iv_ce1 > 0 and _iv_pe1 > 0:
+                        _skew_ratio = round(_iv_pe1 / _iv_ce1, 2)
+                        _skew_emoji = '🔴' if _skew_ratio > 1.1 else ('🟢' if _skew_ratio < 0.9 else '⚪')
+                        _iv_skew = f"{_skew_emoji}{_skew_ratio}(PE{_iv_pe1:.0f}/CE{_iv_ce1:.0f})"
+        except Exception:
+            pass
+
+        # Session IV Rank (min-max over session history)
+        _iv_rank_str = None
+        try:
+            _iv_hist = st.session_state.get('_iv_history', [])
+            if _iv_hist and _atm_iv_now and len(_iv_hist) >= 3:
+                _iv_min = min(_iv_hist)
+                _iv_max = max(_iv_hist)
+                if _iv_max > _iv_min:
+                    _ivr = round((_atm_iv_now - _iv_min) / (_iv_max - _iv_min) * 100, 0)
+                    _ivr_emoji = '🔥' if _ivr >= 70 else ('🧊' if _ivr <= 30 else '⚪')
+                    _iv_rank_str = f"{_ivr_emoji}{int(_ivr)}%(IV{_atm_iv_now})"
+        except Exception:
+            pass
+
+        # ATR(14)
+        _atr_str = None
+        try:
+            _atr_val = st.session_state.get('_atr14')
+            if _atr_val:
+                _atr_str = f"₹{_atr_val:.1f}"
+        except Exception:
+            pass
+
+        # OI Velocity (rate of total OI change per reading from oi_history)
+        _oi_vel_str = None
+        try:
+            _oi_hist = getattr(st.session_state, 'oi_history', [])
+            if _oi_hist and len(_oi_hist) >= 3:
+                _oi_vals = [sum(v for v in x.values() if isinstance(v, (int, float))) if isinstance(x, dict) else x for x in _oi_hist[-6:]]
+                _oi_delta = _oi_vals[-1] - _oi_vals[0] if len(_oi_vals) >= 2 else 0
+                _oi_vel_emoji = '🔺' if _oi_delta > 0 else ('🔻' if _oi_delta < 0 else '➡️')
+                _oi_vel_str = f"{_oi_vel_emoji}{abs(_oi_delta)/1000:.1f}K/rd"
+        except Exception:
+            pass
+
+        _ctx_parts = []
+        if _dte is not None:
+            _ctx_parts.append(f"DTE:{_dte}{_rollover_flag}")
+        if _mp:
+            _ctx_parts.append(f"MaxPain:₹{_mp:.0f}")
+        if _straddle:
+            _ctx_parts.append(f"Straddle:₹{_straddle:.0f}")
+        if _iv_rank_str:
+            _ctx_parts.append(f"IVR:{_iv_rank_str}")
+        if _iv_skew:
+            _ctx_parts.append(f"Skew:{_iv_skew}")
+        if _atr_str:
+            _ctx_parts.append(f"ATR14:{_atr_str}")
+        if _oi_vel_str:
+            _ctx_parts.append(f"OIVel:{_oi_vel_str}")
+        if _ctx_parts:
+            market_ctx_block = "\n<b>🌐 Market Context:</b> " + " | ".join(_ctx_parts) + "\n"
+    except Exception:
+        market_ctx_block = ""
 
     # Triple POC + Future Swing Analysis block
     poc_swing_block = ""
@@ -5342,8 +5461,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
-{_mi_bias_block}{vpfr_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR, Triple POC (P1/P2/P3), Future Swing target, Strike Analysis ATM±2 (PCR S/R + Depth chart/strike price + Capping OI + Δ/Γ/Θ + BA + CE/PE vol/qty), LTP trap+VWAP, VOB, HVP, delta volume, money flow, OI winding. Give SHORT answers:
+{_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC (P1/P2/P3), Future Swing target, Strike Analysis ATM±2 (PCR S/R + Depth chart/strike price + Capping OI + Δ/Γ/Θ + BA + CE/PE vol/qty), LTP trap+VWAP, VOB, HVP, delta volume, money flow, OI winding. Give SHORT answers:
 1. Market structure: (1 line — bull/bear/range + key reason)
 2. Strongest wall: (strike, capping OI + depth pressure, why)
 3. Entry: ₹___ | SL: ₹___ | Target: ₹___ | Direction: BUY/SELL</code>"""
@@ -5705,6 +5824,14 @@ def main():
         # Store for Telegram message access
         st.session_state['_poc_data'] = poc_data_for_chart
         st.session_state['_swing_data'] = swing_data_for_chart
+        # ATR(14) and session IV tracking for market context block
+        try:
+            if not df.empty and len(df) >= 14:
+                _h = df['high']; _l = df['low']; _c = df['close']
+                _tr = pd.concat([_h - _l, (_h - _c.shift(1)).abs(), (_l - _c.shift(1)).abs()], axis=1).max(axis=1)
+                st.session_state['_atr14'] = round(_tr.rolling(14).mean().iloc[-1], 1)
+        except Exception:
+            pass
         # Persist detected patterns (VOB, POC, Swing) to Supabase
         try:
             patterns_to_store = []
@@ -6973,6 +7100,20 @@ def main():
                             st.session_state.oi_current_strikes = [int(s) for s in current_strikes]
                             if len(st.session_state.oi_history) > 200:
                                 st.session_state.oi_history = st.session_state.oi_history[-200:]
+                            # Track ATM IV for session IV rank
+                            try:
+                                _und_p = option_data.get('underlying', 0) if option_data else 0
+                                if _und_p and df_summary is not None and not df_summary.empty:
+                                    _atm_r = df_summary.iloc[(df_summary['Strike'] - _und_p).abs().argsort()].iloc[0]
+                                    _ce_iv = float(_atm_r.get('impliedVolatility_CE', 0) or 0)
+                                    _pe_iv = float(_atm_r.get('impliedVolatility_PE', 0) or 0)
+                                    _atm_iv_val = round((_ce_iv + _pe_iv) / 2, 1) if _ce_iv and _pe_iv else round(_ce_iv or _pe_iv, 1)
+                                    if _atm_iv_val > 0:
+                                        _iv_hist = st.session_state.get('_iv_history', [])
+                                        _iv_hist.append(_atm_iv_val)
+                                        st.session_state['_iv_history'] = _iv_hist[-120:]
+                            except Exception:
+                                pass
                             st.session_state.chgoi_history.append(chgoi_entry)
                             st.session_state.chgoi_last_valid_data = pcr_df.copy()
                             st.session_state.chgoi_current_strikes = [int(s) for s in current_strikes]
