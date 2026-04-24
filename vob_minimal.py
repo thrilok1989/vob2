@@ -5165,9 +5165,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                        f"Ask{_b(_g('AskQty_Bias'))}Bid{_b(_g('BidQty_Bias'))} "
                        f"BA:{_ba} E:{_entry} Mv:{_move}")
 
-                # Line 3: CE/PE raw qty + OI comparison
-                _l3 = (f"  CE B:{_fmtk(_ce_bid)} A:{_fmtk(_ce_ask)} "
-                       f"PE B:{_fmtk(_pe_bid)} A:{_fmtk(_pe_ask)} "
+                # Line 3: CE/PE raw qty + volume + OI comparison
+                _ce_vol = _fmtk(_g('totalTradedVolume_CE'))
+                _pe_vol = _fmtk(_g('totalTradedVolume_PE'))
+                _l3 = (f"  CE B:{_fmtk(_ce_bid)} A:{_fmtk(_ce_ask)} Vol:{_ce_vol} "
+                       f"| PE B:{_fmtk(_pe_bid)} A:{_fmtk(_pe_ask)} Vol:{_pe_vol} "
                        f"| COI:{_esc(str(_g('ChgOI_Cmp')))} OI:{_esc(str(_g('OI_Cmp')))}")
 
                 _strike_blocks.append(_l1 + "\n" + _l2 + "\n" + _l3)
