@@ -5166,9 +5166,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Based on ALL above data, give only:
-Entry: ₹___  |  SL: ₹___  |  Target: ₹___  |  Direction: BUY/SELL
-One line. No explanation.</code>"""
+🤖 <code>Analyze ALL data above: signal/score, PCR S/R, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR, OC bias per strike, LTP trap+VWAP, VOB zones, HVP, HTF S&R, delta volume, money flow, OI winding. Give SHORT answers:
+1. Market structure: (1 line — bull/bear/range + key reason)
+2. Strongest wall: (which strike, call or put capping, why)
+3. Entry: ₹___ | SL: ₹___ | Target: ₹___ | Direction: BUY/SELL</code>"""
 
     # Send image version
     try:
