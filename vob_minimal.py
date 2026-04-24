@@ -4718,6 +4718,63 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
             pass
 
 
+def generate_ai_context_message():
+    """One-time AI context/glossary message to send at start of trading day."""
+    return """🤖 <b>AI SIGNAL GUIDE — NIFTY OPTIONS</b>
+(Send once at start of day before pasting signal messages)
+
+<b>📋 SIGNAL TYPES</b>
+🟥 CALL CAPPING = CE writers blocking price above → SELL zone
+🟩 PUT CAPPING = PE writers defending price below → BUY zone
+🔥=volume confirmed | STRONG=high conviction
+Score: -5(strong bear) to +5(strong bull)
+
+<b>🎨 EMOJI:</b> 🟢=Bullish 🔴=Bearish ⚪=Neutral ⚫=No data
+
+<b>🌍 ALIGNMENT:</b> Name:10m|1h|4h|1D|4D|Pattern+dir
+N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
+REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR=USD/INR
+Candle: NP=NoPattern Ham=Hammer ShStar=ShootingStar
+BullEng/BearEng=Engulfing BullHar/BearHar=Harami
+EveStar=EveningStar MornStar=MorningStar Spinni=SpinningTop
+SGC=StrongGreen SRC=StrongRed TwTop/TwBot=TweezerTop/Bottom InsBar PinBar
+
+<b>🔬 OC BIAS PER STRIKE (ATM-1 / ATM / ATM+1)</b>
+PCR: &gt;1.2=put heavy(bullish) &lt;0.8=call heavy(bearish)
+COI=ChangeOI V=Volume D=Delta G=Gamma T=Theta
+Ask/Bid=order side bias IV=ImpliedVol DEX=DeltaExposure GEX=GammaExposure
+DVP=DeltaVolumeProfile Press=combinedPressure
+BA=net bid-ask (+ve=buyers active -ve=sellers active)
+CE/PE Bid+Ask qty: bigger number = thicker wall = harder to break
+Entry: Bull/Bear=trade direction | Scalp: quick scalp signal
+Move: RealDown/RealUp=genuine | FakeDown/FakeUp=likely reversal
+
+<b>📊 DATA BLOCKS</b>
+GEX: +ve=range -ve=trending/accelerating | Flip=gamma flip price (below=bearish above=bullish)
+VIDYA: adaptive trend | -ve%=falling +ve%=rising
+PCR S/R: put-call ratio S/R near ATM | offset=diff from strike price
+Depth S/R: live CE+PE order pressure (R=resistance S=support qty=wall thickness)
+VPFR: POC=most traded price | VAH/VAL=value area high/low
+OI Wind: CE/PE build🟢/unwind🔴 | Par=parallel winding (B=bull R=bear)
+Money Flow: POC=highest vol price | bearish/bullish nodes | ⭐=max volume node
+LTP Trap=fake breakout | VWAP=vol weighted avg (below=bearish session context)
+VOB=Volume Order Blocks | HVP=High Volume Price pivots
+HTF S&amp;R=price chart swing highs/lows (15m/1h) | Delta Vol=net buy vs sell pressure
+🌐 OC Bias=live option chain bias per index/stock
+
+<b>📈 HOW TO READ</b>
+1. Alignment 3+ same direction across 1h+4h+1D = strong bias
+2. GEX negative + VIDYA bearish = trending, do not fade
+3. Price below VWAP = bearish session context
+4. CE Bid &gt;&gt; Ask at resistance = call writers active = wall holds
+5. BA negative + Move=RealDown = confirmed bearish entry
+6. PCR&lt;0.8 ATM+1 = heavy call wall above
+7. CALL CAPPING + GEX negative + align all red = high conviction SELL
+8. PUT CAPPING + GEX positive + align all green = high conviction BUY
+9. Depth S/R qty in K = wall strength (14.8K=strong, 65=weak)
+10. Money Flow POC far above spot = sellers dominated = bearish"""
+
+
 def compute_depth_sr(df_summary, underlying_price, n=3):
     """Derive S/R levels from live CE+PE bid/ask order pressure near spot."""
     if df_summary is None or df_summary.empty:
@@ -5257,16 +5314,32 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
-    # ── Top-of-page Send to Telegram button ──
-    _top_send_clicked = st.button(
-        "📤 Send to Telegram",
-        key="top_send_telegram",
-        help="Force-send Master Signal + Option Chain Deep Analysis to Telegram",
-        use_container_width=True,
-        type="primary",
-    )
-    if _top_send_clicked:
-        st.session_state['_top_send_triggered'] = True
+    # ── Top-of-page buttons ──
+    _btn_col1, _btn_col2 = st.columns(2)
+    with _btn_col1:
+        _top_send_clicked = st.button(
+            "📤 Send Signal to Telegram",
+            key="top_send_telegram",
+            help="Force-send Master Signal + Option Chain Deep Analysis to Telegram",
+            use_container_width=True,
+            type="primary",
+        )
+        if _top_send_clicked:
+            st.session_state['_top_send_triggered'] = True
+    with _btn_col2:
+        _ctx_clicked = st.button(
+            "📚 Send AI Context to Telegram",
+            key="send_ai_context",
+            help="Send AI glossary/guide to Telegram (once at start of day)",
+            use_container_width=True,
+            type="primary",
+        )
+        if _ctx_clicked:
+            try:
+                send_telegram_message_sync(generate_ai_context_message(), force=True)
+                st.success("✅ AI context guide sent to Telegram!")
+            except Exception as _ctx_err:
+                st.error(f"Failed: {_ctx_err}")
 
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
