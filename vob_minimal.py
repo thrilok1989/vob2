@@ -4861,34 +4861,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _sup_lvls = [x['level'] for x in pcr_sr_levels if x['type'] == 'Support']
             _ceiling = f"₹{min(_res_lvls):.0f}" if _res_lvls else "—"
             _floor   = f"₹{max(_sup_lvls):.0f}" if _sup_lvls else "—"
-            pcr_sr_block = (
-                f"\n<b>📐 PCR S/R Levels:</b>\n"
-                + "\n".join(_pcr_lines)
-                + f"\n  🔴 Ceiling: {_ceiling}  |  🟢 Floor: {_floor}"
-                + "\n"
-            )
+            # pcr_sr_block suppressed from message — data absorbed into unified strike block
+            pcr_sr_block = ""
     except Exception:
         pcr_sr_block = ""
-
-    # Depth-based S/R block (CE+PE combined bid/ask pressure near spot)
-    depth_sr_block = ""
-    try:
-        _df_sum_d = (option_data or {}).get('df_summary') if option_data else None
-        _res_d, _sup_d = compute_depth_sr(_df_sum_d, underlying_price, n=3)
-        def _dfmt(x, side):
-            qty = x['ce_ask'] if side == 'r' else x['pe_ask']
-            qty_k = f"{qty/1000:.1f}K" if qty >= 1000 else str(int(qty))
-            price = x.get('eff_res' if side == 'r' else 'eff_sup', x['strike'])
-            return f"₹{price:.0f}({qty_k})"
-        _r_parts = [f"🔴{_dfmt(x,'r')}" for x in _res_d] if _res_d else ["—"]
-        _s_parts = [f"🟢{_dfmt(x,'s')}" for x in _sup_d] if _sup_d else ["—"]
-        if _res_d or _sup_d:
-            depth_sr_block = (
-                f"\n<b>📌 Depth S/R (CE+PE pressure):</b> "
-                f"R: {' '.join(_r_parts)} | S: {' '.join(_s_parts)}\n"
-            )
-    except Exception:
-        depth_sr_block = ""
+    depth_sr_block = ""  # absorbed into unified strike block
 
     # VPFR block
     vpfr_block = ""
@@ -5025,23 +5002,6 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             hvp_lines.append(f"  🔴 HVP Res ₹{h.get('price', 0):.0f} | Vol: {int(h.get('volume', 0)):,}")
         hvp_text = "\n".join(hvp_lines) if hvp_lines else "  No HVP detected"
 
-        # HTF S&R pivots
-        htf_lines = []
-        res_near = sorted(
-            [l for l in (htf_sr_d.get('resistance') or []) if l['level'] >= underlying_price],
-            key=lambda x: x['level']
-        )[:2]
-        sup_near = sorted(
-            [l for l in (htf_sr_d.get('support') or []) if l['level'] <= underlying_price],
-            key=lambda x: -x['level']
-        )[:2]
-        for l in res_near:
-            htf_lines.append(f"  R ₹{l['level']:.0f} ({l.get('tf', '')})")
-        htf_lines.append(f"  PRICE ₹{underlying_price:.0f}")
-        for l in sup_near:
-            htf_lines.append(f"  S ₹{l['level']:.0f} ({l.get('tf', '')})")
-        htf_text = "\n".join(htf_lines)
-
         price_action_block = f"""
 <b>🔄 LTP Trap:</b>
 {ltp_line}
@@ -5051,9 +5011,6 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 <b>🟢🔴 HVP (High Volume Pivots):</b>
 {hvp_text}
-
-<b>📐 HTF S&R (Price Pivots):</b>
-{htf_text}
 
 <b>📊 Delta Volume Trend:</b> {delta_trend_d}
 """
@@ -5094,8 +5051,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         mf_block = ""
 
-    # OC Bias Summary block — ATM±1 from df_summary (all fields per strike)
-    oc_bias_block = ""
+    # ── Unified Strike Analysis Block (ATM±2) ──────────────────────────────────
+    # Merges: PCR S/R + Depth (chart price + strike) + Capping OI + OC Bias signals
+    strike_analysis_block = ""
+    oc_bias_block = ""  # replaced by strike_analysis_block
     try:
         _df_sum = (option_data or {}).get('df_summary') if option_data else None
         if _df_sum is not None and not _df_sum.empty and 'Strike' in _df_sum.columns:
@@ -5108,11 +5067,22 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             if _atm_strike is None:
                 _atm_strike = min(_strikes_sorted, key=lambda s: abs(s - underlying_price))
             _atm_pos = _strikes_sorted.index(_atm_strike) if _atm_strike in _strikes_sorted else -1
-            _atm_range = []
-            for _off in [2, 1, 0, -1, -2]:   # ATM+2 → ATM-2 (highest → lowest)
-                _idx = _atm_pos + _off
-                if 0 <= _idx < len(_strikes_sorted):
-                    _atm_range.append(_strikes_sorted[_idx])
+
+            # Capping lookup from sa_result
+            _cap_res_map, _cap_sup_map = {}, {}
+            try:
+                _sa_u = getattr(st.session_state, '_sa_result', None)
+                if _sa_u:
+                    for _, _cr in (_sa_u.get('top_resistance') or pd.DataFrame()).iterrows():
+                        _cap_res_map[float(_cr['Strike'])] = {'oi': _cr.get('CE_OI', 0), 'str': _cr.get('Call_Strength', ''), 'act': _cr.get('Call_Activity', '')}
+                    for _, _cs in (_sa_u.get('top_support') or pd.DataFrame()).iterrows():
+                        _cap_sup_map[float(_cs['Strike'])] = {'oi': _cs.get('PE_OI', 0), 'str': _cs.get('Put_Strength', ''), 'act': _cs.get('Put_Activity', '')}
+            except Exception:
+                pass
+
+            # PCR snapshot lookup
+            _pcr_snap_map = {float(s['strike']): s for s in (getattr(st.session_state, '_pcr_sr_snapshot', []) or [])}
+
             def _b(val):
                 return '🟢' if val == 'Bullish' else '🔴' if val == 'Bearish' else '⚪'
             def _esc(v):
@@ -5123,32 +5093,85 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                     return f"{n/1000:.1f}K" if n >= 1000 else str(int(n))
                 except Exception:
                     return '—'
+
             _strike_blocks = []
-            for _sk in _atm_range:
+            for _off in [2, 1, 0, -1, -2]:
+                _idx = _atm_pos + _off
+                if not (0 <= _idx < len(_strikes_sorted)):
+                    continue
+                _sk = _strikes_sorted[_idx]
                 _row = _df_sum[_df_sum['Strike'] == _sk]
                 if _row.empty:
                     continue
                 _r = _row.iloc[0]
-                _g = lambda c: (_r[c] if c in _r.index else 'N/A')
-                _verdict = str(_g('Verdict'))
-                _score = _g('BiasScore')
+                _g = lambda c, _r=_r: (_r[c] if c in _r.index else 'N/A')
+
+                _label = 'ATM  ' if _off == 0 else (f'ATM+{_off}' if _off > 0 else f'ATM{_off}')
                 _pcr = _g('PCR')
-                _label = 'ATM+1' if _sk > _atm_strike else ('ATM-1' if _sk < _atm_strike else 'ATM  ')
+                _score = _g('BiasScore')
+                _verdict = str(_g('Verdict'))
                 _v_emoji = '🔴' if 'Bear' in _verdict else '🟢' if 'Bull' in _verdict else '⚪'
-                _strike_blocks.append(
-                    f"<b>{_label} ₹{_sk:.0f} | PCR:{_pcr} | {_v_emoji} {_verdict} | Score:{_score}</b>\n"
-                    f"  COI:{_b(_g('ChgOI_Bias'))} V:{_b(_g('Volume_Bias'))} D:{_b(_g('Delta_Bias'))} "
-                    f"G:{_b(_g('Gamma_Bias'))} T:{_b(_g('Theta_Bias'))} Ask:{_b(_g('AskQty_Bias'))} "
-                    f"Bid:{_b(_g('BidQty_Bias'))} IV:{_b(_g('IV_Bias'))} DEX:{_b(_g('DeltaExp'))} GEX:{_b(_g('GammaExp'))}\n"
-                    f"  DVP:{_b(_g('DVP_Bias'))} Press:{_b(_g('PressureBias'))} BA:{_esc(_g('BidAskPressure'))}\n"
-                    f"  CE Bid:{_fmtk(_g('bidQty_CE'))} Ask:{_fmtk(_g('askQty_CE'))} | PE Bid:{_fmtk(_g('bidQty_PE'))} Ask:{_fmtk(_g('askQty_PE'))}\n"
-                    f"  Entry:{_esc(_g('Operator_Entry'))} | Scalp:{_esc(_g('Scalp_Moment'))} | Move:{_esc(_g('FakeReal'))}\n"
-                    f"  COI:{_esc(_g('ChgOI_Cmp'))} | OI:{_esc(_g('OI_Cmp'))}"
-                )
+
+                # PCR S/R classification (from snapshot)
+                _snap = _pcr_snap_map.get(float(_sk))
+                if _snap:
+                    _sr_raw = _snap['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+                    _sr_abbr = 'Res' if 'Resist' in _sr_raw else ('Sup' if 'Support' in _sr_raw else 'Neut')
+                    _off_txt = f"{_snap['offset']:+.0f}" if _snap['offset'] != 0 else "0"
+                    _pcr_sr_str = f"{_v_emoji}{_sr_abbr}₹{_snap['level']:.0f}(off{_off_txt})"
+                else:
+                    _pcr_sr_str = f"{_v_emoji}{_verdict[:4]}"
+
+                # Depth: chart-adjusted price → raw strike + wall qty
+                _dist_d = abs(float(_sk) - underlying_price)
+                _off_d = min(15, int(_dist_d * 0.15))
+                _ce_ask = float(_g('askQty_CE') or 0)
+                _pe_ask = float(_g('askQty_PE') or 0)
+                _ce_bid = float(_g('bidQty_CE') or 0)
+                _pe_bid = float(_g('bidQty_PE') or 0)
+                if float(_sk) >= underlying_price:
+                    _eff = float(_sk) - _off_d
+                    _wall = _ce_ask + _pe_bid
+                    _depth_str = f"📌R₹{_eff:.0f}→₹{_sk:.0f}({_fmtk(_wall)})"
+                else:
+                    _eff = float(_sk) + _off_d
+                    _wall = _pe_ask + _ce_bid
+                    _depth_str = f"📌S₹{_eff:.0f}→₹{_sk:.0f}({_fmtk(_wall)})"
+
+                # Capping (OI-based)
+                _cap = _cap_res_map.get(float(_sk)) or _cap_sup_map.get(float(_sk))
+                if _cap:
+                    _cap_emoji = '🟥' if float(_sk) in _cap_res_map else '🟩'
+                    _cap_oi = f"{_cap['oi']/100000:.1f}L"
+                    _cap_str_s = 'HiConv' if 'High' in str(_cap['str']) else ('Mod' if 'Mod' in str(_cap['str']) else str(_cap['str'])[:5])
+                    _cap_str = f"{_cap_emoji}{_cap_oi} {_cap_str_s}"
+                else:
+                    _cap_str = ""
+
+                # Line 1: strike header
+                _l1 = f"<b>{_label} ₹{_sk:.0f}</b> PCR:{_pcr} {_pcr_sr_str} {_cap_str} Sc:{_score}"
+
+                # Line 2: depth + Δ/Γ/Θ + COI/V/IV + Ask/Bid + BA + entry/move
+                _ba = _esc(str(_g('BidAskPressure')))
+                _entry = _esc(str(_g('Operator_Entry'))).replace('Entry ','').replace('No Signal','NoSig').replace('No Entry','NoEnt')
+                _move = _esc(str(_g('FakeReal'))).replace('Real ','R').replace('Fake ','Fk')
+                _l2 = (f"  {_depth_str} | "
+                       f"Δ{_b(_g('Delta_Bias'))}Γ{_b(_g('Gamma_Bias'))}Θ{_b(_g('Theta_Bias'))} "
+                       f"COI{_b(_g('ChgOI_Bias'))}V{_b(_g('Volume_Bias'))}IV{_b(_g('IV_Bias'))} "
+                       f"Ask{_b(_g('AskQty_Bias'))}Bid{_b(_g('BidQty_Bias'))} "
+                       f"BA:{_ba} E:{_entry} Mv:{_move}")
+
+                # Line 3: CE/PE raw qty + OI comparison
+                _l3 = (f"  CE B:{_fmtk(_ce_bid)} A:{_fmtk(_ce_ask)} "
+                       f"PE B:{_fmtk(_pe_bid)} A:{_fmtk(_pe_ask)} "
+                       f"| COI:{_esc(str(_g('ChgOI_Cmp')))} OI:{_esc(str(_g('OI_Cmp')))}")
+
+                _strike_blocks.append(_l1 + "\n" + _l2 + "\n" + _l3)
+
             if _strike_blocks:
-                oc_bias_block = "\n<b>🔬 OC Bias Summary (ATM±1):</b>\n" + "\n\n".join(_strike_blocks) + "\n"
+                strike_analysis_block = "\n<b>🔬 Strike Analysis (ATM±2):</b>\n" + "\n\n".join(_strike_blocks) + "\n"
     except Exception:
-        oc_bias_block = ""
+        strike_analysis_block = ""
 
     # Option Chain Deep Analysis block (from session-state sa_result)
     oc_deep_block = ""
@@ -5222,17 +5245,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             oc_deep_block = f"""
 ━━━ {oc_emoji} <b>OPTION CHAIN: {oc_cond}</b> ━━━
 📈 Confidence: <b>{oc_conf}%</b>
-
-<b>🟥 CALL CAPPING / RESISTANCE:</b>
-{oc_res_text}
-
-<b>🟩 PUT CAPPING LEVELS:</b>
-{oc_sup_text}
-
-<b>⚡ OC ACTIVE SIGNALS:</b>
-{oc_active_text}
-
-<b>🚀 Breakout:</b> {bout_lvl} | <b>💥 Breakdown:</b> {bdn_lvl}
+🚀 Breakout: {bout_lvl} | 💥 Breakdown: {bdn_lvl}
 
 <b>📋 BIAS REASONING:</b>
 {bias_reasoning}
@@ -5280,18 +5293,16 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x
 📍 {loc_text}
-🟥 R: {res_text} | 🟩 S: {sup_text}
-{pcr_sr_block}
 🔮 GEX: {gex['net_gex']:+.0f}L | Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'} | Mode:{gex['market_mode']}
 📊 PCR×GEX: {result['pcr_gex']['badge']}
 📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
-{_mi_bias_block}{depth_sr_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Analyze ALL data above: signal/score, PCR S/R, Depth S/R (CE+PE bid/ask pressure), GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR, OC bias per strike (incl CE/PE raw bid+ask qty), LTP trap+VWAP, VOB zones, HVP, HTF S&R, delta volume, money flow, OI winding. Give SHORT answers:
+{_mi_bias_block}{vpfr_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR, Strike Analysis ATM±2 (PCR S/R + Depth chart/strike price + Capping OI + Δ/Γ/Θ + BA + CE/PE qty), LTP trap+VWAP, VOB, HVP, delta volume, money flow, OI winding. Give SHORT answers:
 1. Market structure: (1 line — bull/bear/range + key reason)
-2. Strongest wall: (which strike, call/put capping + depth pressure, why)
+2. Strongest wall: (strike, capping OI + depth pressure, why)
 3. Entry: ₹___ | SL: ₹___ | Target: ₹___ | Direction: BUY/SELL</code>"""
 
     # Send image version
