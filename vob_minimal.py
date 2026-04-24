@@ -333,7 +333,7 @@ def render_master_signal_image(result, underlying_price, option_data=None):
         for hv,hx2 in zip(['Label','Strike','Verdict','Score','COI','V','D','G','T','Ask','Bid','IV','DEX/GEX'],hdr_x):
             t(hx2, y-0.017, hv, c=GRAY, sz=6.5, w='bold')
         ry = y - 0.028
-        for off,lbl in [(1,'ATM+1'),(0,'ATM'),(-1,'ATM-1')]:
+        for off,lbl in [(2,'ATM+2'),(1,'ATM+1'),(0,'ATM'),(-1,'ATM-1'),(-2,'ATM-2')]:
             idx = ai + off
             if not (0 <= idx < len(srt)):
                 continue
@@ -2484,7 +2484,7 @@ def get_instrument_capping_analysis(config):
         # --- OI Timeline Trend (ATM ±1 strikes, snapshot-based) ---
         oi_trend_data = {}
         try:
-            for offset, label in [(-config['strike_gap'], 'ATM-1'), (0, 'ATM'), (config['strike_gap'], 'ATM+1')]:
+            for offset, label in [(-2*config['strike_gap'], 'ATM-2'), (-config['strike_gap'], 'ATM-1'), (0, 'ATM'), (config['strike_gap'], 'ATM+1'), (2*config['strike_gap'], 'ATM+2')]:
                 target = atm_strike + offset
                 closest = min(df['strikePrice'], key=lambda x: abs(x - target))
                 row = df[df['strikePrice'] == closest].iloc[0]
@@ -4739,7 +4739,7 @@ BullEng/BearEng=Engulfing BullHar/BearHar=Harami
 EveStar=EveningStar MornStar=MorningStar Spinni=SpinningTop
 SGC=StrongGreen SRC=StrongRed TwTop/TwBot=TweezerTop/Bottom InsBar PinBar
 
-<b>🔬 OC BIAS PER STRIKE (ATM-1 / ATM / ATM+1)</b>
+<b>🔬 OC BIAS PER STRIKE (ATM-2 / ATM-1 / ATM / ATM+1 / ATM+2)</b>
 PCR: &gt;1.2=put heavy(bullish) &lt;0.8=call heavy(bearish)
 COI=ChangeOI V=Volume D=Delta G=Gamma T=Theta
 Ask/Bid=order side bias IV=ImpliedVol DEX=DeltaExposure GEX=GammaExposure
@@ -5109,7 +5109,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 _atm_strike = min(_strikes_sorted, key=lambda s: abs(s - underlying_price))
             _atm_pos = _strikes_sorted.index(_atm_strike) if _atm_strike in _strikes_sorted else -1
             _atm_range = []
-            for _off in [1, 0, -1]:   # ATM+1, ATM, ATM-1 (highest → lowest)
+            for _off in [2, 1, 0, -1, -2]:   # ATM+2 → ATM-2 (highest → lowest)
                 _idx = _atm_pos + _off
                 if 0 <= _idx < len(_strikes_sorted):
                     _atm_range.append(_strikes_sorted[_idx])
@@ -8008,7 +8008,7 @@ def main():
                             if len(_oi_hist_s) >= 3 and _oi_str_s:
                                 _sorted_ss = sorted(_oi_str_s)
                                 _atm_i = len(_sorted_ss) // 2
-                                for _soff, _slbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+                                for _soff, _slbl in [(-2, 'ATM-2'), (-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1'), (2, 'ATM+2')]:
                                     _si2 = _atm_i + _soff
                                     if 0 <= _si2 < len(_sorted_ss):
                                         _sk = str(_sorted_ss[_si2])
@@ -8027,7 +8027,7 @@ def main():
                                 if 'PCR' in _dfs2.columns and 'Strike' in _dfs2.columns and _und2:
                                     _slist2 = sorted(_dfs2['Strike'].unique())
                                     _ai2 = min(range(len(_slist2)), key=lambda i: abs(_slist2[i] - _und2))
-                                    for _soff, _slbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+                                    for _soff, _slbl in [(-2, 'ATM-2'), (-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1'), (2, 'ATM+2')]:
                                         _si2 = _ai2 + _soff
                                         if 0 <= _si2 < len(_slist2):
                                             _row2 = _dfs2[_dfs2['Strike'] == _slist2[_si2]]
@@ -8934,7 +8934,7 @@ def main():
             _pcr_sr_snapshot = []
             _pcr_strike_map = {}
             if oi_trend:
-                for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
+                for _lbl in ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']:
                     td = oi_trend.get(_lbl)
                     if td:
                         _pcr_strike_map[_lbl] = {'strike': td['strike'], 'pcr': td.get('pcr_strike', 1.0)}
@@ -8957,7 +8957,7 @@ def main():
                         _atm_s = float(_dfs.iloc[(_dfs['Strike'] - _und).abs().argsort()].iloc[0]['Strike']) if _und else float(_dfs['Strike'].median())
                         _slist = sorted(_dfs['Strike'].unique())
                         _atm_i = min(range(len(_slist)), key=lambda i: abs(_slist[i] - _atm_s))
-                        for _off, _lbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+                        for _off, _lbl in [(-2, 'ATM-2'), (-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1'), (2, 'ATM+2')]:
                             _si = _atm_i + _off
                             if 0 <= _si < len(_slist):
                                 _row = _dfs[_dfs['Strike'] == _slist[_si]]
@@ -8968,7 +8968,7 @@ def main():
                                     }
                     except Exception:
                         pass
-            for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
+            for _lbl in ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']:
                 _sm = _pcr_strike_map.get(_lbl)
                 if not _sm:
                     continue
@@ -9160,7 +9160,7 @@ def main():
 
                 # ── OI Activity Table ──────────────────────────────────────
                 _oi_rows = []
-                for _lbl in ['ATM-1', 'ATM', 'ATM+1']:
+                for _lbl in ['ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2']:
                     td = oi_trend.get(_lbl)
                     if not td:
                         continue
@@ -9208,7 +9208,7 @@ def main():
         if len(_oi_hist) >= 3 and _oi_strikes:
             _sorted_s = sorted(_oi_strikes)
             _atm_idx  = len(_sorted_s) // 2
-            for _off, _lbl in [(-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1')]:
+            for _off, _lbl in [(-2, 'ATM-2'), (-1, 'ATM-1'), (0, 'ATM'), (1, 'ATM+1'), (2, 'ATM+2')]:
                 _si = _atm_idx + _off
                 if 0 <= _si < len(_sorted_s):
                     _s = str(_sorted_s[_si])
