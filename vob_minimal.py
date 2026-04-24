@@ -4721,58 +4721,62 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
 def generate_ai_context_message():
     """One-time AI context/glossary message to send at start of trading day."""
     return """🤖 <b>AI SIGNAL GUIDE — NIFTY OPTIONS</b>
-(Send once at start of day before pasting signal messages)
+(Send once at day start before pasting signals)
 
 <b>📋 SIGNAL TYPES</b>
-🟥 CALL CAPPING = CE writers blocking price above → SELL zone
+🟥 CALL CAPPING = CE writers capping price above → SELL zone
 🟩 PUT CAPPING = PE writers defending price below → BUY zone
-🔥=volume confirmed | STRONG=high conviction
+🔥=vol confirmed | HiConv=high conviction | Mod=moderate
 Score: -5(strong bear) to +5(strong bull)
 
 <b>🎨 EMOJI:</b> 🟢=Bullish 🔴=Bearish ⚪=Neutral ⚫=No data
 
-<b>🌍 ALIGNMENT:</b> Name:10m|1h|4h|1D|4D|Pattern+dir
+<b>🌍 ALIGNMENT (10m|1h|4h|1D|4D|Pat):</b>
 N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
-REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR=USD/INR
-Candle: NP=NoPattern Ham=Hammer ShStar=ShootingStar
-BullEng/BearEng=Engulfing BullHar/BearHar=Harami
-EveStar=EveningStar MornStar=MorningStar Spinni=SpinningTop
-SGC=StrongGreen SRC=StrongRed TwTop/TwBot=TweezerTop/Bottom InsBar PinBar
+REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
+NP=NoPattern Ham=Hammer ShStar=ShootingStar Spinni=SpinningTop
+SGC=StrongGreen SRC=StrongRed BullEng/BearEng=Engulfing
+BullHar/BearHar=Harami TwTop/TwBot=Tweezer InsBar PinBar
 
-<b>🔬 OC BIAS PER STRIKE (ATM-2 / ATM-1 / ATM / ATM+1 / ATM+2)</b>
-PCR: &gt;1.2=put heavy(bullish) &lt;0.8=call heavy(bearish)
-COI=ChangeOI V=Volume D=Delta G=Gamma T=Theta
-Ask/Bid=order side bias IV=ImpliedVol DEX=DeltaExposure GEX=GammaExposure
-DVP=DeltaVolumeProfile Press=combinedPressure
-BA=net bid-ask (+ve=buyers active -ve=sellers active)
-CE/PE Bid+Ask qty: bigger number = thicker wall = harder to break
-Entry: Bull/Bear=trade direction | Scalp: quick scalp signal
-Move: RealDown/RealUp=genuine | FakeDown/FakeUp=likely reversal
+<b>🔬 STRIKE ANALYSIS (ATM±2) — all data per strike in ONE block:</b>
+Line1: ATM±N ₹Strike | PCR | S/R:₹chartprice(offset) | 🟥/🟩Cap OI | Score
+  PCR &gt;1.2=put heavy(bull) &lt;0.8=call heavy(bear)
+  S/R offset = how many pts from strike price the wall is felt
+  Cap OI = open interest at that strike (HiConv=strong wall Mod=moderate)
 
-<b>📊 DATA BLOCKS</b>
-GEX: +ve=range -ve=trending/accelerating | Flip=gamma flip price (below=bearish above=bullish)
+Line2: 📌Depth R/S ₹chartprice→₹strike(wallQty)
+  ₹chartprice = where pressure ACTUALLY felt (before hitting strike)
+  ₹strike = raw option chain strike | wallQty = combined CE+PE pressure
+  Δ=Delta Γ=Gamma Θ=Theta (Greek exposure biases)
+  COI=ChangeOI V=Volume IV=ImpliedVol Ask/Bid=order side bias
+  BA=bid-ask pressure (+ve=buyers active -ve=sellers dominant)
+  E=Entry(Bull/Bear/NoEnt) Mv=Move(RUp/RDn=real FkUp/FkDn=reversal)
+
+Line3: CE B/A = call bid/ask qty | PE B/A = put bid/ask qty
+  Bigger qty = thicker wall = harder for price to break through
+  COI/OI comparison shows whether strikes are building or unwinding
+
+<b>📊 OTHER BLOCKS</b>
+GEX +ve=range mode -ve=trending | Flip=gamma flip level
 VIDYA: adaptive trend | -ve%=falling +ve%=rising
-PCR S/R: put-call ratio S/R near ATM | offset=diff from strike price
-Depth S/R: live CE+PE order pressure (R=resistance S=support qty=wall thickness)
-VPFR: POC=most traded price | VAH/VAL=value area high/low
-OI Wind: CE/PE build🟢/unwind🔴 | Par=parallel winding (B=bull R=bear)
-Money Flow: POC=highest vol price | bearish/bullish nodes | ⭐=max volume node
-LTP Trap=fake breakout | VWAP=vol weighted avg (below=bearish session context)
-VOB=Volume Order Blocks | HVP=High Volume Price pivots
-HTF S&amp;R=price chart swing highs/lows (15m/1h) | Delta Vol=net buy vs sell pressure
-🌐 OC Bias=live option chain bias per index/stock
+VPFR: POC=most traded | VAH/VAL=value area high/low
+OI Wind: CE/PE build🟢/unwind🔴 | Par=parallel winding
+Money Flow: POC=peak vol price | ⭐=max vol node
+LTP Trap=fake breakout | VWAP=vol avg (below=bear context)
+VOB=Volume Order Blocks | HVP=High Volume Pivots
+🌐 OC Bias=live option chain direction per index/stock
 
-<b>📈 HOW TO READ</b>
-1. Alignment 3+ same direction across 1h+4h+1D = strong bias
-2. GEX negative + VIDYA bearish = trending, do not fade
-3. Price below VWAP = bearish session context
-4. CE Bid &gt;&gt; Ask at resistance = call writers active = wall holds
-5. BA negative + Move=RealDown = confirmed bearish entry
-6. PCR&lt;0.8 ATM+1 = heavy call wall above
-7. CALL CAPPING + GEX negative + align all red = high conviction SELL
-8. PUT CAPPING + GEX positive + align all green = high conviction BUY
-9. Depth S/R qty in K = wall strength (14.8K=strong, 65=weak)
-10. Money Flow POC far above spot = sellers dominated = bearish"""
+<b>📈 10 RULES</b>
+1. Alignment 3+ same across 1h+4h+1D = confirmed trend bias
+2. GEX negative + VIDYA bearish = trending — do NOT fade moves
+3. Price below VWAP = bearish session context for entries
+4. 📌Depth qty &gt;5K = major wall | &lt;500 = weak (breakable)
+5. BA negative + Mv=RDn = confirmed bear entry signal
+6. PCR&lt;0.8 + Γ🔴 at ATM+1 = heavy gamma resistance above
+7. 🟥CAP + GEX neg + all-red alignment = high conviction SELL
+8. 🟩CAP + GEX pos + all-green alignment = high conviction BUY
+9. chartprice &lt; strike in Depth = pressure felt before strike (real wall)
+10. Money Flow POC far above spot = sellers dominated day = bearish"""
 
 
 def compute_depth_sr(df_summary, underlying_price, n=3):
