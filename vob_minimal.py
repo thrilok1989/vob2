@@ -5315,10 +5315,10 @@ def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
     # ── Top-of-page buttons ──
-    _btn_col1, _btn_col2 = st.columns([3, 1])
+    _btn_col1, _btn_col2 = st.columns(2)
     with _btn_col1:
         _top_send_clicked = st.button(
-            "📤 Send to Telegram",
+            "📤 Send Signal to Telegram",
             key="top_send_telegram",
             help="Force-send Master Signal + Option Chain Deep Analysis to Telegram",
             use_container_width=True,
@@ -5328,10 +5328,11 @@ def main():
             st.session_state['_top_send_triggered'] = True
     with _btn_col2:
         _ctx_clicked = st.button(
-            "📚 AI Context",
+            "📚 Send AI Context to Telegram",
             key="send_ai_context",
             help="Send AI glossary/guide to Telegram (once at start of day)",
             use_container_width=True,
+            type="primary",
         )
         if _ctx_clicked:
             try:
