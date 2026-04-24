@@ -3820,27 +3820,32 @@ def fetch_alignment_data(api):
     alignment = {}
     for name, sec_id, seg, inst, yf_symbol in tickers:
         try:
-            # Fetch 1-min candle data (last 1 day)
+            # Fetch 5 days of 1-min data to support 1d and 4d trend computation
             if yf_symbol:
-                data = _fetch_yf_intraday(yf_symbol, interval="1m", period="1d")
+                data = _fetch_yf_intraday(yf_symbol, interval="1m", period="5d")
             else:
-                data = api.get_intraday_data(security_id=sec_id, exchange_segment=seg, instrument=inst, interval="1", days_back=1)
+                data = api.get_intraday_data(security_id=sec_id, exchange_segment=seg, instrument=inst, interval="1", days_back=5)
             if data and 'open' in data:
                 adf = process_candle_data(data, "1")
                 if adf.empty:
                     alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
                                        'candle_dir': 'N/A', 'candles': [],
-                                       'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
+                                       'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A',
+                                       'sentiment_1d': 'N/A', 'sentiment_4d': 'N/A'}
                     continue
 
                 ltp = adf.iloc[-1]['close']
-                # Candle pattern detection (5-min chart)
+                # Candle pattern detection (5-min chart using today's data only)
+                today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
+                adf_today = adf[adf['datetime'].dt.date == today_ist]
+                if adf_today.empty:
+                    adf_today = adf
                 try:
-                    adf_5m = adf.set_index('datetime').resample('5min').agg({
+                    adf_5m = adf_today.set_index('datetime').resample('5min').agg({
                         'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
                     }).dropna().reset_index()
                 except Exception:
-                    adf_5m = adf
+                    adf_5m = adf_today
                 cp = detect_candle_patterns(adf_5m, lookback=5)
 
                 # Multi-timeframe sentiment
@@ -3865,16 +3870,16 @@ def fetch_alignment_data(api):
                 s_1h, pct_1h = calc_sentiment(adf.tail(60))
                 # Last 240 minutes (4 hours)
                 s_4h, pct_4h = calc_sentiment(adf.tail(240))
+                # Last 1 day (~375 trading minutes)
+                s_1d, pct_1d = calc_sentiment(adf.tail(375))
+                # Last 4 days (~1500 trading minutes)
+                s_4d, pct_4d = calc_sentiment(adf.tail(1500))
 
                 # Overall trend from LTP
                 prev_ltp = adf.iloc[-2]['close'] if len(adf) >= 2 else ltp
                 trend = 'Bullish' if ltp > prev_ltp else 'Bearish' if ltp < prev_ltp else 'Flat'
 
                 # % change series from day open for line chart (today only)
-                today_ist = datetime.now(pytz.timezone('Asia/Kolkata')).date()
-                adf_today = adf[adf['datetime'].dt.date == today_ist]
-                if adf_today.empty:
-                    adf_today = adf  # fallback if no today data
                 day_open = adf_today.iloc[0]['open']
                 pct_series_time = adf_today['datetime'].tolist()
                 pct_series_vals = [((c - day_open) / day_open) * 100 if day_open > 0 else 0 for c in adf_today['close'].tolist()]
@@ -3887,19 +3892,23 @@ def fetch_alignment_data(api):
                     'sentiment_10m': s_10m, 'pct_10m': pct_10m,
                     'sentiment_1h': s_1h, 'pct_1h': pct_1h,
                     'sentiment_4h': s_4h, 'pct_4h': pct_4h,
-                    'day_high': adf['high'].max(), 'day_low': adf['low'].min(),
-                    'open': adf.iloc[0]['open'],
+                    'sentiment_1d': s_1d, 'pct_1d': pct_1d,
+                    'sentiment_4d': s_4d, 'pct_4d': pct_4d,
+                    'day_high': adf_today['high'].max(), 'day_low': adf_today['low'].min(),
+                    'open': adf_today.iloc[0]['open'],
                     'pct_series_time': pct_series_time,
                     'pct_series_vals': pct_series_vals,
                 }
             else:
                 alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
                                    'candle_dir': 'N/A', 'candles': [],
-                                   'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
+                                   'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A',
+                                   'sentiment_1d': 'N/A', 'sentiment_4d': 'N/A'}
         except Exception:
             alignment[name] = {'ltp': 0, 'trend': 'Unknown', 'candle_pattern': 'N/A',
                                'candle_dir': 'N/A', 'candles': [],
-                               'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A'}
+                               'sentiment_10m': 'N/A', 'sentiment_1h': 'N/A', 'sentiment_4h': 'N/A',
+                               'sentiment_1d': 'N/A', 'sentiment_4d': 'N/A'}
     return alignment
 
 def fetch_vix_data(api):
@@ -4012,6 +4021,8 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
                 nifty_day_open = df_today.iloc[0]['open']
                 nifty_pct_time = df_today['datetime'].tolist()
                 nifty_pct_vals = [((c - nifty_day_open) / nifty_day_open) * 100 if nifty_day_open > 0 else 0 for c in df_today['close'].tolist()]
+            s1d, p1d = _nifty_sentiment(df.tail(375))
+            s4d, p4d = _nifty_sentiment(df.tail(1500))
             alignment['NIFTY 50'] = {
                 'ltp': df.iloc[-1]['close'], 'trend': nifty_cp['direction'],
                 'candle_pattern': nifty_cp['pattern'], 'candle_dir': nifty_cp['direction'],
@@ -4020,6 +4031,8 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
                 'sentiment_10m': s10, 'pct_10m': p10,
                 'sentiment_1h': s1h, 'pct_1h': p1h,
                 'sentiment_4h': s4h, 'pct_4h': p4h,
+                'sentiment_1d': s1d, 'pct_1d': p1d,
+                'sentiment_4d': s4d, 'pct_4d': p4d,
                 'day_high': df['high'].max(), 'day_low': df['low'].min(),
                 'open': nifty_align_1m.get('open', df.iloc[0]['open']),
                 'pct_series_time': nifty_pct_time,
@@ -4798,6 +4811,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             continue
         e10 = _ae(data.get('sentiment_10m', ''))
         e1h = _ae(data.get('sentiment_1h', ''))
+        e4h = _ae(data.get('sentiment_4h', ''))
+        e1d = _ae(data.get('sentiment_1d', ''))
+        e4d = _ae(data.get('sentiment_4d', ''))
         pat = data.get('candle_pattern', '') or ''
         cdir = data.get('candle_dir', '') or ''
         pat_clean = pat.strip()
@@ -4807,7 +4823,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             p_short = _pat_short.get(pat_clean, pat_clean[:6])
             p_emoji = '🟢' if cdir == 'Bullish' else '🔴' if cdir == 'Bearish' else '⚪'
             pat_str = f"{p_short}{p_emoji}"
-        align_parts.append(f"{_short_names.get(name,name)}:{e10}{e1h}{pat_str}")
+        align_parts.append(f"{_short_names.get(name,name)}:{e10}{e1h}{e4h}{e1d}{e4d}{pat_str}")
     align_text = "  " + "  ".join(align_parts) if align_parts else "  Data unavailable"
 
     # Location
@@ -5147,14 +5163,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📊 PCR×GEX: {result['pcr_gex']['badge']}
 📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
-🌍 <b>Alignment:</b> {align_text}
+🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
+{align_text}
 {_mi_bias_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Based on the above Nifty options signal data, answer:
-1. What is the ideal entry point and entry condition?
-2. Where will price NOT go in the next 10 minutes? Identify the strongest call capping or put capping wall price cannot break — enter only near that wall.
-3. How will price move in the next 10 minutes — up, down, or sideways? By how many points?
-4. Give exact entry price, stop-loss (just beyond the wall), and target.
-Give a short, actionable answer.</code>"""
+🤖 <code>Analyze ALL data above: signal/score, PCR S/R levels, GEX (flip/mode), VIX+VIDYA, OI ATM activity, multi-TF alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR (POC/VAH/VAL), OC bias per strike (COI/DVP/Press/Entry/Scalp/Move), LTP trap+VWAP, VOB zones, HVP, HTF S&R pivots, delta volume trend, money flow (POC/value area/sentiment nodes), OI winding/unwinding. Then answer:
+1. What does the combined index+stock alignment and money flow say about market structure?
+2. Which is the strongest wall (call capping or put capping) price cannot break in 10 min?
+3. Ideal entry price, condition, stop-loss (just beyond the wall), and target.</code>"""
 
     # Send image version
     try:
@@ -8288,12 +8303,16 @@ def main():
                             s10 = ad.get('sentiment_10m', 'N/A')
                             s1h = ad.get('sentiment_1h', 'N/A')
                             s4h = ad.get('sentiment_4h', 'N/A')
+                            s1d = ad.get('sentiment_1d', 'N/A')
+                            s4d = ad.get('sentiment_4d', 'N/A')
                             sent_rows.append({
                                 'Index': name,
                                 'LTP': f"₹{ad['ltp']:.2f}" if ad.get('ltp', 0) > 0 else 'N/A',
                                 '10 Min': f"{_sent_emoji(s10)} {s10} ({ad.get('pct_10m', 0):+.2f}%)" if s10 != 'N/A' else 'N/A',
                                 '1 Hour': f"{_sent_emoji(s1h)} {s1h} ({ad.get('pct_1h', 0):+.2f}%)" if s1h != 'N/A' else 'N/A',
                                 '4 Hours': f"{_sent_emoji(s4h)} {s4h} ({ad.get('pct_4h', 0):+.2f}%)" if s4h != 'N/A' else 'N/A',
+                                '1 Day': f"{_sent_emoji(s1d)} {s1d} ({ad.get('pct_1d', 0):+.2f}%)" if s1d != 'N/A' else 'N/A',
+                                '4 Days': f"{_sent_emoji(s4d)} {s4d} ({ad.get('pct_4d', 0):+.2f}%)" if s4d != 'N/A' else 'N/A',
                                 'Trend': ad.get('trend', 'N/A'),
                             })
                         if sent_rows:
@@ -8314,7 +8333,7 @@ def main():
                         bull_1h = sum(1 for v in non_vix_align.values() if v.get('sentiment_1h') == 'Bullish')
                         bear_1h = sum(1 for v in non_vix_align.values() if v.get('sentiment_1h') == 'Bearish')
                         total_idx = len(non_vix_align)
-                        sum_col1, sum_col2, sum_col3 = st.columns(3)
+                        sum_col1, sum_col2, sum_col3, sum_col4, sum_col5 = st.columns(5)
                         with sum_col1:
                             if bull_10m > bear_10m:
                                 st.success(f"10m: Bullish ({bull_10m}/{total_idx})")
@@ -8338,6 +8357,24 @@ def main():
                                 st.error(f"4h: Bearish ({bear_4h}/{total_idx})")
                             else:
                                 st.warning(f"4h: Mixed ({bull_4h}B/{bear_4h}R)")
+                        with sum_col4:
+                            bull_1d = sum(1 for v in non_vix_align.values() if v.get('sentiment_1d') == 'Bullish')
+                            bear_1d = sum(1 for v in non_vix_align.values() if v.get('sentiment_1d') == 'Bearish')
+                            if bull_1d > bear_1d:
+                                st.success(f"1D: Bullish ({bull_1d}/{total_idx})")
+                            elif bear_1d > bull_1d:
+                                st.error(f"1D: Bearish ({bear_1d}/{total_idx})")
+                            else:
+                                st.warning(f"1D: Mixed ({bull_1d}B/{bear_1d}R)")
+                        with sum_col5:
+                            bull_4d = sum(1 for v in non_vix_align.values() if v.get('sentiment_4d') == 'Bullish')
+                            bear_4d = sum(1 for v in non_vix_align.values() if v.get('sentiment_4d') == 'Bearish')
+                            if bull_4d > bear_4d:
+                                st.success(f"4D: Bullish ({bull_4d}/{total_idx})")
+                            elif bear_4d > bull_4d:
+                                st.error(f"4D: Bearish ({bear_4d}/{total_idx})")
+                            else:
+                                st.warning(f"4D: Mixed ({bull_4d}B/{bear_4d}R)")
                         # === % Change from Open - Line Chart ===
                         st.markdown("### 📈 Price Action - % Change from Open (Today)")
                         fig_pct = go.Figure()
