@@ -4759,7 +4759,12 @@ Line3: CE B/A = call bid/ask qty | PE B/A = put bid/ask qty
 <b>📊 OTHER BLOCKS</b>
 GEX +ve=range mode -ve=trending | Flip=gamma flip level
 VIDYA: adaptive trend | -ve%=falling +ve%=rising
-VPFR: POC=most traded | VAH/VAL=value area high/low
+VPFR: POC=most traded | VAH/VAL=value area high/low (3 timeframes)
+📍 Triple POC: P1(10bar) P2(25bar) P3(70bar) — price magnet levels
+  Multiple POCs clustered = strong S/R confluence
+🌀 Future Swing: SwH=last swing high SwL=last swing low
+  →Target=projected next swing level based on avg historical swing %
+  Direction=current swing bias (bull/bear) | sign+/-=up/down projection
 OI Wind: CE/PE build🟢/unwind🔴 | Par=parallel winding
 Money Flow: POC=peak vol price | ⭐=max vol node
 LTP Trap=fake breakout | VWAP=vol avg (below=bear context)
@@ -4961,7 +4966,39 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         unwind_block = ""
 
-    # Price Action block: VIDYA (detailed), LTP Trap, VOB zones, HVP, HTF S&R, Delta Vol
+    # Triple POC + Future Swing Analysis block
+    poc_swing_block = ""
+    try:
+        _poc = st.session_state.get('_poc_data') or {}
+        _sw  = st.session_state.get('_swing_data') or {}
+        _poc_parts = []
+        for _pk, _plabel in [('poc1', 'P1(10)'), ('poc2', 'P2(25)'), ('poc3', 'P3(70)')]:
+            _p = _poc.get(_pk)
+            if _p and _p.get('poc'):
+                _poc_parts.append(f"{_plabel}₹{_p['poc']:.0f}")
+        _proj = _sw.get('projection')
+        _swings = _sw.get('swings', {}) or {}
+        _lh = _swings.get('last_swing_high')
+        _ll = _swings.get('last_swing_low')
+        _sw_dir = _swings.get('direction', '')
+        _sw_emoji = '🔴' if _sw_dir == 'bearish' else '🟢' if _sw_dir == 'bullish' else '⚪'
+        _swing_parts = []
+        if _lh:
+            _swing_parts.append(f"SwH₹{_lh['value']:.0f}")
+        if _ll:
+            _swing_parts.append(f"SwL₹{_ll['value']:.0f}")
+        if _proj:
+            _swing_parts.append(
+                f"→Target₹{_proj['target']:.0f}({_proj['sign']}{_proj['swing_pct']:.1f}%)"
+            )
+        if _poc_parts or _swing_parts:
+            poc_swing_block = "\n<b>📍 Triple POC:</b> " + " | ".join(_poc_parts) + "\n"
+            if _swing_parts:
+                poc_swing_block += f"<b>🌀 Future Swing:</b> {_sw_emoji}{_sw_dir.capitalize()} | " + " | ".join(_swing_parts) + "\n"
+    except Exception:
+        poc_swing_block = ""
+
+    # Price Action block: LTP Trap, VOB zones, HVP, Delta Vol
     price_action_block = ""
     try:
         vidya = result.get('vidya', {}) or {}
@@ -5305,8 +5342,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
-{_mi_bias_block}{vpfr_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR, Strike Analysis ATM±2 (PCR S/R + Depth chart/strike price + Capping OI + Δ/Γ/Θ + BA + CE/PE qty), LTP trap+VWAP, VOB, HVP, delta volume, money flow, OI winding. Give SHORT answers:
+{_mi_bias_block}{vpfr_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR, Triple POC (P1/P2/P3), Future Swing target, Strike Analysis ATM±2 (PCR S/R + Depth chart/strike price + Capping OI + Δ/Γ/Θ + BA + CE/PE vol/qty), LTP trap+VWAP, VOB, HVP, delta volume, money flow, OI winding. Give SHORT answers:
 1. Market structure: (1 line — bull/bear/range + key reason)
 2. Strongest wall: (strike, capping OI + depth pressure, why)
 3. Entry: ₹___ | SL: ₹___ | Target: ₹___ | Direction: BUY/SELL</code>"""
@@ -5665,6 +5702,9 @@ def main():
                 swing_data_for_chart = swing_calculator.analyze(df)
             except Exception:
                 swing_data_for_chart = None
+        # Store for Telegram message access
+        st.session_state['_poc_data'] = poc_data_for_chart
+        st.session_state['_swing_data'] = swing_data_for_chart
         # Persist detected patterns (VOB, POC, Swing) to Supabase
         try:
             patterns_to_store = []
