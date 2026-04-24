@@ -5166,11 +5166,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}{vpfr_block}{oc_bias_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Analyze ALL the above data — Nifty options signal, PCR S/R levels, GEX, VIX, OI unwinding, VPFR, money flow, option chain bias, AND the multi-timeframe alignment of N50/SENSEX/BANKNIFTY/NIFTY IT/RELIANCE/ICICIBANK/GOLD/CRUDE/INR across 10m|1h|4h|1D|4D. Then answer:
-1. What is the market structure right now based on index and stock alignment?
-2. Where will price NOT go in the next 10 minutes? Which call capping or put capping wall is strongest?
-3. What is the ideal entry point, condition, stop-loss and target?
-Give a short, actionable answer.</code>"""
+🤖 <code>Analyze ALL data above: signal/score, PCR S/R levels, GEX (flip/mode), VIX+VIDYA, OI ATM activity, multi-TF alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR (POC/VAH/VAL), OC bias per strike (COI/DVP/Press/Entry/Scalp/Move), LTP trap+VWAP, VOB zones, HVP, HTF S&R pivots, delta volume trend, money flow (POC/value area/sentiment nodes), OI winding/unwinding. Then answer:
+1. What does the combined index+stock alignment and money flow say about market structure?
+2. Which is the strongest wall (call capping or put capping) price cannot break in 10 min?
+3. Ideal entry price, condition, stop-loss (just beyond the wall), and target.</code>"""
 
     # Send image version
     try:
