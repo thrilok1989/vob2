@@ -5556,7 +5556,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + VPFR confluence (POC/VAH/VAL) + Money Flow Profile POC alignment + why
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
-4. Entry: ₹___ | SL: ₹___ | Target: ₹___ | BUY/SELL</code>"""
+4. Entry: ₹___ (at ceiling for SELL / at floor for BUY — where price stalls at the wall) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL</code>"""
 
     # Send image version
     try:
