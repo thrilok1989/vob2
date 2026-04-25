@@ -5677,8 +5677,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
-    # Part 1 — core signal (always short, always fits)
-    message = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
+    # Part 1 — core signal
+    msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x
@@ -5688,7 +5688,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
-{align_text}
+{align_text}"""
+
+    # Part 2 — detailed blocks + AI prompt
+    msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
 {_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, Money Flow Profile, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
@@ -5703,6 +5706,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
    T1: ₹___ | T2: ₹___ | T3: ₹___
    If SL breaks and holds: next wall ₹___</code>"""
 
+    message = msg_part1  # used for Gemini analysis context
+
     # Send image version
     try:
         _img_bytes = render_master_signal_image(result, underlying_price, option_data)
@@ -5710,11 +5715,15 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception as _img_err:
         st.warning(f"Signal image error: {_img_err}")
 
-    # Send single combined message
+    # Send Part 1 then Part 2
     try:
-        send_telegram_message_sync(message, force=force)
+        send_telegram_message_sync(msg_part1, force=force)
     except Exception as _txt_err:
-        st.warning(f"Telegram text send error: {_txt_err}")
+        st.warning(f"Telegram Part 1 send error: {_txt_err}")
+    try:
+        send_telegram_message_sync(msg_part2, force=force)
+    except Exception as _txt_err:
+        st.warning(f"Telegram Part 2 send error: {_txt_err}")
 
     # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
