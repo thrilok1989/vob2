@@ -5001,8 +5001,18 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         _rollover_flag = ""
         try:
             if _expiry_str:
-                _exp_dt = datetime.strptime(str(_expiry_str).strip(), '%d-%b-%Y')
-                _dte = (_exp_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days
+                _exp_str = str(_expiry_str).strip()
+                # API stores expiry as YYYY-MM-DD; try both formats
+                for _fmt in ('%Y-%m-%d', '%d-%b-%Y', '%Y/%m/%d'):
+                    try:
+                        _exp_dt = datetime.strptime(_exp_str, _fmt)
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    _exp_dt = None
+                if _exp_dt:
+                    _dte = (_exp_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days
                 if _dte <= 5:
                     _rollover_flag = " ⚠️Rollover"
         except Exception:
