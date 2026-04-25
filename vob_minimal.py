@@ -124,6 +124,13 @@ def send_telegram_message_sync(message, force=False):
         if _now.weekday() >= 5 or not (_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _now <= _now.replace(hour=15, minute=45, second=0, microsecond=0)):
             return
 
+    # Global rate limit: no two messages sent less than 2 seconds apart
+    _last_tg = getattr(st.session_state, '_last_tg_send_time', None)
+    _now_tg = datetime.now(pytz.timezone('Asia/Kolkata'))
+    if _last_tg and (_now_tg - _last_tg).total_seconds() < 2:
+        import time as _time; _time.sleep(2)
+    st.session_state._last_tg_send_time = datetime.now(pytz.timezone('Asia/Kolkata'))
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -4724,6 +4731,7 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
 def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
     """Fire when a bullish candle forms at support or bearish candle forms at resistance.
     Independent of score — fires on pattern+location match alone. Cooldown 10 min per level."""
+    def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
     direction = candle.get('direction', '')
     pattern = candle.get('pattern', 'No Pattern')
     if direction not in ('Bullish', 'Bearish') or pattern in ('No Pattern', 'N/A', ''):
@@ -4757,15 +4765,12 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             msg = (
                 f"🕯 <b>BULLISH CANDLE AT SUPPORT</b>\n"
                 f"🕐 {time_str}\n"
-                f"Pattern: <b>{pattern}</b> (Bullish) @ ₹{underlying_price:.0f}\n"
-                f"📍 Near {src} Support {lbl} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
+                f"Pattern: <b>{_e(pattern)}</b> (Bullish) @ ₹{underlying_price:.0f}\n"
+                f"📍 Near {_e(src)} Support {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
                 f"📌 Watch for bounce / BUY setup"
             )
-            try:
-                send_telegram_message_sync(msg, force=True)
-                alerted[key] = now
-            except Exception:
-                pass
+            send_telegram_message_sync(msg, force=True)
+            alerted[key] = now
     elif direction == 'Bearish':
         for src, lbl, level in candidate_resistances:
             if abs(underlying_price - level) > proximity_pts:
@@ -4777,19 +4782,17 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             msg = (
                 f"🕯 <b>BEARISH CANDLE AT RESISTANCE</b>\n"
                 f"🕐 {time_str}\n"
-                f"Pattern: <b>{pattern}</b> (Bearish) @ ₹{underlying_price:.0f}\n"
-                f"📍 Near {src} Resistance {lbl} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
+                f"Pattern: <b>{_e(pattern)}</b> (Bearish) @ ₹{underlying_price:.0f}\n"
+                f"📍 Near {_e(src)} Resistance {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
                 f"📌 Watch for rejection / SELL setup"
             )
-            try:
-                send_telegram_message_sync(msg, force=True)
-                alerted[key] = now
-            except Exception:
-                pass
+            send_telegram_message_sync(msg, force=True)
+            alerted[key] = now
 
 
 def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
     """Fire when sudden call capping or put support is detected at S/R. Cooldown 5 min per strike."""
+    def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
     if sa_result is None:
         return
     adf = sa_result.get('analysis_df')
@@ -4819,14 +4822,11 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 f"🟥 <b>CALL CAPPING AT RESISTANCE</b> {vol_tag}\n"
                 f"🕐 {time_str}\n"
                 f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
-                f"CE OI: {oi_l:.1f}L | Class: {r.get('Call_Class','')}\n"
+                f"CE OI: {oi_l:.1f}L | Class: {_e(r.get('Call_Class',''))}\n"
                 f"📌 CE writers capping here — watch for reversal / SELL setup"
             )
-            try:
-                send_telegram_message_sync(msg, force=True)
-                alerted[key] = now
-            except Exception:
-                pass
+            send_telegram_message_sync(msg, force=True)
+            alerted[key] = now
     except Exception:
         pass
 
@@ -4850,14 +4850,11 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 f"🟩 <b>PUT SUPPORT AT SUPPORT</b> {vol_tag}\n"
                 f"🕐 {time_str}\n"
                 f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
-                f"PE OI: {oi_l:.1f}L | Class: {r.get('Put_Class','')}\n"
+                f"PE OI: {oi_l:.1f}L | Class: {_e(r.get('Put_Class',''))}\n"
                 f"📌 PE writers defending here — watch for bounce / BUY setup"
             )
-            try:
-                send_telegram_message_sync(msg, force=True)
-                alerted[key] = now
-            except Exception:
-                pass
+            send_telegram_message_sync(msg, force=True)
+            alerted[key] = now
     except Exception:
         pass
 
