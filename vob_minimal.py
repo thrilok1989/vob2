@@ -5171,18 +5171,28 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             hvp_lines.append(f"  🔴 HVP Res ₹{h.get('price', 0):.0f} | Vol: {int(h.get('volume', 0)):,}")
         hvp_text = "\n".join(hvp_lines) if hvp_lines else "  No HVP detected"
 
-        price_action_block = f"""
-<b>🔄 LTP Trap:</b>
-{ltp_line}
+        # VOB — top 1 bull + top 1 bear inline
+        vob_parts = []
+        for b in sorted((vob_b.get('bullish') or []), key=lambda x: -(x.get('volume', 0)))[:1]:
+            vob_parts.append(f"🟢₹{b.get('lower', 0):.0f}-{b.get('upper', 0):.0f}")
+        for b in sorted((vob_b.get('bearish') or []), key=lambda x: -(x.get('volume', 0)))[:1]:
+            vob_parts.append(f"🔴₹{b.get('lower', 0):.0f}-{b.get('upper', 0):.0f}")
+        vob_inline = " ".join(vob_parts) if vob_parts else "—"
 
-<b>🟢🔴 VOB Zones:</b>
-{vob_text}
+        # HVP inline — top 1 each, skip if empty
+        hvp_parts = []
+        for h in (hvp_d.get('bullish_hvp') or [])[-1:]:
+            hvp_parts.append(f"🟢₹{h.get('price', 0):.0f}")
+        for h in (hvp_d.get('bearish_hvp') or [])[-1:]:
+            hvp_parts.append(f"🔴₹{h.get('price', 0):.0f}")
+        hvp_inline = " ".join(hvp_parts) if hvp_parts else "—"
 
-<b>🟢🔴 HVP (High Volume Pivots):</b>
-{hvp_text}
-
-<b>📊 Delta Volume Trend:</b> {delta_trend_d}
-"""
+        _vwap_val = ltp_trap_d.get('vwap', 0)
+        _vwap_pos = ltp_trap_d.get('price_vs_vwap', 'N/A')
+        price_action_block = (
+            f"\n🔄 VWAP:₹{_vwap_val:.0f}({_vwap_pos}) | LTP:{trap_label} | "
+            f"VOB:{vob_inline} | ΔVol:{delta_trend_d} | HVP:{hvp_inline}\n"
+        )
     except Exception:
         price_action_block = ""
 
@@ -5203,20 +5213,23 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                     f"  {s_emoji} ₹{r['bin_low']:.0f}-₹{r['bin_high']:.0f} | "
                     f"{sent} ({r.get('sentiment_strength', 0):.0f}%) | Vol:{r['volume_pct']:.1f}%{poc_tag}"
                 )
-            hn_text = "\n".join(hn_lines) if hn_lines else "  No high-volume nodes"
             poc_price = mf.get('poc_price', 0)
             vah = mf.get('value_area_high', 0)
             val = mf.get('value_area_low', 0)
             hi_sent_price = mf.get('highest_sentiment_price', 0)
             hi_sent_dir = mf.get('highest_sentiment_direction', 'Neutral')
             hi_sent_emoji = '🟢' if hi_sent_dir == 'Bullish' else '🔴' if hi_sent_dir == 'Bearish' else '⚪'
-            mf_block = f"""
-<b>💰 MONEY FLOW PROFILE:</b>
-  POC: ₹{poc_price:.0f} | Value Area: ₹{val:.0f}-₹{vah:.0f}
-  Strongest Sentiment: {hi_sent_emoji} ₹{hi_sent_price:.0f} ({hi_sent_dir})
-  <b>High Volume Nodes:</b>
-{hn_text}
-"""
+            # Top 3 nodes inline: emoji+range(vol%)+⭐
+            node_parts = []
+            for r in top_nodes[:3]:
+                s_e = '🟢' if r.get('sentiment') == 'Bullish' else '🔴' if r.get('sentiment') == 'Bearish' else '⚪'
+                poc_tag = '⭐' if r.get('is_poc') else ''
+                node_parts.append(f"{s_e}₹{r['bin_low']:.0f}({r['volume_pct']:.0f}%){poc_tag}")
+            nodes_inline = " ".join(node_parts) if node_parts else "—"
+            mf_block = (
+                f"\n💰 MF: POC₹{poc_price:.0f} VA₹{val:.0f}-₹{vah:.0f} "
+                f"Strong:{hi_sent_emoji}₹{hi_sent_price:.0f} | {nodes_inline}\n"
+            )
     except Exception:
         mf_block = ""
 
@@ -5529,11 +5542,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock capping bias (📡 block: R/S levels + 10m|1h|4h price action per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC (P1/P2/P3), Future Swing target, Strike Analysis ATM±2 (PCR S/R + Depth chart/strike price + Capping OI + Δ/Γ/Θ + BA + CE/PE vol/qty), LTP trap+VWAP, VOB, HVP, delta volume, money flow, OI winding. Give SHORT answers:
-1. Market structure: (1 line — bull/bear/range + key reason)
-2. Strongest wall: (strike, capping OI + depth pressure, why)
-3. Index/Stocks: (per instrument — price action 10m|1h|4h bias + at Cap/Sup/Range based on capping)
-4. Entry: ₹___ | SL: ₹___ | Target: ₹___ | Direction: BUY/SELL</code>"""
+🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
+1. Market structure: bull/bear/range + reason
+2. Strongest wall: strike + OI + why
+3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
+4. Entry: ₹___ | SL: ₹___ | Target: ₹___ | BUY/SELL</code>"""
 
     # Send image version
     try:
