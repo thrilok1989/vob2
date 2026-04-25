@@ -5171,18 +5171,28 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             hvp_lines.append(f"  🔴 HVP Res ₹{h.get('price', 0):.0f} | Vol: {int(h.get('volume', 0)):,}")
         hvp_text = "\n".join(hvp_lines) if hvp_lines else "  No HVP detected"
 
-        price_action_block = f"""
-<b>🔄 LTP Trap:</b>
-{ltp_line}
+        # VOB — top 1 bull + top 1 bear inline
+        vob_parts = []
+        for b in sorted((vob_b.get('bullish') or []), key=lambda x: -(x.get('volume', 0)))[:1]:
+            vob_parts.append(f"🟢₹{b.get('lower', 0):.0f}-{b.get('upper', 0):.0f}")
+        for b in sorted((vob_b.get('bearish') or []), key=lambda x: -(x.get('volume', 0)))[:1]:
+            vob_parts.append(f"🔴₹{b.get('lower', 0):.0f}-{b.get('upper', 0):.0f}")
+        vob_inline = " ".join(vob_parts) if vob_parts else "—"
 
-<b>🟢🔴 VOB Zones:</b>
-{vob_text}
+        # HVP inline — top 1 each, skip if empty
+        hvp_parts = []
+        for h in (hvp_d.get('bullish_hvp') or [])[-1:]:
+            hvp_parts.append(f"🟢₹{h.get('price', 0):.0f}")
+        for h in (hvp_d.get('bearish_hvp') or [])[-1:]:
+            hvp_parts.append(f"🔴₹{h.get('price', 0):.0f}")
+        hvp_inline = " ".join(hvp_parts) if hvp_parts else "—"
 
-<b>🟢🔴 HVP (High Volume Pivots):</b>
-{hvp_text}
-
-<b>📊 Delta Volume Trend:</b> {delta_trend_d}
-"""
+        _vwap_val = ltp_trap_d.get('vwap', 0)
+        _vwap_pos = ltp_trap_d.get('price_vs_vwap', 'N/A')
+        price_action_block = (
+            f"\n🔄 VWAP:₹{_vwap_val:.0f}({_vwap_pos}) | LTP:{trap_label} | "
+            f"VOB:{vob_inline} | ΔVol:{delta_trend_d} | HVP:{hvp_inline}\n"
+        )
     except Exception:
         price_action_block = ""
 
