@@ -4728,8 +4728,10 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
         try:
             send_telegram_message_sync(msg, force=True)
             alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
+            return True
         except Exception:
             pass
+    return False
 
 
 def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
@@ -4775,6 +4777,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             )
             send_telegram_message_sync(msg, force=True)
             alerted[key] = now
+            return True
     elif direction == 'Bearish':
         for src, lbl, level in candidate_resistances:
             if abs(underlying_price - level) > proximity_pts:
@@ -4792,6 +4795,8 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             )
             send_telegram_message_sync(msg, force=True)
             alerted[key] = now
+            return True
+    return False
 
 
 def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
@@ -4831,6 +4836,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
             )
             send_telegram_message_sync(msg, force=True)
             alerted[key] = now
+            return True
     except Exception:
         pass
 
@@ -4859,8 +4865,10 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
             )
             send_telegram_message_sync(msg, force=True)
             alerted[key] = now
+            return True
     except Exception:
         pass
+    return False
 
 
 def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
@@ -8748,50 +8756,46 @@ def main():
                     except Exception:
                         pass
 
-                    # PCR S/R proximity alert (every refresh cycle)
+                    # All S/R alerts — each sends its short message then Part 1 + Part 2
+                    _sa_c  = getattr(st.session_state, '_sa_result', None)
+                    _pcr_s = getattr(st.session_state, '_pcr_sr_snapshot', [])
+                    _df5m_c = getattr(st.session_state, '_df_5m', None)
+
+                    def _follow_with_full_signal():
+                        send_master_signal_telegram(master, option_data['underlying'], option_data, force=True, skip_image=True)
+
+                    # PCR S/R proximity alert
                     try:
-                        check_pcr_sr_proximity_alert(option_data['underlying'])
+                        if check_pcr_sr_proximity_alert(option_data['underlying']):
+                            _follow_with_full_signal()
                     except Exception:
                         pass
 
-                    # Candle pattern at S/R alert (every refresh cycle)
+                    # Candle pattern at S/R alert
                     try:
-                        _pcr_snap_c = getattr(st.session_state, '_pcr_sr_snapshot', [])
-                        send_candle_at_sr_alert(
-                            master['candle'],
-                            option_data['underlying'],
-                            _pcr_snap_c,
-                            master.get('support_levels', []),
-                            master.get('resistance_levels', []),
-                        )
+                        if send_candle_at_sr_alert(
+                            master['candle'], option_data['underlying'],
+                            _pcr_s, master.get('support_levels', []), master.get('resistance_levels', []),
+                        ):
+                            _follow_with_full_signal()
                     except Exception:
                         pass
 
-                    # Sudden capping at S/R alert (every refresh cycle)
+                    # Capping at S/R alert
                     try:
-                        _sa_c = getattr(st.session_state, '_sa_result', None)
-                        if _sa_c is not None:
-                            send_capping_at_sr_alert(_sa_c, option_data['underlying'])
+                        if _sa_c is not None and send_capping_at_sr_alert(_sa_c, option_data['underlying']):
+                            _follow_with_full_signal()
                     except Exception:
                         pass
 
-                    # Rejection at strongest ceiling / bounce at strongest floor
-                    # If confirmed, also send the full master signal (Part 1 + Part 2 + AI prompt)
+                    # Rejection / bounce at strongest wall
                     try:
-                        _sa_c = getattr(st.session_state, '_sa_result', None)
-                        _pcr_snap_c = getattr(st.session_state, '_pcr_sr_snapshot', [])
-                        _df5m_c = getattr(st.session_state, '_df_5m', None)
-                        _rej_fired = send_rejection_alert(
-                            master['candle'],
-                            option_data['underlying'],
-                            _df5m_c,
-                            _sa_c,
-                            _pcr_snap_c,
-                            master.get('support_levels', []),
-                            master.get('resistance_levels', []),
-                        )
-                        if _rej_fired:
-                            send_master_signal_telegram(master, option_data['underlying'], option_data, force=True, skip_image=True)
+                        if send_rejection_alert(
+                            master['candle'], option_data['underlying'],
+                            _df5m_c, _sa_c, _pcr_s,
+                            master.get('support_levels', []), master.get('resistance_levels', []),
+                        ):
+                            _follow_with_full_signal()
                     except Exception:
                         pass
 
