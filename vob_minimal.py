@@ -5237,7 +5237,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 node_parts.append(f"{s_e}₹{r['bin_low']:.0f}({r['volume_pct']:.0f}%){poc_tag}")
             nodes_inline = " ".join(node_parts) if node_parts else "—"
             mf_block = (
-                f"\n💰 MF: POC₹{poc_price:.0f} VA₹{val:.0f}-₹{vah:.0f} "
+                f"\n💰 Money Flow Profile: POC₹{poc_price:.0f} VA₹{val:.0f}-₹{vah:.0f} "
                 f"Strong:{hi_sent_emoji}₹{hi_sent_price:.0f} | {nodes_inline}\n"
             )
     except Exception:
