@@ -4669,7 +4669,7 @@ def compute_unwinding_summary(df_atm8):
         'verdict': verdict,
     }
 
-def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
+def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=10):
     """Fire a Telegram alert when spot is within proximity_pts of any PCR S/R level.
     Uses the same _pcr_sr_snapshot stored by the UI — identical data to what's displayed."""
     snapshot = getattr(st.session_state, '_pcr_sr_snapshot', [])
@@ -4685,8 +4685,8 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
         level = _s['level']
         dist = abs(underlying_price - level)
         if dist > proximity_pts:
-            # Reset alert when price moves away (>15 pts buffer)
-            if dist > 15:
+            # Reset alert when price moves away (>20 pts buffer)
+            if dist > 20:
                 alerted.pop(label, None)
             continue
         # Already alerted this level recently?
@@ -4700,7 +4700,7 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
             msg = (
                 f"⚠️ <b>PCR RESISTANCE ALERT</b> ⚠️\n"
                 f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
-                f"Spot ₹{underlying_price:.0f} entered ±5 pts zone of\n"
+                f"Spot ₹{underlying_price:.0f} entered ±{proximity_pts} pts zone of\n"
                 f"🔴 <b>{label} PCR Resistance ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
                 f"Zone: {zone_low} – {zone_high}\n"
                 f"Price likely to <b>stall / reverse here</b>. Watch for rejection."
@@ -4709,7 +4709,7 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
             msg = (
                 f"⚠️ <b>PCR SUPPORT ALERT</b> ⚠️\n"
                 f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
-                f"Spot ₹{underlying_price:.0f} entered ±5 pts zone of\n"
+                f"Spot ₹{underlying_price:.0f} entered ±{proximity_pts} pts zone of\n"
                 f"🟢 <b>{label} PCR Support ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
                 f"Zone: {zone_low} – {zone_high}\n"
                 f"Price likely to <b>hold / bounce here</b>. Watch for reversal."
@@ -4719,6 +4719,147 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
             alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
         except Exception:
             pass
+
+
+def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
+    """Fire when a bullish candle forms at support or bearish candle forms at resistance.
+    Independent of score — fires on pattern+location match alone. Cooldown 10 min per level."""
+    direction = candle.get('direction', '')
+    pattern = candle.get('pattern', 'No Pattern')
+    if direction not in ('Bullish', 'Bearish') or pattern in ('No Pattern', 'N/A', ''):
+        return
+    alerted = st.session_state.setdefault('_candle_sr_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+
+    # Build candidate levels: PCR S/R + OC levels
+    candidate_supports = []
+    candidate_resistances = []
+    for s in (pcr_sr_snapshot or []):
+        sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+        if sr_clean == 'Support':
+            candidate_supports.append(('PCR', s['label'], s['level']))
+        elif sr_clean == 'Resistance':
+            candidate_resistances.append(('PCR', s['label'], s['level']))
+    for lvl in (support_levels or []):
+        candidate_supports.append(('OC', f"₹{lvl:.0f}", lvl))
+    for lvl in (resistance_levels or []):
+        candidate_resistances.append(('OC', f"₹{lvl:.0f}", lvl))
+
+    time_str = now.strftime('%H:%M:%S IST')
+    if direction == 'Bullish':
+        for src, lbl, level in candidate_supports:
+            if abs(underlying_price - level) > proximity_pts:
+                continue
+            key = f"candle_bull_{level:.0f}"
+            last = alerted.get(key)
+            if last and (now - last).total_seconds() < 600:
+                continue
+            msg = (
+                f"🕯 <b>BULLISH CANDLE AT SUPPORT</b>\n"
+                f"🕐 {time_str}\n"
+                f"Pattern: <b>{pattern}</b> (Bullish) @ ₹{underlying_price:.0f}\n"
+                f"📍 Near {src} Support {lbl} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
+                f"📌 Watch for bounce / BUY setup"
+            )
+            try:
+                send_telegram_message_sync(msg, force=True)
+                alerted[key] = now
+            except Exception:
+                pass
+    elif direction == 'Bearish':
+        for src, lbl, level in candidate_resistances:
+            if abs(underlying_price - level) > proximity_pts:
+                continue
+            key = f"candle_bear_{level:.0f}"
+            last = alerted.get(key)
+            if last and (now - last).total_seconds() < 600:
+                continue
+            msg = (
+                f"🕯 <b>BEARISH CANDLE AT RESISTANCE</b>\n"
+                f"🕐 {time_str}\n"
+                f"Pattern: <b>{pattern}</b> (Bearish) @ ₹{underlying_price:.0f}\n"
+                f"📍 Near {src} Resistance {lbl} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
+                f"📌 Watch for rejection / SELL setup"
+            )
+            try:
+                send_telegram_message_sync(msg, force=True)
+                alerted[key] = now
+            except Exception:
+                pass
+
+
+def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=30):
+    """Fire when sudden call capping or put support is detected at S/R. Cooldown 5 min per strike."""
+    if sa_result is None:
+        return
+    adf = sa_result.get('analysis_df')
+    if adf is None:
+        return
+    alerted = st.session_state.setdefault('_capping_sr_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+
+    # Call capping (resistance)
+    try:
+        cap_rows = adf[
+            adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance']) &
+            adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)'])
+        ]
+        for _, r in cap_rows.iterrows():
+            strike = float(r['Strike'])
+            if abs(underlying_price - strike) > proximity_pts:
+                continue
+            key = f"cap_call_{strike:.0f}"
+            last = alerted.get(key)
+            if last and (now - last).total_seconds() < 300:
+                continue
+            vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
+            oi_l = float(r.get('CE_OI', 0) or 0) / 100000
+            msg = (
+                f"🟥 <b>CALL CAPPING AT RESISTANCE</b> {vol_tag}\n"
+                f"🕐 {time_str}\n"
+                f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
+                f"CE OI: {oi_l:.1f}L | Class: {r.get('Call_Class','')}\n"
+                f"📌 CE writers capping here — watch for reversal / SELL setup"
+            )
+            try:
+                send_telegram_message_sync(msg, force=True)
+                alerted[key] = now
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # Put support
+    try:
+        sup_rows = adf[
+            adf['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
+            adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)'])
+        ]
+        for _, r in sup_rows.iterrows():
+            strike = float(r['Strike'])
+            if abs(underlying_price - strike) > proximity_pts:
+                continue
+            key = f"cap_put_{strike:.0f}"
+            last = alerted.get(key)
+            if last and (now - last).total_seconds() < 300:
+                continue
+            vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
+            oi_l = float(r.get('PE_OI', 0) or 0) / 100000
+            msg = (
+                f"🟩 <b>PUT SUPPORT AT SUPPORT</b> {vol_tag}\n"
+                f"🕐 {time_str}\n"
+                f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
+                f"PE OI: {oi_l:.1f}L | Class: {r.get('Put_Class','')}\n"
+                f"📌 PE writers defending here — watch for bounce / BUY setup"
+            )
+            try:
+                send_telegram_message_sync(msg, force=True)
+                alerted[key] = now
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def generate_ai_context_message():
@@ -8389,9 +8530,71 @@ def main():
                         except Exception:
                             pass
 
+                    # Refresh PCR S/R snapshot every cycle so proximity alerts always have fresh data
+                    try:
+                        _snap_cycle = []
+                        _oi_hist_c = getattr(st.session_state, 'oi_history', [])
+                        _oi_str_c  = getattr(st.session_state, 'oi_current_strikes', [])
+                        if len(_oi_hist_c) >= 3 and _oi_str_c:
+                            _sorted_c = sorted(_oi_str_c)
+                            _atm_c = len(_sorted_c) // 2
+                            for _soff, _slbl in [(-2,'ATM-2'),(-1,'ATM-1'),(0,'ATM'),(1,'ATM+1'),(2,'ATM+2')]:
+                                _si = _atm_c + _soff
+                                if 0 <= _si < len(_sorted_c):
+                                    _sk = str(_sorted_c[_si])
+                                    _sodf = pd.DataFrame(_oi_hist_c)
+                                    _sce = _sodf[f'{_sk}_CE'].iloc[-1] if f'{_sk}_CE' in _sodf.columns else 0
+                                    _spe = _sodf[f'{_sk}_PE'].iloc[-1] if f'{_sk}_PE' in _sodf.columns else 0
+                                    _spcr = round(_spe / _sce, 2) if _sce > 0 else 1.0
+                                    _ssr = calculate_pcr_sr_level(_spcr, int(_sk))
+                                    _snap_cycle.append({'label': _slbl, 'strike': int(_sk),
+                                                        'pcr': _spcr, 'type': _ssr['type'],
+                                                        'level': _ssr['level'], 'offset': _ssr['offset']})
+                        if not _snap_cycle and option_data and option_data.get('df_summary') is not None:
+                            _dfs_c = option_data['df_summary']
+                            _und_c = option_data.get('underlying', 0)
+                            if 'PCR' in _dfs_c.columns and 'Strike' in _dfs_c.columns and _und_c:
+                                _slist_c = sorted(_dfs_c['Strike'].unique())
+                                _ai_c = min(range(len(_slist_c)), key=lambda i: abs(_slist_c[i] - _und_c))
+                                for _soff, _slbl in [(-2,'ATM-2'),(-1,'ATM-1'),(0,'ATM'),(1,'ATM+1'),(2,'ATM+2')]:
+                                    _si = _ai_c + _soff
+                                    if 0 <= _si < len(_slist_c):
+                                        _row_c = _dfs_c[_dfs_c['Strike'] == _slist_c[_si]]
+                                        if not _row_c.empty:
+                                            _spcr_c = float(_row_c['PCR'].iloc[0])
+                                            _ssr_c = calculate_pcr_sr_level(_spcr_c, int(_slist_c[_si]))
+                                            _snap_cycle.append({'label': _slbl, 'strike': int(_slist_c[_si]),
+                                                                'pcr': _spcr_c, 'type': _ssr_c['type'],
+                                                                'level': _ssr_c['level'], 'offset': _ssr_c['offset']})
+                        if _snap_cycle:
+                            st.session_state._pcr_sr_snapshot = _snap_cycle
+                    except Exception:
+                        pass
+
                     # PCR S/R proximity alert (every refresh cycle)
                     try:
                         check_pcr_sr_proximity_alert(option_data['underlying'])
+                    except Exception:
+                        pass
+
+                    # Candle pattern at S/R alert (every refresh cycle)
+                    try:
+                        _pcr_snap_c = getattr(st.session_state, '_pcr_sr_snapshot', [])
+                        send_candle_at_sr_alert(
+                            master['candle'],
+                            option_data['underlying'],
+                            _pcr_snap_c,
+                            master.get('support_levels', []),
+                            master.get('resistance_levels', []),
+                        )
+                    except Exception:
+                        pass
+
+                    # Sudden capping at S/R alert (every refresh cycle)
+                    try:
+                        _sa_c = getattr(st.session_state, '_sa_result', None)
+                        if _sa_c is not None:
+                            send_capping_at_sr_alert(_sa_c, option_data['underlying'])
                     except Exception:
                         pass
 
