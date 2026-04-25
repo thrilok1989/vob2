@@ -3945,6 +3945,10 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     except Exception:
         df_5m = df
     candle = detect_candle_patterns(df_5m, lookback=5)
+    try:
+        st.session_state._df_5m = df_5m
+    except Exception:
+        pass
 
     # 2. Order Blocks
     ob = detect_order_blocks(df, lookback=20)
@@ -4721,11 +4725,9 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
                 f"Zone: {zone_low} – {zone_high}\n"
                 f"Price likely to <b>hold / bounce here</b>. Watch for reversal."
             )
-        try:
-            send_telegram_message_sync(msg, force=True)
-            alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
-        except Exception:
-            pass
+        alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
+        return msg
+    return None
 
 
 def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
@@ -4769,8 +4771,8 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 f"📍 Near {_e(src)} Support {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
                 f"📌 Watch for bounce / BUY setup"
             )
-            send_telegram_message_sync(msg, force=True)
             alerted[key] = now
+            return msg
     elif direction == 'Bearish':
         for src, lbl, level in candidate_resistances:
             if abs(underlying_price - level) > proximity_pts:
@@ -4786,8 +4788,9 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 f"📍 Near {_e(src)} Resistance {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
                 f"📌 Watch for rejection / SELL setup"
             )
-            send_telegram_message_sync(msg, force=True)
             alerted[key] = now
+            return msg
+    return None
 
 
 def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
@@ -4825,8 +4828,8 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 f"CE OI: {oi_l:.1f}L | Class: {_e(r.get('Call_Class',''))}\n"
                 f"📌 CE writers capping here — watch for reversal / SELL setup"
             )
-            send_telegram_message_sync(msg, force=True)
             alerted[key] = now
+            return msg
     except Exception:
         pass
 
@@ -4853,94 +4856,267 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 f"PE OI: {oi_l:.1f}L | Class: {_e(r.get('Put_Class',''))}\n"
                 f"📌 PE writers defending here — watch for bounce / BUY setup"
             )
-            send_telegram_message_sync(msg, force=True)
             alerted[key] = now
+            return msg
     except Exception:
         pass
+    return None
+
+
+def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
+    """Detect and alert price rejection at ceiling (resistance) or floor (support).
+
+    Rejection confirmed when at least 2 of 3 signals agree:
+      Chart  — bearish wick (upper wick > body) at ceiling / bullish wick at floor,
+               OR a bearish/bullish candle pattern
+      OC     — CE ChgOI building at resistance OR PE ChgOI building at support
+      Depth  — BidAskPressure bearish at ceiling / bullish at floor
+
+    Cooldown: 10 min per level.
+    """
+    def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+    alerted = st.session_state.setdefault('_rejection_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+
+    # ── Chart signal ──────────────────────────────────────────────────────────
+    chart_bear = False  # rejection wick or pattern at ceiling
+    chart_bull = False  # bounce wick or pattern at floor
+    wick_detail = ''
+    try:
+        if df_5m is not None and len(df_5m) >= 1:
+            last = df_5m.iloc[-1]
+            o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+            body = abs(c - o)
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+            total_range = h - l if h > l else 1
+            if upper_wick > body and upper_wick / total_range > 0.35:
+                chart_bear = True
+                wick_detail = f"Upper wick {upper_wick:.0f}pts ({upper_wick/total_range*100:.0f}% of range)"
+            if lower_wick > body and lower_wick / total_range > 0.35:
+                chart_bull = True
+                wick_detail = f"Lower wick {lower_wick:.0f}pts ({lower_wick/total_range*100:.0f}% of range)"
+        pat = candle.get('pattern', '')
+        cdir = candle.get('direction', '')
+        bearish_patterns = {'Bearish Engulfing','Shooting Star','Bearish Harami','Evening Star',
+                            'Tweezer Top','Strong Red Candle','Pin Bar'}
+        bullish_patterns = {'Bullish Engulfing','Hammer','Bullish Harami','Morning Star',
+                            'Tweezer Bottom','Strong Green Candle','Pin Bar'}
+        if pat in bearish_patterns or cdir == 'Bearish':
+            chart_bear = True
+        if pat in bullish_patterns or cdir == 'Bullish':
+            chart_bull = True
+    except Exception:
+        pass
+
+    # ── OC signal: CE/PE ChgOI at the strike ─────────────────────────────────
+    oc_bear_strikes = {}   # strike → chg_oi for fresh CE writing
+    oc_bull_strikes = {}   # strike → chg_oi for fresh PE writing
+    try:
+        adf = (sa_result or {}).get('analysis_df')
+        if adf is not None:
+            for _, r in adf.iterrows():
+                sk = float(r['Strike'])
+                chg_ce = float(r.get('changeinOpenInterest_CE', 0) or 0)
+                chg_pe = float(r.get('changeinOpenInterest_PE', 0) or 0)
+                if chg_ce > 5000:   # fresh call writing
+                    oc_bear_strikes[sk] = chg_ce
+                if chg_pe > 5000:   # fresh put writing
+                    oc_bull_strikes[sk] = chg_pe
+    except Exception:
+        pass
+
+    # ── Depth signal: BidAskPressure from analysis_df ─────────────────────────
+    depth_bear_strikes = set()
+    depth_bull_strikes = set()
+    try:
+        adf = (sa_result or {}).get('analysis_df')
+        if adf is not None and 'BidAskPressure' in adf.columns:
+            for _, r in adf.iterrows():
+                sk = float(r['Strike'])
+                bap = float(r.get('BidAskPressure', 0) or 0)
+                if bap < -500:
+                    depth_bear_strikes.add(sk)
+                elif bap > 500:
+                    depth_bull_strikes.add(sk)
+    except Exception:
+        pass
+
+    # ── Find STRONGEST S/R only (highest OI strike near price) ───────────────
+    # Only check rejection at the single strongest ceiling and strongest floor
+    strongest_res = None   # (src, lbl, level, strike)
+    strongest_sup = None
+    try:
+        adf = (sa_result or {}).get('analysis_df')
+        if adf is not None:
+            # Strongest resistance: highest CE OI above price within 3× proximity
+            res_rows = adf[adf['Strike'] >= underlying_price - proximity_pts].copy()
+            if not res_rows.empty and 'CE_OI' in res_rows.columns:
+                res_rows = res_rows[res_rows['CE_OI'] == res_rows['CE_OI'].max()]
+                if not res_rows.empty:
+                    sk = float(res_rows.iloc[0]['Strike'])
+                    oi = float(res_rows.iloc[0]['CE_OI'])
+                    strongest_res = ('OC', f"₹{sk:.0f} OI:{oi/100000:.1f}L", sk, int(sk))
+            # Strongest support: highest PE OI below price within 3× proximity
+            sup_rows = adf[adf['Strike'] <= underlying_price + proximity_pts].copy()
+            if not sup_rows.empty and 'PE_OI' in sup_rows.columns:
+                sup_rows = sup_rows[sup_rows['PE_OI'] == sup_rows['PE_OI'].max()]
+                if not sup_rows.empty:
+                    sk = float(sup_rows.iloc[0]['Strike'])
+                    oi = float(sup_rows.iloc[0]['PE_OI'])
+                    strongest_sup = ('OC', f"₹{sk:.0f} OI:{oi/100000:.1f}L", sk, int(sk))
+    except Exception:
+        pass
+    # Fallback to PCR levels if OC not available
+    if strongest_res is None:
+        for s in (pcr_sr_snapshot or []):
+            sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+            if sr_clean == 'Resistance' and abs(underlying_price - s['level']) <= proximity_pts * 3:
+                strongest_res = ('PCR', s['label'], s['level'], int(s['strike']))
+                break
+    if strongest_sup is None:
+        for s in reversed(pcr_sr_snapshot or []):
+            sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+            if sr_clean == 'Support' and abs(underlying_price - s['level']) <= proximity_pts * 3:
+                strongest_sup = ('PCR', s['label'], s['level'], int(s['strike']))
+                break
+
+    candidate_res = [strongest_res] if strongest_res else []
+    candidate_sup = [strongest_sup] if strongest_sup else []
+
+    # ── Check ceiling rejection ───────────────────────────────────────────────
+    for src, lbl, level, strike in candidate_res:
+        if abs(underlying_price - level) > proximity_pts:
+            continue
+        key = f"rej_res_{level:.0f}"
+        last_alerted = alerted.get(key)
+        if last_alerted and (now - last_alerted).total_seconds() < 600:
+            continue
+        # Count confirming signals
+        signals = []
+        if chart_bear:
+            signals.append(f"📊 Chart: {_e(wick_detail) if wick_detail else _e(candle.get('pattern',''))}")
+        oc_chg = oc_bear_strikes.get(float(strike), 0)
+        if oc_chg:
+            signals.append(f"📋 OC: CE ChgOI +{int(oc_chg/1000)}K at ₹{strike}")
+        if float(strike) in depth_bear_strikes:
+            signals.append(f"📉 Depth: Ask wall dominant at ₹{strike}")
+        if len(signals) < 2:
+            continue
+        msg = (
+            f"🔴 <b>REJECTION AT CEILING</b>\n"
+            f"🕐 {time_str} | Spot ₹{underlying_price:.0f}\n"
+            f"🧱 Ceiling: {_e(src)} {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts)\n"
+            f"✅ {len(signals)}/3 signals confirmed:\n" +
+            "\n".join(f"  {s}" for s in signals) +
+            f"\n📌 SELL zone — price stalling here"
+        )
+        alerted[key] = now
+        return msg
+
+    # ── Check floor bounce ────────────────────────────────────────────────────
+    for src, lbl, level, strike in candidate_sup:
+        if abs(underlying_price - level) > proximity_pts:
+            continue
+        key = f"rej_sup_{level:.0f}"
+        last_alerted = alerted.get(key)
+        if last_alerted and (now - last_alerted).total_seconds() < 600:
+            continue
+        signals = []
+        if chart_bull:
+            signals.append(f"📊 Chart: {_e(wick_detail) if wick_detail else _e(candle.get('pattern',''))}")
+        oc_chg = oc_bull_strikes.get(float(strike), 0)
+        if oc_chg:
+            signals.append(f"📋 OC: PE ChgOI +{int(oc_chg/1000)}K at ₹{strike}")
+        if float(strike) in depth_bull_strikes:
+            signals.append(f"📈 Depth: Bid wall dominant at ₹{strike}")
+        if len(signals) < 2:
+            continue
+        msg = (
+            f"🟢 <b>BOUNCE AT FLOOR</b>\n"
+            f"🕐 {time_str} | Spot ₹{underlying_price:.0f}\n"
+            f"🧱 Floor: {_e(src)} {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts)\n"
+            f"✅ {len(signals)}/3 signals confirmed:\n" +
+            "\n".join(f"  {s}" for s in signals) +
+            f"\n📌 BUY zone — price holding here"
+        )
+        alerted[key] = now
+        return msg
+
+    return None
 
 
 def generate_ai_context_message():
     """One-time AI context/glossary — split into two messages to stay under 4096 chars."""
-    part1 = """🤖 <b>AI SIGNAL GUIDE (1/2) — NIFTY OPTIONS</b>
-(Send once at day start before pasting signals)
+    part1 = """🟡 <b>NIFTY SIGNAL GUIDE (1/2)</b>
+(Send once at day start)
 
-<b>📋 SIGNAL TYPES</b>
-🟥 CALL CAPPING = CE writers capping price above → SELL zone
-🟩 PUT CAPPING = PE writers defending price below → BUY zone
-🔥=vol confirmed | HiConv=high conviction | Mod=moderate
+<b>📋 ALERT TYPES</b>
+⚠️ PCR PROXIMITY = price within ±25 pts of PCR S/R level
+🕯 CANDLE AT S/R = bullish candle at support / bearish at resistance
+🟥 CALL CAPPING = CE writers capping → SELL zone 🔥=vol confirmed
+🟩 PUT SUPPORT = PE writers defending → BUY zone 🔥=vol confirmed
+🔴 REJECTION AT CEILING = 2/3 signals: chart wick + OC ChgOI + depth
+🟢 BOUNCE AT FLOOR = 2/3 signals: chart wick + OC ChgOI + depth
+→ Every alert sends: alert header + Part 1 (signal data) + Part 2 (AI prompt)
+
+<b>📋 SIGNAL SCORE</b>
 Score: -5(strong bear) to +5(strong bull)
-
-<b>🎨 EMOJI:</b> 🟢=Bullish 🔴=Bearish ⚪=Neutral ⚫=No data
+🟥 CALL CAPPING / 🟩 PUT CAPPING = OC writers confirmed at wall
+🎨 🟢=Bullish 🔴=Bearish ⚪=Neutral ⚫=No data
 
 <b>🌍 ALIGNMENT (10m|1h|4h|1D|4D|Pat):</b>
 N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
 REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
-NP=NoPattern Ham=Hammer ShStar=ShootingStar Spinni=SpinningTop
-SGC=StrongGreen SRC=StrongRed BullEng/BearEng=Engulfing
-BullHar/BearHar=Harami TwTop/TwBot=Tweezer InsBar PinBar
+NP=NoPattern Ham=Hammer ShStar=ShootingStar SGC=StrongGreen
+SRC=StrongRed BullEng/BearEng=Engulfing BullHar/BearHar=Harami
 
-<b>🔬 STRIKE ANALYSIS (ATM±2) — all data per strike in ONE block:</b>
-Line1: ATM±N ₹Strike | PCR | S/R:₹chartprice(offset) | 🟥/🟩Cap OI | Score
-  PCR &gt;1.2=put heavy(bull) &lt;0.8=call heavy(bear)
-  S/R offset = how many pts from strike the wall is felt
-  Cap OI = open interest (HiConv=strong wall Mod=moderate)
+<b>🔬 STRIKE ANALYSIS (ATM±2):</b>
+Line1: ATM±N ₹Strike | PCR | S/R:₹level(offset) | Cap OI | Score
+  PCR≤0.7=Resistance(offset:-20→+20) | 0.71-1.7=Neutral | ≥1.8=Support(offset:-20→+20)
+  Offset = pts from strike where wall is felt
+Line2: 📌Depth R/S ₹chartprice→₹strike(wallQty) | Δ Γ Θ Greeks
+  BA=bid-ask pressure (+ve=buyers -ve=sellers)
+  E=Entry(Bull/Bear/NoEnt) Mv=RUp/RDn=real FkUp/FkDn=reversal
+Line3: CE/PE bid-ask qty | COI=ChangeOI OI=build/unwind
 
-Line2: 📌Depth R/S ₹chartprice→₹strike(wallQty)
-  ₹chartprice = where pressure ACTUALLY felt (before hitting strike)
-  ₹strike = raw option chain strike | wallQty = combined CE+PE pressure
-  Δ=Delta Γ=Gamma Θ=Theta (Greek biases)
-  COI=ChangeOI V=Volume IV=ImpliedVol Ask/Bid=order side bias
-  BA=bid-ask pressure (+ve=buyers active -ve=sellers dominant)
-  E=Entry(Bull/Bear/NoEnt) Mv=Move(RUp/RDn=real FkUp/FkDn=reversal)
+<b>🌐 MARKET CONTEXT</b>
+DTE=days to expiry | ⚠️Rollover=≤5 days
+MaxPain=price magnet near expiry | Straddle=ATM CE+PE cost
+IVR 🔥≥70%=sell favoured 🧊≤30%=buy favoured
+Skew 🔴&gt;1.1=put fear 🟢&lt;0.9=call greed | ATR14=SL guide"""
 
-Line3: CE B/A = call bid/ask qty | PE B/A = put bid/ask qty
-  Bigger qty = thicker wall | COI/OI = building or unwinding
+    part2 = """🟡 <b>NIFTY SIGNAL GUIDE (2/2)</b>
 
-<b>🌐 MARKET CONTEXT (expiry &amp; volatility)</b>
-DTE=days to expiry | ⚠️Rollover=≤5 days (PCR/GEX less reliable)
-MaxPain=strike MM pay least (price magnet near expiry)
-Straddle=ATM CE+PE last price (wider=bigger expected range)
-IVR=session IV rank: 🔥≥70% ⚪30-70% 🧊≤30%
-  🔥=expensive→favour selling | 🧊=cheap→favour buying
-Skew=PE(ATM-1)IV ÷ CE(ATM+1)IV
-  🔴&gt;1.1=put skew(fear) 🟢&lt;0.9=call skew(greed)
-ATR14=avg true range (SL ≥ 0.5×ATR)
-OIVel: 🔺=building(fresh) 🔻=unwinding(exits)"""
-
-    part2 = """🤖 <b>AI SIGNAL GUIDE (2/2) — OTHER BLOCKS &amp; RULES</b>
-
-<b>📊 OTHER BLOCKS</b>
-GEX +ve=range mode -ve=trending | Flip=gamma flip level
+<b>📊 DATA BLOCKS</b>
+GEX +ve=range -ve=trending | Flip=gamma flip level
 VIDYA: adaptive trend | -ve%=falling +ve%=rising
-VPFR: POC=most traded | VAH/VAL=value area high/low (3 TFs)
-📍 Triple POC: P1(10bar) P2(25bar) P3(70bar) — price magnets
-  Clustered POCs = strong S/R confluence
-🌀 Future Swing: SwH=last swing high SwL=last swing low
-  →Target=projected next swing | bull/bear direction
-OI Wind: CE/PE build🟢/unwind🔴 | Par=parallel winding
-Money Flow: POC=peak vol price | ⭐=max vol node
-LTP Trap=fake breakout | VWAP=vol avg (below=bear context)
+VPFR: POC=most traded | VAH/VAL=value area (3 TFs: 30/60/180 bars)
+Triple POC P1/P2/P3: clustered = strong confluence magnet
+🌀 Swing: SwH/SwL=last highs/lows | →Target=projected swing
+OI Winding: CE/PE build🟢/unwind🔴 | Par=parallel activity
+Money Flow: POC=peak vol node ⭐ | sentiment at price clusters
+VWAP=vol avg (below=bearish context) | LTP Trap=fake breakout
 VOB=Volume Order Blocks | HVP=High Volume Pivots
-📡 Index/Stock Capping: per-instrument compact line
-  {bias_emoji}{SHORT} ₹underlying 🟥R₹cap(OI) 🟩S₹sup(OI)
-  📍=price is within 0.5% of that level (near wall) | 🔥=vol confirmed wall
-  bias from full ATM±2 analyze_strike_activity for all instruments
+📡 Capping: {bias}N50/BNF/REL/ICICI 🟥R₹cap 🟩S₹sup 📍=near 🔥=vol
 
-<b>📈 TRADING RULES</b>
-1. Alignment 3+ same across 1h+4h+1D = confirmed trend
-2. GEX negative + VIDYA bearish = trending — do NOT fade
-3. Price below VWAP = bearish session context
-4. 📌Depth qty &gt;5K = major wall | &lt;500 = weak (breakable)
-5. BA negative + Mv=RDn = confirmed bear entry
-6. PCR&lt;0.8 + Γ🔴 at ATM+1 = heavy gamma resistance above
-7. 🟥CAP + GEX neg + all-red alignment = high conviction SELL
-8. 🟩CAP + GEX pos + all-green alignment = high conviction BUY
-9. chartprice &lt; strike in Depth = real wall before strike
-10. Money Flow POC far above spot = sellers dominated = bearish
-11. DTE≤5 (⚠️Rollover): MaxPain magnet — avoid counter-MaxPain
-12. 🔥IVR + 🔴Skew + red alignment = hedge unwind risk → tight SL
-13. OIVel🔺 surging at strike = fresh wall → wait for confirm
-14. Straddle wide vs ATR = big move priced → widen targets"""
+<b>🧱 CEILING / FLOOR LOGIC (AI prompt step 2)</b>
+Strongest CEILING = highest CE OI strike + depth ask wall + VPFR VAH near strike + MF POC
+Strongest FLOOR = highest PE OI strike + depth bid wall + VPFR VAL near strike + MF POC
+Entry AT ceiling for SELL / AT floor for BUY — where price stalls and won't break
+SL just above ceiling for SELL / just below floor for BUY
+
+<b>📈 RULES</b>
+1. Alignment 3+ same 1h+4h+1D = confirmed trend
+2. GEX neg + VIDYA bear = trending — do NOT fade
+3. Depth qty &gt;5K = major wall | &lt;500 = breakable
+4. BA neg + Mv=RDn = confirmed bear entry
+5. PCR≤0.7 at ATM+1 + Γ🔴 = heavy gamma resistance above
+6. 🔴REJECT at ceiling + OC ChgOI building = high conviction SELL
+7. 🟢BOUNCE at floor + OC ChgOI building = high conviction BUY
+8. DTE≤5 ⚠️Rollover: MaxPain magnet — avoid counter-MaxPain
+9. Straddle wide vs ATR = big move priced → widen targets"""
 
     return [part1, part2]
 
@@ -4984,7 +5160,7 @@ def compute_depth_sr(df_summary, underlying_price, n=3):
     return resistance, support
 
 
-def send_master_signal_telegram(result, underlying_price, option_data=None, force=False):
+def send_master_signal_telegram(result, underlying_price, option_data=None, force=False, skip_image=False, alert_header=""):
     """Send master signal to Telegram. Pass force=True to bypass all guards."""
     if result is None:
         return
@@ -5695,22 +5871,16 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 {_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 🟡 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
-2. Strongest wall: strike + OI + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
+2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
 4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL</code>"""
 
     message = msg_part1  # used for Gemini analysis context
 
-    # Send image version
+    # Send Part 1 (with optional alert header prepended) then Part 2
+    _part1_out = (alert_header + "\n\n" + msg_part1) if alert_header else msg_part1
     try:
-        _img_bytes = render_master_signal_image(result, underlying_price, option_data)
-        send_telegram_photo_sync(_img_bytes, force=force)
-    except Exception as _img_err:
-        st.warning(f"Signal image error: {_img_err}")
-
-    # Send Part 1 then Part 2
-    try:
-        send_telegram_message_sync(msg_part1, force=force)
+        send_telegram_message_sync(_part1_out, force=force)
     except Exception as _txt_err:
         st.warning(f"Telegram Part 1 send error: {_txt_err}")
     try:
@@ -8428,13 +8598,8 @@ def main():
             if _sa:
                 master = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
                 if master:
-                    # Send Telegram (with cooldown)
-                    if 'last_master_signal_time' not in st.session_state:
-                        st.session_state.last_master_signal_time = None
                     _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
-                    _should_send = st.session_state.last_master_signal_time is None or \
-                        (_ist_now - st.session_state.last_master_signal_time).total_seconds() > 300
-                    if _should_send:
+                    if False:  # auto 5-min signal disabled — alerts fire on their own
                         # Refresh PCR S/R snapshot from current OI history so the
                         # auto-send always has fresh data (the UI table sets it later
                         # in the same render, so session state may be stale on first fires)
@@ -8570,30 +8735,47 @@ def main():
                     except Exception:
                         pass
 
-                    # PCR S/R proximity alert (every refresh cycle)
+                    # All S/R alerts — each sends its short message then Part 1 + Part 2
+                    _sa_c  = getattr(st.session_state, '_sa_result', None)
+                    _pcr_s = getattr(st.session_state, '_pcr_sr_snapshot', [])
+                    _df5m_c = getattr(st.session_state, '_df_5m', None)
+
+                    def _send_with_header(header):
+                        send_master_signal_telegram(master, option_data['underlying'], option_data, force=True, skip_image=True, alert_header=header)
+
+                    # PCR S/R proximity alert
                     try:
-                        check_pcr_sr_proximity_alert(option_data['underlying'])
+                        _h = check_pcr_sr_proximity_alert(option_data['underlying'])
+                        if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
-                    # Candle pattern at S/R alert (every refresh cycle)
+                    # Candle pattern at S/R alert
                     try:
-                        _pcr_snap_c = getattr(st.session_state, '_pcr_sr_snapshot', [])
-                        send_candle_at_sr_alert(
-                            master['candle'],
-                            option_data['underlying'],
-                            _pcr_snap_c,
-                            master.get('support_levels', []),
-                            master.get('resistance_levels', []),
+                        _h = send_candle_at_sr_alert(
+                            master['candle'], option_data['underlying'],
+                            _pcr_s, master.get('support_levels', []), master.get('resistance_levels', []),
                         )
+                        if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
-                    # Sudden capping at S/R alert (every refresh cycle)
+                    # Capping at S/R alert
                     try:
-                        _sa_c = getattr(st.session_state, '_sa_result', None)
                         if _sa_c is not None:
-                            send_capping_at_sr_alert(_sa_c, option_data['underlying'])
+                            _h = send_capping_at_sr_alert(_sa_c, option_data['underlying'])
+                            if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
+
+                    # Rejection / bounce at strongest wall
+                    try:
+                        _h = send_rejection_alert(
+                            master['candle'], option_data['underlying'],
+                            _df5m_c, _sa_c, _pcr_s,
+                            master.get('support_levels', []), master.get('resistance_levels', []),
+                        )
+                        if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
