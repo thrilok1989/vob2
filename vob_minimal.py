@@ -4783,7 +4783,10 @@ OI Wind: CE/PE build🟢/unwind🔴 | Par=parallel winding
 Money Flow: POC=peak vol price | ⭐=max vol node
 LTP Trap=fake breakout | VWAP=vol avg (below=bear context)
 VOB=Volume Order Blocks | HVP=High Volume Pivots
-📡 OC Bias=live option chain direction per index/stock
+📡 Index/Stock Capping: per-instrument compact line
+  {bias_emoji}{SHORT} ₹underlying 🟥R₹cap(OI) 🟩S₹sup(OI)
+  📍=price is within 0.5% of that level (near wall) | 🔥=vol confirmed wall
+  bias from full ATM±2 analyze_strike_activity for all instruments
 
 <b>📈 TRADING RULES</b>
 1. Alignment 3+ same across 1h+4h+1D = confirmed trend
@@ -5425,33 +5428,87 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         oc_deep_block = ""
 
-    # Multi-instrument bias block
+    # Multi-instrument capping bias block (compact per-instrument lines)
     _mi_short = {'SENSEX': 'SENX', 'BANKNIFTY': 'BNF',
                  'RELIANCE': 'REL', 'ICICIBANK': 'ICICI', 'INFOSYS': 'INFO'}
     def _bias_emoji(b):
         b = str(b)
         return '🟢' if 'Bullish' in b else '🔴' if 'Bearish' in b else '⚪'
-    _mi_parts = []
+
+    def _mi_cap_line(sn, bias, und, cap_list, sup_list):
+        """Build compact capping line: BIAS+NAME UND 🟥R₹cap(OI) 🟩S₹sup(OI) [📍 if near]"""
+        be = _bias_emoji(bias)
+        parts = [f"{be}{sn}"]
+        if und:
+            parts.append(f"₹{und:.0f}")
+        prox_pct = 0.005  # 0.5% proximity threshold
+        for cap in (cap_list or [])[:1]:
+            try:
+                csk = float(cap['strike'])
+                coi = cap.get('oi_l', 0) or 0
+                near = und and abs(und - csk) / und <= prox_pct
+                tag = f"{'📍' if near else ''}🟥R₹{csk:.0f}({coi:.0f}L)"
+                if cap.get('vol_confirmed'):
+                    tag += '🔥'
+                parts.append(tag)
+            except Exception:
+                pass
+        for sup in (sup_list or [])[:1]:
+            try:
+                ssk = float(sup['strike'])
+                soi = sup.get('oi_l', 0) or 0
+                near = und and abs(und - ssk) / und <= prox_pct
+                tag = f"{'📍' if near else ''}🟩S₹{ssk:.0f}({soi:.0f}L)"
+                if sup.get('vol_confirmed'):
+                    tag += '🔥'
+                parts.append(tag)
+            except Exception:
+                pass
+        return " ".join(parts)
+
+    _mi_lines = []
+    # NIFTY line using sa_result
     try:
-        _sa_bias = st.session_state.get('_sa_result') or getattr(st.session_state, '_sa_result', None)
-        if _sa_bias:
-            _mi_parts.append(f"N50:{_bias_emoji(_sa_bias.get('market_bias', ''))}")
+        _sa_bias = st.session_state.get('_sa_result') or {}
+        _sa_cap = [{'strike': r['Strike'], 'oi_l': float(r.get('openInterest_CE', 0) or 0) / 100000,
+                    'vol_confirmed': bool(r.get('Call_Capping_Confirmed', False))}
+                   for _, r in (_sa_bias.get('analysis_df', __import__('pandas').DataFrame())).iterrows()
+                   if r.get('Call_Capping_Confirmed')] if _sa_bias.get('analysis_df') is not None else []
+        _sa_sup = [{'strike': r['Strike'], 'oi_l': float(r.get('openInterest_PE', 0) or 0) / 100000,
+                    'vol_confirmed': bool(r.get('Put_Support_Confirmed', False))}
+                   for _, r in (_sa_bias.get('analysis_df', __import__('pandas').DataFrame())).iterrows()
+                   if r.get('Put_Support_Confirmed')] if _sa_bias.get('analysis_df') is not None else []
+        _sa_cap = sorted(_sa_cap, key=lambda x: x['strike'])  # lowest cap = nearest resistance
+        _sa_sup = sorted(_sa_sup, key=lambda x: x['strike'], reverse=True)  # highest sup = nearest support
+        _mi_lines.append(_mi_cap_line('N50', _sa_bias.get('market_bias', ''), underlying_price, _sa_cap, _sa_sup))
     except Exception:
-        _mi_parts.append("N50:⚫")
+        _mi_lines.append(f"⚫N50 ₹{underlying_price:.0f}")
+
+    # Other instruments using mi_instrument_data
     try:
         _mi_state = st.session_state.get('mi_instrument_data') or {}
         for _ikey in INSTRUMENT_CONFIGS:
             _sn = _mi_short.get(_ikey, _ikey[:5])
             try:
                 _res = _mi_state.get(_ikey) or {}
-                _deep = _res.get('deep') or {} if 'error' not in _res else {}
-                _b = _deep.get('market_bias', '') if _deep else ''
-                _mi_parts.append(f"{_sn}:{_bias_emoji(_b) if _b else '⚫'}")
+                if 'error' in _res:
+                    _mi_lines.append(f"⚫{_sn}")
+                    continue
+                _deep = _res.get('deep') or {}
+                _bias = _deep.get('market_bias', '') if _deep else _res.get('pcr_bias', '')
+                _und  = _res.get('underlying') or 0
+                _caps = _res.get('capping') or []
+                _sups = _res.get('support') or []
+                # Sort: nearest cap above price, nearest sup below price
+                _caps = sorted([c for c in _caps if float(c.get('strike', 0)) >= _und], key=lambda x: x['strike'])
+                _sups = sorted([s for s in _sups if float(s.get('strike', 0)) <= _und], key=lambda x: x['strike'], reverse=True)
+                _mi_lines.append(_mi_cap_line(_sn, _bias, _und, _caps, _sups))
             except Exception:
-                _mi_parts.append(f"{_sn}:⚫")
+                _mi_lines.append(f"⚫{_sn}")
     except Exception:
         pass
-    _mi_bias_block = ("\n<b>🌐 Index/Stock option chain Bias:</b> " + "  ".join(_mi_parts) + "\n") if _mi_parts else ""
+
+    _mi_bias_block = ("\n<b>📡 Index/Stock Capping:</b>\n" + "\n".join(_mi_lines) + "\n") if _mi_lines else ""
 
     _oit = result.get('oi_trend', {})
     _vid = result.get('vidya', {})
