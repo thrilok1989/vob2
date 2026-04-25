@@ -4669,7 +4669,7 @@ def compute_unwinding_summary(df_atm8):
         'verdict': verdict,
     }
 
-def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=10):
+def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=15):
     """Fire a Telegram alert when spot is within proximity_pts of any PCR S/R level.
     Uses the same _pcr_sr_snapshot stored by the UI — identical data to what's displayed."""
     snapshot = getattr(st.session_state, '_pcr_sr_snapshot', [])
@@ -4721,7 +4721,7 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=10):
             pass
 
 
-def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
+def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=15):
     """Fire when a bullish candle forms at support or bearish candle forms at resistance.
     Independent of score — fires on pattern+location match alone. Cooldown 10 min per level."""
     direction = candle.get('direction', '')
@@ -4788,7 +4788,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 pass
 
 
-def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=30):
+def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=15):
     """Fire when sudden call capping or put support is detected at S/R. Cooldown 5 min per strike."""
     if sa_result is None:
         return
