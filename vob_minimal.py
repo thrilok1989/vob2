@@ -5529,10 +5529,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock bias, VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC (P1/P2/P3), Future Swing target, Strike Analysis ATM±2 (PCR S/R + Depth chart/strike price + Capping OI + Δ/Γ/Θ + BA + CE/PE vol/qty), LTP trap+VWAP, VOB, HVP, delta volume, money flow, OI winding. Give SHORT answers:
+🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), index/stock capping bias (📡 block: R/S levels + 10m|1h|4h price action per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC (P1/P2/P3), Future Swing target, Strike Analysis ATM±2 (PCR S/R + Depth chart/strike price + Capping OI + Δ/Γ/Θ + BA + CE/PE vol/qty), LTP trap+VWAP, VOB, HVP, delta volume, money flow, OI winding. Give SHORT answers:
 1. Market structure: (1 line — bull/bear/range + key reason)
 2. Strongest wall: (strike, capping OI + depth pressure, why)
-3. Entry: ₹___ | SL: ₹___ | Target: ₹___ | Direction: BUY/SELL</code>"""
+3. Index/Stocks: (per instrument — price action 10m|1h|4h bias + at Cap/Sup/Range based on capping)
+4. Entry: ₹___ | SL: ₹___ | Target: ₹___ | Direction: BUY/SELL</code>"""
 
     # Send image version
     try:
