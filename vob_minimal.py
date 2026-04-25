@@ -3945,6 +3945,10 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     except Exception:
         df_5m = df
     candle = detect_candle_patterns(df_5m, lookback=5)
+    try:
+        st.session_state._df_5m = df_5m
+    except Exception:
+        pass
 
     # 2. Order Blocks
     ob = detect_order_blocks(df, lookback=20)
@@ -4857,6 +4861,188 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
             alerted[key] = now
     except Exception:
         pass
+
+
+def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
+    """Detect and alert price rejection at ceiling (resistance) or floor (support).
+
+    Rejection confirmed when at least 2 of 3 signals agree:
+      Chart  — bearish wick (upper wick > body) at ceiling / bullish wick at floor,
+               OR a bearish/bullish candle pattern
+      OC     — CE ChgOI building at resistance OR PE ChgOI building at support
+      Depth  — BidAskPressure bearish at ceiling / bullish at floor
+
+    Cooldown: 10 min per level.
+    """
+    def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+    alerted = st.session_state.setdefault('_rejection_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+
+    # ── Chart signal ──────────────────────────────────────────────────────────
+    chart_bear = False  # rejection wick or pattern at ceiling
+    chart_bull = False  # bounce wick or pattern at floor
+    wick_detail = ''
+    try:
+        if df_5m is not None and len(df_5m) >= 1:
+            last = df_5m.iloc[-1]
+            o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+            body = abs(c - o)
+            upper_wick = h - max(o, c)
+            lower_wick = min(o, c) - l
+            total_range = h - l if h > l else 1
+            if upper_wick > body and upper_wick / total_range > 0.35:
+                chart_bear = True
+                wick_detail = f"Upper wick {upper_wick:.0f}pts ({upper_wick/total_range*100:.0f}% of range)"
+            if lower_wick > body and lower_wick / total_range > 0.35:
+                chart_bull = True
+                wick_detail = f"Lower wick {lower_wick:.0f}pts ({lower_wick/total_range*100:.0f}% of range)"
+        pat = candle.get('pattern', '')
+        cdir = candle.get('direction', '')
+        bearish_patterns = {'Bearish Engulfing','Shooting Star','Bearish Harami','Evening Star',
+                            'Tweezer Top','Strong Red Candle','Pin Bar'}
+        bullish_patterns = {'Bullish Engulfing','Hammer','Bullish Harami','Morning Star',
+                            'Tweezer Bottom','Strong Green Candle','Pin Bar'}
+        if pat in bearish_patterns or cdir == 'Bearish':
+            chart_bear = True
+        if pat in bullish_patterns or cdir == 'Bullish':
+            chart_bull = True
+    except Exception:
+        pass
+
+    # ── OC signal: CE/PE ChgOI at the strike ─────────────────────────────────
+    oc_bear_strikes = {}   # strike → chg_oi for fresh CE writing
+    oc_bull_strikes = {}   # strike → chg_oi for fresh PE writing
+    try:
+        adf = (sa_result or {}).get('analysis_df')
+        if adf is not None:
+            for _, r in adf.iterrows():
+                sk = float(r['Strike'])
+                chg_ce = float(r.get('changeinOpenInterest_CE', 0) or 0)
+                chg_pe = float(r.get('changeinOpenInterest_PE', 0) or 0)
+                if chg_ce > 5000:   # fresh call writing
+                    oc_bear_strikes[sk] = chg_ce
+                if chg_pe > 5000:   # fresh put writing
+                    oc_bull_strikes[sk] = chg_pe
+    except Exception:
+        pass
+
+    # ── Depth signal: BidAskPressure from analysis_df ─────────────────────────
+    depth_bear_strikes = set()
+    depth_bull_strikes = set()
+    try:
+        adf = (sa_result or {}).get('analysis_df')
+        if adf is not None and 'BidAskPressure' in adf.columns:
+            for _, r in adf.iterrows():
+                sk = float(r['Strike'])
+                bap = float(r.get('BidAskPressure', 0) or 0)
+                if bap < -500:
+                    depth_bear_strikes.add(sk)
+                elif bap > 500:
+                    depth_bull_strikes.add(sk)
+    except Exception:
+        pass
+
+    # ── Find STRONGEST S/R only (highest OI strike near price) ───────────────
+    # Only check rejection at the single strongest ceiling and strongest floor
+    strongest_res = None   # (src, lbl, level, strike)
+    strongest_sup = None
+    try:
+        adf = (sa_result or {}).get('analysis_df')
+        if adf is not None:
+            # Strongest resistance: highest CE OI above price within 3× proximity
+            res_rows = adf[adf['Strike'] >= underlying_price - proximity_pts].copy()
+            if not res_rows.empty and 'CE_OI' in res_rows.columns:
+                res_rows = res_rows[res_rows['CE_OI'] == res_rows['CE_OI'].max()]
+                if not res_rows.empty:
+                    sk = float(res_rows.iloc[0]['Strike'])
+                    oi = float(res_rows.iloc[0]['CE_OI'])
+                    strongest_res = ('OC', f"₹{sk:.0f} OI:{oi/100000:.1f}L", sk, int(sk))
+            # Strongest support: highest PE OI below price within 3× proximity
+            sup_rows = adf[adf['Strike'] <= underlying_price + proximity_pts].copy()
+            if not sup_rows.empty and 'PE_OI' in sup_rows.columns:
+                sup_rows = sup_rows[sup_rows['PE_OI'] == sup_rows['PE_OI'].max()]
+                if not sup_rows.empty:
+                    sk = float(sup_rows.iloc[0]['Strike'])
+                    oi = float(sup_rows.iloc[0]['PE_OI'])
+                    strongest_sup = ('OC', f"₹{sk:.0f} OI:{oi/100000:.1f}L", sk, int(sk))
+    except Exception:
+        pass
+    # Fallback to PCR levels if OC not available
+    if strongest_res is None:
+        for s in (pcr_sr_snapshot or []):
+            sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+            if sr_clean == 'Resistance' and abs(underlying_price - s['level']) <= proximity_pts * 3:
+                strongest_res = ('PCR', s['label'], s['level'], int(s['strike']))
+                break
+    if strongest_sup is None:
+        for s in reversed(pcr_sr_snapshot or []):
+            sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+            if sr_clean == 'Support' and abs(underlying_price - s['level']) <= proximity_pts * 3:
+                strongest_sup = ('PCR', s['label'], s['level'], int(s['strike']))
+                break
+
+    candidate_res = [strongest_res] if strongest_res else []
+    candidate_sup = [strongest_sup] if strongest_sup else []
+
+    # ── Check ceiling rejection ───────────────────────────────────────────────
+    for src, lbl, level, strike in candidate_res:
+        if abs(underlying_price - level) > proximity_pts:
+            continue
+        key = f"rej_res_{level:.0f}"
+        last_alerted = alerted.get(key)
+        if last_alerted and (now - last_alerted).total_seconds() < 600:
+            continue
+        # Count confirming signals
+        signals = []
+        if chart_bear:
+            signals.append(f"📊 Chart: {_e(wick_detail) if wick_detail else _e(candle.get('pattern',''))}")
+        oc_chg = oc_bear_strikes.get(float(strike), 0)
+        if oc_chg:
+            signals.append(f"📋 OC: CE ChgOI +{int(oc_chg/1000)}K at ₹{strike}")
+        if float(strike) in depth_bear_strikes:
+            signals.append(f"📉 Depth: Ask wall dominant at ₹{strike}")
+        if len(signals) < 2:
+            continue
+        msg = (
+            f"🔴 <b>REJECTION AT CEILING</b>\n"
+            f"🕐 {time_str} | Spot ₹{underlying_price:.0f}\n"
+            f"🧱 Ceiling: {_e(src)} {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts)\n"
+            f"✅ {len(signals)}/3 signals confirmed:\n" +
+            "\n".join(f"  {s}" for s in signals) +
+            f"\n📌 SELL zone — price stalling here"
+        )
+        send_telegram_message_sync(msg, force=True)
+        alerted[key] = now
+
+    # ── Check floor bounce ────────────────────────────────────────────────────
+    for src, lbl, level, strike in candidate_sup:
+        if abs(underlying_price - level) > proximity_pts:
+            continue
+        key = f"rej_sup_{level:.0f}"
+        last_alerted = alerted.get(key)
+        if last_alerted and (now - last_alerted).total_seconds() < 600:
+            continue
+        signals = []
+        if chart_bull:
+            signals.append(f"📊 Chart: {_e(wick_detail) if wick_detail else _e(candle.get('pattern',''))}")
+        oc_chg = oc_bull_strikes.get(float(strike), 0)
+        if oc_chg:
+            signals.append(f"📋 OC: PE ChgOI +{int(oc_chg/1000)}K at ₹{strike}")
+        if float(strike) in depth_bull_strikes:
+            signals.append(f"📈 Depth: Bid wall dominant at ₹{strike}")
+        if len(signals) < 2:
+            continue
+        msg = (
+            f"🟢 <b>BOUNCE AT FLOOR</b>\n"
+            f"🕐 {time_str} | Spot ₹{underlying_price:.0f}\n"
+            f"🧱 Floor: {_e(src)} {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts)\n"
+            f"✅ {len(signals)}/3 signals confirmed:\n" +
+            "\n".join(f"  {s}" for s in signals) +
+            f"\n📌 BUY zone — price holding here"
+        )
+        send_telegram_message_sync(msg, force=True)
+        alerted[key] = now
 
 
 def generate_ai_context_message():
@@ -8594,6 +8780,23 @@ def main():
                         _sa_c = getattr(st.session_state, '_sa_result', None)
                         if _sa_c is not None:
                             send_capping_at_sr_alert(_sa_c, option_data['underlying'])
+                    except Exception:
+                        pass
+
+                    # Rejection at strongest ceiling / bounce at strongest floor
+                    try:
+                        _sa_c = getattr(st.session_state, '_sa_result', None)
+                        _pcr_snap_c = getattr(st.session_state, '_pcr_sr_snapshot', [])
+                        _df5m_c = getattr(st.session_state, '_df_5m', None)
+                        send_rejection_alert(
+                            master['candle'],
+                            option_data['underlying'],
+                            _df5m_c,
+                            _sa_c,
+                            _pcr_snap_c,
+                            master.get('support_levels', []),
+                            master.get('resistance_levels', []),
+                        )
                     except Exception:
                         pass
 
