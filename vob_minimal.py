@@ -5693,18 +5693,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     # Part 2 — detailed blocks + AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
 {_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, Money Flow Profile, OI winding. SHORT answers:
+🟡 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
-2. Strongest wall: strike + OI + VPFR (POC/VAH/VAL) + Money Flow Profile POC + why
+2. Strongest wall: strike + OI + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
-4. Liquidity pool: ₹___ (BSL above swing high/equal highs for SELL — SSL below swing low/equal lows for BUY — where market sweeps before reversing)
-5. Trade Plan:
-   SELL only at RESISTANCE wall | BUY only at SUPPORT wall — never mid-range
-   Entry A (wall): ₹___ AT resistance for SELL / AT support for BUY
-   Entry B (reversal): ₹___ if sudden reversal signal fires — Mv:FkUp/FkDn + LTP Trap + BA flip + OI Unwind at strike → enter immediately on reversal candle
-   SL: ₹___ (beyond liquidity pool above resistance for SELL / below support for BUY)
-   T1: ₹___ | T2: ₹___ | T3: ₹___
-   If SL breaks and holds: next wall ₹___</code>"""
+4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL</code>"""
 
     message = msg_part1  # used for Gemini analysis context
 
