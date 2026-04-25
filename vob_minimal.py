@@ -5557,11 +5557,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 2. Strongest wall: strike + OI + VPFR (POC/VAH/VAL) + Money Flow Profile POC + why
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
 4. Liquidity pool: ₹___ (BSL above swing high/equal highs for SELL — SSL below swing low/equal lows for BUY — where market sweeps before reversing)
-5. Trade Plan (BUY/SELL):
-   Entry: ₹___ (AT ceiling for SELL / AT floor for BUY — the wall itself)
-   SL: ₹___ (beyond liquidity pool above ceiling for SELL / below floor for BUY — where stops cluster; price may spike there before reversing)
+5. Trade Plan:
+   SELL only at RESISTANCE wall | BUY only at SUPPORT wall — never mid-range
+   Entry A (wall): ₹___ AT resistance for SELL / AT support for BUY
+   Entry B (reversal): ₹___ if sudden reversal signal fires — Mv:FkUp/FkDn + LTP Trap + BA flip + OI Unwind at strike → enter immediately on reversal candle
+   SL: ₹___ (beyond liquidity pool above resistance for SELL / below support for BUY)
    T1: ₹___ | T2: ₹___ | T3: ₹___
-   If price breaks SL level and holds: next wall ₹___</code>"""
+   If SL breaks and holds: next wall ₹___</code>"""
 
     # Send image version
     try:
