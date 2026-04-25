@@ -5558,10 +5558,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
 4. Liquidity pool: ₹___ (BSL above swing high/equal highs for SELL — SSL below swing low/equal lows for BUY — where market sweeps before reversing)
 5. Trade Plan (BUY/SELL):
-   Entry Zone: ₹___–₹___ (at strongest wall; enter ONLY if price stalls — wicks/rejection/volume fade; skip if breaks strongly)
-   SL tight: ₹___ | SL safe: ₹___ (safe = beyond liquidity pool + 0.5×ATR14)
+   Entry Zone: ₹___–₹___ (point of no return — price already swept liquidity above/below the wall and FAILED to hold; enter on first reversal candle closing back inside the wall; this is where it will NOT go further)
+   SL: ₹___ (just beyond the liquidity sweep high/low — if price goes past this it means the wall is broken, not hunted)
    T1: ₹___ | T2: ₹___ | T3: ₹___
-   If breakout sustained: wait for next wall ₹___</code>"""
+   If breakout sustained beyond SL: next wall ₹___</code>"""
 
     # Send image version
     try:
