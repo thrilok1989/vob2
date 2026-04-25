@@ -5001,8 +5001,18 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         _rollover_flag = ""
         try:
             if _expiry_str:
-                _exp_dt = datetime.strptime(str(_expiry_str).strip(), '%d-%b-%Y')
-                _dte = (_exp_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days
+                _exp_str = str(_expiry_str).strip()
+                # API stores expiry as YYYY-MM-DD; try both formats
+                for _fmt in ('%Y-%m-%d', '%d-%b-%Y', '%Y/%m/%d'):
+                    try:
+                        _exp_dt = datetime.strptime(_exp_str, _fmt)
+                        break
+                    except ValueError:
+                        continue
+                else:
+                    _exp_dt = None
+                if _exp_dt:
+                    _dte = (_exp_dt.date() - datetime.now(pytz.timezone('Asia/Kolkata')).date()).days
                 if _dte <= 5:
                     _rollover_flag = " ⚠️Rollover"
         except Exception:
@@ -5227,7 +5237,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 node_parts.append(f"{s_e}₹{r['bin_low']:.0f}({r['volume_pct']:.0f}%){poc_tag}")
             nodes_inline = " ".join(node_parts) if node_parts else "—"
             mf_block = (
-                f"\n💰 MF: POC₹{poc_price:.0f} VA₹{val:.0f}-₹{vah:.0f} "
+                f"\n💰 Money Flow Profile: POC₹{poc_price:.0f} VA₹{val:.0f}-₹{vah:.0f} "
                 f"Strong:{hi_sent_emoji}₹{hi_sent_price:.0f} | {nodes_inline}\n"
             )
     except Exception:
@@ -5544,7 +5554,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 {_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
-2. Strongest wall: strike + OI + why
+2. Strongest wall: strike + OI + VPFR confluence (POC/VAH/VAL) + Money Flow Profile POC alignment + why
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
 4. Entry: ₹___ | SL: ₹___ | Target: ₹___ | BUY/SELL</code>"""
 
