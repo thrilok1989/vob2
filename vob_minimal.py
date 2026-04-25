@@ -4722,8 +4722,8 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=5):
 
 
 def generate_ai_context_message():
-    """One-time AI context/glossary message to send at start of trading day."""
-    return """🤖 <b>AI SIGNAL GUIDE — NIFTY OPTIONS</b>
+    """One-time AI context/glossary — split into two messages to stay under 4096 chars."""
+    part1 = """🤖 <b>AI SIGNAL GUIDE (1/2) — NIFTY OPTIONS</b>
 (Send once at day start before pasting signals)
 
 <b>📋 SIGNAL TYPES</b>
@@ -4744,42 +4744,41 @@ BullHar/BearHar=Harami TwTop/TwBot=Tweezer InsBar PinBar
 <b>🔬 STRIKE ANALYSIS (ATM±2) — all data per strike in ONE block:</b>
 Line1: ATM±N ₹Strike | PCR | S/R:₹chartprice(offset) | 🟥/🟩Cap OI | Score
   PCR &gt;1.2=put heavy(bull) &lt;0.8=call heavy(bear)
-  S/R offset = how many pts from strike price the wall is felt
-  Cap OI = open interest at that strike (HiConv=strong wall Mod=moderate)
+  S/R offset = how many pts from strike the wall is felt
+  Cap OI = open interest (HiConv=strong wall Mod=moderate)
 
 Line2: 📌Depth R/S ₹chartprice→₹strike(wallQty)
   ₹chartprice = where pressure ACTUALLY felt (before hitting strike)
   ₹strike = raw option chain strike | wallQty = combined CE+PE pressure
-  Δ=Delta Γ=Gamma Θ=Theta (Greek exposure biases)
+  Δ=Delta Γ=Gamma Θ=Theta (Greek biases)
   COI=ChangeOI V=Volume IV=ImpliedVol Ask/Bid=order side bias
   BA=bid-ask pressure (+ve=buyers active -ve=sellers dominant)
   E=Entry(Bull/Bear/NoEnt) Mv=Move(RUp/RDn=real FkUp/FkDn=reversal)
 
 Line3: CE B/A = call bid/ask qty | PE B/A = put bid/ask qty
-  Bigger qty = thicker wall = harder for price to break through
-  COI/OI comparison shows whether strikes are building or unwinding
+  Bigger qty = thicker wall | COI/OI = building or unwinding
 
-<b>🌐 MARKET CONTEXT (expiry &amp; volatility awareness)</b>
-DTE=days to expiry | ⚠️Rollover=≤5 days (expiry week — PCR/GEX less reliable)
-MaxPain=strike where market makers pay least (price gravitates here near expiry)
-Straddle=ATM CE+PE last price (wider=bigger expected range; narrow=low vol day)
-IVR=session IV rank: 🔥≥70%(IV elevated) ⚪30-70% 🧊≤30%(IV compressed)
-  🔥IVR high = expensive options → favour selling | 🧊IVR low = favour buying
-Skew=PE(ATM-1) IV ÷ CE(ATM+1) IV
-  🔴&gt;1.1=put skew (hedging/fear dominant) | 🟢&lt;0.9=call skew (greed/bullish bets)
-  Skew&gt;1.1 on red day = genuine fear | Skew&gt;1.1 on green day = smart hedging
-ATR14=14-candle avg true range → use for SL sizing (SL ≥ 0.5×ATR to avoid noise)
-OIVel=OI velocity | 🔺=OI building (fresh positions) 🔻=OI unwinding (exits)
+<b>🌐 MARKET CONTEXT (expiry &amp; volatility)</b>
+DTE=days to expiry | ⚠️Rollover=≤5 days (PCR/GEX less reliable)
+MaxPain=strike MM pay least (price magnet near expiry)
+Straddle=ATM CE+PE last price (wider=bigger expected range)
+IVR=session IV rank: 🔥≥70% ⚪30-70% 🧊≤30%
+  🔥=expensive→favour selling | 🧊=cheap→favour buying
+Skew=PE(ATM-1)IV ÷ CE(ATM+1)IV
+  🔴&gt;1.1=put skew(fear) 🟢&lt;0.9=call skew(greed)
+ATR14=avg true range (SL ≥ 0.5×ATR)
+OIVel: 🔺=building(fresh) 🔻=unwinding(exits)"""
+
+    part2 = """🤖 <b>AI SIGNAL GUIDE (2/2) — OTHER BLOCKS &amp; RULES</b>
 
 <b>📊 OTHER BLOCKS</b>
 GEX +ve=range mode -ve=trending | Flip=gamma flip level
 VIDYA: adaptive trend | -ve%=falling +ve%=rising
-VPFR: POC=most traded | VAH/VAL=value area high/low (3 timeframes)
-📍 Triple POC: P1(10bar) P2(25bar) P3(70bar) — price magnet levels
-  Multiple POCs clustered = strong S/R confluence
+VPFR: POC=most traded | VAH/VAL=value area high/low (3 TFs)
+📍 Triple POC: P1(10bar) P2(25bar) P3(70bar) — price magnets
+  Clustered POCs = strong S/R confluence
 🌀 Future Swing: SwH=last swing high SwL=last swing low
-  →Target=projected next swing level based on avg historical swing %
-  Direction=current swing bias (bull/bear) | sign+/-=up/down projection
+  →Target=projected next swing | bull/bear direction
 OI Wind: CE/PE build🟢/unwind🔴 | Par=parallel winding
 Money Flow: POC=peak vol price | ⭐=max vol node
 LTP Trap=fake breakout | VWAP=vol avg (below=bear context)
@@ -4787,20 +4786,22 @@ VOB=Volume Order Blocks | HVP=High Volume Pivots
 📡 OC Bias=live option chain direction per index/stock
 
 <b>📈 TRADING RULES</b>
-1. Alignment 3+ same across 1h+4h+1D = confirmed trend bias
-2. GEX negative + VIDYA bearish = trending — do NOT fade moves
-3. Price below VWAP = bearish session context for entries
+1. Alignment 3+ same across 1h+4h+1D = confirmed trend
+2. GEX negative + VIDYA bearish = trending — do NOT fade
+3. Price below VWAP = bearish session context
 4. 📌Depth qty &gt;5K = major wall | &lt;500 = weak (breakable)
-5. BA negative + Mv=RDn = confirmed bear entry signal
+5. BA negative + Mv=RDn = confirmed bear entry
 6. PCR&lt;0.8 + Γ🔴 at ATM+1 = heavy gamma resistance above
 7. 🟥CAP + GEX neg + all-red alignment = high conviction SELL
 8. 🟩CAP + GEX pos + all-green alignment = high conviction BUY
-9. chartprice &lt; strike in Depth = pressure felt before strike (real wall)
-10. Money Flow POC far above spot = sellers dominated day = bearish
-11. DTE≤5 (⚠️Rollover): MaxPain becomes dominant magnet — avoid counter-MaxPain trades
-12. 🔥IVR + 🔴Skew + red alignment = hedge unwind risk → tight SL, reduce size
-13. OIVel🔺 surging at key strike = fresh wall forming → wait for confirmation before entry
-14. Straddle wide vs ATR = market pricing big move → widen targets, avoid tight scalps"""
+9. chartprice &lt; strike in Depth = real wall before strike
+10. Money Flow POC far above spot = sellers dominated = bearish
+11. DTE≤5 (⚠️Rollover): MaxPain magnet — avoid counter-MaxPain
+12. 🔥IVR + 🔴Skew + red alignment = hedge unwind risk → tight SL
+13. OIVel🔺 surging at strike = fresh wall → wait for confirm
+14. Straddle wide vs ATR = big move priced → widen targets"""
+
+    return [part1, part2]
 
 
 def compute_depth_sr(df_summary, underlying_price, n=3):
@@ -5527,8 +5528,9 @@ def main():
         )
         if _ctx_clicked:
             try:
-                send_telegram_message_sync(generate_ai_context_message(), force=True)
-                st.success("✅ AI context guide sent to Telegram!")
+                for _ctx_part in generate_ai_context_message():
+                    send_telegram_message_sync(_ctx_part, force=True)
+                st.success("✅ AI context guide sent to Telegram! (2 messages)")
             except Exception as _ctx_err:
                 st.error(f"Failed: {_ctx_err}")
 
