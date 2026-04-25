@@ -5174,7 +5174,7 @@ def compute_depth_sr(df_summary, underlying_price, n=3):
     return resistance, support
 
 
-def send_master_signal_telegram(result, underlying_price, option_data=None, force=False):
+def send_master_signal_telegram(result, underlying_price, option_data=None, force=False, skip_image=False):
     """Send master signal to Telegram. Pass force=True to bypass all guards."""
     if result is None:
         return
@@ -5891,12 +5891,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     message = msg_part1  # used for Gemini analysis context
 
-    # Send image version
-    try:
-        _img_bytes = render_master_signal_image(result, underlying_price, option_data)
-        send_telegram_photo_sync(_img_bytes, force=force)
-    except Exception as _img_err:
-        st.warning(f"Signal image error: {_img_err}")
+    # Send image version (skipped when triggered by rejection alert)
+    if not skip_image:
+        try:
+            _img_bytes = render_master_signal_image(result, underlying_price, option_data)
+            send_telegram_photo_sync(_img_bytes, force=force)
+        except Exception as _img_err:
+            st.warning(f"Signal image error: {_img_err}")
 
     # Send Part 1 then Part 2
     try:
@@ -8803,7 +8804,7 @@ def main():
                             master.get('resistance_levels', []),
                         )
                         if _rej_fired:
-                            send_master_signal_telegram(master, option_data['underlying'], option_data, force=True)
+                            send_master_signal_telegram(master, option_data['underlying'], option_data, force=True, skip_image=True)
                     except Exception:
                         pass
 
