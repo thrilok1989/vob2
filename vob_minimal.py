@@ -8611,13 +8611,8 @@ def main():
             if _sa:
                 master = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
                 if master:
-                    # Send Telegram (with cooldown)
-                    if 'last_master_signal_time' not in st.session_state:
-                        st.session_state.last_master_signal_time = None
                     _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
-                    _should_send = st.session_state.last_master_signal_time is None or \
-                        (_ist_now - st.session_state.last_master_signal_time).total_seconds() > 300
-                    if _should_send:
+                    if False:  # auto 5-min signal disabled — alerts fire on their own
                         # Refresh PCR S/R snapshot from current OI history so the
                         # auto-send always has fresh data (the UI table sets it later
                         # in the same render, so session state may be stale on first fires)
