@@ -5014,6 +5014,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
         )
         send_telegram_message_sync(msg, force=True)
         alerted[key] = now
+        return True  # caller should follow with full master signal
 
     # ── Check floor bounce ────────────────────────────────────────────────────
     for src, lbl, level, strike in candidate_sup:
@@ -5043,6 +5044,9 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
         )
         send_telegram_message_sync(msg, force=True)
         alerted[key] = now
+        return True  # caller should follow with full master signal
+
+    return False
 
 
 def generate_ai_context_message():
@@ -8784,11 +8788,12 @@ def main():
                         pass
 
                     # Rejection at strongest ceiling / bounce at strongest floor
+                    # If confirmed, also send the full master signal (Part 1 + Part 2 + AI prompt)
                     try:
                         _sa_c = getattr(st.session_state, '_sa_result', None)
                         _pcr_snap_c = getattr(st.session_state, '_pcr_sr_snapshot', [])
                         _df5m_c = getattr(st.session_state, '_df_5m', None)
-                        send_rejection_alert(
+                        _rej_fired = send_rejection_alert(
                             master['candle'],
                             option_data['underlying'],
                             _df5m_c,
@@ -8797,6 +8802,8 @@ def main():
                             master.get('support_levels', []),
                             master.get('resistance_levels', []),
                         )
+                        if _rej_fired:
+                            send_master_signal_telegram(master, option_data['underlying'], option_data, force=True)
                     except Exception:
                         pass
 
