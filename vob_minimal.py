@@ -4759,16 +4759,17 @@ Line3: CE B/A = call bid/ask qty | PE B/A = put bid/ask qty
   Bigger qty = thicker wall = harder for price to break through
   COI/OI comparison shows whether strikes are building or unwinding
 
-<b>🌐 MARKET CONTEXT</b>
+<b>🌐 MARKET CONTEXT (expiry &amp; volatility awareness)</b>
 DTE=days to expiry | ⚠️Rollover=≤5 days (expiry week — PCR/GEX less reliable)
 MaxPain=strike where market makers pay least (price gravitates here near expiry)
-Straddle=ATM CE+PE last price (cost of hedging both sides; bigger=wider expected range)
+Straddle=ATM CE+PE last price (wider=bigger expected range; narrow=low vol day)
 IVR=session IV rank: 🔥≥70%(IV elevated) ⚪30-70% 🧊≤30%(IV compressed)
-  IVR high = expensive options → favour selling; IVR low = favour buying
-Skew=PE(ATM-1) IV ÷ CE(ATM+1) IV: 🔴&gt;1.1=put skew(hedging/fear) 🟢&lt;0.9=call skew(greed)
-  Skew&gt;1.1 on red day = genuine fear; same skew on green day = smart hedging
-ATR14=14-candle avg true range (volatility ruler for SL sizing)
-OIVel=OI velocity 🔺=building 🔻=unwinding | big spike = fresh positioning
+  🔥IVR high = expensive options → favour selling | 🧊IVR low = favour buying
+Skew=PE(ATM-1) IV ÷ CE(ATM+1) IV
+  🔴&gt;1.1=put skew (hedging/fear dominant) | 🟢&lt;0.9=call skew (greed/bullish bets)
+  Skew&gt;1.1 on red day = genuine fear | Skew&gt;1.1 on green day = smart hedging
+ATR14=14-candle avg true range → use for SL sizing (SL ≥ 0.5×ATR to avoid noise)
+OIVel=OI velocity | 🔺=OI building (fresh positions) 🔻=OI unwinding (exits)
 
 <b>📊 OTHER BLOCKS</b>
 GEX +ve=range mode -ve=trending | Flip=gamma flip level
@@ -4783,9 +4784,9 @@ OI Wind: CE/PE build🟢/unwind🔴 | Par=parallel winding
 Money Flow: POC=peak vol price | ⭐=max vol node
 LTP Trap=fake breakout | VWAP=vol avg (below=bear context)
 VOB=Volume Order Blocks | HVP=High Volume Pivots
-🌐 OC Bias=live option chain direction per index/stock
+📡 OC Bias=live option chain direction per index/stock
 
-<b>📈 10 RULES</b>
+<b>📈 TRADING RULES</b>
 1. Alignment 3+ same across 1h+4h+1D = confirmed trend bias
 2. GEX negative + VIDYA bearish = trending — do NOT fade moves
 3. Price below VWAP = bearish session context for entries
@@ -4795,7 +4796,11 @@ VOB=Volume Order Blocks | HVP=High Volume Pivots
 7. 🟥CAP + GEX neg + all-red alignment = high conviction SELL
 8. 🟩CAP + GEX pos + all-green alignment = high conviction BUY
 9. chartprice &lt; strike in Depth = pressure felt before strike (real wall)
-10. Money Flow POC far above spot = sellers dominated day = bearish"""
+10. Money Flow POC far above spot = sellers dominated day = bearish
+11. DTE≤5 (⚠️Rollover): MaxPain becomes dominant magnet — avoid counter-MaxPain trades
+12. 🔥IVR + 🔴Skew + red alignment = hedge unwind risk → tight SL, reduce size
+13. OIVel🔺 surging at key strike = fresh wall forming → wait for confirmation before entry
+14. Straddle wide vs ATR = market pricing big move → widen targets, avoid tight scalps"""
 
 
 def compute_depth_sr(df_summary, underlying_price, n=3):
