@@ -5256,7 +5256,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             def _fmtk(v):
                 try:
                     n = float(v) if v != 'N/A' else 0
-                    return f"{n/1000:.1f}K" if n >= 1000 else str(int(n))
+                    if n >= 1_000_000:
+                        return f"{n/1_000_000:.1f}M"
+                    if n >= 1_000:
+                        return f"{n/1000:.1f}K"
+                    return str(int(n))
                 except Exception:
                     return '—'
 
