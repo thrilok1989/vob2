@@ -5213,20 +5213,23 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                     f"  {s_emoji} ₹{r['bin_low']:.0f}-₹{r['bin_high']:.0f} | "
                     f"{sent} ({r.get('sentiment_strength', 0):.0f}%) | Vol:{r['volume_pct']:.1f}%{poc_tag}"
                 )
-            hn_text = "\n".join(hn_lines) if hn_lines else "  No high-volume nodes"
             poc_price = mf.get('poc_price', 0)
             vah = mf.get('value_area_high', 0)
             val = mf.get('value_area_low', 0)
             hi_sent_price = mf.get('highest_sentiment_price', 0)
             hi_sent_dir = mf.get('highest_sentiment_direction', 'Neutral')
             hi_sent_emoji = '🟢' if hi_sent_dir == 'Bullish' else '🔴' if hi_sent_dir == 'Bearish' else '⚪'
-            mf_block = f"""
-<b>💰 MONEY FLOW PROFILE:</b>
-  POC: ₹{poc_price:.0f} | Value Area: ₹{val:.0f}-₹{vah:.0f}
-  Strongest Sentiment: {hi_sent_emoji} ₹{hi_sent_price:.0f} ({hi_sent_dir})
-  <b>High Volume Nodes:</b>
-{hn_text}
-"""
+            # Top 3 nodes inline: emoji+range(vol%)+⭐
+            node_parts = []
+            for r in top_nodes[:3]:
+                s_e = '🟢' if r.get('sentiment') == 'Bullish' else '🔴' if r.get('sentiment') == 'Bearish' else '⚪'
+                poc_tag = '⭐' if r.get('is_poc') else ''
+                node_parts.append(f"{s_e}₹{r['bin_low']:.0f}({r['volume_pct']:.0f}%){poc_tag}")
+            nodes_inline = " ".join(node_parts) if node_parts else "—"
+            mf_block = (
+                f"\n💰 MF: POC₹{poc_price:.0f} VA₹{val:.0f}-₹{vah:.0f} "
+                f"Strong:{hi_sent_emoji}₹{hi_sent_price:.0f} | {nodes_inline}\n"
+            )
     except Exception:
         mf_block = ""
 
