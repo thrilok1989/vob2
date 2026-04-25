@@ -4725,13 +4725,9 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
                 f"Zone: {zone_low} – {zone_high}\n"
                 f"Price likely to <b>hold / bounce here</b>. Watch for reversal."
             )
-        try:
-            send_telegram_message_sync(msg, force=True)
-            alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
-            return True
-        except Exception:
-            pass
-    return False
+        alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
+        return msg
+    return None
 
 
 def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
@@ -4775,9 +4771,8 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 f"📍 Near {_e(src)} Support {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
                 f"📌 Watch for bounce / BUY setup"
             )
-            send_telegram_message_sync(msg, force=True)
             alerted[key] = now
-            return True
+            return msg
     elif direction == 'Bearish':
         for src, lbl, level in candidate_resistances:
             if abs(underlying_price - level) > proximity_pts:
@@ -4793,10 +4788,9 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 f"📍 Near {_e(src)} Resistance {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
                 f"📌 Watch for rejection / SELL setup"
             )
-            send_telegram_message_sync(msg, force=True)
             alerted[key] = now
-            return True
-    return False
+            return msg
+    return None
 
 
 def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
@@ -4834,9 +4828,8 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 f"CE OI: {oi_l:.1f}L | Class: {_e(r.get('Call_Class',''))}\n"
                 f"📌 CE writers capping here — watch for reversal / SELL setup"
             )
-            send_telegram_message_sync(msg, force=True)
             alerted[key] = now
-            return True
+            return msg
     except Exception:
         pass
 
@@ -4863,12 +4856,11 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 f"PE OI: {oi_l:.1f}L | Class: {_e(r.get('Put_Class',''))}\n"
                 f"📌 PE writers defending here — watch for bounce / BUY setup"
             )
-            send_telegram_message_sync(msg, force=True)
             alerted[key] = now
-            return True
+            return msg
     except Exception:
         pass
-    return False
+    return None
 
 
 def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
@@ -5020,9 +5012,8 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             "\n".join(f"  {s}" for s in signals) +
             f"\n📌 SELL zone — price stalling here"
         )
-        send_telegram_message_sync(msg, force=True)
         alerted[key] = now
-        return True  # caller should follow with full master signal
+        return msg
 
     # ── Check floor bounce ────────────────────────────────────────────────────
     for src, lbl, level, strike in candidate_sup:
@@ -5050,11 +5041,10 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             "\n".join(f"  {s}" for s in signals) +
             f"\n📌 BUY zone — price holding here"
         )
-        send_telegram_message_sync(msg, force=True)
         alerted[key] = now
-        return True  # caller should follow with full master signal
+        return msg
 
-    return False
+    return None
 
 
 def generate_ai_context_message():
@@ -5182,7 +5172,7 @@ def compute_depth_sr(df_summary, underlying_price, n=3):
     return resistance, support
 
 
-def send_master_signal_telegram(result, underlying_price, option_data=None, force=False, skip_image=False):
+def send_master_signal_telegram(result, underlying_price, option_data=None, force=False, skip_image=False, alert_header=""):
     """Send master signal to Telegram. Pass force=True to bypass all guards."""
     if result is None:
         return
@@ -5899,9 +5889,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     message = msg_part1  # used for Gemini analysis context
 
-    # Send Part 1 then Part 2
+    # Send Part 1 (with optional alert header prepended) then Part 2
+    _part1_out = (alert_header + "\n\n" + msg_part1) if alert_header else msg_part1
     try:
-        send_telegram_message_sync(msg_part1, force=force)
+        send_telegram_message_sync(_part1_out, force=force)
     except Exception as _txt_err:
         st.warning(f"Telegram Part 1 send error: {_txt_err}")
     try:
@@ -8761,41 +8752,42 @@ def main():
                     _pcr_s = getattr(st.session_state, '_pcr_sr_snapshot', [])
                     _df5m_c = getattr(st.session_state, '_df_5m', None)
 
-                    def _follow_with_full_signal():
-                        send_master_signal_telegram(master, option_data['underlying'], option_data, force=True, skip_image=True)
+                    def _send_with_header(header):
+                        send_master_signal_telegram(master, option_data['underlying'], option_data, force=True, skip_image=True, alert_header=header)
 
                     # PCR S/R proximity alert
                     try:
-                        if check_pcr_sr_proximity_alert(option_data['underlying']):
-                            _follow_with_full_signal()
+                        _h = check_pcr_sr_proximity_alert(option_data['underlying'])
+                        if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
                     # Candle pattern at S/R alert
                     try:
-                        if send_candle_at_sr_alert(
+                        _h = send_candle_at_sr_alert(
                             master['candle'], option_data['underlying'],
                             _pcr_s, master.get('support_levels', []), master.get('resistance_levels', []),
-                        ):
-                            _follow_with_full_signal()
+                        )
+                        if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
                     # Capping at S/R alert
                     try:
-                        if _sa_c is not None and send_capping_at_sr_alert(_sa_c, option_data['underlying']):
-                            _follow_with_full_signal()
+                        if _sa_c is not None:
+                            _h = send_capping_at_sr_alert(_sa_c, option_data['underlying'])
+                            if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
                     # Rejection / bounce at strongest wall
                     try:
-                        if send_rejection_alert(
+                        _h = send_rejection_alert(
                             master['candle'], option_data['underlying'],
                             _df5m_c, _sa_c, _pcr_s,
                             master.get('support_levels', []), master.get('resistance_levels', []),
-                        ):
-                            _follow_with_full_signal()
+                        )
+                        if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
