@@ -5891,14 +5891,6 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     message = msg_part1  # used for Gemini analysis context
 
-    # Send image version (skipped when triggered by rejection alert)
-    if not skip_image:
-        try:
-            _img_bytes = render_master_signal_image(result, underlying_price, option_data)
-            send_telegram_photo_sync(_img_bytes, force=force)
-        except Exception as _img_err:
-            st.warning(f"Signal image error: {_img_err}")
-
     # Send Part 1 then Part 2
     try:
         send_telegram_message_sync(msg_part1, force=force)
