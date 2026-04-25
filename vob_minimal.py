@@ -5554,7 +5554,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 {_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 🤖 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
-2. Strongest wall: strike + OI + VPFR confluence (POC/VAH/VAL) + MF POC alignment + why
+2. Strongest wall: strike + OI + VPFR confluence (POC/VAH/VAL) + Money Flow Profile POC alignment + why
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
 4. Entry: ₹___ | SL: ₹___ | Target: ₹___ | BUY/SELL</code>"""
 
