@@ -5556,7 +5556,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + VPFR confluence (POC/VAH/VAL) + Money Flow Profile POC alignment + why
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
-4. Entry: ₹___ (at ceiling for SELL / at floor for BUY) | SL: ₹___ (beyond stop hunt zone — ceiling + 1×ATR14 for SELL / floor - 1×ATR14 for BUY; price often spikes past the wall to grab liquidity before reversing, so SL must clear that spike) | Target: ₹___ | BUY/SELL</code>"""
+4. Liquidity: ₹___ (where BSL/SSL sits — above swing high / equal highs for SELL, below swing low / equal lows for BUY; use Future Swing SwH/SwL + OI walls + round numbers) | Entry: ₹___ (AFTER liquidity sweep — wait for fake breakout above BSL / fake breakdown below SSL, then enter on reversal candle back inside the wall; confirm with Mv:FkUp/FkDn) | SL: ₹___ (beyond liquidity pool + 0.5×ATR14 buffer) | Target: ₹___ | BUY/SELL</code>"""
 
     # Send image version
     try:
