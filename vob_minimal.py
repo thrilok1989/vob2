@@ -115,6 +115,11 @@ def cached_iv_average(option_data_json):
     iv_pe_avg = df['impliedVolatility_PE'].mean()
     return iv_ce_avg, iv_pe_avg
 
+def _strip_html_tags(text):
+    """Strip HTML tags for plain-text fallback."""
+    import re
+    return re.sub(r'<[^>]+>', '', text)
+
 def send_telegram_message_sync(message, force=False):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
@@ -132,18 +137,23 @@ def send_telegram_message_sync(message, force=False):
     st.session_state._last_tg_send_time = datetime.now(pytz.timezone('Asia/Kolkata'))
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "HTML"
-    }
+    # Telegram max message length is 4096 chars — truncate to be safe
+    msg_text = message[:4090] if len(message) > 4090 else message
 
     try:
-        response = requests.post(url, json=payload, timeout=10)
+        # Try HTML mode first
+        response = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg_text, "parse_mode": "HTML"}, timeout=10)
         if response.status_code == 200:
             return response.json()
+        # HTML parse error (400) — retry as plain text
+        if response.status_code == 400:
+            plain_text = _strip_html_tags(msg_text)
+            response2 = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": plain_text}, timeout=10)
+            if response2.status_code == 200:
+                return response2.json()
+            st.error(f"Telegram error (plain fallback): {response2.status_code} — {response2.text[:200]}")
         else:
-            st.error(f"Telegram error: {response.status_code}")
+            st.error(f"Telegram error: {response.status_code} — {response.text[:200]}")
     except Exception as e:
         st.error(f"Telegram notification error: {e}")
 
@@ -8569,15 +8579,19 @@ def main():
             _conf = getattr(st.session_state, '_confluence', None)
             _do_send = _force_send_clicked or st.session_state.pop('_top_send_triggered', False)
             if _do_send:
-                try:
-                    _master_now = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api) if _sa else None
-                    if _master_now:
-                        send_master_signal_telegram(_master_now, option_data['underlying'], option_data, force=True)
-                    if _sa is not None:
+                if _sa is None:
+                    st.warning("⚠️ Option chain data not loaded yet. Please wait for the option chain section to refresh, then click Send again.")
+                else:
+                    try:
+                        _master_now = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
+                        if _master_now:
+                            send_master_signal_telegram(_master_now, option_data['underlying'], option_data, force=True)
+                        else:
+                            st.warning("⚠️ Master signal could not be generated. Check that price data is loaded.")
                         send_option_chain_signal(_sa, option_data['underlying'], force=True)
-                    st.success("✅ Sent Master Signal to Telegram | OC snapshot saved to history")
-                except Exception as _e:
-                    st.error(f"Failed to force-send: {_e}")
+                        st.success("✅ Sent Master Signal to Telegram")
+                    except Exception as _e:
+                        st.error(f"Failed to force-send: {_e}")
             if _ai_explain_clicked:
                 with st.spinner("🤖 Gemini is analyzing the current setup..."):
                     try:
