@@ -4514,9 +4514,7 @@ def ai_analyze_telegram_message(message, kind="master"):
         return None, "Gemini not configured (no GEMINI_API_KEY)."
 
     try:
-        import re
-        clean = re.sub(r'<[^>]+>', '', message)
-        resp = client.models.generate_content(model="gemini-2.0-flash", contents=clean)
+        resp = client.models.generate_content(model="gemini-2.0-flash", contents=message)
         return (resp.text or "").strip(), None
     except Exception as e:
         return None, f"Gemini error: {str(e)[:200]}"
