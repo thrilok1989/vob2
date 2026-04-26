@@ -4518,33 +4518,13 @@ def ai_analyze_telegram_message(message, kind="master"):
         import re
         clean = re.sub(r'<[^>]+>', '', message)
 
-        if kind == "oc":
-            task = (
-                "This is an Option Chain Deep Analysis snapshot from a Nifty trading app. "
-                "Interpret what the option writers/buyers are doing right now, identify the "
-                "dominant side, and state whether the current structure favours a bounce, "
-                "breakdown, or range. Be concise."
-            )
-        else:
-            task = (
-                "This is a Nifty options Master Trading Signal snapshot. Act as an experienced "
-                "options trader and give an actionable trade plan."
-            )
+        prompt = f"""{clean}
 
-        prompt = f"""{task}
-
-Respond in exactly this format (plain text, no markdown headers):
-
-📍 Read: one-line summary of the current setup
-✅ Trade: entry zone | stop loss | target 1 | target 2
-⚠️ Invalidation: one line — what kills the trade
-🎯 Confidence: LOW / MEDIUM / HIGH — one-line reason
-💡 Key Risk: biggest thing that could go wrong in the next 15 minutes
-
-Keep the whole reply under 170 words. No disclaimers.
-
-SNAPSHOT:
-{clean}
+Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
+1. Market structure: bull/bear/range + reason
+2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
+3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
+4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL
 """
         resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return (resp.text or "").strip(), None
