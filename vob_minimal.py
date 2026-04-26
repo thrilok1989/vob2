@@ -569,6 +569,39 @@ class DhanAPI:
         except Exception:
             return None
 
+    def get_positions(self):
+        """Fetch all open positions from Dhan."""
+        url = f"{self.base_url}/positions"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception:
+            return None
+
+    def get_orders(self):
+        """Fetch today's orders from Dhan."""
+        url = f"{self.base_url}/orders"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception:
+            return None
+
+    def get_order_by_id(self, order_id):
+        """Fetch a specific order status from Dhan."""
+        url = f"{self.base_url}/orders/{order_id}"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception:
+            return None
+
 @st.cache_data(ttl=300)
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
     return get_dhan_expiry_list(underlying_scrip, underlying_seg)
@@ -5966,20 +5999,49 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 #  ZONE-BASED AUTO TRADE SYSTEM
 # ═══════════════════════════════════════════════════════════════
 
-def _analyze_zone(spot, zone_bottom, zone_top, option_data, df_1m):
+def _detect_candle_pattern(df, label):
+    """Detect candle pattern from last candle in dataframe. Returns confirmation string."""
+    if df is None or df.empty or len(df) < 2:
+        return None
+    try:
+        c = df.iloc[-1]
+        o, h, l, cl = float(c['Open']), float(c['High']), float(c['Low']), float(c['Close'])
+        body = abs(cl - o)
+        rng = h - l if h > l else 1
+        upper_wick = h - max(o, cl)
+        lower_wick = min(o, cl) - l
+        is_bullish = cl > o
+        is_bearish = cl < o
+        if lower_wick > body * 2 and upper_wick < body:
+            pat = "Hammer ✅" if is_bullish else "Hanging Man ✅"
+        elif upper_wick > body * 2 and lower_wick < body:
+            pat = "Shooting Star ✅" if is_bearish else "Inv Hammer ✅"
+        elif body / rng > 0.6 and is_bullish:
+            pat = "Strong Green ✅"
+        elif body / rng > 0.6 and is_bearish:
+            pat = "Strong Red ✅"
+        else:
+            pat = "Doji/Inside ⚪"
+        return f"{label} Candle: {pat}"
+    except Exception:
+        return None
+
+
+def _analyze_zone(spot, zone_bottom, zone_top, option_data, df_5m, df_1m=None):
     """Analyze market conditions inside a S/R zone. Returns list of confirmation signals."""
     confirmations = []
 
-    # 1. OI check
+    # 1. OI check — use correct Dhan API column names
     try:
-        sa = getattr(st.session_state, '_sa_result', None)
-        if sa is not None and option_data:
+        if option_data:
             sg = option_data.get('df_summary')
             if sg is not None and not sg.empty and 'Strike' in sg.columns:
                 strikes_in_zone = sg[(sg['Strike'] >= zone_bottom) & (sg['Strike'] <= zone_top)]
                 if not strikes_in_zone.empty:
-                    ce_chg = strikes_in_zone.get('CE_ChgOI', pd.Series([0])).sum() if 'CE_ChgOI' in strikes_in_zone.columns else 0
-                    pe_chg = strikes_in_zone.get('PE_ChgOI', pd.Series([0])).sum() if 'PE_ChgOI' in strikes_in_zone.columns else 0
+                    ce_col = next((c for c in ['changeinOpenInterest_CE', 'CE_ChgOI', 'chgOI_CE'] if c in strikes_in_zone.columns), None)
+                    pe_col = next((c for c in ['changeinOpenInterest_PE', 'PE_ChgOI', 'chgOI_PE'] if c in strikes_in_zone.columns), None)
+                    ce_chg = float(strikes_in_zone[ce_col].sum()) if ce_col else 0
+                    pe_chg = float(strikes_in_zone[pe_col].sum()) if pe_col else 0
                     if pe_chg > 0 and pe_chg > ce_chg:
                         confirmations.append("OI: PE writing ↑ (floor holding) ✅")
                     elif ce_chg > 0 and ce_chg > pe_chg:
@@ -5989,71 +6051,62 @@ def _analyze_zone(spot, zone_bottom, zone_top, option_data, df_1m):
     except Exception:
         pass
 
-    # 2. Depth check
+    # 2. Depth check — use bidQty/askQty from df_summary for strikes in zone
     try:
-        ob_data = getattr(st.session_state, '_orderbook_data', None)
-        if ob_data:
-            _bids = ob_data.get('bids', []) or []
-            _asks = ob_data.get('asks', []) or []
-            bid_wall = any(float(b.get('price', 0)) >= zone_bottom and float(b.get('price', 0)) <= zone_top for b in _bids[:5])
-            ask_wall = any(float(a.get('price', 0)) >= zone_bottom and float(a.get('price', 0)) <= zone_top for a in _asks[:5])
-            if bid_wall:
-                confirmations.append("Depth: Bid wall in zone ✅")
-            elif ask_wall:
-                confirmations.append("Depth: Ask wall in zone ✅")
-            else:
-                confirmations.append("Depth: No wall detected ⚪")
+        if option_data:
+            sg = option_data.get('df_summary')
+            if sg is not None and not sg.empty and 'Strike' in sg.columns:
+                strikes_in_zone = sg[(sg['Strike'] >= zone_bottom) & (sg['Strike'] <= zone_top)]
+                if not strikes_in_zone.empty:
+                    bid_ce = float(strikes_in_zone.get('bidQty_CE', pd.Series([0])).sum()) if 'bidQty_CE' in strikes_in_zone.columns else 0
+                    ask_ce = float(strikes_in_zone.get('askQty_CE', pd.Series([0])).sum()) if 'askQty_CE' in strikes_in_zone.columns else 0
+                    bid_pe = float(strikes_in_zone.get('bidQty_PE', pd.Series([0])).sum()) if 'bidQty_PE' in strikes_in_zone.columns else 0
+                    ask_pe = float(strikes_in_zone.get('askQty_PE', pd.Series([0])).sum()) if 'askQty_PE' in strikes_in_zone.columns else 0
+                    # Support zone: strong bid on PE side = buyers defending
+                    # Resistance zone: strong ask on CE side = sellers defending
+                    if bid_pe > ask_pe * 1.2:
+                        confirmations.append("Depth: PE Bid wall (support defending) ✅")
+                    elif ask_ce > bid_ce * 1.2:
+                        confirmations.append("Depth: CE Ask wall (resistance defending) ✅")
+                    elif bid_ce > ask_ce * 1.2:
+                        confirmations.append("Depth: CE Bid wall (breakout pressure) ✅")
+                    else:
+                        confirmations.append("Depth: Balanced ⚪")
     except Exception:
         pass
 
-    # 3. Delta Volume check
+    # 3. Delta Volume check — from 5m candle (always available)
     try:
-        if df_1m is not None and not df_1m.empty and len(df_1m) >= 2:
-            last = df_1m.iloc[-1]
-            buy_vol = float(last.get('buy_volume', last.get('Volume', 0)) or 0)
-            sell_vol = float(last.get('sell_volume', 0) or 0)
-            if buy_vol > 0 or sell_vol > 0:
-                if buy_vol > sell_vol * 1.2:
-                    confirmations.append("Delta Vol: Buy dominant ✅")
-                elif sell_vol > buy_vol * 1.2:
-                    confirmations.append("Delta Vol: Sell dominant ✅")
-                else:
-                    confirmations.append("Delta Vol: Balanced ⚪")
+        df_vol = df_1m if (df_1m is not None and not df_1m.empty) else df_5m
+        if df_vol is not None and not df_vol.empty and len(df_vol) >= 2:
+            last = df_vol.iloc[-1]
+            vol = float(last.get('Volume', 0) or 0)
+            avg_vol = float(df_vol['Volume'].mean()) if 'Volume' in df_vol.columns else 0
+            # Check last 3 candles for volume trend
+            last3_vol = df_vol['Volume'].iloc[-3:].mean() if len(df_vol) >= 3 and 'Volume' in df_vol.columns else vol
+            prev_avg = df_vol['Volume'].iloc[:-3].mean() if len(df_vol) > 3 and 'Volume' in df_vol.columns else avg_vol
+            close_trend = df_vol['Close'].iloc[-3:].diff().sum() if len(df_vol) >= 3 and 'Close' in df_vol.columns else 0
+            if last3_vol > prev_avg * 1.3 and close_trend > 0:
+                confirmations.append("Delta Vol: Buying surge ✅")
+            elif last3_vol > prev_avg * 1.3 and close_trend < 0:
+                confirmations.append("Delta Vol: Selling surge ✅")
+            elif vol > avg_vol * 1.3:
+                confirmations.append("Delta Vol: Volume spike ✅")
             else:
-                vol = float(last.get('Volume', 0) or 0)
-                avg_vol = float(df_1m['Volume'].mean()) if 'Volume' in df_1m.columns else 0
-                if vol > avg_vol * 1.3:
-                    confirmations.append("Delta Vol: Volume spike ✅")
-                else:
-                    confirmations.append("Delta Vol: Normal ⚪")
+                confirmations.append("Delta Vol: Normal ⚪")
     except Exception:
         pass
 
-    # 4. 1-min candle pattern
-    try:
-        if df_1m is not None and not df_1m.empty and len(df_1m) >= 2:
-            c = df_1m.iloc[-1]
-            o, h, l, cl = float(c['Open']), float(c['High']), float(c['Low']), float(c['Close'])
-            body = abs(cl - o)
-            rng = h - l if h > l else 1
-            upper_wick = h - max(o, cl)
-            lower_wick = min(o, cl) - l
-            is_bullish = cl > o
-            is_bearish = cl < o
-            # Detect pattern
-            if lower_wick > body * 2 and upper_wick < body:
-                pat = "Hammer ✅" if is_bullish else "Hanging Man ✅"
-            elif upper_wick > body * 2 and lower_wick < body:
-                pat = "Shooting Star ✅" if is_bearish else "Inv Hammer ✅"
-            elif body / rng > 0.6 and is_bullish:
-                pat = "Strong Green Candle ✅"
-            elif body / rng > 0.6 and is_bearish:
-                pat = "Strong Red Candle ✅"
-            else:
-                pat = "Doji/Inside ⚪"
-            confirmations.append(f"1m Candle: {pat}")
-    except Exception:
-        pass
+    # 4a. 5-min candle pattern
+    pat_5m = _detect_candle_pattern(df_5m, "5m")
+    if pat_5m:
+        confirmations.append(pat_5m)
+
+    # 4b. 1-min candle pattern (if available)
+    if df_1m is not None and not df_1m.empty:
+        pat_1m = _detect_candle_pattern(df_1m, "1m")
+        if pat_1m:
+            confirmations.append(pat_1m)
 
     return confirmations
 
@@ -6143,7 +6196,7 @@ def _exit_trade(api, trade, exit_reason, db):
     return updated, exit_price
 
 
-def show_auto_trade_section(option_data, df_1m, api, db):
+def show_auto_trade_section(option_data, df_5m, api, db):
     """Render the full auto-trade UI section."""
     st.markdown("---")
     st.markdown("## 🎯 Zone-Based Auto Trade")
@@ -6273,7 +6326,7 @@ def show_auto_trade_section(option_data, df_1m, api, db):
                 zone_type = "SUPPORT" if in_support else "RESISTANCE"
                 zb = sup_bot if in_support else res_bot
                 zt = sup_top if in_support else res_top
-                confs = _analyze_zone(spot, zb, zt, option_data, df_1m)
+                confs = _analyze_zone(spot, zb, zt, option_data, df_1m, getattr(st.session_state, '_df_1m_trade', None))
                 score = sum(1 for c in confs if '✅' in c)
 
                 color = '#00ff88' if in_support else '#ff4444'
@@ -6321,18 +6374,25 @@ def show_auto_trade_section(option_data, df_1m, api, db):
                             st.error(f"Set {trade_type} entry price first and save setup.")
                         else:
                             with st.spinner(f"Placing {trade_type} order..."):
-                                # security_id lookup: use strike from option chain
-                                sec_id = selected_strike  # fallback; ideally from option chain security mapping
+                                # Resolve security_id from option chain — required for Dhan order
+                                sec_id = None
                                 try:
                                     if option_data and option_data.get('df_summary') is not None:
                                         df_s2 = option_data['df_summary']
                                         row = df_s2[df_s2['Strike'] == selected_strike]
                                         if not row.empty:
                                             col_name = 'CE_SecurityId' if trade_type == 'CALL' else 'PE_SecurityId'
-                                            if col_name in row.columns:
-                                                sec_id = int(row.iloc[0][col_name])
+                                            # Also try suffixed form from merge
+                                            alt_col = f"securityId_CE" if trade_type == 'CALL' else f"securityId_PE"
+                                            for cn in [col_name, alt_col, 'securityId']:
+                                                if cn in row.columns and row.iloc[0][cn]:
+                                                    sec_id = int(row.iloc[0][cn])
+                                                    break
                                 except Exception:
                                     pass
+                                if not sec_id:
+                                    st.error(f"Could not find Dhan security ID for {selected_strike} {trade_type}. Load option chain first.")
+                                    st.stop()
 
                                 saved_trade, order_id, err = _place_trade(
                                     api, trade_type, selected_strike, sec_id,
@@ -6355,24 +6415,41 @@ def show_auto_trade_section(option_data, df_1m, api, db):
                                     st.success(f"✅ {trade_type} order placed! Order ID: {order_id}")
                                 st.rerun()
 
-    # ── TRADE MONITOR (auto exit at target/SL) ──
+    # ── TRADE MONITOR (auto exit at target/SL using Dhan position data) ──
     if active_trade and active_trade.get('status') == 'OPEN':
-        spot = option_data.get('underlying', 0) if option_data else 0
         sec_id = active_trade.get('security_id')
-        current_ltp = None
-        try:
-            if api and sec_id:
-                current_ltp = api.get_option_ltp(sec_id)
-        except Exception:
-            pass
-
         target_p = float(active_trade.get('target') or 0)
         sl_p = float(active_trade.get('sl') or 0)
         entry_p = float(active_trade.get('entry_price') or 0)
         tt = active_trade.get('trade_type', '')
+        current_ltp = None
+        dhan_pnl = None
+
+        # Try to get live LTP and P&L from Dhan positions
+        try:
+            positions = api.get_positions() if api else None
+            if positions:
+                pos_list = positions if isinstance(positions, list) else positions.get('data', [])
+                for pos in pos_list:
+                    pos_sec = str(pos.get('securityId', '') or pos.get('security_id', ''))
+                    if pos_sec == str(sec_id):
+                        current_ltp = float(pos.get('lastTradedPrice', 0) or pos.get('ltp', 0) or 0)
+                        dhan_pnl = float(pos.get('unrealizedProfit', 0) or pos.get('pnl', 0) or 0)
+                        break
+        except Exception:
+            pass
+
+        # Fallback: fetch LTP directly if position not found
+        if not current_ltp:
+            try:
+                if api and sec_id:
+                    current_ltp = api.get_option_ltp(sec_id)
+            except Exception:
+                pass
 
         if current_ltp:
-            st.markdown(f"📡 Current LTP: ₹{current_ltp:.1f} | Target: ₹{target_p} | SL: ₹{sl_p}")
+            pnl_display = f"₹{dhan_pnl:+.0f}" if dhan_pnl is not None else f"₹{(current_ltp - entry_p) * 25:+.0f} (est)"
+            st.markdown(f"📡 **Live:** LTP ₹{current_ltp:.1f} | Target ₹{target_p} | SL ₹{sl_p} | P&L {pnl_display}")
             exit_reason = None
             if target_p > 0 and current_ltp >= target_p:
                 exit_reason = "TARGET"
@@ -6382,14 +6459,15 @@ def show_auto_trade_section(option_data, df_1m, api, db):
             if exit_reason:
                 updated, exit_p = _exit_trade(api, active_trade, exit_reason, db)
                 st.session_state.active_trade = None
-                pnl = (float(exit_p or current_ltp) - entry_p) * 25 * int(active_trade.get('lot_size', 1))
+                final_exit = float(exit_p or current_ltp)
+                pnl = (final_exit - entry_p) * 25 * int(active_trade.get('lot_size', 1))
                 emoji = "✅" if exit_reason == "TARGET" else "🛑"
                 tg_exit = (
                     f"{emoji} <b>AUTO EXIT — {exit_reason} HIT</b>\n"
-                    f"{active_trade.get('strike')} {tt} | Exit: ₹{exit_p or current_ltp:.1f} | P&L: ₹{pnl:+.0f}"
+                    f"{active_trade.get('strike')} {tt} | Exit: ₹{final_exit:.1f} | P&L: ₹{pnl:+.0f}"
                 )
                 send_telegram_message_sync(tg_exit, force=True)
-                st.success(f"{emoji} {exit_reason} hit! Exited at ₹{exit_p or current_ltp:.1f} | P&L: ₹{pnl:+.0f}")
+                st.success(f"{emoji} {exit_reason} hit! Exit ₹{final_exit:.1f} | P&L ₹{pnl:+.0f}")
                 st.rerun()
 
         # Reverse signal check
@@ -6708,12 +6786,29 @@ def main():
 
     api = DhanAPI(access_token, client_id)
 
+    # Fetch 1m candle data for zone analysis (cached in session_state)
+    try:
+        _last_1m_fetch = st.session_state.get('_last_1m_candle_fetch')
+        _now_1m = datetime.now(pytz.timezone('Asia/Kolkata'))
+        if _last_1m_fetch is None or (_now_1m - _last_1m_fetch).total_seconds() > 60:
+            _raw_1m = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval="1", days_back=1)
+            if _raw_1m and 'open' in _raw_1m:
+                _df_1m_new = pd.DataFrame({
+                    'Open': _raw_1m['open'], 'High': _raw_1m['high'],
+                    'Low': _raw_1m['low'], 'Close': _raw_1m['close'],
+                    'Volume': _raw_1m.get('volume', [0]*len(_raw_1m['open'])),
+                })
+                st.session_state._df_1m_trade = _df_1m_new
+                st.session_state._last_1m_candle_fetch = _now_1m
+    except Exception:
+        pass
+
     # Fill the auto trade container at the top of the page
     with _auto_trade_container:
         try:
             _opt_data_top = st.session_state.get('_cached_option_data')
-            _df_1m_top = getattr(st.session_state, '_df_5m', None)
-            show_auto_trade_section(_opt_data_top, _df_1m_top, api, db)
+            _df_5m_top = getattr(st.session_state, '_df_5m', None)
+            show_auto_trade_section(_opt_data_top, _df_5m_top, api, db)
         except Exception as _ate_top:
             st.caption(f"Auto trade init: {_ate_top}")
 
