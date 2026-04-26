@@ -5066,74 +5066,89 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
 
 def generate_ai_context_message():
     """One-time AI context/glossary — split into two messages to stay under 4096 chars."""
-    part1 = """🟡 <b>NIFTY SIGNAL GUIDE (1/2)</b>
-(Send once at day start)
+    part1 = """🟡 <b>NIFTY SIGNAL GUIDE (1/2) — FINAL</b>
 
-<b>📋 ALERT TYPES</b>
-⚠️ PCR PROXIMITY = price within ±25 pts of PCR S/R level
-🕯 CANDLE AT S/R = bullish candle at support / bearish at resistance
-🟥 CALL CAPPING = CE writers capping → SELL zone 🔥=vol confirmed
-🟩 PUT SUPPORT = PE writers defending → BUY zone 🔥=vol confirmed
-🔴 REJECTION AT CEILING = 2/3 signals: chart wick + OC ChgOI + depth
-🟢 BOUNCE AT FLOOR = 2/3 signals: chart wick + OC ChgOI + depth
-→ Every alert sends: alert header + Part 1 (signal data) + Part 2 (AI prompt)
+<b>📋 ALERT TYPES</b> (Only actionable alerts)
+⚠️ PCR PROXIMITY → Context only (NOT entry)
+🟥 CALL CAPPING 🔥 → SELL bias active
+🟩 PUT SUPPORT 🔥 → BUY bias active
 
-<b>📋 SIGNAL SCORE</b>
-Score: -5(strong bear) to +5(strong bull)
-🟥 CALL CAPPING / 🟩 PUT CAPPING = OC writers confirmed at wall
-🎨 🟢=Bullish 🔴=Bearish ⚪=Neutral ⚫=No data
+🔴 <b>REJECTION AT CEILING</b> (SELL TRIGGER)
+→ Must have ANY 2 of 3:
+• Wick rejection (price chart)
+• CE OI build (OC ChgOI)
+• Ask depth wall (&gt;5K)
 
-<b>🌍 ALIGNMENT (10m|1h|4h|1D|4D|Pat):</b>
-N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
-REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
-NP=NoPattern Ham=Hammer ShStar=ShootingStar SGC=StrongGreen
-SRC=StrongRed BullEng/BearEng=Engulfing BullHar/BearHar=Harami
+🟢 <b>BOUNCE AT FLOOR</b> (BUY TRIGGER)
+→ Must have ANY 2 of 3:
+• Wick bounce (price chart)
+• PE OI build (OC ChgOI)
+• Bid depth wall (&gt;5K)
 
-<b>🔬 STRIKE ANALYSIS (ATM±2):</b>
-Line1: ATM±N ₹Strike | PCR | S/R:₹level(offset) | Cap OI | Score
-  PCR≤0.7=Resistance(offset:-20→+20) | 0.71-1.7=Neutral | ≥1.8=Support(offset:-20→+20)
-  Offset = pts from strike where wall is felt
-Line2: 📌Depth R/S ₹chartprice→₹strike(wallQty) | Δ Γ Θ Greeks
-  BA=bid-ask pressure (+ve=buyers -ve=sellers)
-  E=Entry(Bull/Bear/NoEnt) Mv=RUp/RDn=real FkUp/FkDn=reversal
-Line3: CE/PE bid-ask qty | COI=ChangeOI OI=build/unwind
+👉 ONLY these 2 give ENTRY. Ignore rest.
 
-<b>🌐 MARKET CONTEXT</b>
-DTE=days to expiry | ⚠️Rollover=≤5 days
-MaxPain=price magnet near expiry | Straddle=ATM CE+PE cost
-IVR 🔥≥70%=sell favoured 🧊≤30%=buy favoured
-Skew 🔴&gt;1.1=put fear 🟢&lt;0.9=call greed | ATR14=SL guide"""
+<b>📋 SIGNAL SCORE</b> (Bias Filter Only)
++3 to +5 → Only BUY setups allowed
+-3 to -5 → Only SELL setups allowed
+-2 to +2 → Range → Trade edges only
 
-    part2 = """🟡 <b>NIFTY SIGNAL GUIDE (2/2)</b>
+<b>🌍 ALIGNMENT RULE</b> (Trend Filter)
+✅ If 1h + 4h + 1D agree (3 same) → TREND CONFIRMED
+❌ If mixed → RANGE → Only ceiling/floor trades
+🎨 🟢=Bullish 🔴=Bearish ⚪=Neutral
+N50=Nifty BNF=BankNifty SENS=Sensex REL/ICICI/IT
+
+<b>🔬 STRIKE ANALYSIS</b> (Execution Zone)
+Focus only on ATM±1 (ignore ±2 unless strong)
+Highest OI wall | Depth &gt;5K = real wall
+BA=bid-ask pressure (+ve=buyers -ve=sellers)
+Mv=RUp/RDn=real move FkUp/FkDn=fake/reversal
+PCR≤0.7=Resistance | 0.71-1.7=Neutral | ≥1.8=Support
+
+<b>📊 ENTRY CONFIRMATION</b> (MANDATORY)
+SELL Setup: ✔ At CEILING ✔ BA negative ✔ Mv=RDn ✔ CE OI building
+BUY Setup: ✔ At FLOOR ✔ BA positive ✔ Mv=RUp ✔ PE OI building
+
+<b>🚫 NO TRADE ZONES</b>
+❌ Middle of range | ❌ Volume &lt;0.3x
+❌ Depth &lt;500 | ❌ GEX flip zone (choppy)"""
+
+    part2 = """🟡 <b>NIFTY SIGNAL GUIDE (2/2) — FINAL</b>
+
+<b>🧱 CEILING / FLOOR</b> (Core Logic)
+CEILING (SELL ZONE) = Highest CE OI + Ask wall + Near VAH/POC
+FLOOR (BUY ZONE) = Highest PE OI + Bid wall + Near VAL/POC
+👉 Trade ONLY here. No chasing.
+
+<b>📈 MARKET MODE FILTER</b>
+TRENDING: GEX negative + VIDYA strong
+→ Trade WITH trend only (no reversal)
+RANGE: GEX positive
+→ Buy floor, Sell ceiling ONLY
+
+<b>⚠️ EXPIRY LOGIC</b>
+DTE ≤5 → MaxPain magnet → avoid counter moves
+IVR ≥70 🔥 → Option selling edge
+IVR ≤30 🧊 → Option buying edge
+Straddle wide vs ATR = big move priced → widen targets
 
 <b>📊 DATA BLOCKS</b>
-GEX +ve=range -ve=trending | Flip=gamma flip level
-VIDYA: adaptive trend | -ve%=falling +ve%=rising
-VPFR: POC=most traded | VAH/VAL=value area (3 TFs: 30/60/180 bars)
-Triple POC P1/P2/P3: clustered = strong confluence magnet
-🌀 Swing: SwH/SwL=last highs/lows | →Target=projected swing
-OI Winding: CE/PE build🟢/unwind🔴 | Par=parallel activity
-Money Flow: POC=peak vol node ⭐ | sentiment at price clusters
-VWAP=vol avg (below=bearish context) | LTP Trap=fake breakout
+GEX: +ve=range -ve=trending | Flip=gamma flip level
+VIDYA: adaptive trend | ±%=momentum strength
+VPFR: POC=most traded VAH/VAL=value area (30/60/180 bars)
+Triple POC P1/P2/P3: clustered = strong magnet
+Money Flow: POC⭐=peak vol node | sentiment clusters
+OI Winding: CE/PE build🟢/unwind🔴 | Par=parallel
+VWAP=vol avg (below=bearish) | LTP Trap=fake breakout
 VOB=Volume Order Blocks | HVP=High Volume Pivots
-📡 Capping: {bias}N50/BNF/REL/ICICI 🟥R₹cap 🟩S₹sup 📍=near 🔥=vol
+📡 Capping: {bias} 🟥R₹ceil 🟩S₹floor 📍=near 🔥=vol confirmed
 
-<b>🧱 CEILING / FLOOR LOGIC (AI prompt step 2)</b>
-Strongest CEILING = highest CE OI strike + depth ask wall + VPFR VAH near strike + MF POC
-Strongest FLOOR = highest PE OI strike + depth bid wall + VPFR VAL near strike + MF POC
-Entry AT ceiling for SELL / AT floor for BUY — where price stalls and won't break
-SL just above ceiling for SELL / just below floor for BUY
-
-<b>📈 RULES</b>
-1. Alignment 3+ same 1h+4h+1D = confirmed trend
-2. GEX neg + VIDYA bear = trending — do NOT fade
-3. Depth qty &gt;5K = major wall | &lt;500 = breakable
-4. BA neg + Mv=RDn = confirmed bear entry
-5. PCR≤0.7 at ATM+1 + Γ🔴 = heavy gamma resistance above
-6. 🔴REJECT at ceiling + OC ChgOI building = high conviction SELL
-7. 🟢BOUNCE at floor + OC ChgOI building = high conviction BUY
-8. DTE≤5 ⚠️Rollover: MaxPain magnet — avoid counter-MaxPain
-9. Straddle wide vs ATR = big move priced → widen targets"""
+<b>🎯 FINAL EXECUTION RULE</b>
+Take trade ONLY if ALL align:
+1. Ceiling/Floor identified (highest OI + depth wall)
+2. 2/3 confirmation (wick + OI build + depth)
+3. BA + Mv confirms direction
+4. Not in no-trade zone"""
 
     return [part1, part2]
 
