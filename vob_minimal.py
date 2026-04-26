@@ -4563,7 +4563,7 @@ def _get_gemini_client(api_key: str = ""):
         return None
 
 def ai_explain_signal(master, sa_result, underlying_price, mf_data=None, unwind_summary=None):
-    """Ask Gemini to explain the current master signal in plain English."""
+    """Ask Gemini for a structured trade plan: market structure + CALL/PUT entry/SL/target."""
     client = _get_gemini_client(GEMINI_API_KEY)
     if client is None:
         return None, "Gemini not configured. Add GEMINI_API_KEY to Streamlit secrets."
@@ -4576,61 +4576,93 @@ def ai_explain_signal(master, sa_result, underlying_price, mf_data=None, unwind_
         oi_trend = master.get('oi_trend', {})
         reasons = master.get('reasons', [])
         alignment = master.get('alignment', {})
-        bull_align = sum(1 for v in alignment.values() if v.get('sentiment_10m') == 'Bullish')
-        bear_align = sum(1 for v in alignment.values() if v.get('sentiment_10m') == 'Bearish')
+        vpfr = master.get('vpfr', {})
 
-        mf_poc = mf_data.get('poc_price') if mf_data else None
-        mf_hi_sent_price = mf_data.get('highest_sentiment_price') if mf_data else None
-        mf_hi_sent_dir = mf_data.get('highest_sentiment_direction') if mf_data else None
+        # Alignment summary per instrument
+        align_lines = []
+        for name in ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'RELIANCE', 'ICICIBANK', 'NIFTY IT']:
+            d = alignment.get(name, {})
+            if d:
+                s = d.get('sentiment_10m', '?')
+                s1h = d.get('sentiment_1h', '?')
+                s4h = d.get('sentiment_4h', '?')
+                align_lines.append(f"  {name}: 10m={s} 1h={s1h} 4h={s4h}")
+        align_text = "\n".join(align_lines) or "  N/A"
 
-        oc_bias = sa_result.get('market_bias', 'N/A') if sa_result else 'N/A'
-        oc_conf = sa_result.get('confidence', 'N/A') if sa_result else 'N/A'
+        # Top resistance / support from OC
+        res_lines, sup_lines = [], []
+        if sa_result is not None:
+            try:
+                for _, r in sa_result['top_resistance'].iterrows():
+                    res_lines.append(f"  ₹{r['Strike']:.0f} | OI:{r.get('CE_OI',0)/100000:.1f}L | {r.get('Call_Strength','')} | {r.get('Call_Activity','')}")
+            except Exception:
+                pass
+            try:
+                for _, r in sa_result['top_support'].iterrows():
+                    sup_lines.append(f"  ₹{r['Strike']:.0f} | OI:{r.get('PE_OI',0)/100000:.1f}L | {r.get('Put_Strength','')} | {r.get('Put_Activity','')}")
+            except Exception:
+                pass
 
-        context = f"""
-Nifty Spot: ₹{underlying_price:.2f}
-Signal: {master.get('signal', 'N/A')} ({master.get('trade_type', 'N/A')})
-Score: {master.get('abs_score', 0)}/10 ({master.get('strength', 'N/A')})
-Confidence: {master.get('confidence', 0)}%
+        # VPFR (medium 60-bar)
+        vp = vpfr.get('medium') or vpfr.get('short') or {}
+        vpfr_text = f"POC ₹{vp.get('poc',0):.0f} | VAH ₹{vp.get('vah',0):.0f} | VAL ₹{vp.get('val',0):.0f}" if vp else "N/A"
 
-Candle: {candle.get('pattern', 'N/A')} ({candle.get('direction', 'N/A')})
-Location: {', '.join(master.get('location', []))}
-Volume: {master.get('volume', {}).get('label', 'N/A')} ({master.get('volume', {}).get('ratio', 0)}x)
+        # Money Flow
+        mf_poc = f"₹{mf_data.get('poc_price',0):.0f}" if mf_data else "N/A"
+        mf_dir = mf_data.get('highest_sentiment_direction', '') if mf_data else ''
 
-Resistance: {master.get('resistance_levels', [])[:3]}
-Support: {master.get('support_levels', [])[:3]}
+        context = f"""Nifty Spot: ₹{underlying_price:.0f}
+Signal: {master.get('signal','N/A')} | Score: {master.get('score',0):+d}/10 | Confidence: {master.get('confidence',0)}%
+Candle: {candle.get('pattern','N/A')} ({candle.get('direction','N/A')}) | Location: {', '.join(master.get('location',[]))}
+GEX: Net={gex.get('net_gex',0):+.0f}L | Mode={gex.get('market_mode','N/A')} | Flip=₹{gex.get('gamma_flip','N/A')}
+VIDYA: {vidya.get('trend','N/A')} ({vidya.get('delta_pct',0):+.0f}%) | VWAP: ₹{ltp_trap.get('vwap',0):.0f} ({ltp_trap.get('price_vs_vwap','N/A')})
+OI Trend: CE={oi_trend.get('ce_activity','N/A')} PE={oi_trend.get('pe_activity','N/A')} | Signal={oi_trend.get('signal','N/A')}
+VPFR (60-bar): {vpfr_text}
+Money Flow POC: {mf_poc} ({mf_dir})
+OC Bias: {sa_result.get('market_bias','N/A') if sa_result else 'N/A'}
 
-GEX: Net={gex.get('net_gex', 0):+.0f}L | ATM={gex.get('atm_gex', 0):+.0f}L | Flip=₹{gex.get('gamma_flip', 'N/A')} | Magnet=₹{gex.get('magnet', 'N/A')} | Mode={gex.get('market_mode', 'N/A')}
+Resistance levels (CE OI):
+{chr(10).join(res_lines) or '  None'}
 
-OI Trend (ATM): CE={oi_trend.get('ce_activity', 'N/A')} PE={oi_trend.get('pe_activity', 'N/A')} Signal={oi_trend.get('signal', 'N/A')}
+Support levels (PE OI):
+{chr(10).join(sup_lines) or '  None'}
 
-VIDYA: {vidya.get('trend', 'N/A')} (Delta {vidya.get('delta_pct', 0):+.0f}%)
-VWAP: ₹{ltp_trap.get('vwap', 0):.0f} ({ltp_trap.get('price_vs_vwap', 'N/A')})
-Delta Volume: {master.get('delta_trend', 'N/A')}
+Alignment:
+{align_text}
 
-Alignment (10m): Bull={bull_align} Bear={bear_align}
-Option Chain Bias: {oc_bias} (Confidence: {oc_conf}%)
+Confluence reasons:
+{chr(10).join(['  - '+r for r in reasons])}"""
 
-Money Flow POC: ₹{mf_poc if mf_poc else 'N/A'}
-MF Strongest Sentiment: ₹{mf_hi_sent_price if mf_hi_sent_price else 'N/A'} ({mf_hi_sent_dir if mf_hi_sent_dir else 'N/A'})
-
-Unwinding Verdict: {unwind_summary.get('verdict') if unwind_summary else 'N/A'}
-
-Confluence Reasons:
-{chr(10).join(['- ' + r for r in reasons])}
-"""
-
-        prompt = f"""You are an experienced Nifty options trader. Analyze this live market snapshot and give a concise, actionable assessment.
+        prompt = f"""You are an experienced Nifty options trader analyzing live market data.
 
 {context}
 
-Respond in exactly this format (markdown):
-**📍 Read:** 1 line summarizing what the market is doing right now.
-**✅ Trade Setup:** Entry zone, stop loss, target 1, target 2 (use nearest S/R levels).
-**⚠️ Invalidation:** What single event would invalidate this trade.
-**🎯 Confidence:** LOW / MEDIUM / HIGH with a one-line reason.
-**💡 Key Risk:** The biggest thing that could go wrong in the next 15 minutes.
+Give a clean, direct trade plan in EXACTLY this format (use actual price numbers):
 
-Keep the total under 180 words. No disclaimers."""
+MARKET: [RANGE/TREND] | [Bullish/Bearish/Neutral] bias
+Reason: [1 line — key reason from OI + VIDYA + alignment]
+
+CEILING (Sell Zone): ₹[price]
+→ OI: [CE OI at that strike]L | Depth: [ask pressure] | VPFR: [POC/VAH confluence if any]
+
+FLOOR (Buy Zone): ₹[price]
+→ OI: [PE OI at that strike]L | Depth: [bid pressure] | VPFR: [POC/VAL confluence if any]
+
+CALL SELL SETUP:
+Entry: ₹[price range]
+SL: ₹[price]
+Target 1: ₹[price]
+Target 2: ₹[price]
+
+PUT BUY SETUP:
+Entry: ₹[price range]
+SL: ₹[price]
+Target 1: ₹[price]
+Target 2: ₹[price]
+
+BOTTOM LINE: [1 line — what to do and why, e.g. "Sell rallies near ceiling, avoid chasing"]
+
+Rules: Use real price numbers only. No fluff. No disclaimers. Keep total under 200 words."""
 
         resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return resp.text, None
@@ -8578,15 +8610,29 @@ def main():
             _gemini_ok = bool(GEMINI_API_KEY) and _HAS_GEMINI
             st.markdown(f"## 🎯 Master Trading Signal {'🤖✅' if _gemini_ok else '🤖❌'}")
         with hdr_col2:
-            _ai_explain_clicked = st.button("🤖 AI Explain", key="ai_explain_master", help="Ask Gemini to analyze the current signal and give a trade plan")
+            _ai_explain_clicked = st.button("🎯 AI Trade Plan", key="ai_explain_master", help="Get AI entry, SL and target for CALL and PUT", use_container_width=True, type="primary")
 
         # Persistent Gemini analysis panel — only shown when real analysis text exists
         _last_gm = st.session_state.get('_last_gemini_master')
         _last_gm_oc = st.session_state.get('_last_gemini_oc')
+        _last_tp = st.session_state.get('_last_gemini_trade_plan')
         _gm_valid = _last_gm and _last_gm.get('time') and not str(_last_gm.get('text', '')).startswith('⚠️')
         _gm_oc_valid = _last_gm_oc and _last_gm_oc.get('time') and not str(_last_gm_oc.get('text', '')).startswith('⚠️')
+        _tp_valid = _last_tp and _last_tp.get('time') and _last_tp.get('text')
+
+        # Trade Plan panel — primary display
+        if _tp_valid:
+            _tp_text = _last_tp.get('text', '')
+            _tp_time = _last_tp.get('time', '')
+            # Detect bias for color
+            _tp_color = '#ff4444' if 'BEARISH' in _tp_text.upper() or 'SELL' in _tp_text.upper()[:200] else '#00ff88' if 'BULLISH' in _tp_text.upper() or 'BUY' in _tp_text.upper()[:200] else '#FFD700'
+            with st.expander(f"🎯 AI Trade Plan — {_tp_time}", expanded=True):
+                st.markdown(f"""
+<div style="background:#1a1a2e;padding:18px;border-radius:12px;border-left:4px solid {_tp_color};font-family:monospace;white-space:pre-wrap;color:#e0e0e0;font-size:14px;line-height:1.6;">{_tp_text}</div>
+""", unsafe_allow_html=True)
+
         if _gm_valid or _gm_oc_valid:
-            with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=True):
+            with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=False):
                 if _gm_valid:
                     st.markdown(f"**Master Signal** — {_last_gm.get('time', '')}")
                     st.markdown(_last_gm.get('text', ''))
@@ -8613,11 +8659,11 @@ def main():
                 except Exception as _e:
                     st.error(f"Failed to force-send: {_e}")
             if _ai_explain_clicked:
-                with st.spinner("🤖 Gemini is analyzing the current setup..."):
+                with st.spinner("🎯 Getting AI trade plan..."):
                     try:
-                        _master_for_ai = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api) if _sa else None
+                        _master_for_ai = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
                         if _master_for_ai is None:
-                            st.warning("Master signal not ready yet — load option chain first.")
+                            st.warning("Price data not available — cannot generate trade plan.")
                         else:
                             _mf = st.session_state.get('_money_flow_data')
                             _uw = compute_unwinding_summary(option_data.get('df_atm8'))
@@ -8625,10 +8671,17 @@ def main():
                             if _err:
                                 st.error(_err)
                             else:
-                                st.markdown("### 🤖 Gemini Analysis")
-                                st.markdown(_text)
+                                _tp_time = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
+                                st.session_state['_last_gemini_trade_plan'] = {'text': _text, 'time': _tp_time}
+                                # Also send to Telegram
+                                try:
+                                    _tp_tg = f"🎯 <b>AI TRADE PLAN</b> — {_tp_time}\n\n{_text}"
+                                    send_telegram_message_sync(_tp_tg, force=True)
+                                except Exception:
+                                    pass
+                                st.rerun()
                     except Exception as _e:
-                        st.error(f"AI explain failed: {_e}")
+                        st.error(f"AI trade plan failed: {_e}")
             if _sa:
                 master = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
                 if master:
