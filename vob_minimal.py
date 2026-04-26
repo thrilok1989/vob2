@@ -3944,7 +3944,7 @@ def fetch_vix_data(api):
 
 def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_price, api):
     """Generate comprehensive trading signal using all available data."""
-    if df is None or df.empty or sa_result is None:
+    if df is None or df.empty:
         return None
 
     # 1. Candle Pattern (last 5 candles on 5-min chart)
@@ -3966,9 +3966,15 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     # 3. Volume Analysis
     vol = detect_volume_spike(df, lookback=5)
 
-    # 4. Key levels from existing app data
-    support_levels = [float(r['Strike']) for _, r in sa_result['top_support'].iterrows()] if not sa_result['top_support'].empty else []
-    resistance_levels = [float(r['Strike']) for _, r in sa_result['top_resistance'].iterrows()] if not sa_result['top_resistance'].empty else []
+    # 4. Key levels from existing app data (empty when option chain not available)
+    support_levels = []
+    resistance_levels = []
+    if sa_result is not None:
+        try:
+            support_levels = [float(r['Strike']) for _, r in sa_result['top_support'].iterrows()] if not sa_result['top_support'].empty else []
+            resistance_levels = [float(r['Strike']) for _, r in sa_result['top_resistance'].iterrows()] if not sa_result['top_resistance'].empty else []
+        except Exception:
+            pass
 
     # 5. Candle location
     location = get_candle_location(underlying_price, support_levels, resistance_levels, gex_data, ob)
@@ -4076,8 +4082,9 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         pass
 
     # === EXISTING APP DATA ===
-    market_bias = sa_result.get('market_bias', 'Neutral')
-    app_confidence = sa_result.get('confidence', 50)
+    _sa = sa_result or {}
+    market_bias = _sa.get('market_bias', 'Neutral')
+    app_confidence = _sa.get('confidence', 50)
 
     # GEX data
     net_gex = gex_data.get('total_gex', 0) if gex_data else 0
@@ -4398,15 +4405,15 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
 
     # Boost near_support/near_resistance from direct OC writing detection so
     # PUT CAPPING and CALL CAPPING fire even when price proximity check misses
-    _adf = sa_result.get('analysis_df')
+    _adf = sa_result.get('analysis_df') if sa_result is not None else None
     if _adf is not None:
         if not near_resistance and _adf.get('Call_Capping_Confirmed', pd.Series([False])).any():
             near_resistance = True
         if not near_support and _adf.get('Put_Support_Confirmed', pd.Series([False])).any():
             near_support = True
 
-    breakout_zones = not sa_result['breakout_zones'].empty
-    breakdown_zones = not sa_result['breakdown_zones'].empty
+    breakout_zones = sa_result is not None and not sa_result['breakout_zones'].empty
+    breakdown_zones = sa_result is not None and not sa_result['breakdown_zones'].empty
 
     if breakout_zones and vol['spike'] and candle['direction'] == 'Bullish' and net_gex < 0:
         signal = '🚀 BREAKOUT'
@@ -8579,19 +8586,17 @@ def main():
             _conf = getattr(st.session_state, '_confluence', None)
             _do_send = _force_send_clicked or st.session_state.pop('_top_send_triggered', False)
             if _do_send:
-                if _sa is None:
-                    st.warning("⚠️ Option chain data not loaded yet. Please wait for the option chain section to refresh, then click Send again.")
-                else:
-                    try:
-                        _master_now = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
-                        if _master_now:
-                            send_master_signal_telegram(_master_now, option_data['underlying'], option_data, force=True)
-                        else:
-                            st.warning("⚠️ Master signal could not be generated. Check that price data is loaded.")
+                try:
+                    _master_now = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
+                    if _master_now:
+                        send_master_signal_telegram(_master_now, option_data['underlying'], option_data, force=True)
+                    else:
+                        st.warning("⚠️ Master signal could not be generated — price data may be empty.")
+                    if _sa is not None:
                         send_option_chain_signal(_sa, option_data['underlying'], force=True)
-                        st.success("✅ Sent Master Signal to Telegram")
-                    except Exception as _e:
-                        st.error(f"Failed to force-send: {_e}")
+                    st.success("✅ Sent Master Signal to Telegram")
+                except Exception as _e:
+                    st.error(f"Failed to force-send: {_e}")
             if _ai_explain_clicked:
                 with st.spinner("🤖 Gemini is analyzing the current setup..."):
                     try:
