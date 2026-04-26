@@ -6467,6 +6467,9 @@ def main():
             except Exception as _ctx_err:
                 st.error(f"Failed: {_ctx_err}")
 
+    # Placeholder — auto trade section renders here (filled after db/api init below)
+    _auto_trade_container = st.container()
+
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
     market_open = current_time.replace(hour=8, minute=30, second=0, microsecond=0)
@@ -6704,6 +6707,15 @@ def main():
     st.sidebar.write(f"Chat ID: {TELEGRAM_CHAT_ID}")
 
     api = DhanAPI(access_token, client_id)
+
+    # Fill the auto trade container at the top of the page
+    with _auto_trade_container:
+        try:
+            _opt_data_top = st.session_state.get('_cached_option_data')
+            _df_1m_top = getattr(st.session_state, '_df_5m', None)
+            show_auto_trade_section(_opt_data_top, _df_1m_top, api, db)
+        except Exception as _ate_top:
+            st.caption(f"Auto trade init: {_ate_top}")
 
     col1, col2 = st.columns([2, 1])
 
@@ -7260,6 +7272,7 @@ def main():
     with col2:
         option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
         if option_data and option_data.get('underlying'):
+            st.session_state._cached_option_data = option_data
             underlying_price = option_data['underlying']
             df_summary = option_data['df_summary']
             expiry = option_data.get('expiry', selected_expiry)
@@ -10753,14 +10766,6 @@ def main():
     if show_analytics:
         st.markdown("---")
         display_analytics_dashboard(db)
-
-    # ── Auto Trade Section ──
-    try:
-        _df_1m_trade = getattr(st.session_state, '_df_5m', None)
-        _opt_data_trade = option_data if 'option_data' in dir() else None
-        show_auto_trade_section(_opt_data_trade, _df_1m_trade, api, db)
-    except Exception as _ate:
-        st.caption(f"Auto trade section error: {_ate}")
 
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S IST")
