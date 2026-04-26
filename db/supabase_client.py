@@ -560,3 +560,87 @@ class SupabaseDB:
                 q = q.eq('expiry', expiry)
             return q.order('timestamp', desc=False).execute()
         return self._safe_query('max_pain_history', query, {'trading_day': trading_day})
+
+    # ── Trade Config (manual S&R, entry, target, SL — persists across refresh) ──
+    def save_trade_config(self, config: dict):
+        now = datetime.now(IST)
+        record = {
+            'id': 1,  # single-row config
+            'support_zone_bottom': config.get('support_zone_bottom'),
+            'support_zone_top': config.get('support_zone_top'),
+            'resistance_zone_bottom': config.get('resistance_zone_bottom'),
+            'resistance_zone_top': config.get('resistance_zone_top'),
+            'selected_strike': config.get('selected_strike'),
+            'call_entry': config.get('call_entry'),
+            'call_target': config.get('call_target'),
+            'call_sl': config.get('call_sl'),
+            'put_entry': config.get('put_entry'),
+            'put_target': config.get('put_target'),
+            'put_sl': config.get('put_sl'),
+            'auto_trade_enabled': config.get('auto_trade_enabled', False),
+            'lot_size': config.get('lot_size', 1),
+            'updated_at': now.isoformat(),
+        }
+        try:
+            self.client.table('trade_config').upsert(record, on_conflict='id').execute()
+        except Exception as e:
+            st.warning(f"Could not save trade config: {e}")
+
+    def get_trade_config(self):
+        try:
+            result = self.client.table('trade_config').select('*').eq('id', 1).execute()
+            if result.data:
+                return result.data[0]
+        except Exception:
+            pass
+        return {}
+
+    # ── Auto Trades ──
+    def upsert_auto_trade(self, trade: dict):
+        now = datetime.now(IST)
+        record = {
+            'trading_day': now.date().isoformat(),
+            'trade_type': trade.get('trade_type'),        # 'CALL' or 'PUT'
+            'strike': trade.get('strike'),
+            'security_id': trade.get('security_id'),
+            'entry_price': trade.get('entry_price'),
+            'target': trade.get('target'),
+            'sl': trade.get('sl'),
+            'lot_size': trade.get('lot_size', 1),
+            'status': trade.get('status', 'OPEN'),        # OPEN / CLOSED
+            'exit_price': trade.get('exit_price'),
+            'exit_reason': trade.get('exit_reason'),      # TARGET / SL / MANUAL / REVERSE
+            'order_id': trade.get('order_id'),
+            'entry_time': trade.get('entry_time', now.isoformat()),
+            'exit_time': trade.get('exit_time'),
+            'zone_confirmations': trade.get('zone_confirmations'),
+            'spot_at_entry': trade.get('spot_at_entry'),
+            'updated_at': now.isoformat(),
+        }
+        if trade.get('id'):
+            record['id'] = trade['id']
+        try:
+            result = self.client.table('auto_trades').upsert(record).execute()
+            if result.data:
+                return result.data[0]
+        except Exception as e:
+            st.warning(f"Could not save trade: {e}")
+        return record
+
+    def get_active_trade(self):
+        try:
+            result = self.client.table('auto_trades').select('*').eq('status', 'OPEN').order('entry_time', desc=True).limit(1).execute()
+            if result.data:
+                return result.data[0]
+        except Exception:
+            pass
+        return None
+
+    def get_trade_history(self, trading_day=None, limit=20):
+        if trading_day is None:
+            trading_day = datetime.now(IST).date().isoformat()
+        try:
+            result = self.client.table('auto_trades').select('*').eq('trading_day', trading_day).order('entry_time', desc=True).limit(limit).execute()
+            return result.data or []
+        except Exception:
+            return []

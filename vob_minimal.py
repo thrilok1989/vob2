@@ -530,6 +530,78 @@ class DhanAPI:
             st.error(f"Error fetching LTP: {str(e)}")
             return None
 
+    def place_order(self, security_id, exchange_segment, transaction_type, quantity, order_type="MARKET", price=0, product_type="INTRADAY"):
+        url = f"{self.base_url}/orders"
+        payload = {
+            "dhanClientId": self.client_id,
+            "transactionType": transaction_type,  # "BUY" or "SELL"
+            "exchangeSegment": exchange_segment,
+            "productType": product_type,
+            "orderType": order_type,
+            "validity": "DAY",
+            "securityId": str(security_id),
+            "quantity": quantity,
+            "price": price,
+            "triggerPrice": 0,
+            "disclosedQuantity": 0,
+            "afterMarketOrder": False,
+        }
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            if response.status_code == 200:
+                return response.json()
+            else:
+                return {"error": f"{response.status_code} — {response.text[:200]}"}
+        except Exception as e:
+            return {"error": str(e)}
+
+    def get_option_ltp(self, security_id, exchange_segment="NSE_FNO"):
+        url = f"{self.base_url}/marketfeed/ltp"
+        payload = {exchange_segment: [int(security_id)]}
+        try:
+            response = requests.post(url, headers=self.headers, json=payload)
+            if response.status_code == 200:
+                data = response.json()
+                items = data.get('data', {}).get(exchange_segment, [])
+                if items:
+                    return float(items[0].get('last_price', 0))
+            return None
+        except Exception:
+            return None
+
+    def get_positions(self):
+        """Fetch all open positions from Dhan."""
+        url = f"{self.base_url}/positions"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception:
+            return None
+
+    def get_orders(self):
+        """Fetch today's orders from Dhan."""
+        url = f"{self.base_url}/orders"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception:
+            return None
+
+    def get_order_by_id(self, order_id):
+        """Fetch a specific order status from Dhan."""
+        url = f"{self.base_url}/orders/{order_id}"
+        try:
+            response = requests.get(url, headers=self.headers, timeout=10)
+            if response.status_code == 200:
+                return response.json()
+            return None
+        except Exception:
+            return None
+
 @st.cache_data(ttl=300)
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
     return get_dhan_expiry_list(underlying_scrip, underlying_seg)
@@ -5922,6 +5994,526 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         pass
 
+
+# ═══════════════════════════════════════════════════════════════
+#  ZONE-BASED AUTO TRADE SYSTEM
+# ═══════════════════════════════════════════════════════════════
+
+def _detect_candle_pattern(df, label):
+    """Detect candle pattern from last candle in dataframe. Returns confirmation string."""
+    if df is None or df.empty or len(df) < 2:
+        return None
+    try:
+        c = df.iloc[-1]
+        o, h, l, cl = float(c['Open']), float(c['High']), float(c['Low']), float(c['Close'])
+        body = abs(cl - o)
+        rng = h - l if h > l else 1
+        upper_wick = h - max(o, cl)
+        lower_wick = min(o, cl) - l
+        is_bullish = cl > o
+        is_bearish = cl < o
+        if lower_wick > body * 2 and upper_wick < body:
+            pat = "Hammer ✅" if is_bullish else "Hanging Man ✅"
+        elif upper_wick > body * 2 and lower_wick < body:
+            pat = "Shooting Star ✅" if is_bearish else "Inv Hammer ✅"
+        elif body / rng > 0.6 and is_bullish:
+            pat = "Strong Green ✅"
+        elif body / rng > 0.6 and is_bearish:
+            pat = "Strong Red ✅"
+        else:
+            pat = "Doji/Inside ⚪"
+        return f"{label} Candle: {pat}"
+    except Exception:
+        return None
+
+
+def _analyze_zone(spot, zone_bottom, zone_top, option_data, df_5m, df_1m=None):
+    """Analyze market conditions inside a S/R zone. Returns list of confirmation signals."""
+    confirmations = []
+
+    # 1. OI check — use correct Dhan API column names
+    try:
+        if option_data:
+            sg = option_data.get('df_summary')
+            if sg is not None and not sg.empty and 'Strike' in sg.columns:
+                strikes_in_zone = sg[(sg['Strike'] >= zone_bottom) & (sg['Strike'] <= zone_top)]
+                if not strikes_in_zone.empty:
+                    ce_col = next((c for c in ['changeinOpenInterest_CE', 'CE_ChgOI', 'chgOI_CE'] if c in strikes_in_zone.columns), None)
+                    pe_col = next((c for c in ['changeinOpenInterest_PE', 'PE_ChgOI', 'chgOI_PE'] if c in strikes_in_zone.columns), None)
+                    ce_chg = float(strikes_in_zone[ce_col].sum()) if ce_col else 0
+                    pe_chg = float(strikes_in_zone[pe_col].sum()) if pe_col else 0
+                    if pe_chg > 0 and pe_chg > ce_chg:
+                        confirmations.append("OI: PE writing ↑ (floor holding) ✅")
+                    elif ce_chg > 0 and ce_chg > pe_chg:
+                        confirmations.append("OI: CE writing ↑ (ceiling holding) ✅")
+                    else:
+                        confirmations.append("OI: Mixed ⚪")
+    except Exception:
+        pass
+
+    # 2. Depth check — use bidQty/askQty from df_summary for strikes in zone
+    try:
+        if option_data:
+            sg = option_data.get('df_summary')
+            if sg is not None and not sg.empty and 'Strike' in sg.columns:
+                strikes_in_zone = sg[(sg['Strike'] >= zone_bottom) & (sg['Strike'] <= zone_top)]
+                if not strikes_in_zone.empty:
+                    bid_ce = float(strikes_in_zone.get('bidQty_CE', pd.Series([0])).sum()) if 'bidQty_CE' in strikes_in_zone.columns else 0
+                    ask_ce = float(strikes_in_zone.get('askQty_CE', pd.Series([0])).sum()) if 'askQty_CE' in strikes_in_zone.columns else 0
+                    bid_pe = float(strikes_in_zone.get('bidQty_PE', pd.Series([0])).sum()) if 'bidQty_PE' in strikes_in_zone.columns else 0
+                    ask_pe = float(strikes_in_zone.get('askQty_PE', pd.Series([0])).sum()) if 'askQty_PE' in strikes_in_zone.columns else 0
+                    # Support zone: strong bid on PE side = buyers defending
+                    # Resistance zone: strong ask on CE side = sellers defending
+                    if bid_pe > ask_pe * 1.2:
+                        confirmations.append("Depth: PE Bid wall (support defending) ✅")
+                    elif ask_ce > bid_ce * 1.2:
+                        confirmations.append("Depth: CE Ask wall (resistance defending) ✅")
+                    elif bid_ce > ask_ce * 1.2:
+                        confirmations.append("Depth: CE Bid wall (breakout pressure) ✅")
+                    else:
+                        confirmations.append("Depth: Balanced ⚪")
+    except Exception:
+        pass
+
+    # 3. Delta Volume check — from 5m candle (always available)
+    try:
+        df_vol = df_1m if (df_1m is not None and not df_1m.empty) else df_5m
+        if df_vol is not None and not df_vol.empty and len(df_vol) >= 2:
+            last = df_vol.iloc[-1]
+            vol = float(last.get('Volume', 0) or 0)
+            avg_vol = float(df_vol['Volume'].mean()) if 'Volume' in df_vol.columns else 0
+            # Check last 3 candles for volume trend
+            last3_vol = df_vol['Volume'].iloc[-3:].mean() if len(df_vol) >= 3 and 'Volume' in df_vol.columns else vol
+            prev_avg = df_vol['Volume'].iloc[:-3].mean() if len(df_vol) > 3 and 'Volume' in df_vol.columns else avg_vol
+            close_trend = df_vol['Close'].iloc[-3:].diff().sum() if len(df_vol) >= 3 and 'Close' in df_vol.columns else 0
+            if last3_vol > prev_avg * 1.3 and close_trend > 0:
+                confirmations.append("Delta Vol: Buying surge ✅")
+            elif last3_vol > prev_avg * 1.3 and close_trend < 0:
+                confirmations.append("Delta Vol: Selling surge ✅")
+            elif vol > avg_vol * 1.3:
+                confirmations.append("Delta Vol: Volume spike ✅")
+            else:
+                confirmations.append("Delta Vol: Normal ⚪")
+    except Exception:
+        pass
+
+    # 4a. 5-min candle pattern
+    pat_5m = _detect_candle_pattern(df_5m, "5m")
+    if pat_5m:
+        confirmations.append(pat_5m)
+
+    # 4b. 1-min candle pattern (if available)
+    if df_1m is not None and not df_1m.empty:
+        pat_1m = _detect_candle_pattern(df_1m, "1m")
+        if pat_1m:
+            confirmations.append(pat_1m)
+
+    return confirmations
+
+
+def _get_zone_telegram_msg(spot, zone_type, zone_bottom, zone_top, confirmations, strike, call_entry, call_target, call_sl, put_entry, put_target, put_sl):
+    """Build Telegram zone alert message."""
+    score = sum(1 for c in confirmations if '✅' in c)
+    total = len(confirmations)
+    emoji = "🟢" if zone_type == "SUPPORT" else "🔴"
+    trade_type = "CALL" if zone_type == "SUPPORT" else "PUT"
+    entry = call_entry if zone_type == "SUPPORT" else put_entry
+    target = call_target if zone_type == "SUPPORT" else put_target
+    sl = call_sl if zone_type == "SUPPORT" else put_sl
+    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
+
+    conf_lines = "\n".join([f"  {c}" for c in confirmations])
+    msg = f"""{emoji} <b>SPOT IN {zone_type} ZONE</b>
+🕐 {time_str}
+📍 Spot: ₹{spot:.0f} | Zone: ₹{zone_bottom:.0f}–₹{zone_top:.0f}
+
+<b>Zone Analysis ({score}/{total} confirmations):</b>
+{conf_lines}
+
+<b>Trade Setup:</b>
+Strike: {strike} {trade_type}
+Entry: ₹{entry} | Target: ₹{target} | SL: ₹{sl}
+
+⚡ Review and click <b>Enter {trade_type}</b> in the app to execute."""
+    return msg
+
+
+def _place_trade(api, trade_type, strike, security_id, entry_price, target, sl, lot_size, spot, confirmations, db):
+    """Place order on Dhan and store in Supabase."""
+    # Dhan NSE_FNO segment, 1 lot = 25 qty for Nifty (weekly)
+    qty = lot_size * 25
+    result = api.place_order(
+        security_id=security_id,
+        exchange_segment="NSE_FNO",
+        transaction_type="BUY",
+        quantity=qty,
+        order_type="MARKET",
+    )
+    order_id = None
+    error = result.get('error') if result else "No response"
+    if result and not result.get('error'):
+        order_id = result.get('orderId') or result.get('order_id') or str(result)
+
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    trade = {
+        'trade_type': trade_type,
+        'strike': str(strike),
+        'security_id': str(security_id),
+        'entry_price': entry_price,
+        'target': target,
+        'sl': sl,
+        'lot_size': lot_size,
+        'status': 'OPEN',
+        'order_id': order_id,
+        'entry_time': now.isoformat(),
+        'spot_at_entry': spot,
+        'zone_confirmations': " | ".join(confirmations),
+    }
+    saved = db.upsert_auto_trade(trade)
+    return saved, order_id, error
+
+
+def _exit_trade(api, trade, exit_reason, db):
+    """Place exit order on Dhan and update Supabase."""
+    qty = int(trade.get('lot_size', 1)) * 25
+    security_id = trade.get('security_id')
+    result = api.place_order(
+        security_id=security_id,
+        exchange_segment="NSE_FNO",
+        transaction_type="SELL",
+        quantity=qty,
+        order_type="MARKET",
+    )
+    exit_price = None
+    if result and not result.get('error'):
+        exit_price = result.get('averagePrice') or result.get('price')
+
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    updated = {**trade, 'status': 'CLOSED', 'exit_reason': exit_reason, 'exit_time': now.isoformat()}
+    if exit_price:
+        updated['exit_price'] = float(exit_price)
+    db.upsert_auto_trade(updated)
+    return updated, exit_price
+
+
+def show_auto_trade_section(option_data, df_5m, api, db):
+    """Render the full auto-trade UI section."""
+    st.markdown("---")
+    st.markdown("## 🎯 Zone-Based Auto Trade")
+
+    # ── Load persisted config from Supabase ──
+    if 'trade_cfg' not in st.session_state:
+        cfg = db.get_trade_config() or {}
+        st.session_state.trade_cfg = cfg
+
+    cfg = st.session_state.trade_cfg
+
+    # ── Active trade from Supabase ──
+    if 'active_trade' not in st.session_state:
+        st.session_state.active_trade = db.get_active_trade()
+
+    active_trade = st.session_state.active_trade
+
+    # ── ACTIVE TRADE STATUS ──
+    if active_trade and active_trade.get('status') == 'OPEN':
+        tt = active_trade.get('trade_type', '')
+        color = '#00ff88' if tt == 'CALL' else '#ff4444'
+        entry_p = active_trade.get('entry_price', 0)
+        target_p = active_trade.get('target', 0)
+        sl_p = active_trade.get('sl', 0)
+        strike_s = active_trade.get('strike', '')
+        etime = active_trade.get('entry_time', '')[:16]
+        st.markdown(f"""
+        <div style="background:{color}20;padding:15px;border-radius:10px;border:2px solid {color};margin-bottom:10px;">
+        <b style="color:{color};">🟢 ACTIVE TRADE — BUY {tt}</b><br>
+        Strike: {strike_s} | Entry: ₹{entry_p} | Target: ₹{target_p} | SL: ₹{sl_p}<br>
+        <span style="color:#aaa;font-size:12px;">Entered: {etime}</span>
+        </div>""", unsafe_allow_html=True)
+
+        if st.button("🔴 Manual Exit", key="manual_exit_btn", type="primary"):
+            with st.spinner("Exiting trade..."):
+                updated, exit_p = _exit_trade(api, active_trade, "MANUAL", db)
+                st.session_state.active_trade = None
+                pnl = (float(exit_p or entry_p) - float(entry_p)) * 25 * int(active_trade.get('lot_size', 1))
+                tg_msg = f"🔴 <b>MANUAL EXIT</b>\n{strike_s} {tt} | Exit: ₹{exit_p or '—'} | P&L: ₹{pnl:+.0f}"
+                send_telegram_message_sync(tg_msg, force=True)
+                st.success(f"✅ Exited at ₹{exit_p or '—'}")
+                st.rerun()
+        st.markdown("---")
+
+    # ── MANUAL INPUTS ──
+    st.markdown("### ⚙️ Manual Zone & Trade Setup")
+    st.caption("All values saved to Supabase — safe across refresh")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("**🟢 Support Zone**")
+        sup_bot = st.number_input("Bottom", value=float(cfg.get('support_zone_bottom') or 0), step=25.0, key="sup_bot", format="%.0f")
+        sup_top = st.number_input("Top", value=float(cfg.get('support_zone_top') or 0), step=25.0, key="sup_top", format="%.0f")
+    with c2:
+        st.markdown("**🔴 Resistance Zone**")
+        res_bot = st.number_input("Bottom", value=float(cfg.get('resistance_zone_bottom') or 0), step=25.0, key="res_bot", format="%.0f")
+        res_top = st.number_input("Top", value=float(cfg.get('resistance_zone_top') or 0), step=25.0, key="res_top", format="%.0f")
+
+    # Strike selector ATM±5
+    strike_options = []
+    atm_strike = None
+    try:
+        if option_data and option_data.get('df_summary') is not None:
+            df_s = option_data['df_summary']
+            und = option_data.get('underlying', 0)
+            sg = option_data.get('strike_gap', 50)
+            atm_strike = round(und / sg) * sg
+            all_strikes = sorted(df_s['Strike'].unique().tolist())
+            atm_pos = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - atm_strike))
+            strike_options = [int(all_strikes[i]) for i in range(max(0, atm_pos - 5), min(len(all_strikes), atm_pos + 6))]
+    except Exception:
+        pass
+
+    saved_strike = int(cfg.get('selected_strike') or (strike_options[len(strike_options)//2] if strike_options else 0))
+    strike_idx = strike_options.index(saved_strike) if saved_strike in strike_options else 0
+    selected_strike = st.selectbox("Strike Price (ATM±5)", options=strike_options, index=strike_idx, key="strike_sel") if strike_options else None
+
+    st.markdown("**📞 CALL Setup** (BUY at Support Bottom)")
+    ca1, ca2, ca3 = st.columns(3)
+    with ca1:
+        call_entry = st.number_input("Entry ₹", value=float(cfg.get('call_entry') or 0), step=1.0, key="call_entry", format="%.1f")
+    with ca2:
+        call_target = st.number_input("Target ₹", value=float(cfg.get('call_target') or 0), step=1.0, key="call_target", format="%.1f")
+    with ca3:
+        call_sl = st.number_input("SL ₹", value=float(cfg.get('call_sl') or 0), step=1.0, key="call_sl_inp", format="%.1f")
+
+    st.markdown("**📉 PUT Setup** (BUY at Resistance Top)")
+    pa1, pa2, pa3 = st.columns(3)
+    with pa1:
+        put_entry = st.number_input("Entry ₹", value=float(cfg.get('put_entry') or 0), step=1.0, key="put_entry", format="%.1f")
+    with pa2:
+        put_target = st.number_input("Target ₹", value=float(cfg.get('put_target') or 0), step=1.0, key="put_target", format="%.1f")
+    with pa3:
+        put_sl = st.number_input("SL ₹", value=float(cfg.get('put_sl') or 0), step=1.0, key="put_sl_inp", format="%.1f")
+
+    auto_enabled = st.toggle("🤖 Enable Auto Zone Watch", value=bool(cfg.get('auto_trade_enabled', False)), key="auto_trade_toggle")
+
+    # Save config button
+    if st.button("💾 Save Setup", key="save_trade_cfg"):
+        new_cfg = {
+            'support_zone_bottom': sup_bot,
+            'support_zone_top': sup_top,
+            'resistance_zone_bottom': res_bot,
+            'resistance_zone_top': res_top,
+            'selected_strike': selected_strike,
+            'call_entry': call_entry,
+            'call_target': call_target,
+            'call_sl': call_sl,
+            'put_entry': put_entry,
+            'put_target': put_target,
+            'put_sl': put_sl,
+            'auto_trade_enabled': auto_enabled,
+            'lot_size': 1,
+        }
+        db.save_trade_config(new_cfg)
+        st.session_state.trade_cfg = new_cfg
+        st.success("✅ Setup saved to Supabase")
+
+    # ── ZONE WATCH (only when auto enabled and no active trade) ──
+    if auto_enabled and not (active_trade and active_trade.get('status') == 'OPEN'):
+        spot = option_data.get('underlying', 0) if option_data else 0
+        if spot and selected_strike:
+            in_support = sup_bot > 0 and sup_top > 0 and sup_bot <= spot <= sup_top
+            in_resistance = res_bot > 0 and res_top > 0 and res_bot <= spot <= res_top
+
+            if in_support or in_resistance:
+                zone_type = "SUPPORT" if in_support else "RESISTANCE"
+                zb = sup_bot if in_support else res_bot
+                zt = sup_top if in_support else res_top
+                confs = _analyze_zone(spot, zb, zt, option_data, df_1m, getattr(st.session_state, '_df_1m_trade', None))
+                score = sum(1 for c in confs if '✅' in c)
+
+                color = '#00ff88' if in_support else '#ff4444'
+                trade_type = "CALL" if in_support else "PUT"
+                entry_v = call_entry if in_support else put_entry
+                target_v = call_target if in_support else put_target
+                sl_v = call_sl if in_support else put_sl
+
+                st.markdown(f"""
+                <div style="background:{color}20;padding:15px;border-radius:10px;border:2px solid {color};">
+                <b style="color:{color};">⚠️ SPOT IN {zone_type} ZONE — ₹{spot:.0f}</b><br>
+                Zone: ₹{zb:.0f} – ₹{zt:.0f} | Confirmations: {score}/{len(confs)}
+                </div>""", unsafe_allow_html=True)
+
+                for c in confs:
+                    st.markdown(f"  {c}")
+
+                # Send Telegram alert once per zone entry (cooldown 5 min)
+                _last_zone_alert = st.session_state.get('_last_zone_alert_time')
+                _last_zone_type = st.session_state.get('_last_zone_alert_type')
+                _now_z = datetime.now(pytz.timezone('Asia/Kolkata'))
+                _zone_cooldown_ok = (
+                    _last_zone_alert is None or
+                    (_now_z - _last_zone_alert).total_seconds() > 300 or
+                    _last_zone_type != zone_type
+                )
+                if _zone_cooldown_ok:
+                    try:
+                        tg_msg = _get_zone_telegram_msg(
+                            spot, zone_type, zb, zt, confs,
+                            selected_strike, call_entry, call_target, call_sl,
+                            put_entry, put_target, put_sl
+                        )
+                        send_telegram_message_sync(tg_msg, force=True)
+                        st.session_state._last_zone_alert_time = _now_z
+                        st.session_state._last_zone_alert_type = zone_type
+                    except Exception:
+                        pass
+
+                # Enter button
+                btn_col, _ = st.columns([1, 2])
+                with btn_col:
+                    if st.button(f"✅ Enter {trade_type}", key=f"enter_{trade_type.lower()}_btn", type="primary"):
+                        if entry_v <= 0:
+                            st.error(f"Set {trade_type} entry price first and save setup.")
+                        else:
+                            with st.spinner(f"Placing {trade_type} order..."):
+                                # Resolve security_id from option chain — required for Dhan order
+                                sec_id = None
+                                try:
+                                    if option_data and option_data.get('df_summary') is not None:
+                                        df_s2 = option_data['df_summary']
+                                        row = df_s2[df_s2['Strike'] == selected_strike]
+                                        if not row.empty:
+                                            col_name = 'CE_SecurityId' if trade_type == 'CALL' else 'PE_SecurityId'
+                                            # Also try suffixed form from merge
+                                            alt_col = f"securityId_CE" if trade_type == 'CALL' else f"securityId_PE"
+                                            for cn in [col_name, alt_col, 'securityId']:
+                                                if cn in row.columns and row.iloc[0][cn]:
+                                                    sec_id = int(row.iloc[0][cn])
+                                                    break
+                                except Exception:
+                                    pass
+                                if not sec_id:
+                                    st.error(f"Could not find Dhan security ID for {selected_strike} {trade_type}. Load option chain first.")
+                                    st.stop()
+
+                                saved_trade, order_id, err = _place_trade(
+                                    api, trade_type, selected_strike, sec_id,
+                                    entry_v, target_v, sl_v, 1, spot, confs, db
+                                )
+                                st.session_state.active_trade = db.get_active_trade()
+                                tg_entry = (
+                                    f"{'🟢' if trade_type == 'CALL' else '🔴'} <b>AUTO ENTRY — BUY {trade_type}</b>\n"
+                                    f"Strike: {selected_strike}{trade_type[0]}E | Entry: ₹{entry_v} | Target: ₹{target_v} | SL: ₹{sl_v}\n"
+                                    f"Spot: ₹{spot:.0f} | Zone: {zone_type} ₹{zb:.0f}–₹{zt:.0f}\n"
+                                    f"Confirmations: {score}/{len(confs)}\n"
+                                    f"Order ID: {order_id or '—'}"
+                                )
+                                if err:
+                                    tg_entry += f"\n⚠️ Order error: {err}"
+                                send_telegram_message_sync(tg_entry, force=True)
+                                if err:
+                                    st.warning(f"Order placed with warning: {err}")
+                                else:
+                                    st.success(f"✅ {trade_type} order placed! Order ID: {order_id}")
+                                st.rerun()
+
+    # ── TRADE MONITOR (auto exit at target/SL using Dhan position data) ──
+    if active_trade and active_trade.get('status') == 'OPEN':
+        sec_id = active_trade.get('security_id')
+        target_p = float(active_trade.get('target') or 0)
+        sl_p = float(active_trade.get('sl') or 0)
+        entry_p = float(active_trade.get('entry_price') or 0)
+        tt = active_trade.get('trade_type', '')
+        current_ltp = None
+        dhan_pnl = None
+
+        # Try to get live LTP and P&L from Dhan positions
+        try:
+            positions = api.get_positions() if api else None
+            if positions:
+                pos_list = positions if isinstance(positions, list) else positions.get('data', [])
+                for pos in pos_list:
+                    pos_sec = str(pos.get('securityId', '') or pos.get('security_id', ''))
+                    if pos_sec == str(sec_id):
+                        current_ltp = float(pos.get('lastTradedPrice', 0) or pos.get('ltp', 0) or 0)
+                        dhan_pnl = float(pos.get('unrealizedProfit', 0) or pos.get('pnl', 0) or 0)
+                        break
+        except Exception:
+            pass
+
+        # Fallback: fetch LTP directly if position not found
+        if not current_ltp:
+            try:
+                if api and sec_id:
+                    current_ltp = api.get_option_ltp(sec_id)
+            except Exception:
+                pass
+
+        if current_ltp:
+            pnl_display = f"₹{dhan_pnl:+.0f}" if dhan_pnl is not None else f"₹{(current_ltp - entry_p) * 25:+.0f} (est)"
+            st.markdown(f"📡 **Live:** LTP ₹{current_ltp:.1f} | Target ₹{target_p} | SL ₹{sl_p} | P&L {pnl_display}")
+            exit_reason = None
+            if target_p > 0 and current_ltp >= target_p:
+                exit_reason = "TARGET"
+            elif sl_p > 0 and current_ltp <= sl_p:
+                exit_reason = "SL"
+
+            if exit_reason:
+                updated, exit_p = _exit_trade(api, active_trade, exit_reason, db)
+                st.session_state.active_trade = None
+                final_exit = float(exit_p or current_ltp)
+                pnl = (final_exit - entry_p) * 25 * int(active_trade.get('lot_size', 1))
+                emoji = "✅" if exit_reason == "TARGET" else "🛑"
+                tg_exit = (
+                    f"{emoji} <b>AUTO EXIT — {exit_reason} HIT</b>\n"
+                    f"{active_trade.get('strike')} {tt} | Exit: ₹{final_exit:.1f} | P&L: ₹{pnl:+.0f}"
+                )
+                send_telegram_message_sync(tg_exit, force=True)
+                st.success(f"{emoji} {exit_reason} hit! Exit ₹{final_exit:.1f} | P&L ₹{pnl:+.0f}")
+                st.rerun()
+
+        # Reverse signal check
+        try:
+            master = getattr(st.session_state, '_master_signal_latest', None)
+            if master:
+                trade_signal = master.get('trade_type', '')
+                if tt == 'CALL' and ('SELL' in trade_signal or 'BREAKDOWN' in trade_signal.upper()):
+                    st.warning("⚠️ REVERSE SIGNAL detected — consider manual exit")
+                    tg_rev = f"⚠️ <b>REVERSE SIGNAL</b> — Active {tt} trade but SELL signal detected. Review manually."
+                    _last_rev = st.session_state.get('_last_reverse_alert')
+                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 300:
+                        send_telegram_message_sync(tg_rev, force=True)
+                        st.session_state._last_reverse_alert = datetime.now(pytz.timezone('Asia/Kolkata'))
+                elif tt == 'PUT' and ('BUY' in trade_signal or 'BREAKOUT' in trade_signal.upper()):
+                    st.warning("⚠️ REVERSE SIGNAL detected — consider manual exit")
+                    tg_rev = f"⚠️ <b>REVERSE SIGNAL</b> — Active {tt} trade but BUY signal detected. Review manually."
+                    _last_rev = st.session_state.get('_last_reverse_alert')
+                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 300:
+                        send_telegram_message_sync(tg_rev, force=True)
+                        st.session_state._last_reverse_alert = datetime.now(pytz.timezone('Asia/Kolkata'))
+        except Exception:
+            pass
+
+    # ── TRADE HISTORY ──
+    with st.expander("📋 Today's Trade History", expanded=False):
+        history = db.get_trade_history()
+        if history:
+            for t in history:
+                status_color = '#00ff88' if t.get('status') == 'OPEN' else '#aaa'
+                ep = t.get('exit_price', '—')
+                pnl_str = ''
+                if t.get('exit_price') and t.get('entry_price'):
+                    pnl = (float(t['exit_price']) - float(t['entry_price'])) * 25 * int(t.get('lot_size', 1))
+                    pnl_str = f" | P&L: ₹{pnl:+.0f}"
+                st.markdown(
+                    f"<span style='color:{status_color};'>●</span> "
+                    f"**{t.get('trade_type')}** {t.get('strike')} | "
+                    f"Entry:₹{t.get('entry_price')} Target:₹{t.get('target')} SL:₹{t.get('sl')} | "
+                    f"Exit:₹{ep} ({t.get('exit_reason','—')}){pnl_str} | {t.get('entry_time','')[:16]}",
+                    unsafe_allow_html=True
+                )
+        else:
+            st.info("No trades today.")
+
+
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
@@ -5952,6 +6544,9 @@ def main():
                 st.success("✅ AI context guide sent to Telegram! (2 messages)")
             except Exception as _ctx_err:
                 st.error(f"Failed: {_ctx_err}")
+
+    # Placeholder — auto trade section renders here (filled after db/api init below)
+    _auto_trade_container = st.container()
 
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
@@ -6190,6 +6785,32 @@ def main():
     st.sidebar.write(f"Chat ID: {TELEGRAM_CHAT_ID}")
 
     api = DhanAPI(access_token, client_id)
+
+    # Fetch 1m candle data for zone analysis (cached in session_state)
+    try:
+        _last_1m_fetch = st.session_state.get('_last_1m_candle_fetch')
+        _now_1m = datetime.now(pytz.timezone('Asia/Kolkata'))
+        if _last_1m_fetch is None or (_now_1m - _last_1m_fetch).total_seconds() > 60:
+            _raw_1m = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval="1", days_back=1)
+            if _raw_1m and 'open' in _raw_1m:
+                _df_1m_new = pd.DataFrame({
+                    'Open': _raw_1m['open'], 'High': _raw_1m['high'],
+                    'Low': _raw_1m['low'], 'Close': _raw_1m['close'],
+                    'Volume': _raw_1m.get('volume', [0]*len(_raw_1m['open'])),
+                })
+                st.session_state._df_1m_trade = _df_1m_new
+                st.session_state._last_1m_candle_fetch = _now_1m
+    except Exception:
+        pass
+
+    # Fill the auto trade container at the top of the page
+    with _auto_trade_container:
+        try:
+            _opt_data_top = st.session_state.get('_cached_option_data')
+            _df_5m_top = getattr(st.session_state, '_df_5m', None)
+            show_auto_trade_section(_opt_data_top, _df_5m_top, api, db)
+        except Exception as _ate_top:
+            st.caption(f"Auto trade init: {_ate_top}")
 
     col1, col2 = st.columns([2, 1])
 
@@ -6746,6 +7367,7 @@ def main():
     with col2:
         option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
         if option_data and option_data.get('underlying'):
+            st.session_state._cached_option_data = option_data
             underlying_price = option_data['underlying']
             df_summary = option_data['df_summary']
             expiry = option_data.get('expiry', selected_expiry)
@@ -8617,6 +9239,7 @@ def main():
             if _sa:
                 master = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
                 if master:
+                    st.session_state._master_signal_latest = master
                     _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
                     if False:  # auto 5-min signal disabled — alerts fire on their own
                         # Refresh PCR S/R snapshot from current OI history so the
