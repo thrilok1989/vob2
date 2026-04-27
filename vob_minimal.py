@@ -6155,7 +6155,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     # ── Part 1: Signal + Direction + S/R + OI Positioning ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
     #         future swing → S/R analysis → OI positioning (winding + option chain verdict)
-        msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
+    msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
