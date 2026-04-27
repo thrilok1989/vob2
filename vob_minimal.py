@@ -5464,8 +5464,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         market_ctx_block = ""
 
-    # Triple POC + Future Swing Analysis block
-    poc_swing_block = ""
+    # Future Swing block (for Part 1 — directional info needed up front)
+    swing_block = ""
+    # Triple POC block (for Part 2 — deep context)
+    poc_block = ""
     try:
         _poc = st.session_state.get('_poc_data') or {}
         _sw  = st.session_state.get('_swing_data') or {}
@@ -5489,12 +5491,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _swing_parts.append(
                 f"→Target₹{_proj['target']:.0f}({_proj['sign']}{_proj['swing_pct']:.1f}%)"
             )
-        if _poc_parts or _swing_parts:
-            poc_swing_block = "\n<b>📍 Triple POC:</b> " + " | ".join(_poc_parts) + "\n"
-            if _swing_parts:
-                poc_swing_block += f"<b>🌀 Future Swing:</b> {_sw_emoji}{_sw_dir.capitalize()} | " + " | ".join(_swing_parts) + "\n"
+        if _swing_parts:
+            swing_block = f"🌀 <b>Future Swing:</b> {_sw_emoji}{_sw_dir.capitalize()} | " + " | ".join(_swing_parts) + "\n"
+        if _poc_parts:
+            poc_block = "\n<b>📍 Triple POC:</b> " + " | ".join(_poc_parts) + "\n"
     except Exception:
-        poc_swing_block = ""
+        swing_block = ""
+        poc_block = ""
 
     # Price Action block: LTP Trap, VOB zones, HVP, Delta Vol
     price_action_block = ""
@@ -6009,24 +6012,38 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
-    # Part 1 — core signal + ALL S/R data
+    # ── Part 1: Signal + Direction + S/R ──
+    # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
+    #         future swing → alignment → S/R analysis → index/stock capping
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
+<b>━━━ PRICE ACTION ━━━</b>
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x
 📍 {loc_text}
+
+<b>━━━ GAMMA &amp; SENTIMENT ━━━</b>
 🔮 GEX: {gex['net_gex']:+.0f}L | Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'} | Mode:{gex['market_mode']}
 📊 PCR×GEX: {result['pcr_gex']['badge']}
 📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
-🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
+
+<b>━━━ DIRECTION ━━━</b>
+{swing_block}🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {capping_block}{_mi_bias_block}"""
 
-    # Part 2 — detailed analysis blocks + AI prompt
+    # ── Part 2: Deep Analysis ──
+    # Layout: header → market context → vpfr/triple POC/money flow → strike analysis →
+    #         price action (vwap/vob/hvp) → OI winding → option chain verdict → AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
-{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🟡 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
+
+<b>━━━ MARKET CONTEXT ━━━</b>{market_ctx_block}
+<b>━━━ VOLUME &amp; LIQUIDITY PROFILE ━━━</b>{vpfr_block}{poc_block}{mf_block}
+<b>━━━ STRIKE-LEVEL DEEP DIVE ━━━</b>{strike_analysis_block}
+<b>━━━ PRICE STRUCTURE ━━━</b>{price_action_block}
+<b>━━━ OI POSITIONING ━━━</b>{unwind_block}{oc_deep_block}
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), S/R analysis (per-level OI/depth/VPFR/GEX/MF), 📡 capping (bias+R/S per instrument), Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
 3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
