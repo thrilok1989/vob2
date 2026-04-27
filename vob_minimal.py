@@ -5403,6 +5403,44 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         depth_block = ""
 
+    # Volume Delta block: summary + candles at S/R zones
+    vol_delta_block = ""
+    try:
+        _vd = getattr(st.session_state, '_volume_delta_data', None)
+        if _vd and _vd.get('summary'):
+            _vds = _vd['summary']
+            _bias_e = '🟢' if _vds.get('bias') == 'Bullish' else '🔴' if _vds.get('bias') == 'Bearish' else '⚪'
+            _tot_d  = int(_vds.get('total_delta', 0))
+            _buy_v  = int(_vds.get('total_buy_volume', 0))
+            _sell_v = int(_vds.get('total_sell_volume', 0))
+            _d_rat  = float(_vds.get('delta_ratio', 0))
+            _cum_d  = int(_vds.get('cum_delta_last', 0))
+            _divg   = int(_vds.get('divergence_bars', 0))
+            vol_delta_block = (
+                f"\n<b>⚡ VOLUME DELTA:</b> {_bias_e} {_vds.get('bias','N/A')}\n"
+                f"  Total Delta: {_tot_d:+,} | Cumulative Delta: {_cum_d:+,}\n"
+                f"  Buy Volume: {_buy_v:,} | Sell Volume: {_sell_v:,}\n"
+                f"  Delta Ratio: {_d_rat:.2f} | Divergence Bars: {_divg}\n"
+            )
+            # Delta at S/R zones: find candles where close is within 30 pts of any S/R level
+            _sr_levels = (result.get('resistance_levels', [])[:3] +
+                          result.get('support_levels', [])[:3])
+            _vd_df = _vd.get('df')
+            if _vd_df is not None and not _vd_df.empty and _sr_levels:
+                _zone_lines = []
+                for _lvl in _sr_levels:
+                    _near = _vd_df[abs(_vd_df['close'] - _lvl) <= 30].tail(3)
+                    for _, _c in _near.iterrows():
+                        _cd = int(_c.get('delta', 0))
+                        _ct = str(_c.get('datetime', ''))[-8:-3]
+                        _ce = '🟢' if _cd > 0 else '🔴'
+                        _typ = 'R' if _lvl in result.get('resistance_levels', []) else 'S'
+                        _zone_lines.append(f"  {_ce} ₹{_lvl:.0f}({_typ}) @{_ct} Delta:{_cd:+,} Buy:{int(_c.get('buy_volume',0)):,} Sell:{int(_c.get('sell_volume',0)):,}")
+                if _zone_lines:
+                    vol_delta_block += "<b>  Delta at S/R Zones:</b>\n" + "\n".join(_zone_lines[:6]) + "\n"
+    except Exception:
+        vol_delta_block = ""
+
     # Market Context block: DTE, Max Pain, Straddle, IV Rank, IV Skew, ATR, OI Velocity
     market_ctx_block = ""
     try:
@@ -6118,6 +6156,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
 
 <b>━━━ MARKET CONTEXT ━━━</b>{market_ctx_block}
+<b>━━━ VOLUME DELTA ━━━</b>{vol_delta_block}
 <b>━━━ VOLUME &amp; LIQUIDITY PROFILE ━━━</b>{vpfr_block}{poc_block}{mf_block}
 <b>━━━ STRIKE-LEVEL DEEP DIVE ━━━</b>{strike_analysis_block}
 <b>━━━ PRICE STRUCTURE ━━━</b>{price_action_block}
@@ -6499,6 +6538,83 @@ def _render_alignment_capping_top():
                                 st.markdown("**🟢 Support:** " + " | ".join([f"₹{int(r['Strike'])}" for _, r in _top_s.iterrows()]))
                 except Exception as _e:
                     st.caption(f"Capping render error: {_e}")
+
+
+def _render_vol_delta_chart():
+    """Render Buy Volume vs Sell Volume over time, same style as per-strike OI chart."""
+    import plotly.graph_objects as go
+    vd = getattr(st.session_state, '_volume_delta_data', None)
+    if vd is None or vd.get('df') is None:
+        st.info("⚡ Volume Delta chart builds after the first chart load. Please wait...")
+        return
+    try:
+        df = vd['df'].copy()
+        if df.empty:
+            st.info("No Volume Delta data yet.")
+            return
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        vds = vd.get('summary', {})
+        bias = vds.get('bias', 'N/A')
+        bias_e = '🟢' if bias == 'Bullish' else '🔴' if bias == 'Bearish' else '⚪'
+        tot_d = int(vds.get('total_delta', 0))
+        d_rat = float(vds.get('delta_ratio', 1))
+
+        fig = go.Figure()
+        # Buy Volume bars (green)
+        fig.add_trace(go.Bar(
+            x=df['datetime'], y=df['buy_volume'],
+            name='Buy Volume', marker_color='#089981',
+            opacity=0.85
+        ))
+        # Sell Volume bars (red, negative direction for mirror effect)
+        fig.add_trace(go.Bar(
+            x=df['datetime'], y=-df['sell_volume'],
+            name='Sell Volume', marker_color='#f23645',
+            opacity=0.85
+        ))
+        # Cumulative delta line on secondary y
+        fig.add_trace(go.Scatter(
+            x=df['datetime'], y=df['cum_delta'],
+            name='Cum Delta', mode='lines',
+            line=dict(color='#FFD700', width=2, dash='dot'),
+            yaxis='y2'
+        ))
+        # Divergence markers
+        div_df = df[df['divergence'] == True] if 'divergence' in df.columns else pd.DataFrame()
+        if not div_df.empty:
+            fig.add_trace(go.Scatter(
+                x=div_df['datetime'], y=div_df['delta'],
+                mode='markers', name='Divergence',
+                marker=dict(symbol='diamond', size=10, color='#FF6B35',
+                            line=dict(color='white', width=1)),
+                yaxis='y'
+            ))
+        fig.update_layout(
+            title=f'⚡ Buy vs Sell Volume | {bias_e} {bias} | Delta: {tot_d:+,} | Ratio: {d_rat:.2f}x',
+            template='plotly_dark',
+            height=320,
+            barmode='overlay',
+            showlegend=True,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+            margin=dict(l=10, r=60, t=80, b=20),
+            xaxis=dict(tickformat='%H:%M', title='Time'),
+            yaxis=dict(title='Volume', zeroline=True, zerolinecolor='#555'),
+            yaxis2=dict(title='Cum Delta', overlaying='y', side='right',
+                        showgrid=False, zeroline=True, zerolinecolor='#FFD70060'),
+            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Summary metrics row
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Delta", f"{tot_d:+,}", delta=bias,
+                  delta_color="normal" if bias == 'Bullish' else "inverse")
+        m2.metric("Buy Volume", f"{int(vds.get('total_buy_volume', 0)):,}")
+        m3.metric("Sell Volume", f"{int(vds.get('total_sell_volume', 0)):,}")
+        m4.metric("Delta Ratio", f"{d_rat:.2f}x")
+        m5.metric("Divergences", f"{int(vds.get('divergence_bars', 0))}")
+    except Exception as e:
+        st.caption(f"Volume Delta chart error: {e}")
 
 
 def _render_per_strike_oi_top():
@@ -7269,6 +7385,8 @@ def main():
     with _per_strike_oi_container:
         with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
             _render_per_strike_oi_top()
+        with st.expander("⚡ Buy Volume vs Sell Volume (Delta Chart)", expanded=True):
+            _render_vol_delta_chart()
 
     # Fill Alignment + Index/Stock Capping below Per-Strike OI
     with _align_cap_container:
@@ -7422,6 +7540,7 @@ def main():
             st.session_state._money_flow_data = money_flow_data
             try:
                 volume_delta_data = calculate_volume_delta(df)
+                st.session_state._volume_delta_data = volume_delta_data
             except Exception as e:
                 st.caption(f"⚠️ Volume Delta error: {str(e)[:80]}")
                 volume_delta_data = None
