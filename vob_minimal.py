@@ -6338,6 +6338,136 @@ def _exit_trade(api, trade, exit_reason, db):
     return updated, exit_price
 
 
+def _render_alignment_capping_top():
+    """Render Alignment + Index/Stock Capping panels from session state."""
+    _master = getattr(st.session_state, '_master_signal_latest', None)
+    _sa = getattr(st.session_state, '_sa_result', None)
+
+    _short_names = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
+                    'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
+                    'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+    _pat_short = {
+        'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
+        'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
+        'Bullish Harami':'BullHar','Bearish Harami':'BearHar',
+        'Morning Star':'MornStar','Evening Star':'EveStar',
+        'Tweezer Top':'TwTop','Tweezer Bottom':'TwBot',
+        'Strong Green Candle':'SGC','Strong Red Candle':'SRC',
+        'Inside Bar':'InsBar','Outside Bar':'OutBar','Pin Bar':'PinBar','Marubozu':'Maru',
+    }
+    def _ae(s): return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
+
+    _ac_col1, _ac_col2 = st.columns([1, 1])
+
+    # ── Alignment panel ──
+    with _ac_col1:
+        with st.expander("🌍 Alignment (10m|1h|4h|1D|4D|Pat)", expanded=True):
+            if _master is None:
+                st.info("Alignment data loads after first signal calculation.")
+            else:
+                _alignment = _master.get('alignment', {})
+                if not _alignment:
+                    st.info("No alignment data yet.")
+                else:
+                    _rows = []
+                    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
+                        data = _alignment.get(name)
+                        if data is None:
+                            continue
+                        e10 = _ae(data.get('sentiment_10m', ''))
+                        e1h = _ae(data.get('sentiment_1h', ''))
+                        e4h = _ae(data.get('sentiment_4h', ''))
+                        e1d = _ae(data.get('sentiment_1d', ''))
+                        e4d = _ae(data.get('sentiment_4d', ''))
+                        pat = (data.get('candle_pattern', '') or '').strip()
+                        cdir = data.get('candle_dir', '') or ''
+                        if not pat or pat in ('No Pattern', 'N/A'):
+                            pat_str = 'NP'
+                            pat_color = '#888'
+                        else:
+                            p_short = _pat_short.get(pat, pat[:7])
+                            p_emoji = '🟢' if cdir == 'Bullish' else '🔴' if cdir == 'Bearish' else '⚪'
+                            pat_str = f"{p_short}{p_emoji}"
+                            pat_color = '#00cc66' if cdir == 'Bullish' else '#ff4444' if cdir == 'Bearish' else '#aaa'
+                        sn = _short_names.get(name, name)
+                        _rows.append((sn, e10, e1h, e4h, e1d, e4d, pat_str, pat_color))
+                    for sn, e10, e1h, e4h, e1d, e4d, pat_str, pat_color in _rows:
+                        st.markdown(
+                            f'<div style="font-family:monospace;font-size:13px;padding:2px 0;">'
+                            f'<b style="min-width:50px;display:inline-block;">{sn}</b> '
+                            f'{e10}{e1h}{e4h}{e1d}{e4d} '
+                            f'<span style="color:{pat_color};font-size:12px;">{pat_str}</span>'
+                            f'</div>',
+                            unsafe_allow_html=True
+                        )
+
+    # ── Index/Stock Capping panel ──
+    with _ac_col2:
+        with st.expander("📡 Index/Stock Capping", expanded=True):
+            if _sa is None:
+                st.info("Capping data loads after option chain analysis.")
+            else:
+                try:
+                    # Rebuild capping lines same as Telegram message
+                    _underlying = _master.get('underlying_price', 0) if _master else 0
+                    _sa_bias = _sa or {}
+                    _adf = _sa_bias.get('analysis_df')
+
+                    def _cap_badge(label, bias, spot, caps, sups):
+                        b_em = '🟢' if bias == 'Bullish' else '🔴' if bias == 'Bearish' else '⚪'
+                        parts = [f"{b_em}{label} ₹{spot:.0f}"]
+                        for c in (caps or [])[:2]:
+                            oi_l = c.get('oi_l', 0)
+                            fire = '🔥' if oi_l > 0 else ''
+                            parts.append(f"🟥R₹{c['strike']:.0f}({oi_l:.0f}L){fire}")
+                        for s in (sups or [])[:2]:
+                            oi_l = s.get('oi_l', 0)
+                            fire = '🔥' if oi_l > 0 else ''
+                            parts.append(f"🟩S₹{s['strike']:.0f}({oi_l:.0f}L){fire}")
+                        return " ".join(parts)
+
+                    lines = []
+                    if _adf is not None and not _adf.empty and _underlying:
+                        _res = _adf[_adf['Strike'] > _underlying].sort_values('Strike').head(2)
+                        _sup = _adf[_adf['Strike'] < _underlying].sort_values('Strike', ascending=False).head(2)
+                        _caps_n50 = [{'strike': float(r['Strike']), 'oi_l': float(r.get('CE_OI',0) or 0)/100000} for _, r in _res.iterrows()]
+                        _sups_n50 = [{'strike': float(r['Strike']), 'oi_l': float(r.get('PE_OI', r.get('openInterest_PE',0)) or 0)/100000} for _, r in _sup.iterrows()]
+                        lines.append(_cap_badge('N50', _sa_bias.get('market_bias',''), _underlying, _caps_n50, _sups_n50))
+
+                    # Stock capping from alignment data
+                    _stocks = [
+                        ('SENX', 'SENSEX'), ('BNF', 'BANKNIFTY'), ('REL', 'RELIANCE'),
+                        ('ICICI', 'ICICIBANK'), ('INFO', 'NIFTY IT'),
+                    ]
+                    _stock_data = _sa_bias.get('stock_data', {})
+                    for sn, full_name in _stocks:
+                        _sd = _stock_data.get(full_name) or _stock_data.get(sn) or {}
+                        _bias = _sd.get('bias', '')
+                        _und = _sd.get('ltp', 0) or 0
+                        _scaps = _sd.get('caps', [])
+                        _ssups = _sd.get('sups', [])
+                        if _und:
+                            lines.append(_cap_badge(sn, _bias, _und, _scaps, _ssups))
+
+                    if lines:
+                        for ln in lines:
+                            st.markdown(f'<div style="font-family:monospace;font-size:13px;padding:2px 0;">{ln}</div>', unsafe_allow_html=True)
+                    else:
+                        # Fallback: show raw market bias
+                        bias = _sa_bias.get('market_bias', '—')
+                        b_em = '🟢' if bias == 'Bullish' else '🔴' if bias == 'Bearish' else '⚪'
+                        st.markdown(f"**N50 bias:** {b_em} {bias}")
+                        if _adf is not None and not _adf.empty:
+                            _top_r = _adf[_adf.get('Call_Class', pd.Series(dtype=str)).isin(['High Conviction Resistance','Strong Resistance'])].head(3) if 'Call_Class' in _adf.columns else pd.DataFrame()
+                            _top_s = _adf[_adf.get('Put_Class', pd.Series(dtype=str)).isin(['High Conviction Support','Strong Support'])].head(3) if 'Put_Class' in _adf.columns else pd.DataFrame()
+                            if not _top_r.empty:
+                                st.markdown("**🔴 Resistance:** " + " | ".join([f"₹{int(r['Strike'])}" for _, r in _top_r.iterrows()]))
+                            if not _top_s.empty:
+                                st.markdown("**🟢 Support:** " + " | ".join([f"₹{int(r['Strike'])}" for _, r in _top_s.iterrows()]))
+                except Exception as _e:
+                    st.caption(f"Capping render error: {_e}")
+
+
 def _render_per_strike_oi_top():
     """Render Per-Strike CE vs PE OI charts + signals from session state."""
     import plotly.graph_objects as go
@@ -6468,7 +6598,7 @@ def show_auto_trade_section(option_data, df_5m, api, db):
         st.markdown(f"""
         <div style="background:{color}20;padding:15px;border-radius:10px;border:2px solid {color};margin-bottom:10px;">
         <b style="color:{color};">🟢 ACTIVE TRADE — BUY {tt}</b><br>
-        Strike: {strike_s} | Entry: ₹{entry_p} | Target: ₹{target_p} | SL: ₹{sl_p}<br>
+        Strike: {strike_s} | Entry Spot: ₹{entry_p} | Target Spot: ₹{target_p} | SL Spot: ₹{sl_p}<br>
         <span style="color:#aaa;font-size:12px;">Entered: {etime}</span>
         </div>""", unsafe_allow_html=True)
 
@@ -6501,14 +6631,17 @@ def show_auto_trade_section(option_data, df_5m, api, db):
     strike_options = []
     atm_strike = None
     try:
-        if option_data and option_data.get('df_summary') is not None:
-            df_s = option_data['df_summary']
+        if option_data:
             und = option_data.get('underlying', 0)
             sg = option_data.get('strike_gap', 50)
             atm_strike = round(und / sg) * sg
-            all_strikes = sorted(df_s['Strike'].unique().tolist())
-            atm_pos = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - atm_strike))
-            strike_options = [int(all_strikes[i]) for i in range(max(0, atm_pos - 5), min(len(all_strikes), atm_pos + 6))]
+            # Prefer df_atm8 (ATM±5 strikes, 11 rows) over df_summary (ATM±2)
+            df_atm_src = option_data.get('df_atm8') or option_data.get('df_summary')
+            if df_atm_src is not None:
+                strike_col = 'strikePrice' if 'strikePrice' in df_atm_src.columns else 'Strike'
+                all_strikes = sorted(df_atm_src[strike_col].unique().tolist())
+                atm_pos = min(range(len(all_strikes)), key=lambda i: abs(all_strikes[i] - atm_strike))
+                strike_options = [int(all_strikes[i]) for i in range(max(0, atm_pos - 5), min(len(all_strikes), atm_pos + 6))]
     except Exception:
         pass
 
@@ -6516,23 +6649,23 @@ def show_auto_trade_section(option_data, df_5m, api, db):
     strike_idx = strike_options.index(saved_strike) if saved_strike in strike_options else 0
     selected_strike = st.selectbox("Strike Price (ATM±5)", options=strike_options, index=strike_idx, key="strike_sel") if strike_options else None
 
-    st.markdown("**📞 CALL Setup** (BUY at Support Bottom)")
+    st.markdown("**📞 CALL Setup** (BUY at Support Bottom) — enter **spot price** levels")
     ca1, ca2, ca3 = st.columns(3)
     with ca1:
-        call_entry = st.number_input("Entry ₹", value=float(cfg.get('call_entry') or 0), step=1.0, key="call_entry", format="%.1f")
+        call_entry = st.number_input("Entry Spot ₹", value=float(cfg.get('call_entry') or 0), step=25.0, key="call_entry", format="%.0f")
     with ca2:
-        call_target = st.number_input("Target ₹", value=float(cfg.get('call_target') or 0), step=1.0, key="call_target", format="%.1f")
+        call_target = st.number_input("Target Spot ₹", value=float(cfg.get('call_target') or 0), step=25.0, key="call_target", format="%.0f")
     with ca3:
-        call_sl = st.number_input("SL ₹", value=float(cfg.get('call_sl') or 0), step=1.0, key="call_sl_inp", format="%.1f")
+        call_sl = st.number_input("SL Spot ₹", value=float(cfg.get('call_sl') or 0), step=25.0, key="call_sl_inp", format="%.0f")
 
-    st.markdown("**📉 PUT Setup** (BUY at Resistance Top)")
+    st.markdown("**📉 PUT Setup** (BUY at Resistance Top) — enter **spot price** levels")
     pa1, pa2, pa3 = st.columns(3)
     with pa1:
-        put_entry = st.number_input("Entry ₹", value=float(cfg.get('put_entry') or 0), step=1.0, key="put_entry", format="%.1f")
+        put_entry = st.number_input("Entry Spot ₹", value=float(cfg.get('put_entry') or 0), step=25.0, key="put_entry", format="%.0f")
     with pa2:
-        put_target = st.number_input("Target ₹", value=float(cfg.get('put_target') or 0), step=1.0, key="put_target", format="%.1f")
+        put_target = st.number_input("Target Spot ₹", value=float(cfg.get('put_target') or 0), step=25.0, key="put_target", format="%.0f")
     with pa3:
-        put_sl = st.number_input("SL ₹", value=float(cfg.get('put_sl') or 0), step=1.0, key="put_sl_inp", format="%.1f")
+        put_sl = st.number_input("SL Spot ₹", value=float(cfg.get('put_sl') or 0), step=25.0, key="put_sl_inp", format="%.0f")
 
     auto_enabled = st.toggle("🤖 Enable Auto Zone Watch", value=bool(cfg.get('auto_trade_enabled', False)), key="auto_trade_toggle")
 
@@ -6643,9 +6776,9 @@ def show_auto_trade_section(option_data, df_5m, api, db):
                                 st.session_state.active_trade = db.get_active_trade()
                                 tg_entry = (
                                     f"{'🟢' if trade_type == 'CALL' else '🔴'} <b>AUTO ENTRY — BUY {trade_type}</b>\n"
-                                    f"Strike: {selected_strike}{trade_type[0]}E | Entry: ₹{entry_v} | Target: ₹{target_v} | SL: ₹{sl_v}\n"
-                                    f"Spot: ₹{spot:.0f} | Zone: {zone_type} ₹{zb:.0f}–₹{zt:.0f}\n"
-                                    f"Confirmations: {score}/{len(confs)}\n"
+                                    f"Strike: {selected_strike}{trade_type[0]}E | Spot: ₹{spot:.0f}\n"
+                                    f"Entry Spot: ₹{entry_v:.0f} | Target Spot: ₹{target_v:.0f} | SL Spot: ₹{sl_v:.0f}\n"
+                                    f"Zone: {zone_type} ₹{zb:.0f}–₹{zt:.0f} | Confirmations: {score}/{len(confs)}\n"
                                     f"Order ID: {order_id or '—'}"
                                 )
                                 if err:
@@ -6657,17 +6790,18 @@ def show_auto_trade_section(option_data, df_5m, api, db):
                                     st.success(f"✅ {trade_type} order placed! Order ID: {order_id}")
                                 st.rerun()
 
-    # ── TRADE MONITOR (auto exit at target/SL using Dhan position data) ──
+    # ── TRADE MONITOR (auto exit at target/SL using spot price) ──
     if active_trade and active_trade.get('status') == 'OPEN':
         sec_id = active_trade.get('security_id')
         target_p = float(active_trade.get('target') or 0)
         sl_p = float(active_trade.get('sl') or 0)
         entry_p = float(active_trade.get('entry_price') or 0)
         tt = active_trade.get('trade_type', '')
+        current_spot = float(option_data.get('underlying', 0)) if option_data else 0
         current_ltp = None
         dhan_pnl = None
 
-        # Try to get live LTP and P&L from Dhan positions
+        # Get option LTP + P&L from Dhan positions (for display only)
         try:
             positions = api.get_positions() if api else None
             if positions:
@@ -6680,8 +6814,6 @@ def show_auto_trade_section(option_data, df_5m, api, db):
                         break
         except Exception:
             pass
-
-        # Fallback: fetch LTP directly if position not found
         if not current_ltp:
             try:
                 if api and sec_id:
@@ -6689,28 +6821,39 @@ def show_auto_trade_section(option_data, df_5m, api, db):
             except Exception:
                 pass
 
-        if current_ltp:
-            pnl_display = f"₹{dhan_pnl:+.0f}" if dhan_pnl is not None else f"₹{(current_ltp - entry_p) * 25:+.0f} (est)"
-            st.markdown(f"📡 **Live:** LTP ₹{current_ltp:.1f} | Target ₹{target_p} | SL ₹{sl_p} | P&L {pnl_display}")
-            exit_reason = None
-            if target_p > 0 and current_ltp >= target_p:
+        # Display using spot as primary reference
+        spot_disp = f"Spot ₹{current_spot:.0f}" if current_spot else "Spot —"
+        ltp_disp = f" | Option LTP ₹{current_ltp:.1f}" if current_ltp else ""
+        pnl_disp = f"₹{dhan_pnl:+.0f}" if dhan_pnl is not None else "—"
+        st.markdown(
+            f"📡 **Live:** {spot_disp}{ltp_disp} | "
+            f"Entry ₹{entry_p:.0f} | Target ₹{target_p:.0f} | SL ₹{sl_p:.0f} | P&L {pnl_disp}"
+        )
+
+        # Auto-exit: compare SPOT against target/SL (all values are spot prices)
+        exit_reason = None
+        if current_spot > 0:
+            if target_p > 0 and tt == 'CALL' and current_spot >= target_p:
                 exit_reason = "TARGET"
-            elif sl_p > 0 and current_ltp <= sl_p:
+            elif target_p > 0 and tt == 'PUT' and current_spot <= target_p:
+                exit_reason = "TARGET"
+            elif sl_p > 0 and tt == 'CALL' and current_spot <= sl_p:
+                exit_reason = "SL"
+            elif sl_p > 0 and tt == 'PUT' and current_spot >= sl_p:
                 exit_reason = "SL"
 
-            if exit_reason:
-                updated, exit_p = _exit_trade(api, active_trade, exit_reason, db)
-                st.session_state.active_trade = None
-                final_exit = float(exit_p or current_ltp)
-                pnl = (final_exit - entry_p) * 25 * int(active_trade.get('lot_size', 1))
-                emoji = "✅" if exit_reason == "TARGET" else "🛑"
-                tg_exit = (
-                    f"{emoji} <b>AUTO EXIT — {exit_reason} HIT</b>\n"
-                    f"{active_trade.get('strike')} {tt} | Exit: ₹{final_exit:.1f} | P&L: ₹{pnl:+.0f}"
-                )
-                send_telegram_message_sync(tg_exit, force=True)
-                st.success(f"{emoji} {exit_reason} hit! Exit ₹{final_exit:.1f} | P&L ₹{pnl:+.0f}")
-                st.rerun()
+        if exit_reason:
+            updated, exit_p = _exit_trade(api, active_trade, exit_reason, db)
+            st.session_state.active_trade = None
+            pnl_str = f"₹{dhan_pnl:+.0f}" if dhan_pnl is not None else f"Spot exit ₹{current_spot:.0f}"
+            emoji = "✅" if exit_reason == "TARGET" else "🛑"
+            tg_exit = (
+                f"{emoji} <b>AUTO EXIT — {exit_reason} HIT</b>\n"
+                f"{active_trade.get('strike')} {tt} | Spot: ₹{current_spot:.0f} | P&L: {pnl_str}"
+            )
+            send_telegram_message_sync(tg_exit, force=True)
+            st.success(f"{emoji} {exit_reason} hit! Spot ₹{current_spot:.0f} | P&L {pnl_str}")
+            st.rerun()
 
         # Reverse signal check
         try:
@@ -6791,6 +6934,8 @@ def main():
     _auto_trade_container = st.container()
     # Placeholder — Per-Strike OI chart renders here (filled after auto trade)
     _per_strike_oi_container = st.container()
+    # Placeholder — Alignment + Capping panel (filled after api init)
+    _align_cap_container = st.container()
 
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
@@ -7091,6 +7236,10 @@ def main():
     with _per_strike_oi_container:
         with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
             _render_per_strike_oi_top()
+
+    # Fill Alignment + Index/Stock Capping below Per-Strike OI
+    with _align_cap_container:
+        _render_alignment_capping_top()
 
     col1, col2 = st.columns([2, 1])
 
