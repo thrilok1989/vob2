@@ -5106,74 +5106,87 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
 
 def generate_ai_context_message():
     """One-time AI context/glossary — split into two messages to stay under 4096 chars."""
-    part1 = """🟡 <b>NIFTY SIGNAL GUIDE (1/2)</b>
-(Send once at day start)
+    part1 = """🟡 <b>NIFTY SIGNAL GUIDE (EXECUTION)</b>
 
-<b>📋 ALERT TYPES</b>
-⚠️ PCR PROXIMITY = price within ±25 pts of PCR S/R level
-🕯 CANDLE AT S/R = bullish candle at support / bearish at resistance
-🟥 CALL CAPPING = CE writers capping → SELL zone 🔥=vol confirmed
-🟩 PUT SUPPORT = PE writers defending → BUY zone 🔥=vol confirmed
-🔴 REJECTION AT CEILING = 2/3 signals: chart wick + OC ChgOI + depth
-🟢 BOUNCE AT FLOOR = 2/3 signals: chart wick + OC ChgOI + depth
-→ Every alert sends: alert header + Part 1 (signal data) + Part 2 (AI prompt)
+<b>📋 ALERT TYPES (CORE ONLY)</b>
+⚠️ PCR NEAR LEVEL → price near S/R (±25 pts)
+🕯 CANDLE AT LEVEL → confirmation
+🟥 CALL CAPPING 🔥 → SELL zone
+🟩 PUT SUPPORT 🔥 → BUY zone
+🔴 REJECTION (CEILING) → SELL trigger
+🟢 BOUNCE (FLOOR) → BUY trigger
+👉 No trade without 2 confirmations minimum
 
-<b>📋 SIGNAL SCORE</b>
-Score: -5(strong bear) to +5(strong bull)
-🟥 CALL CAPPING / 🟩 PUT CAPPING = OC writers confirmed at wall
-🎨 🟢=Bullish 🔴=Bearish ⚪=Neutral ⚫=No data
+<b>📊 SIGNAL SCORE</b>
+Range: -5 → +5 | 🟥=Bearish 🟩=Bullish ⚪=Neutral
+👉 Bias filter only — not entry trigger
 
-<b>🌍 ALIGNMENT (10m|1h|4h|1D|4D|Pat):</b>
-N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
-REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
-NP=NoPattern Ham=Hammer ShStar=ShootingStar SGC=StrongGreen
-SRC=StrongRed BullEng/BearEng=Engulfing BullHar/BearHar=Harami
+<b>🌍 ALIGNMENT (TREND FILTER)</b>
+Focus: 1H + 4H + 1D
+3 same → Strong trend | Mixed → Range / Sit out
 
-<b>🔬 STRIKE ANALYSIS (ATM±2):</b>
-Line1: ATM±N ₹Strike | PCR | S/R:₹level(offset) | Cap OI | Score
-  PCR≤0.7=Resistance(offset:-20→+20) | 0.71-1.7=Neutral | ≥1.8=Support(offset:-20→+20)
-  Offset = pts from strike where wall is felt
-Line2: 📌Depth R/S ₹chartprice→₹strike(wallQty) | Δ Γ Θ Greeks
-  BA=bid-ask pressure (+ve=buyers -ve=sellers)
-  E=Entry(Bull/Bear/NoEnt) Mv=RUp/RDn=real FkUp/FkDn=reversal
-Line3: CE/PE bid-ask qty | COI=ChangeOI OI=build/unwind
+<b>🧱 ENTRY LOGIC</b>
+🔴 SELL (CEILING) — all must align:
+• Call OI highest (wall)
+• Depth ask &gt;5K
+• Price rejection (wick)
+• BA negative
+👉 Entry: At ceiling stall | SL: Above ceiling
 
-<b>🌐 MARKET CONTEXT</b>
-DTE=days to expiry | ⚠️Rollover=≤5 days
-MaxPain=price magnet near expiry | Straddle=ATM CE+PE cost
-IVR 🔥≥70%=sell favoured 🧊≤30%=buy favoured
-Skew 🔴&gt;1.1=put fear 🟢&lt;0.9=call greed | ATR14=SL guide"""
+🟢 BUY (FLOOR) — all must align:
+• Put OI highest (support)
+• Depth bid &gt;5K
+• Price bounce (wick)
+• BA positive
+👉 Entry: At floor stall | SL: Below floor
 
-    part2 = """🟡 <b>NIFTY SIGNAL GUIDE (2/2)</b>
+<b>📡 MARKET MODE</b>
+GEX +ve → RANGE → sell high, buy low
+GEX -ve → TREND → follow move, no counter
+VIDYA confirms direction"""
 
-<b>📊 DATA BLOCKS</b>
+    part2 = """🟡 <b>NIFTY SIGNAL GUIDE (REFERENCE)</b>
+
+<b>⚠️ CRITICAL RULES</b>
+1. GEX -ve + VIDYA trend → DO NOT FADE
+2. Depth &lt;500 → weak level → expect break
+3. DTE ≤5 → MaxPain magnet
+4. Straddle &gt;&gt; ATR → big move already priced
+5. PCR ≤0.7 near ATM+1 → strong resistance above
+
+<b>🚫 NO TRADE ZONE</b>
+• Alignment mixed
+• GEX neutral
+• No depth walls
+= Sit out — this is your edge
+
+<b>🧠 QUICK MEMORY</b>
+🏠 Floor = Buyers = Bounce = BUY
+🧱 Ceiling = Sellers = Reject = SELL
+🌊 Trend = Follow flow
+🧊 No wall = No trade
+
+<b>📦 REFERENCE (NOT DAILY)</b>
 GEX +ve=range -ve=trending | Flip=gamma flip level
 VIDYA: adaptive trend | -ve%=falling +ve%=rising
-VPFR: POC=most traded | VAH/VAL=value area (3 TFs: 30/60/180 bars)
-Triple POC P1/P2/P3: clustered = strong confluence magnet
-🌀 Swing: SwH/SwL=last highs/lows | →Target=projected swing
-OI Winding: CE/PE build🟢/unwind🔴 | Par=parallel activity
-Money Flow: POC=peak vol node ⭐ | sentiment at price clusters
-VWAP=vol avg (below=bearish context) | LTP Trap=fake breakout
+VPFR: POC=most traded | VAH/VAL=value area
+Triple POC P1/P2/P3: clustered = strong confluence
+OI Winding: CE/PE build🟢/unwind🔴
+Money Flow: POC=peak vol ⭐ | VWAP=vol avg
 VOB=Volume Order Blocks | HVP=High Volume Pivots
-📡 Capping: {bias}N50/BNF/REL/ICICI 🟥R₹cap 🟩S₹sup 📍=near 🔥=vol
+Skew 🔴&gt;1.1=put fear 🟢&lt;0.9=call greed | ATR14=SL guide
+IVR 🔥≥70%=sell favoured 🧊≤30%=buy favoured
 
-<b>🧱 CEILING / FLOOR LOGIC (AI prompt step 2)</b>
-Strongest CEILING = highest CE OI strike + depth ask wall + VPFR VAH near strike + MF POC
-Strongest FLOOR = highest PE OI strike + depth bid wall + VPFR VAL near strike + MF POC
-Entry AT ceiling for SELL / AT floor for BUY — where price stalls and won't break
-SL just above ceiling for SELL / just below floor for BUY
+<b>🌍 ALIGNMENT CODES</b>
+N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
+REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
+NP=NoPattern Ham=Hammer ShStar=ShootingStar
+SGC=StrongGreen SRC=StrongRed BullEng/BearEng BullHar/BearHar
 
-<b>📈 RULES</b>
-1. Alignment 3+ same 1h+4h+1D = confirmed trend
-2. GEX neg + VIDYA bear = trending — do NOT fade
-3. Depth qty &gt;5K = major wall | &lt;500 = breakable
-4. BA neg + Mv=RDn = confirmed bear entry
-5. PCR≤0.7 at ATM+1 + Γ🔴 = heavy gamma resistance above
-6. 🔴REJECT at ceiling + OC ChgOI building = high conviction SELL
-7. 🟢BOUNCE at floor + OC ChgOI building = high conviction BUY
-8. DTE≤5 ⚠️Rollover: MaxPain magnet — avoid counter-MaxPain
-9. Straddle wide vs ATR = big move priced → widen targets"""
+<b>🔬 STRIKE ANALYSIS (ATM±2)</b>
+PCR≤0.7=Resistance | 0.71-1.7=Neutral | ≥1.8=Support
+BA=bid-ask (+ve=buyers -ve=sellers)
+Depth &gt;5K=major wall | &lt;500=breakable"""
 
     return [part1, part2]
 
