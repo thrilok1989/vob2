@@ -5955,9 +5955,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                     _vt   = "🔥VOL" if r.get('CE_Vol_High', False) else "📊"
                     _oi   = r.get('CE_OI', 0) / 100000
                     _chg  = r.get('CE_ChgOI', r.get('changeinOpenInterest_CE', 0)) / 1000
-                    _ltp  = r.get('lastPrice_CE', 0)
+                    _ltp  = r.get('CE_LTP', r.get('lastPrice_CE', 0))
                     _cls  = r.get('Call_Class', '')
-                    _act  = r.get('Call_Activity', '')
                     _dist = underlying_price - float(r['Strike'])
                     _prox = f"📍{abs(_dist):.0f}pts {'below' if _dist > 0 else 'above'} spot"
                     _call_caps.append(
@@ -5973,9 +5972,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                     _vt   = "🔥VOL" if r.get('PE_Vol_High', False) else "📊"
                     _oi   = r.get('PE_OI', 0) / 100000
                     _chg  = r.get('PE_ChgOI', r.get('changeinOpenInterest_PE', 0)) / 1000
-                    _ltp  = r.get('lastPrice_PE', 0)
+                    _ltp  = r.get('PE_LTP', r.get('lastPrice_PE', 0))
                     _cls  = r.get('Put_Class', '')
-                    _act  = r.get('Put_Activity', '')
                     _dist = float(r['Strike']) - underlying_price
                     _prox = f"📍{abs(_dist):.0f}pts {'above' if _dist > 0 else 'below'} spot"
                     _put_sups.append(
@@ -5995,6 +5993,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         capping_block = ""
 
 
+    _oit = result.get('oi_trend', {})
     _vid = result.get('vidya', {})
     _ob = result.get('order_blocks', {})
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
