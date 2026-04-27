@@ -6097,12 +6097,35 @@ def _analyze_zone(spot, zone_bottom, zone_top, option_data, df_5m, df_1m=None):
     except Exception:
         pass
 
-    # 4a. 5-min candle pattern
+    # 4. ATM OI Activity — from latest master signal oi_trend
+    try:
+        master = getattr(st.session_state, '_master_signal_latest', None)
+        if master:
+            oit = master.get('oi_trend', {}) or {}
+            atm_s = oit.get('atm_strike', '')
+            ce_act = oit.get('ce_activity', 'N/A')
+            pe_act = oit.get('pe_activity', 'N/A')
+            ce_pct = oit.get('ce_oi_pct', 0)
+            pe_pct = oit.get('pe_oi_pct', 0)
+            # Bullish at support: PE Short Building + CE weakening
+            # Bearish at resistance: CE Short Building + PE weakening
+            bullish_oi = pe_act in ('Short Building', 'Long Building') and ce_act in ('Short Covering', 'Long Unwinding')
+            bearish_oi = ce_act in ('Short Building', 'Long Building') and pe_act in ('Short Covering', 'Long Unwinding')
+            if bullish_oi:
+                confirmations.append(f"ATM OI ({atm_s}): PE {pe_act}({pe_pct:+.1f}%) CE {ce_act} → Bullish ✅")
+            elif bearish_oi:
+                confirmations.append(f"ATM OI ({atm_s}): CE {ce_act}({ce_pct:+.1f}%) PE {pe_act} → Bearish ✅")
+            else:
+                confirmations.append(f"ATM OI ({atm_s}): CE {ce_act}({ce_pct:+.1f}%) | PE {pe_act}({pe_pct:+.1f}%) ⚪")
+    except Exception:
+        pass
+
+    # 5a. 5-min candle pattern
     pat_5m = _detect_candle_pattern(df_5m, "5m")
     if pat_5m:
         confirmations.append(pat_5m)
 
-    # 4b. 1-min candle pattern (if available)
+    # 5b. 1-min candle pattern (if available)
     if df_1m is not None and not df_1m.empty:
         pat_1m = _detect_candle_pattern(df_1m, "1m")
         if pat_1m:
