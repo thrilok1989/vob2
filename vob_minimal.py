@@ -5936,59 +5936,112 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     _mi_bias_block = ("\n<b>📡 Index/Stock Capping:</b>\n" + "\n".join(_mi_lines) + "\n") if _mi_lines else ""
 
-    # ── Dedicated Capping Block (Nifty only, clearly separated) ──
+    # ── Comprehensive S/R Block — all data per level ──
     capping_block = ""
     try:
         _sa_cap = getattr(st.session_state, '_sa_result', None)
+        _mf_cap = getattr(st.session_state, '_money_flow_data', None)
+        _vpfr_c = result.get('vpfr', {}) or {}
+        _gex_c  = result.get('gex', {}) or {}
+        _flip   = _gex_c.get('gamma_flip')
+
+        def _nearest_vpfr(level):
+            """Return closest VPFR label and distance for a given price level."""
+            best, best_d = None, 9999
+            for _tf, _lbl in [('short','S30'),('medium','M60'),('long','L180')]:
+                _vd = _vpfr_c.get(_tf) or {}
+                for _k, _klbl in [('poc','POC'),('vah','VAH'),('val','VAL')]:
+                    _v = _vd.get(_k)
+                    if _v:
+                        _d = abs(level - _v)
+                        if _d < best_d:
+                            best_d, best = _d, f"{_lbl} {_klbl}₹{_v:.0f}({_d:.0f}pts)"
+            return best or "—"
+
+        def _mf_prox(level):
+            """Return money flow proximity string for a given price level."""
+            if not _mf_cap:
+                return "—"
+            parts = []
+            _poc = _mf_cap.get('poc_price', 0)
+            _vah = _mf_cap.get('value_area_high', 0)
+            _val = _mf_cap.get('value_area_low', 0)
+            if _poc and abs(level - _poc) <= 50:
+                parts.append(f"POC₹{_poc:.0f}({abs(level-_poc):.0f}pts)")
+            if _vah and abs(level - _vah) <= 50:
+                parts.append(f"VAH₹{_vah:.0f}({abs(level-_vah):.0f}pts)")
+            if _val and abs(level - _val) <= 50:
+                parts.append(f"VAL₹{_val:.0f}({abs(level-_val):.0f}pts)")
+            return " ".join(parts) if parts else "—"
+
+        def _gex_prox(level):
+            if _flip:
+                return f"Flip₹{_flip:.0f}({abs(level-_flip):.0f}pts)"
+            return "—"
+
         if _sa_cap is not None:
             _adf = _sa_cap.get('analysis_df')
             if _adf is not None and not _adf.empty:
-                _call_caps = []
-                _put_sups  = []
+                _sr_lines = []
 
-                # Call capping rows
+                # ── RESISTANCE levels ──
                 _cap_rows = _adf[
                     _adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance', 'Moderate Resistance']) &
                     _adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)', 'Short Building'])
-                ].sort_values('CE_OI', ascending=False)
-                for _, r in _cap_rows.iterrows():
-                    _vt   = "🔥VOL" if r.get('CE_Vol_High', False) else "📊"
-                    _oi   = r.get('CE_OI', 0) / 100000
-                    _chg  = r.get('CE_ChgOI', r.get('changeinOpenInterest_CE', 0)) / 1000
-                    _ltp  = r.get('CE_LTP', r.get('lastPrice_CE', 0))
-                    _cls  = r.get('Call_Class', '')
-                    _dist = underlying_price - float(r['Strike'])
-                    _prox = f"📍{abs(_dist):.0f}pts {'below' if _dist > 0 else 'above'} spot"
-                    _call_caps.append(
-                        f"  🟥 ₹{r['Strike']:.0f} | {_vt} | OI:{_oi:.1f}L ChgOI:{_chg:+.0f}K | LTP:₹{_ltp:.0f} | {_cls} | {_prox}"
-                    )
+                ].sort_values('CE_OI', ascending=False).head(3)
 
-                # Put support rows
+                if not _cap_rows.empty:
+                    _sr_lines.append("\n🔴 <b>RESISTANCE LEVELS</b>")
+                    for _, r in _cap_rows.iterrows():
+                        _sk   = float(r['Strike'])
+                        _vt   = "🔥Vol" if r.get('CE_Vol_High', False) else "📊"
+                        _oi   = r.get('CE_OI', 0) / 100000
+                        _chg  = r.get('CE_ChgOI', 0) / 1000
+                        _ltp  = r.get('CE_LTP', 0)
+                        _cls  = r.get('Call_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
+                        _bid  = r.get('bidQty_CE', r.get('Bid_CE', 0))
+                        _ask  = r.get('askQty_CE', r.get('Ask_CE', 0))
+                        _ba   = r.get('BidAskPressure', 0)
+                        _dist = _sk - underlying_price
+                        _sr_lines.append(
+                            f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'above' if _dist>0 else 'below'} spot\n"
+                            f"  ├ OI: {_oi:.1f}L | ChgOI: {_chg:+.0f}K | LTP: ₹{_ltp:.0f}\n"
+                            f"  ├ Depth: Bid {_bid} Ask {_ask} | BA:{_ba:+.0f}\n"
+                            f"  ├ VPFR: {_nearest_vpfr(_sk)}\n"
+                            f"  ├ GEX:  {_gex_prox(_sk)}\n"
+                            f"  └ MFlow:{_mf_prox(_sk)}"
+                        )
+
+                # ── SUPPORT levels ──
                 _sup_rows = _adf[
                     _adf['Put_Class'].isin(['High Conviction Support', 'Strong Support', 'Moderate Support']) &
                     _adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)', 'Short Building'])
-                ].sort_values('PE_OI', ascending=False)
-                for _, r in _sup_rows.iterrows():
-                    _vt   = "🔥VOL" if r.get('PE_Vol_High', False) else "📊"
-                    _oi   = r.get('PE_OI', 0) / 100000
-                    _chg  = r.get('PE_ChgOI', r.get('changeinOpenInterest_PE', 0)) / 1000
-                    _ltp  = r.get('PE_LTP', r.get('lastPrice_PE', 0))
-                    _cls  = r.get('Put_Class', '')
-                    _dist = float(r['Strike']) - underlying_price
-                    _prox = f"📍{abs(_dist):.0f}pts {'above' if _dist > 0 else 'below'} spot"
-                    _put_sups.append(
-                        f"  🟩 ₹{r['Strike']:.0f} | {_vt} | OI:{_oi:.1f}L ChgOI:{_chg:+.0f}K | LTP:₹{_ltp:.0f} | {_cls} | {_prox}"
-                    )
+                ].sort_values('PE_OI', ascending=False).head(3)
 
-                if _call_caps or _put_sups:
-                    _cap_lines = []
-                    if _call_caps:
-                        _cap_lines.append("<b>🟥 CALL CAPPING (Resistance):</b>")
-                        _cap_lines.extend(_call_caps[:4])
-                    if _put_sups:
-                        _cap_lines.append("<b>🟩 PUT SUPPORT (Floor):</b>")
-                        _cap_lines.extend(_put_sups[:4])
-                    capping_block = "\n<b>━━ CAPPING DATA ━━</b>\n" + "\n".join(_cap_lines) + "\n"
+                if not _sup_rows.empty:
+                    _sr_lines.append("\n🟢 <b>SUPPORT LEVELS</b>")
+                    for _, r in _sup_rows.iterrows():
+                        _sk   = float(r['Strike'])
+                        _vt   = "🔥Vol" if r.get('PE_Vol_High', False) else "📊"
+                        _oi   = r.get('PE_OI', 0) / 100000
+                        _chg  = r.get('PE_ChgOI', 0) / 1000
+                        _ltp  = r.get('PE_LTP', 0)
+                        _cls  = r.get('Put_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
+                        _bid  = r.get('bidQty_PE', r.get('Bid_PE', 0))
+                        _ask  = r.get('askQty_PE', r.get('Ask_PE', 0))
+                        _ba   = r.get('BidAskPressure', 0)
+                        _dist = underlying_price - _sk
+                        _sr_lines.append(
+                            f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'below' if _dist>0 else 'above'} spot\n"
+                            f"  ├ OI: {_oi:.1f}L | ChgOI: {_chg:+.0f}K | LTP: ₹{_ltp:.0f}\n"
+                            f"  ├ Depth: Bid {_bid} Ask {_ask} | BA:{_ba:+.0f}\n"
+                            f"  ├ VPFR: {_nearest_vpfr(_sk)}\n"
+                            f"  ├ GEX:  {_gex_prox(_sk)}\n"
+                            f"  └ MFlow:{_mf_prox(_sk)}"
+                        )
+
+                if _sr_lines:
+                    capping_block = "\n<b>━━━ S/R ANALYSIS ━━━</b>" + "\n".join(_sr_lines) + "\n"
     except Exception:
         capping_block = ""
 
@@ -6274,6 +6327,106 @@ def _exit_trade(api, trade, exit_reason, db):
         updated['exit_price'] = float(exit_price)
     db.upsert_auto_trade(updated)
     return updated, exit_price
+
+
+def _render_per_strike_oi_top():
+    """Render Per-Strike CE vs PE OI charts + signals from session state."""
+    import plotly.graph_objects as go
+    oi_history = st.session_state.get('oi_history', [])
+    if not oi_history:
+        st.info("📊 Per-Strike OI data builds up as the app refreshes. Please wait...")
+        return
+    try:
+        oi_history_df = pd.DataFrame(oi_history)
+        oi_strikes = st.session_state.get('oi_current_strikes') or []
+        if not oi_strikes:
+            _lv = st.session_state.get('oi_last_valid_data')
+            if _lv is not None:
+                oi_strikes = [int(s) for s in _lv['Strike'].tolist()]
+        oi_strikes = sorted(oi_strikes)
+        if not oi_strikes:
+            st.info("Waiting for strike data...")
+            return
+        oi_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+        st.markdown(f"**📈 {len(oi_history)} data points | OI values in Lakhs**")
+        oi_strike_cols = st.columns(min(len(oi_strikes), 5))
+        for i, strike in enumerate(oi_strikes):
+            if i >= len(oi_strike_cols):
+                break
+            ce_col = f'{strike}_CE'
+            pe_col = f'{strike}_PE'
+            with oi_strike_cols[i]:
+                label = oi_position_labels[i] if i < len(oi_position_labels) else f'Strike {i}'
+                fig_strike = go.Figure()
+                if ce_col in oi_history_df.columns:
+                    fig_strike.add_trace(go.Scatter(
+                        x=oi_history_df['time'], y=oi_history_df[ce_col] / 100000,
+                        mode='lines+markers', name='Call OI',
+                        line=dict(color='#ff4444', width=2), marker=dict(size=3),
+                    ))
+                if pe_col in oi_history_df.columns:
+                    fig_strike.add_trace(go.Scatter(
+                        x=oi_history_df['time'], y=oi_history_df[pe_col] / 100000,
+                        mode='lines+markers', name='Put OI',
+                        line=dict(color='#00cc66', width=2), marker=dict(size=3),
+                    ))
+                cur_ce = oi_history_df[ce_col].iloc[-1] / 100000 if ce_col in oi_history_df.columns and len(oi_history_df) > 0 else 0
+                cur_pe = oi_history_df[pe_col].iloc[-1] / 100000 if pe_col in oi_history_df.columns and len(oi_history_df) > 0 else 0
+                fig_strike.update_layout(
+                    title=f'{label}<br>₹{strike}<br>CE:{cur_ce:.1f}L PE:{cur_pe:.1f}L',
+                    template='plotly_dark', height=260, showlegend=True,
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=8)),
+                    margin=dict(l=5, r=5, t=80, b=20),
+                    xaxis=dict(tickformat='%H:%M', title=''),
+                    yaxis=dict(title='OI (L)'),
+                    plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
+                )
+                st.plotly_chart(fig_strike, use_container_width=True)
+                # Signal badges
+                if ce_col in oi_history_df.columns and pe_col in oi_history_df.columns and len(oi_history_df) >= 3:
+                    ce_s = oi_history_df[ce_col]; pe_s = oi_history_df[pe_col]
+                    ce_chg = ce_s.iloc[-1] - ce_s.iloc[0]; pe_chg = pe_s.iloc[-1] - pe_s.iloc[0]
+                    ce_pct = (ce_chg / ce_s.iloc[0] * 100) if ce_s.iloc[0] > 0 else 0
+                    pe_pct = (pe_chg / pe_s.iloc[0] * 100) if pe_s.iloc[0] > 0 else 0
+                    if pe_chg > 0: st.success(f"Support Building (PE +{pe_pct:.1f}%)")
+                    elif pe_chg < 0: st.error(f"Support Weakening (PE {pe_pct:.1f}%)")
+                    if ce_chg > 0: st.error(f"Resistance Building (CE +{ce_pct:.1f}%)")
+                    elif ce_chg < 0: st.success(f"Resistance Weakening (CE {ce_pct:.1f}%)")
+                    oi_diff_l = abs(cur_pe - cur_ce)
+                    if cur_pe > cur_ce:
+                        r = cur_pe / cur_ce if cur_ce > 0 else 0
+                        c = '#00ff88' if r >= 2.0 else '#00cc66'; lbl = 'STRONG SUPPORT' if r >= 2.0 else 'MODERATE SUPPORT'
+                        st.markdown(f'<div style="background:{c}30;padding:6px;border-radius:6px;border-left:3px solid {c};font-size:12px;"><b style="color:{c};">{lbl}</b> | PE {cur_pe:.1f}L vs CE {cur_ce:.1f}L | Diff:{oi_diff_l:.1f}L | Ratio:{r:.1f}x</div>', unsafe_allow_html=True)
+                    elif cur_ce > cur_pe:
+                        r = cur_ce / cur_pe if cur_pe > 0 else 0
+                        c = '#ff4444' if r >= 2.0 else '#cc4444'; lbl = 'STRONG RESISTANCE' if r >= 2.0 else 'MODERATE RESISTANCE'
+                        st.markdown(f'<div style="background:{c}30;padding:6px;border-radius:6px;border-left:3px solid {c};font-size:12px;"><b style="color:{c};">{lbl}</b> | CE {cur_ce:.1f}L vs PE {cur_pe:.1f}L | Diff:{oi_diff_l:.1f}L | Ratio:{r:.1f}x</div>', unsafe_allow_html=True)
+                    # LTP-based long/short signals
+                    ce_ltp_col = f'{strike}_CE_LTP'; pe_ltp_col = f'{strike}_PE_LTP'
+                    if ce_ltp_col in oi_history_df.columns and len(oi_history_df) >= 3:
+                        ce_ltp_chg = oi_history_df[ce_ltp_col].iloc[-1] - oi_history_df[ce_ltp_col].iloc[0]
+                        ce_ltp_pct = (ce_ltp_chg / oi_history_df[ce_ltp_col].iloc[0] * 100) if oi_history_df[ce_ltp_col].iloc[0] > 0 else 0
+                        if ce_chg < 0 and ce_ltp_chg > 0:
+                            st.markdown(f'<div style="background:#00ff8830;padding:5px;border-radius:5px;border-left:3px solid #00ff88;font-size:12px;"><b style="color:#00ff88;">CE: SHORT COVERING</b> | OI {ce_pct:.1f}% | LTP +{ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif ce_chg > 0 and ce_ltp_chg > 0:
+                            st.markdown(f'<div style="background:#ff880030;padding:5px;border-radius:5px;border-left:3px solid #ff8800;font-size:12px;"><b style="color:#ff8800;">CE: LONG BUILDING</b> | OI +{ce_pct:.1f}% | LTP +{ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif ce_chg > 0 and ce_ltp_chg <= 0:
+                            st.markdown(f'<div style="background:#ff444430;padding:5px;border-radius:5px;border-left:3px solid #ff4444;font-size:12px;"><b style="color:#ff4444;">CE: SHORT BUILDING</b> | OI +{ce_pct:.1f}% | LTP {ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif ce_chg < 0 and ce_ltp_chg <= 0:
+                            st.markdown(f'<div style="background:#88888830;padding:5px;border-radius:5px;border-left:3px solid #888;font-size:12px;"><b style="color:#888;">CE: LONG UNWINDING</b> | OI {ce_pct:.1f}% | LTP {ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                    if pe_ltp_col in oi_history_df.columns and len(oi_history_df) >= 3:
+                        pe_ltp_chg = oi_history_df[pe_ltp_col].iloc[-1] - oi_history_df[pe_ltp_col].iloc[0]
+                        pe_ltp_pct = (pe_ltp_chg / oi_history_df[pe_ltp_col].iloc[0] * 100) if oi_history_df[pe_ltp_col].iloc[0] > 0 else 0
+                        if pe_chg > 0 and pe_ltp_chg <= 0:
+                            st.markdown(f'<div style="background:#00ff8830;padding:5px;border-radius:5px;border-left:3px solid #00ff88;font-size:12px;"><b style="color:#00ff88;">PE: SHORT BUILDING</b> | OI +{pe_pct:.1f}% | LTP {pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif pe_chg < 0 and pe_ltp_chg > 0:
+                            st.markdown(f'<div style="background:#00cc6630;padding:5px;border-radius:5px;border-left:3px solid #00cc66;font-size:12px;"><b style="color:#00cc66;">PE: SHORT COVERING</b> | OI {pe_pct:.1f}% | LTP +{pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif pe_chg > 0 and pe_ltp_chg > 0:
+                            st.markdown(f'<div style="background:#ff444430;padding:5px;border-radius:5px;border-left:3px solid #ff4444;font-size:12px;"><b style="color:#ff4444;">PE: LONG BUILDING</b> | OI +{pe_pct:.1f}% | LTP +{pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif pe_chg < 0 and pe_ltp_chg <= 0:
+                            st.markdown(f'<div style="background:#88888830;padding:5px;border-radius:5px;border-left:3px solid #888;font-size:12px;"><b style="color:#888;">PE: LONG UNWINDING</b> | OI {pe_pct:.1f}% | LTP {pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+    except Exception as _e:
+        st.caption(f"OI chart error: {_e}")
 
 
 def show_auto_trade_section(option_data, df_5m, api, db):
@@ -6627,6 +6780,8 @@ def main():
 
     # Placeholder — auto trade section renders here (filled after db/api init below)
     _auto_trade_container = st.container()
+    # Placeholder — Per-Strike OI chart renders here (filled after auto trade)
+    _per_strike_oi_container = st.container()
 
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
@@ -6891,6 +7046,11 @@ def main():
             show_auto_trade_section(_opt_data_top, _df_5m_top, api, db)
         except Exception as _ate_top:
             st.caption(f"Auto trade init: {_ate_top}")
+
+    # Fill Per-Strike OI chart right below auto trade section
+    with _per_strike_oi_container:
+        with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
+            _render_per_strike_oi_top()
 
     col1, col2 = st.columns([2, 1])
 
