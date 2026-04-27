@@ -6076,7 +6076,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
 3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS — bias + Cap/Sup/Range
-4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL</code>"""
+4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
 
     message = msg_part1  # used for Gemini analysis context
 
