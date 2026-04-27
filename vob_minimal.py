@@ -5140,15 +5140,11 @@ Focus: 1H + 4H + 1D
 • BA positive
 👉 Entry: At floor stall | SL: Below floor
 
-<b>📡 MARKET MODE FILTER</b>
-GEX +ve → RANGE → sell high, buy low
-GEX -ve → TREND → follow move (no counter)
-VIDYA confirms direction
-
-🏠 Floor = Buyers = Bounce = BUY
-🧱 Ceiling = Sellers = Reject = SELL
-🌊 Trend = Follow flow
-🧊 No wall = No trade"""
+<b>📡 MARKET MODE (from live GEX value in signal)</b>
+GEX +ve → RANGE → sell ceiling, buy floor
+GEX -ve → TREND → follow momentum, no counter
+Confirm with VIDYA direction
+🧊 No depth wall = No trade"""
 
     part2 = """🟡 <b>NIFTY SIGNAL GUIDE (REFERENCE)</b>
 
@@ -6085,7 +6081,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 {align_text}
 {_mi_bias_block}
 🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
-1. Market structure: bull/bear/range + reason
+GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
+1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
 3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR — bias + Cap/Sup/Range
 4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
