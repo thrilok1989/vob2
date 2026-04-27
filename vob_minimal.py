@@ -5433,6 +5433,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         if _vd and _vd.get('summary'):
             _vds = _vd['summary']
             _bias_e = '🟢' if _vds.get('bias') == 'Bullish' else '🔴' if _vds.get('bias') == 'Bearish' else '⚪'
+            def _fmt_vol(v):
+                v = int(v or 0)
+                return f"{v/1000000:.1f}M" if abs(v) >= 1000000 else f"{v/1000:.0f}K"
             _tot_d  = int(_vds.get('total_delta', 0))
             _buy_v  = int(_vds.get('total_buy_volume', 0))
             _sell_v = int(_vds.get('total_sell_volume', 0))
@@ -5441,26 +5444,32 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _divg   = int(_vds.get('divergence_bars', 0))
             vol_delta_block = (
                 f"\n<b>⚡ VOLUME DELTA:</b> {_bias_e} {_vds.get('bias','N/A')}\n"
-                f"  Total Delta: {_tot_d:+,} | Cumulative Delta: {_cum_d:+,}\n"
-                f"  Buy Volume: {_buy_v:,} | Sell Volume: {_sell_v:,}\n"
-                f"  Delta Ratio: {_d_rat:.2f} | Divergence Bars: {_divg}\n"
+                f"  Delta: {_fmt_vol(_tot_d)} | Cum Delta: {_fmt_vol(_cum_d)}\n"
+                f"  Buy Vol: {_fmt_vol(_buy_v)} | Sell Vol: {_fmt_vol(_sell_v)}\n"
+                f"  Ratio: {_d_rat:.2f} | Divergences: {_divg}\n"
             )
             # Delta at S/R zones: find candles where close is within 30 pts of any S/R level
-            _sr_levels = (result.get('resistance_levels', [])[:3] +
-                          result.get('support_levels', [])[:3])
+            _sr_levels = (result.get('resistance_levels', [])[:2] +
+                          result.get('support_levels', [])[:2])
             _vd_df = _vd.get('df')
             if _vd_df is not None and not _vd_df.empty and _sr_levels:
                 _zone_lines = []
                 for _lvl in _sr_levels:
-                    _near = _vd_df[abs(_vd_df['close'] - _lvl) <= 30].tail(3)
+                    _near = _vd_df[abs(_vd_df['close'] - _lvl) <= 30].tail(2)
                     for _, _c in _near.iterrows():
                         _cd = int(_c.get('delta', 0))
-                        _ct = str(_c.get('datetime', ''))[-8:-3]
+                        try:
+                            _ct = pd.to_datetime(_c.get('datetime')).strftime('%H:%M')
+                        except Exception:
+                            _ct = str(_c.get('datetime', ''))[-13:-8]
                         _ce = '🟢' if _cd > 0 else '🔴'
                         _typ = 'R' if _lvl in result.get('resistance_levels', []) else 'S'
-                        _zone_lines.append(f"  {_ce} ₹{_lvl:.0f}({_typ}) @{_ct} Delta:{_cd:+,} Buy:{int(_c.get('buy_volume',0)):,} Sell:{int(_c.get('sell_volume',0)):,}")
+                        _zone_lines.append(
+                            f"  {_ce} ₹{_lvl:.0f}({_typ}) @{_ct} "
+                            f"Δ:{_fmt_vol(_cd)} B:{_fmt_vol(int(_c.get('buy_volume',0)))} S:{_fmt_vol(int(_c.get('sell_volume',0)))}"
+                        )
                 if _zone_lines:
-                    vol_delta_block += "<b>  Delta at S/R Zones:</b>\n" + "\n".join(_zone_lines[:6]) + "\n"
+                    vol_delta_block += "<b>  Delta at S/R Zones:</b>\n" + "\n".join(_zone_lines[:4]) + "\n"
     except Exception:
         vol_delta_block = ""
 
@@ -6171,6 +6180,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 <b>━━━ DIRECTION ━━━</b>
 {swing_block}{capping_block}
 <b>━━━ MARKET DEPTH ━━━</b>{depth_block}
+<b>━━━ STRIKE-LEVEL DEEP DIVE ━━━</b>{strike_analysis_block}
 <b>━━━ OI POSITIONING ━━━</b>{unwind_block}{oc_deep_block}"""
 
     # ── Part 2: Deep Analysis + Indices & Stocks at bottom ──
@@ -6181,7 +6191,6 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 <b>━━━ MARKET CONTEXT ━━━</b>{market_ctx_block}
 <b>━━━ VOLUME DELTA ━━━</b>{vol_delta_block}
 <b>━━━ VOLUME &amp; LIQUIDITY PROFILE ━━━</b>{vpfr_block}{poc_block}{mf_block}
-<b>━━━ STRIKE-LEVEL DEEP DIVE ━━━</b>{strike_analysis_block}
 <b>━━━ PRICE STRUCTURE ━━━</b>{price_action_block}
 <b>━━━ INDICES &amp; STOCKS ━━━</b>
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
