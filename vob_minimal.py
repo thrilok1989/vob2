@@ -6329,6 +6329,106 @@ def _exit_trade(api, trade, exit_reason, db):
     return updated, exit_price
 
 
+def _render_per_strike_oi_top():
+    """Render Per-Strike CE vs PE OI charts + signals from session state."""
+    import plotly.graph_objects as go
+    oi_history = st.session_state.get('oi_history', [])
+    if not oi_history:
+        st.info("📊 Per-Strike OI data builds up as the app refreshes. Please wait...")
+        return
+    try:
+        oi_history_df = pd.DataFrame(oi_history)
+        oi_strikes = st.session_state.get('oi_current_strikes') or []
+        if not oi_strikes:
+            _lv = st.session_state.get('oi_last_valid_data')
+            if _lv is not None:
+                oi_strikes = [int(s) for s in _lv['Strike'].tolist()]
+        oi_strikes = sorted(oi_strikes)
+        if not oi_strikes:
+            st.info("Waiting for strike data...")
+            return
+        oi_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+        st.markdown(f"**📈 {len(oi_history)} data points | OI values in Lakhs**")
+        oi_strike_cols = st.columns(min(len(oi_strikes), 5))
+        for i, strike in enumerate(oi_strikes):
+            if i >= len(oi_strike_cols):
+                break
+            ce_col = f'{strike}_CE'
+            pe_col = f'{strike}_PE'
+            with oi_strike_cols[i]:
+                label = oi_position_labels[i] if i < len(oi_position_labels) else f'Strike {i}'
+                fig_strike = go.Figure()
+                if ce_col in oi_history_df.columns:
+                    fig_strike.add_trace(go.Scatter(
+                        x=oi_history_df['time'], y=oi_history_df[ce_col] / 100000,
+                        mode='lines+markers', name='Call OI',
+                        line=dict(color='#ff4444', width=2), marker=dict(size=3),
+                    ))
+                if pe_col in oi_history_df.columns:
+                    fig_strike.add_trace(go.Scatter(
+                        x=oi_history_df['time'], y=oi_history_df[pe_col] / 100000,
+                        mode='lines+markers', name='Put OI',
+                        line=dict(color='#00cc66', width=2), marker=dict(size=3),
+                    ))
+                cur_ce = oi_history_df[ce_col].iloc[-1] / 100000 if ce_col in oi_history_df.columns and len(oi_history_df) > 0 else 0
+                cur_pe = oi_history_df[pe_col].iloc[-1] / 100000 if pe_col in oi_history_df.columns and len(oi_history_df) > 0 else 0
+                fig_strike.update_layout(
+                    title=f'{label}<br>₹{strike}<br>CE:{cur_ce:.1f}L PE:{cur_pe:.1f}L',
+                    template='plotly_dark', height=260, showlegend=True,
+                    legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=8)),
+                    margin=dict(l=5, r=5, t=80, b=20),
+                    xaxis=dict(tickformat='%H:%M', title=''),
+                    yaxis=dict(title='OI (L)'),
+                    plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
+                )
+                st.plotly_chart(fig_strike, use_container_width=True)
+                # Signal badges
+                if ce_col in oi_history_df.columns and pe_col in oi_history_df.columns and len(oi_history_df) >= 3:
+                    ce_s = oi_history_df[ce_col]; pe_s = oi_history_df[pe_col]
+                    ce_chg = ce_s.iloc[-1] - ce_s.iloc[0]; pe_chg = pe_s.iloc[-1] - pe_s.iloc[0]
+                    ce_pct = (ce_chg / ce_s.iloc[0] * 100) if ce_s.iloc[0] > 0 else 0
+                    pe_pct = (pe_chg / pe_s.iloc[0] * 100) if pe_s.iloc[0] > 0 else 0
+                    if pe_chg > 0: st.success(f"Support Building (PE +{pe_pct:.1f}%)")
+                    elif pe_chg < 0: st.error(f"Support Weakening (PE {pe_pct:.1f}%)")
+                    if ce_chg > 0: st.error(f"Resistance Building (CE +{ce_pct:.1f}%)")
+                    elif ce_chg < 0: st.success(f"Resistance Weakening (CE {ce_pct:.1f}%)")
+                    oi_diff_l = abs(cur_pe - cur_ce)
+                    if cur_pe > cur_ce:
+                        r = cur_pe / cur_ce if cur_ce > 0 else 0
+                        c = '#00ff88' if r >= 2.0 else '#00cc66'; lbl = 'STRONG SUPPORT' if r >= 2.0 else 'MODERATE SUPPORT'
+                        st.markdown(f'<div style="background:{c}30;padding:6px;border-radius:6px;border-left:3px solid {c};font-size:12px;"><b style="color:{c};">{lbl}</b> | PE {cur_pe:.1f}L vs CE {cur_ce:.1f}L | Diff:{oi_diff_l:.1f}L | Ratio:{r:.1f}x</div>', unsafe_allow_html=True)
+                    elif cur_ce > cur_pe:
+                        r = cur_ce / cur_pe if cur_pe > 0 else 0
+                        c = '#ff4444' if r >= 2.0 else '#cc4444'; lbl = 'STRONG RESISTANCE' if r >= 2.0 else 'MODERATE RESISTANCE'
+                        st.markdown(f'<div style="background:{c}30;padding:6px;border-radius:6px;border-left:3px solid {c};font-size:12px;"><b style="color:{c};">{lbl}</b> | CE {cur_ce:.1f}L vs PE {cur_pe:.1f}L | Diff:{oi_diff_l:.1f}L | Ratio:{r:.1f}x</div>', unsafe_allow_html=True)
+                    # LTP-based long/short signals
+                    ce_ltp_col = f'{strike}_CE_LTP'; pe_ltp_col = f'{strike}_PE_LTP'
+                    if ce_ltp_col in oi_history_df.columns and len(oi_history_df) >= 3:
+                        ce_ltp_chg = oi_history_df[ce_ltp_col].iloc[-1] - oi_history_df[ce_ltp_col].iloc[0]
+                        ce_ltp_pct = (ce_ltp_chg / oi_history_df[ce_ltp_col].iloc[0] * 100) if oi_history_df[ce_ltp_col].iloc[0] > 0 else 0
+                        if ce_chg < 0 and ce_ltp_chg > 0:
+                            st.markdown(f'<div style="background:#00ff8830;padding:5px;border-radius:5px;border-left:3px solid #00ff88;font-size:12px;"><b style="color:#00ff88;">CE: SHORT COVERING</b> | OI {ce_pct:.1f}% | LTP +{ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif ce_chg > 0 and ce_ltp_chg > 0:
+                            st.markdown(f'<div style="background:#ff880030;padding:5px;border-radius:5px;border-left:3px solid #ff8800;font-size:12px;"><b style="color:#ff8800;">CE: LONG BUILDING</b> | OI +{ce_pct:.1f}% | LTP +{ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif ce_chg > 0 and ce_ltp_chg <= 0:
+                            st.markdown(f'<div style="background:#ff444430;padding:5px;border-radius:5px;border-left:3px solid #ff4444;font-size:12px;"><b style="color:#ff4444;">CE: SHORT BUILDING</b> | OI +{ce_pct:.1f}% | LTP {ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif ce_chg < 0 and ce_ltp_chg <= 0:
+                            st.markdown(f'<div style="background:#88888830;padding:5px;border-radius:5px;border-left:3px solid #888;font-size:12px;"><b style="color:#888;">CE: LONG UNWINDING</b> | OI {ce_pct:.1f}% | LTP {ce_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                    if pe_ltp_col in oi_history_df.columns and len(oi_history_df) >= 3:
+                        pe_ltp_chg = oi_history_df[pe_ltp_col].iloc[-1] - oi_history_df[pe_ltp_col].iloc[0]
+                        pe_ltp_pct = (pe_ltp_chg / oi_history_df[pe_ltp_col].iloc[0] * 100) if oi_history_df[pe_ltp_col].iloc[0] > 0 else 0
+                        if pe_chg > 0 and pe_ltp_chg <= 0:
+                            st.markdown(f'<div style="background:#00ff8830;padding:5px;border-radius:5px;border-left:3px solid #00ff88;font-size:12px;"><b style="color:#00ff88;">PE: SHORT BUILDING</b> | OI +{pe_pct:.1f}% | LTP {pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif pe_chg < 0 and pe_ltp_chg > 0:
+                            st.markdown(f'<div style="background:#00cc6630;padding:5px;border-radius:5px;border-left:3px solid #00cc66;font-size:12px;"><b style="color:#00cc66;">PE: SHORT COVERING</b> | OI {pe_pct:.1f}% | LTP +{pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif pe_chg > 0 and pe_ltp_chg > 0:
+                            st.markdown(f'<div style="background:#ff444430;padding:5px;border-radius:5px;border-left:3px solid #ff4444;font-size:12px;"><b style="color:#ff4444;">PE: LONG BUILDING</b> | OI +{pe_pct:.1f}% | LTP +{pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+                        elif pe_chg < 0 and pe_ltp_chg <= 0:
+                            st.markdown(f'<div style="background:#88888830;padding:5px;border-radius:5px;border-left:3px solid #888;font-size:12px;"><b style="color:#888;">PE: LONG UNWINDING</b> | OI {pe_pct:.1f}% | LTP {pe_ltp_pct:.1f}%</div>', unsafe_allow_html=True)
+    except Exception as _e:
+        st.caption(f"OI chart error: {_e}")
+
+
 def show_auto_trade_section(option_data, df_5m, api, db):
     """Render the full auto-trade UI section."""
     st.markdown("---")
@@ -6680,6 +6780,8 @@ def main():
 
     # Placeholder — auto trade section renders here (filled after db/api init below)
     _auto_trade_container = st.container()
+    # Placeholder — Per-Strike OI chart renders here (filled after auto trade)
+    _per_strike_oi_container = st.container()
 
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
@@ -6944,6 +7046,11 @@ def main():
             show_auto_trade_section(_opt_data_top, _df_5m_top, api, db)
         except Exception as _ate_top:
             st.caption(f"Auto trade init: {_ate_top}")
+
+    # Fill Per-Strike OI chart right below auto trade section
+    with _per_strike_oi_container:
+        with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
+            _render_per_strike_oi_top()
 
     col1, col2 = st.columns([2, 1])
 
