@@ -6039,9 +6039,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
-    # ── Part 1: Signal + Direction + S/R + Indices/Stocks at bottom ──
+    # ── Part 1: Signal + Direction + S/R + OI Positioning ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
-    #         future swing → S/R analysis → indices & stocks (alignment + capping at bottom)
+    #         future swing → S/R analysis → OI positioning (winding + option chain verdict)
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
@@ -6057,25 +6057,25 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 <b>━━━ DIRECTION ━━━</b>
 {swing_block}{capping_block}
-<b>━━━ INDICES &amp; STOCKS ━━━</b>
-🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
-{align_text}
-{_mi_bias_block}"""
+<b>━━━ OI POSITIONING ━━━</b>{unwind_block}{oc_deep_block}"""
 
-    # ── Part 2: Deep Analysis ──
+    # ── Part 2: Deep Analysis + Indices & Stocks at bottom ──
     # Layout: header → market context → vpfr/triple POC/money flow → strike analysis →
-    #         price action (vwap/vob/hvp) → OI winding → option chain verdict → AI prompt
+    #         price action (vwap/vob/hvp) → indices & stocks (alignment + capping) → AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
 
 <b>━━━ MARKET CONTEXT ━━━</b>{market_ctx_block}
 <b>━━━ VOLUME &amp; LIQUIDITY PROFILE ━━━</b>{vpfr_block}{poc_block}{mf_block}
 <b>━━━ STRIKE-LEVEL DEEP DIVE ━━━</b>{strike_analysis_block}
 <b>━━━ PRICE STRUCTURE ━━━</b>{price_action_block}
-<b>━━━ OI POSITIONING ━━━</b>{unwind_block}{oc_deep_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), S/R analysis (per-level OI/depth/VPFR/GEX/MF), 📡 capping (bias+R/S per instrument), Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, OI winding. SHORT answers:
+<b>━━━ INDICES &amp; STOCKS ━━━</b>
+🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
+{align_text}
+{_mi_bias_block}
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
-3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
+3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS — bias + Cap/Sup/Range
 4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL</code>"""
 
     message = msg_part1  # used for Gemini analysis context
