@@ -5819,6 +5819,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📈 Confidence: <b>{oc_conf}%</b>
 🚀 Breakout: {bout_lvl} | 💥 Breakdown: {bdn_lvl}
 
+<b>📋 ACTIVE CAPPING / SUPPORT:</b>
+{oc_active_text}
+
 <b>📋 BIAS REASONING:</b>
 {bias_reasoning}
 """
