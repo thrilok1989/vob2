@@ -5936,59 +5936,112 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     _mi_bias_block = ("\n<b>📡 Index/Stock Capping:</b>\n" + "\n".join(_mi_lines) + "\n") if _mi_lines else ""
 
-    # ── Dedicated Capping Block (Nifty only, clearly separated) ──
+    # ── Comprehensive S/R Block — all data per level ──
     capping_block = ""
     try:
         _sa_cap = getattr(st.session_state, '_sa_result', None)
+        _mf_cap = getattr(st.session_state, '_money_flow_data', None)
+        _vpfr_c = result.get('vpfr', {}) or {}
+        _gex_c  = result.get('gex', {}) or {}
+        _flip   = _gex_c.get('gamma_flip')
+
+        def _nearest_vpfr(level):
+            """Return closest VPFR label and distance for a given price level."""
+            best, best_d = None, 9999
+            for _tf, _lbl in [('short','S30'),('medium','M60'),('long','L180')]:
+                _vd = _vpfr_c.get(_tf) or {}
+                for _k, _klbl in [('poc','POC'),('vah','VAH'),('val','VAL')]:
+                    _v = _vd.get(_k)
+                    if _v:
+                        _d = abs(level - _v)
+                        if _d < best_d:
+                            best_d, best = _d, f"{_lbl} {_klbl}₹{_v:.0f}({_d:.0f}pts)"
+            return best or "—"
+
+        def _mf_prox(level):
+            """Return money flow proximity string for a given price level."""
+            if not _mf_cap:
+                return "—"
+            parts = []
+            _poc = _mf_cap.get('poc_price', 0)
+            _vah = _mf_cap.get('value_area_high', 0)
+            _val = _mf_cap.get('value_area_low', 0)
+            if _poc and abs(level - _poc) <= 50:
+                parts.append(f"POC₹{_poc:.0f}({abs(level-_poc):.0f}pts)")
+            if _vah and abs(level - _vah) <= 50:
+                parts.append(f"VAH₹{_vah:.0f}({abs(level-_vah):.0f}pts)")
+            if _val and abs(level - _val) <= 50:
+                parts.append(f"VAL₹{_val:.0f}({abs(level-_val):.0f}pts)")
+            return " ".join(parts) if parts else "—"
+
+        def _gex_prox(level):
+            if _flip:
+                return f"Flip₹{_flip:.0f}({abs(level-_flip):.0f}pts)"
+            return "—"
+
         if _sa_cap is not None:
             _adf = _sa_cap.get('analysis_df')
             if _adf is not None and not _adf.empty:
-                _call_caps = []
-                _put_sups  = []
+                _sr_lines = []
 
-                # Call capping rows
+                # ── RESISTANCE levels ──
                 _cap_rows = _adf[
                     _adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance', 'Moderate Resistance']) &
                     _adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)', 'Short Building'])
-                ].sort_values('CE_OI', ascending=False)
-                for _, r in _cap_rows.iterrows():
-                    _vt   = "🔥VOL" if r.get('CE_Vol_High', False) else "📊"
-                    _oi   = r.get('CE_OI', 0) / 100000
-                    _chg  = r.get('CE_ChgOI', r.get('changeinOpenInterest_CE', 0)) / 1000
-                    _ltp  = r.get('CE_LTP', r.get('lastPrice_CE', 0))
-                    _cls  = r.get('Call_Class', '')
-                    _dist = underlying_price - float(r['Strike'])
-                    _prox = f"📍{abs(_dist):.0f}pts {'below' if _dist > 0 else 'above'} spot"
-                    _call_caps.append(
-                        f"  🟥 ₹{r['Strike']:.0f} | {_vt} | OI:{_oi:.1f}L ChgOI:{_chg:+.0f}K | LTP:₹{_ltp:.0f} | {_cls} | {_prox}"
-                    )
+                ].sort_values('CE_OI', ascending=False).head(3)
 
-                # Put support rows
+                if not _cap_rows.empty:
+                    _sr_lines.append("\n🔴 <b>RESISTANCE LEVELS</b>")
+                    for _, r in _cap_rows.iterrows():
+                        _sk   = float(r['Strike'])
+                        _vt   = "🔥Vol" if r.get('CE_Vol_High', False) else "📊"
+                        _oi   = r.get('CE_OI', 0) / 100000
+                        _chg  = r.get('CE_ChgOI', 0) / 1000
+                        _ltp  = r.get('CE_LTP', 0)
+                        _cls  = r.get('Call_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
+                        _bid  = r.get('bidQty_CE', r.get('Bid_CE', 0))
+                        _ask  = r.get('askQty_CE', r.get('Ask_CE', 0))
+                        _ba   = r.get('BidAskPressure', 0)
+                        _dist = _sk - underlying_price
+                        _sr_lines.append(
+                            f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'above' if _dist>0 else 'below'} spot\n"
+                            f"  ├ OI: {_oi:.1f}L | ChgOI: {_chg:+.0f}K | LTP: ₹{_ltp:.0f}\n"
+                            f"  ├ Depth: Bid {_bid} Ask {_ask} | BA:{_ba:+.0f}\n"
+                            f"  ├ VPFR: {_nearest_vpfr(_sk)}\n"
+                            f"  ├ GEX:  {_gex_prox(_sk)}\n"
+                            f"  └ MFlow:{_mf_prox(_sk)}"
+                        )
+
+                # ── SUPPORT levels ──
                 _sup_rows = _adf[
                     _adf['Put_Class'].isin(['High Conviction Support', 'Strong Support', 'Moderate Support']) &
                     _adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)', 'Short Building'])
-                ].sort_values('PE_OI', ascending=False)
-                for _, r in _sup_rows.iterrows():
-                    _vt   = "🔥VOL" if r.get('PE_Vol_High', False) else "📊"
-                    _oi   = r.get('PE_OI', 0) / 100000
-                    _chg  = r.get('PE_ChgOI', r.get('changeinOpenInterest_PE', 0)) / 1000
-                    _ltp  = r.get('PE_LTP', r.get('lastPrice_PE', 0))
-                    _cls  = r.get('Put_Class', '')
-                    _dist = float(r['Strike']) - underlying_price
-                    _prox = f"📍{abs(_dist):.0f}pts {'above' if _dist > 0 else 'below'} spot"
-                    _put_sups.append(
-                        f"  🟩 ₹{r['Strike']:.0f} | {_vt} | OI:{_oi:.1f}L ChgOI:{_chg:+.0f}K | LTP:₹{_ltp:.0f} | {_cls} | {_prox}"
-                    )
+                ].sort_values('PE_OI', ascending=False).head(3)
 
-                if _call_caps or _put_sups:
-                    _cap_lines = []
-                    if _call_caps:
-                        _cap_lines.append("<b>🟥 CALL CAPPING (Resistance):</b>")
-                        _cap_lines.extend(_call_caps[:4])
-                    if _put_sups:
-                        _cap_lines.append("<b>🟩 PUT SUPPORT (Floor):</b>")
-                        _cap_lines.extend(_put_sups[:4])
-                    capping_block = "\n<b>━━ CAPPING DATA ━━</b>\n" + "\n".join(_cap_lines) + "\n"
+                if not _sup_rows.empty:
+                    _sr_lines.append("\n🟢 <b>SUPPORT LEVELS</b>")
+                    for _, r in _sup_rows.iterrows():
+                        _sk   = float(r['Strike'])
+                        _vt   = "🔥Vol" if r.get('PE_Vol_High', False) else "📊"
+                        _oi   = r.get('PE_OI', 0) / 100000
+                        _chg  = r.get('PE_ChgOI', 0) / 1000
+                        _ltp  = r.get('PE_LTP', 0)
+                        _cls  = r.get('Put_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
+                        _bid  = r.get('bidQty_PE', r.get('Bid_PE', 0))
+                        _ask  = r.get('askQty_PE', r.get('Ask_PE', 0))
+                        _ba   = r.get('BidAskPressure', 0)
+                        _dist = underlying_price - _sk
+                        _sr_lines.append(
+                            f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'below' if _dist>0 else 'above'} spot\n"
+                            f"  ├ OI: {_oi:.1f}L | ChgOI: {_chg:+.0f}K | LTP: ₹{_ltp:.0f}\n"
+                            f"  ├ Depth: Bid {_bid} Ask {_ask} | BA:{_ba:+.0f}\n"
+                            f"  ├ VPFR: {_nearest_vpfr(_sk)}\n"
+                            f"  ├ GEX:  {_gex_prox(_sk)}\n"
+                            f"  └ MFlow:{_mf_prox(_sk)}"
+                        )
+
+                if _sr_lines:
+                    capping_block = "\n<b>━━━ S/R ANALYSIS ━━━</b>" + "\n".join(_sr_lines) + "\n"
     except Exception:
         capping_block = ""
 
