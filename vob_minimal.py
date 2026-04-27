@@ -9790,8 +9790,24 @@ def main():
                     _df5m_c = getattr(st.session_state, '_df_5m', None)
 
                     def _send_with_header(header):
-                        # Send only the alert header — full signal already sent on button click
-                        send_telegram_message_sync(header, force=True)
+                        # Block auto-alerts outside market hours (8:30 AM - 3:45 PM IST, weekdays)
+                        _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        _mo = _ist_now.replace(hour=8, minute=30, second=0, microsecond=0)
+                        _mc = _ist_now.replace(hour=15, minute=45, second=0, microsecond=0)
+                        if _ist_now.weekday() >= 5 or not (_mo <= _ist_now <= _mc):
+                            return
+                        # Content-hash dedup: skip if same alert text sent in last 30 min
+                        import hashlib as _hl
+                        _hsh = _hl.md5(header.split('|')[0].strip().encode('utf-8', errors='ignore')).hexdigest()
+                        _sent = st.session_state.setdefault('_auto_alert_sent', {})
+                        _last = _sent.get(_hsh)
+                        if _last and (_ist_now - _last).total_seconds() < 1800:
+                            return
+                        _sent[_hsh] = _ist_now
+                        if len(_sent) > 50:
+                            for _k in sorted(_sent, key=lambda k: _sent[k])[:len(_sent)-50]:
+                                _sent.pop(_k, None)
+                        send_telegram_message_sync(header, force=False)
 
                     # PCR S/R proximity alert
                     try:
