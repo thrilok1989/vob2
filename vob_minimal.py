@@ -5382,12 +5382,12 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _uv = uw['verdict']
             _uv_e = '🔴' if 'BEAR' in _uv.upper() else '🟢' if 'BULL' in _uv.upper() else '⚪'
             unwind_block = (
-                f"\n<b>🔄 OI Winding / Unwinding:</b> {_uv_e} {_uv}\n"
-                f"  CALL (CE): Unwinding 🔴 {uw['ce_unwind_count']} strikes (resistance weakening) | Building 🟢 {uw['ce_build_count']} strikes (resistance forming)\n"
-                f"  PUT  (PE): Unwinding 🔴 {uw['pe_unwind_count']} strikes (support weakening)   | Building 🟢 {uw['pe_build_count']} strikes (support forming)\n"
-                f"  Parallel Activity: {uw['parallel_count']} strikes (Bullish: {uw['bull_parallel']} | Bearish: {uw['bear_parallel']})\n"
-                f"  Top PE Unwinding (support leaving): {uw['pe_unwind_top']}\n"
-                f"  Top CE Building (new resistance): {uw['ce_build_top']}\n"
+                f"\n<b>🔄 OI Wind/Unwind:</b> {_uv_e} {_uv}\n"
+                f"  CE: Unwind🔴{uw['ce_unwind_count']}(resist↓) | Build🟢{uw['ce_build_count']}(resist↑)\n"
+                f"  PE: Unwind🔴{uw['pe_unwind_count']}(supp↓) | Build🟢{uw['pe_build_count']}(supp↑)\n"
+                f"  Parallel:{uw['parallel_count']}(Bull:{uw['bull_parallel']} Bear:{uw['bear_parallel']})\n"
+                f"  PE Unwind:{uw['pe_unwind_top']}\n"
+                f"  CE Build:{uw['ce_build_top']}\n"
             )
     except Exception:
         unwind_block = ""
@@ -5411,18 +5411,17 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                     _side = 'Above' if _dsk >= underlying_price else 'Below'
                     _wall_tag = ''
                     if _ca > 0 and _cb > 0:
-                        if _ca / max(_cb, 1) > 2: _wall_tag = ' 🧱 Sellers wall'
-                        elif _cb / max(_ca, 1) > 2: _wall_tag = ' 🛡 Buyers wall'
+                        if _ca / max(_cb, 1) > 2: _wall_tag = ' 🧱Sell'
+                        elif _cb / max(_ca, 1) > 2: _wall_tag = ' 🛡Buy'
+                    _arrow = '↑' if _dsk >= underlying_price else '↓'
+                    def _fk(v): return f"{v/1000:.1f}K" if abs(v) >= 1000 else str(v)
                     _depth_lines.append(
-                        f"  ₹{_dsk:.0f} ({_side}): "
-                        f"CE Bid {_cb:,} | CE Ask {_ca:,} | "
-                        f"PE Bid {_pb:,} | PE Ask {_pa:,} | "
-                        f"Pressure {_ba:+.0f}{_wall_tag}"
+                        f"  ₹{_dsk:.0f}{_arrow} CB:{_fk(_cb)} CA:{_fk(_ca)} PB:{_fk(_pb)} PA:{_fk(_pa)} P:{_ba:+.0f}{_wall_tag}"
                     )
                 except Exception:
                     pass
             if _depth_lines:
-                depth_block = "\n<b>📉 MARKET DEPTH (Bid/Ask walls per strike):</b>\n" + "\n".join(_depth_lines) + "\n"
+                depth_block = "\n<b>📉 MARKET DEPTH:</b>\n" + "\n".join(_depth_lines) + "\n"
     except Exception:
         depth_block = ""
 
@@ -6150,50 +6149,38 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _vid = result.get('vidya', {})
     _ob = result.get('order_blocks', {})
     _net_gex = gex.get('net_gex', 0)
-    _gex_mode_line = (
-        f"📡 GEX {_net_gex:+.0f}L → RANGE mode → sell ceiling / buy floor"
-        if _net_gex > 0 else
-        f"📡 GEX {_net_gex:+.0f}L → TREND mode → follow momentum, no counter-trade"
-        if _net_gex < 0 else
-        "📡 GEX: neutral — wait for confirmation"
-    )
+    _gex_action = "→sell ceiling/buy floor" if _net_gex > 0 else "→follow momentum" if _net_gex < 0 else "→wait"
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
     # ── Part 1: Signal + Direction + S/R + OI Positioning ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
     #         future swing → S/R analysis → OI positioning (winding + option chain verdict)
-    msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
+        msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
-<b>━━━ PRICE ACTION ━━━</b>
-🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x
-📍 {loc_text}
-
-<b>━━━ GAMMA &amp; SENTIMENT ━━━</b>
-🔮 GEX: {gex['net_gex']:+.0f}L | Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'} | Mode:{gex['market_mode']}
-{_gex_mode_line}
-📊 PCR×GEX: {result['pcr_gex']['badge']}
-📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
+🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
+🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
+📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 
-<b>━━━ DIRECTION ━━━</b>
+<b>📍 DIRECTION</b>
 {swing_block}{capping_block}
-<b>━━━ MARKET DEPTH ━━━</b>{depth_block}
-<b>━━━ STRIKE-LEVEL DEEP DIVE ━━━</b>{strike_analysis_block}
-<b>━━━ OI POSITIONING ━━━</b>{unwind_block}{oc_deep_block}"""
+<b>📉 MARKET DEPTH</b>{depth_block}
+<b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
+<b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}"""
 
     # ── Part 2: Deep Analysis + Indices & Stocks at bottom ──
     # Layout: header → market context → vpfr/triple POC/money flow → strike analysis →
     #         price action (vwap/vob/hvp) → indices & stocks (alignment + capping) → AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
 
-<b>━━━ MARKET CONTEXT ━━━</b>{market_ctx_block}
-<b>━━━ VOLUME DELTA ━━━</b>{vol_delta_block}
-<b>━━━ VOLUME &amp; LIQUIDITY PROFILE ━━━</b>{vpfr_block}{poc_block}{mf_block}
-<b>━━━ PRICE STRUCTURE ━━━</b>{price_action_block}
-<b>━━━ INDICES &amp; STOCKS ━━━</b>
-🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
+<b>📊 MARKET CONTEXT</b>{market_ctx_block}
+<b>⚡ VOLUME DELTA</b>{vol_delta_block}
+<b>📈 VPFR / POC / MONEY FLOW</b>{vpfr_block}{poc_block}{mf_block}
+<b>🔄 PRICE STRUCTURE</b>{price_action_block}
+<b>🌍 INDICES &amp; STOCKS</b>
+<b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}
 🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
