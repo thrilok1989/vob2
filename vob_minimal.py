@@ -5140,10 +5140,15 @@ Focus: 1H + 4H + 1D
 • BA positive
 👉 Entry: At floor stall | SL: Below floor
 
-<b>📡 MARKET MODE</b>
+<b>📡 MARKET MODE FILTER</b>
 GEX +ve → RANGE → sell high, buy low
-GEX -ve → TREND → follow move, no counter
-VIDYA confirms direction"""
+GEX -ve → TREND → follow move (no counter)
+VIDYA confirms direction
+
+🏠 Floor = Buyers = Bounce = BUY
+🧱 Ceiling = Sellers = Reject = SELL
+🌊 Trend = Follow flow
+🧊 No wall = No trade"""
 
     part2 = """🟡 <b>NIFTY SIGNAL GUIDE (REFERENCE)</b>
 
@@ -5159,12 +5164,6 @@ VIDYA confirms direction"""
 • GEX neutral
 • No depth walls
 = Sit out — this is your edge
-
-<b>🧠 QUICK MEMORY</b>
-🏠 Floor = Buyers = Bounce = BUY
-🧱 Ceiling = Sellers = Reject = SELL
-🌊 Trend = Follow flow
-🧊 No wall = No trade
 
 <b>📦 REFERENCE (NOT DAILY)</b>
 GEX +ve=range -ve=trending | Flip=gamma flip level
