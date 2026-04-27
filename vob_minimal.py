@@ -4806,23 +4806,9 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
         zone_low  = f"₹{level - proximity_pts:.0f}"
         zone_high = f"₹{level + proximity_pts:.0f}"
         if sr_clean == 'Resistance':
-            msg = (
-                f"⚠️ <b>PCR RESISTANCE ALERT</b> ⚠️\n"
-                f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
-                f"Spot ₹{underlying_price:.0f} entered ±{proximity_pts} pts zone of\n"
-                f"🔴 <b>{label} PCR Resistance ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
-                f"Zone: {zone_low} – {zone_high}\n"
-                f"Price likely to <b>stall / reverse here</b>. Watch for rejection."
-            )
+            msg = f"⚠️ PCR RESISTANCE near ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST')}"
         else:
-            msg = (
-                f"⚠️ <b>PCR SUPPORT ALERT</b> ⚠️\n"
-                f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
-                f"Spot ₹{underlying_price:.0f} entered ±{proximity_pts} pts zone of\n"
-                f"🟢 <b>{label} PCR Support ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
-                f"Zone: {zone_low} – {zone_high}\n"
-                f"Price likely to <b>hold / bounce here</b>. Watch for reversal."
-            )
+            msg = f"⚠️ PCR SUPPORT near ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST')}"
         alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
         return msg
     return None
@@ -4862,13 +4848,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             last = alerted.get(key)
             if last and (now - last).total_seconds() < 1800:
                 continue
-            msg = (
-                f"🕯 <b>BULLISH CANDLE AT SUPPORT</b>\n"
-                f"🕐 {time_str}\n"
-                f"Pattern: <b>{_e(pattern)}</b> (Bullish) @ ₹{underlying_price:.0f}\n"
-                f"📍 Near {_e(src)} Support {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
-                f"📌 Watch for bounce / BUY setup"
-            )
+            msg = f"🕯 BULLISH CANDLE at Support ₹{level:.0f} | {_e(pattern)} | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     elif direction == 'Bearish':
@@ -4879,13 +4859,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             last = alerted.get(key)
             if last and (now - last).total_seconds() < 1800:
                 continue
-            msg = (
-                f"🕯 <b>BEARISH CANDLE AT RESISTANCE</b>\n"
-                f"🕐 {time_str}\n"
-                f"Pattern: <b>{_e(pattern)}</b> (Bearish) @ ₹{underlying_price:.0f}\n"
-                f"📍 Near {_e(src)} Resistance {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
-                f"📌 Watch for rejection / SELL setup"
-            )
+            msg = f"🕯 BEARISH CANDLE at Resistance ₹{level:.0f} | {_e(pattern)} | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     return None
@@ -4919,13 +4893,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
             oi_l = float(r.get('CE_OI', 0) or 0) / 100000
-            msg = (
-                f"🟥 <b>CALL CAPPING AT RESISTANCE</b> {vol_tag}\n"
-                f"🕐 {time_str}\n"
-                f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
-                f"CE OI: {oi_l:.1f}L | Class: {_e(r.get('Call_Class',''))}\n"
-                f"📌 CE writers capping here — watch for reversal / SELL setup"
-            )
+            msg = f"🟥 CALL CAPPING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     except Exception:
@@ -4947,13 +4915,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-            msg = (
-                f"🟩 <b>PUT SUPPORT AT SUPPORT</b> {vol_tag}\n"
-                f"🕐 {time_str}\n"
-                f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
-                f"PE OI: {oi_l:.1f}L | Class: {_e(r.get('Put_Class',''))}\n"
-                f"📌 PE writers defending here — watch for bounce / BUY setup"
-            )
+            msg = f"🟩 PUT SUPPORT ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     except Exception:
@@ -5102,14 +5064,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             signals.append(f"📉 Depth: Ask wall dominant at ₹{strike}")
         if len(signals) < 2:
             continue
-        msg = (
-            f"🔴 <b>REJECTION AT CEILING</b>\n"
-            f"🕐 {time_str} | Spot ₹{underlying_price:.0f}\n"
-            f"🧱 Ceiling: {_e(src)} {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts)\n"
-            f"✅ {len(signals)}/3 signals confirmed:\n" +
-            "\n".join(f"  {s}" for s in signals) +
-            f"\n📌 SELL zone — price stalling here"
-        )
+        msg = f"🔴 REJECTION at ₹{level:.0f} ({len(signals)}/3) | Spot ₹{underlying_price:.0f} | {time_str}"
         alerted[key] = now
         return msg
 
@@ -5131,14 +5086,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             signals.append(f"📈 Depth: Bid wall dominant at ₹{strike}")
         if len(signals) < 2:
             continue
-        msg = (
-            f"🟢 <b>BOUNCE AT FLOOR</b>\n"
-            f"🕐 {time_str} | Spot ₹{underlying_price:.0f}\n"
-            f"🧱 Floor: {_e(src)} {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts)\n"
-            f"✅ {len(signals)}/3 signals confirmed:\n" +
-            "\n".join(f"  {s}" for s in signals) +
-            f"\n📌 BUY zone — price holding here"
-        )
+        msg = f"🟢 BOUNCE at ₹{level:.0f} ({len(signals)}/3) | Spot ₹{underlying_price:.0f} | {time_str}"
         alerted[key] = now
         return msg
 
@@ -6255,30 +6203,13 @@ def _analyze_zone(spot, zone_bottom, zone_top, option_data, df_5m, df_1m=None):
 
 
 def _get_zone_telegram_msg(spot, zone_type, zone_bottom, zone_top, confirmations, strike, call_entry, call_target, call_sl, put_entry, put_target, put_sl):
-    """Build Telegram zone alert message."""
+    """Build short Telegram zone alert message."""
     score = sum(1 for c in confirmations if '✅' in c)
     total = len(confirmations)
     emoji = "🟢" if zone_type == "SUPPORT" else "🔴"
     trade_type = "CALL" if zone_type == "SUPPORT" else "PUT"
-    entry = call_entry if zone_type == "SUPPORT" else put_entry
-    target = call_target if zone_type == "SUPPORT" else put_target
-    sl = call_sl if zone_type == "SUPPORT" else put_sl
-    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
-
-    conf_lines = "\n".join([f"  {c}" for c in confirmations])
-    msg = f"""{emoji} <b>SPOT IN {zone_type} ZONE</b>
-🕐 {time_str}
-📍 Spot: ₹{spot:.0f} | Zone: ₹{zone_bottom:.0f}–₹{zone_top:.0f}
-
-<b>Zone Analysis ({score}/{total} confirmations):</b>
-{conf_lines}
-
-<b>Trade Setup:</b>
-Strike: {strike} {trade_type}
-Entry: ₹{entry} | Target: ₹{target} | SL: ₹{sl}
-
-⚡ Review and click <b>Enter {trade_type}</b> in the app to execute."""
-    return msg
+    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST')
+    return f"{emoji} SPOT IN {zone_type} ZONE | ₹{spot:.0f} | Zone ₹{zone_bottom:.0f}–₹{zone_top:.0f} | {score}/{total} confirm | {time_str}"
 
 
 def _place_trade(api, trade_type, strike, security_id, entry_price, target, sl, lot_size, spot, confirmations, db):
