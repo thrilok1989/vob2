@@ -3267,12 +3267,23 @@ def analyze_strike_activity(df_summary, underlying_price):
         call_trapped = ce_high_oi and ce_oi_falling and not price_below_strike  # price went above, writers trapped
         put_trapped = pe_high_oi and pe_oi_falling and price_below_strike  # price went below, writers trapped
 
+        # Market depth + bid-ask pressure
+        ce_bid_qty = row.get('bidQty_CE', 0) or 0
+        ce_ask_qty = row.get('askQty_CE', 0) or 0
+        pe_bid_qty = row.get('bidQty_PE', 0) or 0
+        pe_ask_qty = row.get('askQty_PE', 0) or 0
+        bid_ask_pressure = (ce_bid_qty + pe_bid_qty) - (ce_ask_qty + pe_ask_qty)
+
         strike_analysis.append({
             'Strike': strike, 'Zone': zone,
             'CE_OI': ce_oi, 'CE_ChgOI': ce_chg_oi, 'CE_LTP': ce_ltp, 'CE_Vol': ce_vol, 'CE_IV': ce_iv,
             'CE_Vol_High': ce_high_vol,
             'PE_OI': pe_oi, 'PE_ChgOI': pe_chg_oi, 'PE_LTP': pe_ltp, 'PE_Vol': pe_vol, 'PE_IV': pe_iv,
             'PE_Vol_High': pe_high_vol,
+            'bidQty_CE': ce_bid_qty, 'askQty_CE': ce_ask_qty,
+            'bidQty_PE': pe_bid_qty, 'askQty_PE': pe_ask_qty,
+            'BidAskPressure': bid_ask_pressure,
+            'changeinOpenInterest_CE': ce_chg_oi, 'changeinOpenInterest_PE': pe_chg_oi,
             'Call_Class': call_class, 'Call_Strength': call_strength, 'Call_Activity': call_activity,
             'Call_Capping_Confirmed': call_capping_confirmed,
             'Put_Class': put_class, 'Put_Strength': put_strength, 'Put_Activity': put_activity,
@@ -4806,23 +4817,9 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
         zone_low  = f"₹{level - proximity_pts:.0f}"
         zone_high = f"₹{level + proximity_pts:.0f}"
         if sr_clean == 'Resistance':
-            msg = (
-                f"⚠️ <b>PCR RESISTANCE ALERT</b> ⚠️\n"
-                f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
-                f"Spot ₹{underlying_price:.0f} entered ±{proximity_pts} pts zone of\n"
-                f"🔴 <b>{label} PCR Resistance ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
-                f"Zone: {zone_low} – {zone_high}\n"
-                f"Price likely to <b>stall / reverse here</b>. Watch for rejection."
-            )
+            msg = f"⚠️ PCR RESISTANCE near ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST')}"
         else:
-            msg = (
-                f"⚠️ <b>PCR SUPPORT ALERT</b> ⚠️\n"
-                f"🕐 {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}\n"
-                f"Spot ₹{underlying_price:.0f} entered ±{proximity_pts} pts zone of\n"
-                f"🟢 <b>{label} PCR Support ₹{level:.0f}</b> (PCR {pcr_val:.2f})\n"
-                f"Zone: {zone_low} – {zone_high}\n"
-                f"Price likely to <b>hold / bounce here</b>. Watch for reversal."
-            )
+            msg = f"⚠️ PCR SUPPORT near ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST')}"
         alerted[label] = datetime.now(pytz.timezone('Asia/Kolkata'))
         return msg
     return None
@@ -4862,13 +4859,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             last = alerted.get(key)
             if last and (now - last).total_seconds() < 1800:
                 continue
-            msg = (
-                f"🕯 <b>BULLISH CANDLE AT SUPPORT</b>\n"
-                f"🕐 {time_str}\n"
-                f"Pattern: <b>{_e(pattern)}</b> (Bullish) @ ₹{underlying_price:.0f}\n"
-                f"📍 Near {_e(src)} Support {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
-                f"📌 Watch for bounce / BUY setup"
-            )
+            msg = f"🕯 BULLISH CANDLE at Support ₹{level:.0f} | {_e(pattern)} | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     elif direction == 'Bearish':
@@ -4879,13 +4870,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             last = alerted.get(key)
             if last and (now - last).total_seconds() < 1800:
                 continue
-            msg = (
-                f"🕯 <b>BEARISH CANDLE AT RESISTANCE</b>\n"
-                f"🕐 {time_str}\n"
-                f"Pattern: <b>{_e(pattern)}</b> (Bearish) @ ₹{underlying_price:.0f}\n"
-                f"📍 Near {_e(src)} Resistance {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts away)\n"
-                f"📌 Watch for rejection / SELL setup"
-            )
+            msg = f"🕯 BEARISH CANDLE at Resistance ₹{level:.0f} | {_e(pattern)} | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     return None
@@ -4919,13 +4904,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
             oi_l = float(r.get('CE_OI', 0) or 0) / 100000
-            msg = (
-                f"🟥 <b>CALL CAPPING AT RESISTANCE</b> {vol_tag}\n"
-                f"🕐 {time_str}\n"
-                f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
-                f"CE OI: {oi_l:.1f}L | Class: {_e(r.get('Call_Class',''))}\n"
-                f"📌 CE writers capping here — watch for reversal / SELL setup"
-            )
+            msg = f"🟥 CALL CAPPING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     except Exception:
@@ -4947,13 +4926,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-            msg = (
-                f"🟩 <b>PUT SUPPORT AT SUPPORT</b> {vol_tag}\n"
-                f"🕐 {time_str}\n"
-                f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
-                f"PE OI: {oi_l:.1f}L | Class: {_e(r.get('Put_Class',''))}\n"
-                f"📌 PE writers defending here — watch for bounce / BUY setup"
-            )
+            msg = f"🟩 PUT SUPPORT ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     except Exception:
@@ -5102,14 +5075,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             signals.append(f"📉 Depth: Ask wall dominant at ₹{strike}")
         if len(signals) < 2:
             continue
-        msg = (
-            f"🔴 <b>REJECTION AT CEILING</b>\n"
-            f"🕐 {time_str} | Spot ₹{underlying_price:.0f}\n"
-            f"🧱 Ceiling: {_e(src)} {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts)\n"
-            f"✅ {len(signals)}/3 signals confirmed:\n" +
-            "\n".join(f"  {s}" for s in signals) +
-            f"\n📌 SELL zone — price stalling here"
-        )
+        msg = f"🔴 REJECTION at ₹{level:.0f} ({len(signals)}/3) | Spot ₹{underlying_price:.0f} | {time_str}"
         alerted[key] = now
         return msg
 
@@ -5131,14 +5097,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             signals.append(f"📈 Depth: Bid wall dominant at ₹{strike}")
         if len(signals) < 2:
             continue
-        msg = (
-            f"🟢 <b>BOUNCE AT FLOOR</b>\n"
-            f"🕐 {time_str} | Spot ₹{underlying_price:.0f}\n"
-            f"🧱 Floor: {_e(src)} {_e(lbl)} ₹{level:.0f} ({abs(underlying_price-level):.0f} pts)\n"
-            f"✅ {len(signals)}/3 signals confirmed:\n" +
-            "\n".join(f"  {s}" for s in signals) +
-            f"\n📌 BUY zone — price holding here"
-        )
+        msg = f"🟢 BOUNCE at ₹{level:.0f} ({len(signals)}/3) | Spot ₹{underlying_price:.0f} | {time_str}"
         alerted[key] = now
         return msg
 
@@ -5327,9 +5286,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         vpfr_block = ""
 
-    _short_names = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
-                    'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+    _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
+                    'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
@@ -5516,8 +5475,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         market_ctx_block = ""
 
-    # Triple POC + Future Swing Analysis block
-    poc_swing_block = ""
+    # Future Swing block (for Part 1 — directional info needed up front)
+    swing_block = ""
+    # Triple POC block (for Part 2 — deep context)
+    poc_block = ""
     try:
         _poc = st.session_state.get('_poc_data') or {}
         _sw  = st.session_state.get('_swing_data') or {}
@@ -5541,12 +5502,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _swing_parts.append(
                 f"→Target₹{_proj['target']:.0f}({_proj['sign']}{_proj['swing_pct']:.1f}%)"
             )
-        if _poc_parts or _swing_parts:
-            poc_swing_block = "\n<b>📍 Triple POC:</b> " + " | ".join(_poc_parts) + "\n"
-            if _swing_parts:
-                poc_swing_block += f"<b>🌀 Future Swing:</b> {_sw_emoji}{_sw_dir.capitalize()} | " + " | ".join(_swing_parts) + "\n"
+        if _swing_parts:
+            swing_block = f"🌀 <b>Future Swing:</b> {_sw_emoji}{_sw_dir.capitalize()} | " + " | ".join(_swing_parts) + "\n"
+        if _poc_parts:
+            poc_block = "\n<b>📍 Triple POC:</b> " + " | ".join(_poc_parts) + "\n"
     except Exception:
-        poc_swing_block = ""
+        swing_block = ""
+        poc_block = ""
 
     # Price Action block: LTP Trap, VOB zones, HVP, Delta Vol
     price_action_block = ""
@@ -5857,6 +5819,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📈 Confidence: <b>{oc_conf}%</b>
 🚀 Breakout: {bout_lvl} | 💥 Breakdown: {bdn_lvl}
 
+<b>📋 ACTIVE CAPPING / SUPPORT:</b>
+{oc_active_text}
+
 <b>📋 BIAS REASONING:</b>
 {bias_reasoning}
 """
@@ -5864,8 +5829,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         oc_deep_block = ""
 
     # Multi-instrument capping bias block (compact per-instrument lines)
-    _mi_short = {'SENSEX': 'SENX', 'BANKNIFTY': 'BNF',
-                 'RELIANCE': 'REL', 'ICICIBANK': 'ICICI', 'INFOSYS': 'INFO'}
+    _mi_short = {'SENSEX': 'SENSEX', 'BANKNIFTY': 'BANK NIFTY',
+                 'RELIANCE': 'RELIANCE', 'ICICIBANK': 'ICICI BANK', 'INFOSYS': 'INFOSYS'}
     def _bias_emoji(b):
         b = str(b)
         return '🟢' if 'Bullish' in b else '🔴' if 'Bearish' in b else '⚪'
@@ -5915,9 +5880,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                    if r.get('Put_Support_Confirmed')] if _sa_bias.get('analysis_df') is not None else []
         _sa_cap = sorted(_sa_cap, key=lambda x: x['strike'])  # lowest cap = nearest resistance
         _sa_sup = sorted(_sa_sup, key=lambda x: x['strike'], reverse=True)  # highest sup = nearest support
-        _mi_lines.append(_mi_cap_line('N50', _sa_bias.get('market_bias', ''), underlying_price, _sa_cap, _sa_sup))
+        _mi_lines.append(_mi_cap_line('NIFTY 50', _sa_bias.get('market_bias', ''), underlying_price, _sa_cap, _sa_sup))
     except Exception:
-        _mi_lines.append(f"⚫N50 ₹{underlying_price:.0f}")
+        _mi_lines.append(f"⚫NIFTY 50 ₹{underlying_price:.0f}")
 
     # Other instruments using mi_instrument_data
     try:
@@ -6008,17 +5973,24 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                         _chg  = r.get('CE_ChgOI', 0) / 1000
                         _ltp  = r.get('CE_LTP', 0)
                         _cls  = r.get('Call_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
-                        _bid  = r.get('bidQty_CE', r.get('Bid_CE', 0))
-                        _ask  = r.get('askQty_CE', r.get('Ask_CE', 0))
-                        _ba   = r.get('BidAskPressure', 0)
+                        _act  = r.get('Call_Activity', '')
+                        _bid  = int(r.get('bidQty_CE', 0) or 0)
+                        _ask  = int(r.get('askQty_CE', 0) or 0)
+                        _ba   = float(r.get('BidAskPressure', 0) or 0)
+                        # Bid/Ask wall interpretation
+                        _wall = ''
+                        if _ask > 0 and _bid > 0:
+                            _ratio = _ask / max(_bid, 1)
+                            if _ratio > 2: _wall = ' 🧱Sellers strong'
+                            elif _ratio < 0.5: _wall = ' 🛡Buyers strong'
                         _dist = _sk - underlying_price
                         _sr_lines.append(
                             f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'above' if _dist>0 else 'below'} spot\n"
-                            f"  ├ OI: {_oi:.1f}L | ChgOI: {_chg:+.0f}K | LTP: ₹{_ltp:.0f}\n"
-                            f"  ├ Depth: Bid {_bid} Ask {_ask} | BA:{_ba:+.0f}\n"
-                            f"  ├ VPFR: {_nearest_vpfr(_sk)}\n"
-                            f"  ├ GEX:  {_gex_prox(_sk)}\n"
-                            f"  └ MFlow:{_mf_prox(_sk)}"
+                            f"  ├ 📊 Capping: OI {_oi:.1f}L | ChgOI {_chg:+.0f}K | LTP ₹{_ltp:.0f} | Activity: {_act}\n"
+                            f"  ├ 📉 Market Depth: Bid {_bid:,} qty | Ask {_ask:,} qty | Pressure {_ba:+.0f}{_wall}\n"
+                            f"  ├ 📈 VPFR Confluence: {_nearest_vpfr(_sk)}\n"
+                            f"  ├ 🔮 GEX: {_gex_prox(_sk)}\n"
+                            f"  └ 💰 Money Flow: {_mf_prox(_sk)}"
                         )
 
                 # ── SUPPORT levels ──
@@ -6036,17 +6008,23 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                         _chg  = r.get('PE_ChgOI', 0) / 1000
                         _ltp  = r.get('PE_LTP', 0)
                         _cls  = r.get('Put_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
-                        _bid  = r.get('bidQty_PE', r.get('Bid_PE', 0))
-                        _ask  = r.get('askQty_PE', r.get('Ask_PE', 0))
-                        _ba   = r.get('BidAskPressure', 0)
+                        _act  = r.get('Put_Activity', '')
+                        _bid  = int(r.get('bidQty_PE', 0) or 0)
+                        _ask  = int(r.get('askQty_PE', 0) or 0)
+                        _ba   = float(r.get('BidAskPressure', 0) or 0)
+                        _wall = ''
+                        if _ask > 0 and _bid > 0:
+                            _ratio = _bid / max(_ask, 1)
+                            if _ratio > 2: _wall = ' 🛡Buyers strong'
+                            elif _ratio < 0.5: _wall = ' 🧱Sellers strong'
                         _dist = underlying_price - _sk
                         _sr_lines.append(
                             f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'below' if _dist>0 else 'above'} spot\n"
-                            f"  ├ OI: {_oi:.1f}L | ChgOI: {_chg:+.0f}K | LTP: ₹{_ltp:.0f}\n"
-                            f"  ├ Depth: Bid {_bid} Ask {_ask} | BA:{_ba:+.0f}\n"
-                            f"  ├ VPFR: {_nearest_vpfr(_sk)}\n"
-                            f"  ├ GEX:  {_gex_prox(_sk)}\n"
-                            f"  └ MFlow:{_mf_prox(_sk)}"
+                            f"  ├ 📊 Support: OI {_oi:.1f}L | ChgOI {_chg:+.0f}K | LTP ₹{_ltp:.0f} | Activity: {_act}\n"
+                            f"  ├ 📉 Market Depth: Bid {_bid:,} qty | Ask {_ask:,} qty | Pressure {_ba:+.0f}{_wall}\n"
+                            f"  ├ 📈 VPFR Confluence: {_nearest_vpfr(_sk)}\n"
+                            f"  ├ 🔮 GEX: {_gex_prox(_sk)}\n"
+                            f"  └ 💰 Money Flow: {_mf_prox(_sk)}"
                         )
 
                 if _sr_lines:
@@ -6061,27 +6039,43 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
-    # Part 1 — core signal + ALL S/R data
+    # ── Part 1: Signal + Direction + S/R + OI Positioning ──
+    # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
+    #         future swing → S/R analysis → OI positioning (winding + option chain verdict)
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
+<b>━━━ PRICE ACTION ━━━</b>
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x
 📍 {loc_text}
+
+<b>━━━ GAMMA &amp; SENTIMENT ━━━</b>
 🔮 GEX: {gex['net_gex']:+.0f}L | Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'} | Mode:{gex['market_mode']}
 📊 PCR×GEX: {result['pcr_gex']['badge']}
 📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
+
+<b>━━━ DIRECTION ━━━</b>
+{swing_block}{capping_block}
+<b>━━━ OI POSITIONING ━━━</b>{unwind_block}{oc_deep_block}"""
+
+    # ── Part 2: Deep Analysis + Indices & Stocks at bottom ──
+    # Layout: header → market context → vpfr/triple POC/money flow → strike analysis →
+    #         price action (vwap/vob/hvp) → indices & stocks (alignment + capping) → AI prompt
+    msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
+
+<b>━━━ MARKET CONTEXT ━━━</b>{market_ctx_block}
+<b>━━━ VOLUME &amp; LIQUIDITY PROFILE ━━━</b>{vpfr_block}{poc_block}{mf_block}
+<b>━━━ STRIKE-LEVEL DEEP DIVE ━━━</b>{strike_analysis_block}
+<b>━━━ PRICE STRUCTURE ━━━</b>{price_action_block}
+<b>━━━ INDICES &amp; STOCKS ━━━</b>
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
-{capping_block}{_mi_bias_block}"""
-
-    # Part 2 — detailed analysis blocks + AI prompt
-    msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
-{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
-🟡 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
+{_mi_bias_block}
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
-3. Index/Stocks: N50/SENX/BNF/REL/ICICI/INFO — bias + Cap/Sup/Range
+3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS — bias + Cap/Sup/Range
 4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL</code>"""
 
     message = msg_part1  # used for Gemini analysis context
@@ -6255,30 +6249,13 @@ def _analyze_zone(spot, zone_bottom, zone_top, option_data, df_5m, df_1m=None):
 
 
 def _get_zone_telegram_msg(spot, zone_type, zone_bottom, zone_top, confirmations, strike, call_entry, call_target, call_sl, put_entry, put_target, put_sl):
-    """Build Telegram zone alert message."""
+    """Build short Telegram zone alert message."""
     score = sum(1 for c in confirmations if '✅' in c)
     total = len(confirmations)
     emoji = "🟢" if zone_type == "SUPPORT" else "🔴"
     trade_type = "CALL" if zone_type == "SUPPORT" else "PUT"
-    entry = call_entry if zone_type == "SUPPORT" else put_entry
-    target = call_target if zone_type == "SUPPORT" else put_target
-    sl = call_sl if zone_type == "SUPPORT" else put_sl
-    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
-
-    conf_lines = "\n".join([f"  {c}" for c in confirmations])
-    msg = f"""{emoji} <b>SPOT IN {zone_type} ZONE</b>
-🕐 {time_str}
-📍 Spot: ₹{spot:.0f} | Zone: ₹{zone_bottom:.0f}–₹{zone_top:.0f}
-
-<b>Zone Analysis ({score}/{total} confirmations):</b>
-{conf_lines}
-
-<b>Trade Setup:</b>
-Strike: {strike} {trade_type}
-Entry: ₹{entry} | Target: ₹{target} | SL: ₹{sl}
-
-⚡ Review and click <b>Enter {trade_type}</b> in the app to execute."""
-    return msg
+    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST')
+    return f"{emoji} SPOT IN {zone_type} ZONE | ₹{spot:.0f} | Zone ₹{zone_bottom:.0f}–₹{zone_top:.0f} | {score}/{total} confirm | {time_str}"
 
 
 def _place_trade(api, trade_type, strike, security_id, entry_price, target, sl, lot_size, spot, confirmations, db):
@@ -6344,9 +6321,9 @@ def _render_alignment_capping_top():
     _master = getattr(st.session_state, '_master_signal_latest', None)
     _sa = getattr(st.session_state, '_sa_result', None)
 
-    _short_names = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
-                    'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+    _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
+                    'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
