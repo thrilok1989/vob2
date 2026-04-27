@@ -6540,6 +6540,83 @@ def _render_alignment_capping_top():
                     st.caption(f"Capping render error: {_e}")
 
 
+def _render_vol_delta_chart():
+    """Render Buy Volume vs Sell Volume over time, same style as per-strike OI chart."""
+    import plotly.graph_objects as go
+    vd = getattr(st.session_state, '_volume_delta_data', None)
+    if vd is None or vd.get('df') is None:
+        st.info("⚡ Volume Delta chart builds after the first chart load. Please wait...")
+        return
+    try:
+        df = vd['df'].copy()
+        if df.empty:
+            st.info("No Volume Delta data yet.")
+            return
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        vds = vd.get('summary', {})
+        bias = vds.get('bias', 'N/A')
+        bias_e = '🟢' if bias == 'Bullish' else '🔴' if bias == 'Bearish' else '⚪'
+        tot_d = int(vds.get('total_delta', 0))
+        d_rat = float(vds.get('delta_ratio', 1))
+
+        fig = go.Figure()
+        # Buy Volume bars (green)
+        fig.add_trace(go.Bar(
+            x=df['datetime'], y=df['buy_volume'],
+            name='Buy Volume', marker_color='#089981',
+            opacity=0.85
+        ))
+        # Sell Volume bars (red, negative direction for mirror effect)
+        fig.add_trace(go.Bar(
+            x=df['datetime'], y=-df['sell_volume'],
+            name='Sell Volume', marker_color='#f23645',
+            opacity=0.85
+        ))
+        # Cumulative delta line on secondary y
+        fig.add_trace(go.Scatter(
+            x=df['datetime'], y=df['cum_delta'],
+            name='Cum Delta', mode='lines',
+            line=dict(color='#FFD700', width=2, dash='dot'),
+            yaxis='y2'
+        ))
+        # Divergence markers
+        div_df = df[df['divergence'] == True] if 'divergence' in df.columns else pd.DataFrame()
+        if not div_df.empty:
+            fig.add_trace(go.Scatter(
+                x=div_df['datetime'], y=div_df['delta'],
+                mode='markers', name='Divergence',
+                marker=dict(symbol='diamond', size=10, color='#FF6B35',
+                            line=dict(color='white', width=1)),
+                yaxis='y'
+            ))
+        fig.update_layout(
+            title=f'⚡ Buy vs Sell Volume | {bias_e} {bias} | Delta: {tot_d:+,} | Ratio: {d_rat:.2f}x',
+            template='plotly_dark',
+            height=320,
+            barmode='overlay',
+            showlegend=True,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+            margin=dict(l=10, r=60, t=80, b=20),
+            xaxis=dict(tickformat='%H:%M', title='Time'),
+            yaxis=dict(title='Volume', zeroline=True, zerolinecolor='#555'),
+            yaxis2=dict(title='Cum Delta', overlaying='y', side='right',
+                        showgrid=False, zeroline=True, zerolinecolor='#FFD70060'),
+            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Summary metrics row
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Delta", f"{tot_d:+,}", delta=bias,
+                  delta_color="normal" if bias == 'Bullish' else "inverse")
+        m2.metric("Buy Volume", f"{int(vds.get('total_buy_volume', 0)):,}")
+        m3.metric("Sell Volume", f"{int(vds.get('total_sell_volume', 0)):,}")
+        m4.metric("Delta Ratio", f"{d_rat:.2f}x")
+        m5.metric("Divergences", f"{int(vds.get('divergence_bars', 0))}")
+    except Exception as e:
+        st.caption(f"Volume Delta chart error: {e}")
+
+
 def _render_per_strike_oi_top():
     """Render Per-Strike CE vs PE OI charts + signals from session state."""
     import plotly.graph_objects as go
@@ -7308,6 +7385,8 @@ def main():
     with _per_strike_oi_container:
         with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
             _render_per_strike_oi_top()
+        with st.expander("⚡ Buy Volume vs Sell Volume (Delta Chart)", expanded=True):
+            _render_vol_delta_chart()
 
     # Fill Alignment + Index/Stock Capping below Per-Strike OI
     with _align_cap_container:
