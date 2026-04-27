@@ -3267,12 +3267,23 @@ def analyze_strike_activity(df_summary, underlying_price):
         call_trapped = ce_high_oi and ce_oi_falling and not price_below_strike  # price went above, writers trapped
         put_trapped = pe_high_oi and pe_oi_falling and price_below_strike  # price went below, writers trapped
 
+        # Market depth + bid-ask pressure
+        ce_bid_qty = row.get('bidQty_CE', 0) or 0
+        ce_ask_qty = row.get('askQty_CE', 0) or 0
+        pe_bid_qty = row.get('bidQty_PE', 0) or 0
+        pe_ask_qty = row.get('askQty_PE', 0) or 0
+        bid_ask_pressure = (ce_bid_qty + pe_bid_qty) - (ce_ask_qty + pe_ask_qty)
+
         strike_analysis.append({
             'Strike': strike, 'Zone': zone,
             'CE_OI': ce_oi, 'CE_ChgOI': ce_chg_oi, 'CE_LTP': ce_ltp, 'CE_Vol': ce_vol, 'CE_IV': ce_iv,
             'CE_Vol_High': ce_high_vol,
             'PE_OI': pe_oi, 'PE_ChgOI': pe_chg_oi, 'PE_LTP': pe_ltp, 'PE_Vol': pe_vol, 'PE_IV': pe_iv,
             'PE_Vol_High': pe_high_vol,
+            'bidQty_CE': ce_bid_qty, 'askQty_CE': ce_ask_qty,
+            'bidQty_PE': pe_bid_qty, 'askQty_PE': pe_ask_qty,
+            'BidAskPressure': bid_ask_pressure,
+            'changeinOpenInterest_CE': ce_chg_oi, 'changeinOpenInterest_PE': pe_chg_oi,
             'Call_Class': call_class, 'Call_Strength': call_strength, 'Call_Activity': call_activity,
             'Call_Capping_Confirmed': call_capping_confirmed,
             'Put_Class': put_class, 'Put_Strength': put_strength, 'Put_Activity': put_activity,
@@ -5275,9 +5286,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         vpfr_block = ""
 
-    _short_names = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
-                    'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+    _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
+                    'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
@@ -5815,8 +5826,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         oc_deep_block = ""
 
     # Multi-instrument capping bias block (compact per-instrument lines)
-    _mi_short = {'SENSEX': 'SENX', 'BANKNIFTY': 'BNF',
-                 'RELIANCE': 'REL', 'ICICIBANK': 'ICICI', 'INFOSYS': 'INFO'}
+    _mi_short = {'SENSEX': 'SENSEX', 'BANKNIFTY': 'BANK NIFTY',
+                 'RELIANCE': 'RELIANCE', 'ICICIBANK': 'ICICI BANK', 'INFOSYS': 'INFOSYS'}
     def _bias_emoji(b):
         b = str(b)
         return '🟢' if 'Bullish' in b else '🔴' if 'Bearish' in b else '⚪'
@@ -5866,9 +5877,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                    if r.get('Put_Support_Confirmed')] if _sa_bias.get('analysis_df') is not None else []
         _sa_cap = sorted(_sa_cap, key=lambda x: x['strike'])  # lowest cap = nearest resistance
         _sa_sup = sorted(_sa_sup, key=lambda x: x['strike'], reverse=True)  # highest sup = nearest support
-        _mi_lines.append(_mi_cap_line('N50', _sa_bias.get('market_bias', ''), underlying_price, _sa_cap, _sa_sup))
+        _mi_lines.append(_mi_cap_line('NIFTY 50', _sa_bias.get('market_bias', ''), underlying_price, _sa_cap, _sa_sup))
     except Exception:
-        _mi_lines.append(f"⚫N50 ₹{underlying_price:.0f}")
+        _mi_lines.append(f"⚫NIFTY 50 ₹{underlying_price:.0f}")
 
     # Other instruments using mi_instrument_data
     try:
@@ -5959,17 +5970,24 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                         _chg  = r.get('CE_ChgOI', 0) / 1000
                         _ltp  = r.get('CE_LTP', 0)
                         _cls  = r.get('Call_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
-                        _bid  = r.get('bidQty_CE', r.get('Bid_CE', 0))
-                        _ask  = r.get('askQty_CE', r.get('Ask_CE', 0))
-                        _ba   = r.get('BidAskPressure', 0)
+                        _act  = r.get('Call_Activity', '')
+                        _bid  = int(r.get('bidQty_CE', 0) or 0)
+                        _ask  = int(r.get('askQty_CE', 0) or 0)
+                        _ba   = float(r.get('BidAskPressure', 0) or 0)
+                        # Bid/Ask wall interpretation
+                        _wall = ''
+                        if _ask > 0 and _bid > 0:
+                            _ratio = _ask / max(_bid, 1)
+                            if _ratio > 2: _wall = ' 🧱Sellers strong'
+                            elif _ratio < 0.5: _wall = ' 🛡Buyers strong'
                         _dist = _sk - underlying_price
                         _sr_lines.append(
                             f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'above' if _dist>0 else 'below'} spot\n"
-                            f"  ├ OI: {_oi:.1f}L | ChgOI: {_chg:+.0f}K | LTP: ₹{_ltp:.0f}\n"
-                            f"  ├ Depth: Bid {_bid} Ask {_ask} | BA:{_ba:+.0f}\n"
-                            f"  ├ VPFR: {_nearest_vpfr(_sk)}\n"
-                            f"  ├ GEX:  {_gex_prox(_sk)}\n"
-                            f"  └ MFlow:{_mf_prox(_sk)}"
+                            f"  ├ 📊 Capping: OI {_oi:.1f}L | ChgOI {_chg:+.0f}K | LTP ₹{_ltp:.0f} | Activity: {_act}\n"
+                            f"  ├ 📉 Market Depth: Bid {_bid:,} qty | Ask {_ask:,} qty | Pressure {_ba:+.0f}{_wall}\n"
+                            f"  ├ 📈 VPFR Confluence: {_nearest_vpfr(_sk)}\n"
+                            f"  ├ 🔮 GEX: {_gex_prox(_sk)}\n"
+                            f"  └ 💰 Money Flow: {_mf_prox(_sk)}"
                         )
 
                 # ── SUPPORT levels ──
@@ -5987,17 +6005,23 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                         _chg  = r.get('PE_ChgOI', 0) / 1000
                         _ltp  = r.get('PE_LTP', 0)
                         _cls  = r.get('Put_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
-                        _bid  = r.get('bidQty_PE', r.get('Bid_PE', 0))
-                        _ask  = r.get('askQty_PE', r.get('Ask_PE', 0))
-                        _ba   = r.get('BidAskPressure', 0)
+                        _act  = r.get('Put_Activity', '')
+                        _bid  = int(r.get('bidQty_PE', 0) or 0)
+                        _ask  = int(r.get('askQty_PE', 0) or 0)
+                        _ba   = float(r.get('BidAskPressure', 0) or 0)
+                        _wall = ''
+                        if _ask > 0 and _bid > 0:
+                            _ratio = _bid / max(_ask, 1)
+                            if _ratio > 2: _wall = ' 🛡Buyers strong'
+                            elif _ratio < 0.5: _wall = ' 🧱Sellers strong'
                         _dist = underlying_price - _sk
                         _sr_lines.append(
                             f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'below' if _dist>0 else 'above'} spot\n"
-                            f"  ├ OI: {_oi:.1f}L | ChgOI: {_chg:+.0f}K | LTP: ₹{_ltp:.0f}\n"
-                            f"  ├ Depth: Bid {_bid} Ask {_ask} | BA:{_ba:+.0f}\n"
-                            f"  ├ VPFR: {_nearest_vpfr(_sk)}\n"
-                            f"  ├ GEX:  {_gex_prox(_sk)}\n"
-                            f"  └ MFlow:{_mf_prox(_sk)}"
+                            f"  ├ 📊 Support: OI {_oi:.1f}L | ChgOI {_chg:+.0f}K | LTP ₹{_ltp:.0f} | Activity: {_act}\n"
+                            f"  ├ 📉 Market Depth: Bid {_bid:,} qty | Ask {_ask:,} qty | Pressure {_ba:+.0f}{_wall}\n"
+                            f"  ├ 📈 VPFR Confluence: {_nearest_vpfr(_sk)}\n"
+                            f"  ├ 🔮 GEX: {_gex_prox(_sk)}\n"
+                            f"  └ 💰 Money Flow: {_mf_prox(_sk)}"
                         )
 
                 if _sr_lines:
@@ -6012,9 +6036,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
-    # ── Part 1: Signal + Direction + S/R ──
+    # ── Part 1: Signal + Direction + S/R + Indices/Stocks at bottom ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
-    #         future swing → alignment → S/R analysis → index/stock capping
+    #         future swing → S/R analysis → indices & stocks (alignment + capping at bottom)
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
@@ -6029,9 +6053,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 
 <b>━━━ DIRECTION ━━━</b>
-{swing_block}🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
+{swing_block}{capping_block}
+<b>━━━ INDICES &amp; STOCKS ━━━</b>
+🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
-{capping_block}{_mi_bias_block}"""
+{_mi_bias_block}"""
 
     # ── Part 2: Deep Analysis ──
     # Layout: header → market context → vpfr/triple POC/money flow → strike analysis →
@@ -6292,9 +6318,9 @@ def _render_alignment_capping_top():
     _master = getattr(st.session_state, '_master_signal_latest', None)
     _sa = getattr(st.session_state, '_sa_result', None)
 
-    _short_names = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
-                    'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+    _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
+                    'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
