@@ -5936,7 +5936,65 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     _mi_bias_block = ("\n<b>📡 Index/Stock Capping:</b>\n" + "\n".join(_mi_lines) + "\n") if _mi_lines else ""
 
-    _oit = result.get('oi_trend', {})
+    # ── Dedicated Capping Block (Nifty only, clearly separated) ──
+    capping_block = ""
+    try:
+        _sa_cap = getattr(st.session_state, '_sa_result', None)
+        if _sa_cap is not None:
+            _adf = _sa_cap.get('analysis_df')
+            if _adf is not None and not _adf.empty:
+                _call_caps = []
+                _put_sups  = []
+
+                # Call capping rows
+                _cap_rows = _adf[
+                    _adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance', 'Moderate Resistance']) &
+                    _adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)', 'Short Building'])
+                ].sort_values('CE_OI', ascending=False)
+                for _, r in _cap_rows.iterrows():
+                    _vt   = "🔥VOL" if r.get('CE_Vol_High', False) else "📊"
+                    _oi   = r.get('CE_OI', 0) / 100000
+                    _chg  = r.get('CE_ChgOI', r.get('changeinOpenInterest_CE', 0)) / 1000
+                    _ltp  = r.get('lastPrice_CE', 0)
+                    _cls  = r.get('Call_Class', '')
+                    _act  = r.get('Call_Activity', '')
+                    _dist = underlying_price - float(r['Strike'])
+                    _prox = f"📍{abs(_dist):.0f}pts {'below' if _dist > 0 else 'above'} spot"
+                    _call_caps.append(
+                        f"  🟥 ₹{r['Strike']:.0f} | {_vt} | OI:{_oi:.1f}L ChgOI:{_chg:+.0f}K | LTP:₹{_ltp:.0f} | {_cls} | {_prox}"
+                    )
+
+                # Put support rows
+                _sup_rows = _adf[
+                    _adf['Put_Class'].isin(['High Conviction Support', 'Strong Support', 'Moderate Support']) &
+                    _adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)', 'Short Building'])
+                ].sort_values('PE_OI', ascending=False)
+                for _, r in _sup_rows.iterrows():
+                    _vt   = "🔥VOL" if r.get('PE_Vol_High', False) else "📊"
+                    _oi   = r.get('PE_OI', 0) / 100000
+                    _chg  = r.get('PE_ChgOI', r.get('changeinOpenInterest_PE', 0)) / 1000
+                    _ltp  = r.get('lastPrice_PE', 0)
+                    _cls  = r.get('Put_Class', '')
+                    _act  = r.get('Put_Activity', '')
+                    _dist = float(r['Strike']) - underlying_price
+                    _prox = f"📍{abs(_dist):.0f}pts {'above' if _dist > 0 else 'below'} spot"
+                    _put_sups.append(
+                        f"  🟩 ₹{r['Strike']:.0f} | {_vt} | OI:{_oi:.1f}L ChgOI:{_chg:+.0f}K | LTP:₹{_ltp:.0f} | {_cls} | {_prox}"
+                    )
+
+                if _call_caps or _put_sups:
+                    _cap_lines = []
+                    if _call_caps:
+                        _cap_lines.append("<b>🟥 CALL CAPPING (Resistance):</b>")
+                        _cap_lines.extend(_call_caps[:4])
+                    if _put_sups:
+                        _cap_lines.append("<b>🟩 PUT SUPPORT (Floor):</b>")
+                        _cap_lines.extend(_put_sups[:4])
+                    capping_block = "\n<b>━━ CAPPING DATA ━━</b>\n" + "\n".join(_cap_lines) + "\n"
+    except Exception:
+        capping_block = ""
+
+
     _vid = result.get('vidya', {})
     _ob = result.get('order_blocks', {})
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
@@ -5957,7 +6015,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     # Part 2 — detailed blocks + AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
-{_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+{capping_block}{_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 🟡 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
