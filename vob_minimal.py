@@ -129,21 +129,8 @@ def send_telegram_message_sync(message, force=False):
         if _now.weekday() >= 5 or not (_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _now <= _now.replace(hour=15, minute=45, second=0, microsecond=0)):
             return
 
-    # Deduplicate: same message text not sent again within 30 minutes
-    import hashlib as _hl
-    _msg_hash = _hl.md5(message[:500].encode('utf-8', errors='ignore')).hexdigest()
-    _sent_hashes = st.session_state.setdefault('_tg_sent_hashes', {})
-    _now_tg = datetime.now(pytz.timezone('Asia/Kolkata'))
-    _last_sent = _sent_hashes.get(_msg_hash)
-    if _last_sent and (_now_tg - _last_sent).total_seconds() < 1800:
-        return  # exact same message already sent within 30 min
-    _sent_hashes[_msg_hash] = _now_tg
-    # Prune old entries (keep last 100)
-    if len(_sent_hashes) > 100:
-        _oldest = sorted(_sent_hashes, key=lambda k: _sent_hashes[k])[:len(_sent_hashes)-100]
-        for _k in _oldest: _sent_hashes.pop(_k, None)
-
     # Global rate limit: no two messages sent less than 2 seconds apart
+    _now_tg = datetime.now(pytz.timezone('Asia/Kolkata'))
     _last_tg = getattr(st.session_state, '_last_tg_send_time', None)
     if _last_tg and (_now_tg - _last_tg).total_seconds() < 2:
         import time as _time; _time.sleep(2)
