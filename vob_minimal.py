@@ -5128,16 +5128,16 @@ Focus: 1H + 4H + 1D
 <b>🧱 ENTRY LOGIC</b>
 🔴 SELL (CEILING) — all must align:
 • Call OI highest (wall)
-• Depth ask &gt;5K
-• Price rejection (wick)
-• BA negative
+• Market Depth: Ask qty &gt;5K (sellers queued)
+• Volume Delta: Sell volume &gt; Buy volume (delta negative)
+• Price rejection (wick) | BA negative
 👉 Entry: At ceiling stall | SL: Above ceiling
 
 🟢 BUY (FLOOR) — all must align:
 • Put OI highest (support)
-• Depth bid &gt;5K
-• Price bounce (wick)
-• BA positive
+• Market Depth: Bid qty &gt;5K (buyers queued)
+• Volume Delta: Buy volume &gt; Sell volume (delta positive)
+• Price bounce (wick) | BA positive
 👉 Entry: At floor stall | SL: Below floor
 
 <b>📡 MARKET MODE (live GEX value sent in every signal)</b>
@@ -5150,23 +5150,46 @@ Confirm with VIDYA direction | 🧊 No depth wall = No trade"""
 
 <b>⚠️ CRITICAL RULES</b>
 1. GEX -ve + VIDYA trend → DO NOT FADE
-2. Depth &lt;500 → weak level → expect break
+2. Market Depth &lt;500 qty → weak level → expect break
 3. DTE ≤5 → MaxPain magnet
 4. Straddle &gt;&gt; ATR → big move already priced
 5. PCR ≤0.7 near ATM+1 → strong resistance above
+6. Volume Delta divergence → price direction ≠ delta → reversal warning
 
 <b>🚫 NO TRADE ZONE</b>
-• Alignment mixed
-• GEX neutral
-• No depth walls
+• Alignment mixed | GEX neutral | No depth walls
+• Buy vol ≈ Sell vol (delta near zero — no conviction)
 = Sit out — this is your edge
+
+<b>⚡ VOLUME DELTA (sent in every signal)</b>
+Total Delta = Buy Volume − Sell Volume (session total)
+Cumulative Delta = running sum — rising=buyers in control
+Delta Ratio = Buy Vol ÷ Sell Vol (&gt;1=buyers, &lt;1=sellers)
+Divergence = price up but delta -ve (or vice versa) → reversal clue
+Delta at S/R zones = delta of candles that touched key levels
+🟢 +Delta at support → buyers defending → strong floor
+🔴 -Delta at resistance → sellers defending → strong ceiling
+
+<b>📉 MARKET DEPTH (sent in every signal per strike)</b>
+Bid qty = buyers waiting at that strike (support strength)
+Ask qty = sellers waiting at that strike (resistance strength)
+🧱 Sellers wall = Ask &gt; 2× Bid → strong ceiling, price likely to reject
+🛡 Buyers wall = Bid &gt; 2× Ask → strong floor, price likely to bounce
+Pressure = BA value (+ve=buyers dominant, -ve=sellers dominant)
+
+<b>🔄 OI WINDING / UNWINDING</b>
+CE Building (resistance forming) = call writers adding → ceiling getting stronger
+CE Unwinding (resistance weakening) = call writers exiting → ceiling may break
+PE Building (support forming) = put writers adding → floor getting stronger
+PE Unwinding (support weakening) = put writers exiting → floor may break
+Parallel Bullish = CE unwinding + PE building simultaneously → strong BUY signal
+Parallel Bearish = PE unwinding + CE building simultaneously → strong SELL signal
 
 <b>📦 REFERENCE (NOT DAILY)</b>
 GEX +ve=range -ve=trending | Flip=gamma flip level
 VIDYA: adaptive trend | -ve%=falling +ve%=rising
 VPFR: POC=most traded | VAH/VAL=value area
 Triple POC P1/P2/P3: clustered = strong confluence
-OI Winding: CE/PE build🟢/unwind🔴
 Money Flow: POC=peak vol ⭐ | VWAP=vol avg
 VOB=Volume Order Blocks | HVP=High Volume Pivots
 Skew 🔴&gt;1.1=put fear 🟢&lt;0.9=call greed | ATR14=SL guide
