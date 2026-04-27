@@ -5140,11 +5140,11 @@ Focus: 1H + 4H + 1D
 • BA positive
 👉 Entry: At floor stall | SL: Below floor
 
-<b>📡 MARKET MODE (from live GEX value in signal)</b>
-GEX +ve → RANGE → sell ceiling, buy floor
-GEX -ve → TREND → follow momentum, no counter
-Confirm with VIDYA direction
-🧊 No depth wall = No trade"""
+<b>📡 MARKET MODE (live GEX value sent in every signal)</b>
+📡 GEX +XXL → RANGE mode → sell ceiling / buy floor
+📡 GEX -XXL → TREND mode → follow momentum, no counter-trade
+📡 GEX 0 → neutral — wait for confirmation
+Confirm with VIDYA direction | 🧊 No depth wall = No trade"""
 
     part2 = """🟡 <b>NIFTY SIGNAL GUIDE (REFERENCE)</b>
 
@@ -6044,6 +6044,14 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _oit = result.get('oi_trend', {})
     _vid = result.get('vidya', {})
     _ob = result.get('order_blocks', {})
+    _net_gex = gex.get('net_gex', 0)
+    _gex_mode_line = (
+        f"📡 GEX {_net_gex:+.0f}L → RANGE mode → sell ceiling / buy floor"
+        if _net_gex > 0 else
+        f"📡 GEX {_net_gex:+.0f}L → TREND mode → follow momentum, no counter-trade"
+        if _net_gex < 0 else
+        "📡 GEX: neutral — wait for confirmation"
+    )
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
@@ -6059,6 +6067,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 <b>━━━ GAMMA &amp; SENTIMENT ━━━</b>
 🔮 GEX: {gex['net_gex']:+.0f}L | Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'} | Mode:{gex['market_mode']}
+{_gex_mode_line}
 📊 PCR×GEX: {result['pcr_gex']['badge']}
 📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
