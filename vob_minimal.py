@@ -130,8 +130,8 @@ def send_telegram_message_sync(message, force=False):
             return
 
     # Global rate limit: no two messages sent less than 2 seconds apart
-    _last_tg = getattr(st.session_state, '_last_tg_send_time', None)
     _now_tg = datetime.now(pytz.timezone('Asia/Kolkata'))
+    _last_tg = getattr(st.session_state, '_last_tg_send_time', None)
     if _last_tg and (_now_tg - _last_tg).total_seconds() < 2:
         import time as _time; _time.sleep(2)
     st.session_state._last_tg_send_time = datetime.now(pytz.timezone('Asia/Kolkata'))
@@ -4800,7 +4800,7 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
             continue
         # Already alerted this level recently?
         last_alert = alerted.get(label)
-        if last_alert and (datetime.now(pytz.timezone('Asia/Kolkata')) - last_alert).total_seconds() < 300:
+        if last_alert and (datetime.now(pytz.timezone('Asia/Kolkata')) - last_alert).total_seconds() < 1800:
             continue
         sr_clean = sr_type.replace('🔴', '').replace('🟢', '').replace('⚪', '').strip()
         zone_low  = f"₹{level - proximity_pts:.0f}"
@@ -4860,7 +4860,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 continue
             key = f"candle_bull_{level:.0f}"
             last = alerted.get(key)
-            if last and (now - last).total_seconds() < 600:
+            if last and (now - last).total_seconds() < 1800:
                 continue
             msg = (
                 f"🕯 <b>BULLISH CANDLE AT SUPPORT</b>\n"
@@ -4877,7 +4877,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 continue
             key = f"candle_bear_{level:.0f}"
             last = alerted.get(key)
-            if last and (now - last).total_seconds() < 600:
+            if last and (now - last).total_seconds() < 1800:
                 continue
             msg = (
                 f"🕯 <b>BEARISH CANDLE AT RESISTANCE</b>\n"
@@ -4915,7 +4915,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             key = f"cap_call_{strike:.0f}"
             last = alerted.get(key)
-            if last and (now - last).total_seconds() < 300:
+            if last and (now - last).total_seconds() < 1800:
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
             oi_l = float(r.get('CE_OI', 0) or 0) / 100000
@@ -4943,7 +4943,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             key = f"cap_put_{strike:.0f}"
             last = alerted.get(key)
-            if last and (now - last).total_seconds() < 300:
+            if last and (now - last).total_seconds() < 1800:
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
@@ -5089,7 +5089,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             continue
         key = f"rej_res_{level:.0f}"
         last_alerted = alerted.get(key)
-        if last_alerted and (now - last_alerted).total_seconds() < 600:
+        if last_alerted and (now - last_alerted).total_seconds() < 1800:
             continue
         # Count confirming signals
         signals = []
@@ -5119,7 +5119,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             continue
         key = f"rej_sup_{level:.0f}"
         last_alerted = alerted.get(key)
-        if last_alerted and (now - last_alerted).total_seconds() < 600:
+        if last_alerted and (now - last_alerted).total_seconds() < 1800:
             continue
         signals = []
         if chart_bull:
@@ -6061,7 +6061,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
-    # Part 1 — core signal
+    # Part 1 — core signal + ALL S/R data
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
@@ -6072,11 +6072,12 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
-{align_text}"""
+{align_text}
+{capping_block}{_mi_bias_block}"""
 
-    # Part 2 — detailed blocks + AI prompt
+    # Part 2 — detailed analysis blocks + AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
-{capping_block}{_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 🟡 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
@@ -6725,7 +6726,7 @@ def show_auto_trade_section(option_data, df_5m, api, db):
                 _now_z = datetime.now(pytz.timezone('Asia/Kolkata'))
                 _zone_cooldown_ok = (
                     _last_zone_alert is None or
-                    (_now_z - _last_zone_alert).total_seconds() > 300 or
+                    (_now_z - _last_zone_alert).total_seconds() > 1800 or
                     _last_zone_type != zone_type
                 )
                 if _zone_cooldown_ok:
@@ -6864,14 +6865,14 @@ def show_auto_trade_section(option_data, df_5m, api, db):
                     st.warning("⚠️ REVERSE SIGNAL detected — consider manual exit")
                     tg_rev = f"⚠️ <b>REVERSE SIGNAL</b> — Active {tt} trade but SELL signal detected. Review manually."
                     _last_rev = st.session_state.get('_last_reverse_alert')
-                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 300:
+                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 1800:
                         send_telegram_message_sync(tg_rev, force=True)
                         st.session_state._last_reverse_alert = datetime.now(pytz.timezone('Asia/Kolkata'))
                 elif tt == 'PUT' and ('BUY' in trade_signal or 'BREAKOUT' in trade_signal.upper()):
                     st.warning("⚠️ REVERSE SIGNAL detected — consider manual exit")
                     tg_rev = f"⚠️ <b>REVERSE SIGNAL</b> — Active {tt} trade but BUY signal detected. Review manually."
                     _last_rev = st.session_state.get('_last_reverse_alert')
-                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 300:
+                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 1800:
                         send_telegram_message_sync(tg_rev, force=True)
                         st.session_state._last_reverse_alert = datetime.now(pytz.timezone('Asia/Kolkata'))
         except Exception:
@@ -9806,13 +9807,14 @@ def main():
                     except Exception:
                         pass
 
-                    # All S/R alerts — each sends its short message then Part 1 + Part 2
+                    # All S/R alerts — send ONLY the short alert header (no repeated full signal)
                     _sa_c  = getattr(st.session_state, '_sa_result', None)
                     _pcr_s = getattr(st.session_state, '_pcr_sr_snapshot', [])
                     _df5m_c = getattr(st.session_state, '_df_5m', None)
 
                     def _send_with_header(header):
-                        send_master_signal_telegram(master, option_data['underlying'], option_data, force=True, skip_image=True, alert_header=header)
+                        # Send only the alert header — full signal already sent on button click
+                        send_telegram_message_sync(header, force=True)
 
                     # PCR S/R proximity alert
                     try:
