@@ -489,6 +489,17 @@ class DhanAPI:
             'client-id': self.client_id
         }
 
+    def _handle_response(self, response, context=""):
+        """Check response; flag token expiry on 401 and return None."""
+        if response.status_code == 200:
+            return response.json()
+        if response.status_code == 401:
+            st.session_state['_dhan_token_expired'] = True
+            st.error("🔑 **Dhan token expired.** Open the **Refresh Dhan Token** panel in the sidebar, paste your new access token, and click Apply.")
+        else:
+            st.error(f"API Error: {response.status_code} - {response.text}")
+        return None
+
     def get_intraday_data(self, security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval="1", days_back=1):
         url = f"{self.base_url}/charts/intraday"
         ist = pytz.timezone('Asia/Kolkata')
@@ -505,11 +516,7 @@ class DhanAPI:
         }
         try:
             response = requests.post(url, headers=self.headers, json=payload)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                st.error(f"API Error: {response.status_code} - {response.text}")
-                return None
+            return self._handle_response(response)
         except Exception as e:
             st.error(f"Error fetching data: {str(e)}")
             return None
@@ -521,11 +528,7 @@ class DhanAPI:
         }
         try:
             response = requests.post(url, headers=self.headers, json=payload)
-            if response.status_code == 200:
-                return response.json()
-            else:
-                st.error(f"LTP API Error: {response.status_code}")
-                return None
+            return self._handle_response(response)
         except Exception as e:
             st.error(f"Error fetching LTP: {str(e)}")
             return None
@@ -534,7 +537,7 @@ class DhanAPI:
         url = f"{self.base_url}/orders"
         payload = {
             "dhanClientId": self.client_id,
-            "transactionType": transaction_type,  # "BUY" or "SELL"
+            "transactionType": transaction_type,
             "exchangeSegment": exchange_segment,
             "productType": product_type,
             "orderType": order_type,
@@ -548,10 +551,12 @@ class DhanAPI:
         }
         try:
             response = requests.post(url, headers=self.headers, json=payload)
+            if response.status_code == 401:
+                st.session_state['_dhan_token_expired'] = True
+                return {"error": "Token expired — refresh in sidebar"}
             if response.status_code == 200:
                 return response.json()
-            else:
-                return {"error": f"{response.status_code} — {response.text[:200]}"}
+            return {"error": f"{response.status_code} — {response.text[:200]}"}
         except Exception as e:
             return {"error": str(e)}
 
@@ -560,6 +565,9 @@ class DhanAPI:
         payload = {exchange_segment: [int(security_id)]}
         try:
             response = requests.post(url, headers=self.headers, json=payload)
+            if response.status_code == 401:
+                st.session_state['_dhan_token_expired'] = True
+                return None
             if response.status_code == 200:
                 data = response.json()
                 items = data.get('data', {}).get(exchange_segment, [])
@@ -570,35 +578,32 @@ class DhanAPI:
             return None
 
     def get_positions(self):
-        """Fetch all open positions from Dhan."""
         url = f"{self.base_url}/positions"
         try:
             response = requests.get(url, headers=self.headers, timeout=10)
-            if response.status_code == 200:
-                return response.json()
-            return None
+            if response.status_code == 401:
+                st.session_state['_dhan_token_expired'] = True
+            return response.json() if response.status_code == 200 else None
         except Exception:
             return None
 
     def get_orders(self):
-        """Fetch today's orders from Dhan."""
         url = f"{self.base_url}/orders"
         try:
             response = requests.get(url, headers=self.headers, timeout=10)
-            if response.status_code == 200:
-                return response.json()
-            return None
+            if response.status_code == 401:
+                st.session_state['_dhan_token_expired'] = True
+            return response.json() if response.status_code == 200 else None
         except Exception:
             return None
 
     def get_order_by_id(self, order_id):
-        """Fetch a specific order status from Dhan."""
         url = f"{self.base_url}/orders/{order_id}"
         try:
             response = requests.get(url, headers=self.headers, timeout=10)
-            if response.status_code == 200:
-                return response.json()
-            return None
+            if response.status_code == 401:
+                st.session_state['_dhan_token_expired'] = True
+            return response.json() if response.status_code == 200 else None
         except Exception:
             return None
 
@@ -615,6 +620,10 @@ def _dhan_post(url, payload, max_retries=4):
     for attempt in range(max_retries + 1):
         try:
             response = requests.post(url, headers=headers, json=payload)
+            if response.status_code == 401:
+                st.session_state['_dhan_token_expired'] = True
+                st.error("🔑 **Dhan token expired.** Open **Refresh Dhan Token** in the sidebar and paste your new token.")
+                return None
             if response.status_code == 429:
                 if attempt < max_retries:
                     d = delays[min(attempt, 3)]
@@ -7018,6 +7027,37 @@ def main():
     st.sidebar.write(f"Telegram Chat ID: {'✅ Set' if TELEGRAM_CHAT_ID else '❌ Missing'}")
     st.sidebar.write(f"Token length: {len(TELEGRAM_BOT_TOKEN) if TELEGRAM_BOT_TOKEN else 0}")
     st.sidebar.write(f"Chat ID: {TELEGRAM_CHAT_ID}")
+
+    # ── Token Refresh (for when Dhan token expires daily) ──
+    with st.sidebar.expander("🔑 Refresh Dhan Token", expanded=bool(st.session_state.get('_dhan_token_expired'))):
+        st.caption("Dhan access tokens expire daily. Paste your new token here to refresh without restarting.")
+        _new_token = st.text_input(
+            "New Access Token",
+            type="password",
+            placeholder="Paste new Dhan access token...",
+            key="_new_dhan_token_input",
+        )
+        _col_a, _col_b = st.columns(2)
+        with _col_a:
+            if st.button("✅ Apply Token", key="_apply_dhan_token"):
+                if _new_token and len(_new_token.strip()) > 10:
+                    st.session_state['_dhan_token_override'] = _new_token.strip()
+                    st.session_state['_dhan_token_expired'] = False
+                    st.success("Token updated!")
+                    st.rerun()
+                else:
+                    st.error("Token too short")
+        with _col_b:
+            if st.button("🗑️ Clear", key="_clear_dhan_token"):
+                st.session_state.pop('_dhan_token_override', None)
+                st.session_state['_dhan_token_expired'] = False
+                st.rerun()
+        if st.session_state.get('_dhan_token_override'):
+            st.success("✅ Using overridden token")
+
+    # Use overridden token if set
+    if st.session_state.get('_dhan_token_override'):
+        access_token = st.session_state['_dhan_token_override']
 
     api = DhanAPI(access_token, client_id)
 
