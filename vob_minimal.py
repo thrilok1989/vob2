@@ -9807,13 +9807,14 @@ def main():
                     except Exception:
                         pass
 
-                    # All S/R alerts — each sends its short message then Part 1 + Part 2
+                    # All S/R alerts — send ONLY the short alert header (no repeated full signal)
                     _sa_c  = getattr(st.session_state, '_sa_result', None)
                     _pcr_s = getattr(st.session_state, '_pcr_sr_snapshot', [])
                     _df5m_c = getattr(st.session_state, '_df_5m', None)
 
                     def _send_with_header(header):
-                        send_master_signal_telegram(master, option_data['underlying'], option_data, force=True, skip_image=True, alert_header=header)
+                        # Send only the alert header — full signal already sent on button click
+                        send_telegram_message_sync(header, force=True)
 
                     # PCR S/R proximity alert
                     try:
