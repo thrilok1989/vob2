@@ -5359,14 +5359,49 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _uv = uw['verdict']
             _uv_e = '🔴' if 'BEAR' in _uv.upper() else '🟢' if 'BULL' in _uv.upper() else '⚪'
             unwind_block = (
-                f"\n<b>🔄 OI Wind/Unwind:</b> {_uv_e} {_uv}\n"
-                f"  CE: Unw🔴{uw['ce_unwind_count']} Bld🟢{uw['ce_build_count']} | "
-                f"PE: Unw🔴{uw['pe_unwind_count']} Bld🟢{uw['pe_build_count']} | "
-                f"Par:{uw['parallel_count']}(B{uw['bull_parallel']}|R{uw['bear_parallel']})\n"
-                f"  Top PE Unw:{uw['pe_unwind_top']} | Top CE Bld:{uw['ce_build_top']}\n"
+                f"\n<b>🔄 OI Winding / Unwinding:</b> {_uv_e} {_uv}\n"
+                f"  CALL (CE): Unwinding 🔴 {uw['ce_unwind_count']} strikes (resistance weakening) | Building 🟢 {uw['ce_build_count']} strikes (resistance forming)\n"
+                f"  PUT  (PE): Unwinding 🔴 {uw['pe_unwind_count']} strikes (support weakening)   | Building 🟢 {uw['pe_build_count']} strikes (support forming)\n"
+                f"  Parallel Activity: {uw['parallel_count']} strikes (Bullish: {uw['bull_parallel']} | Bearish: {uw['bear_parallel']})\n"
+                f"  Top PE Unwinding (support leaving): {uw['pe_unwind_top']}\n"
+                f"  Top CE Building (new resistance): {uw['ce_build_top']}\n"
             )
     except Exception:
         unwind_block = ""
+
+    # Market Depth block: top bid/ask walls from ATM±2 strikes
+    depth_block = ""
+    try:
+        _df_d = option_data.get('df_summary') if option_data else None
+        if _df_d is not None and not _df_d.empty:
+            _depth_lines = []
+            for _, _dr in _df_d.iterrows():
+                try:
+                    _dsk = float(_dr.get('Strike', 0) or 0)
+                    if abs(_dsk - underlying_price) > 200:
+                        continue
+                    _cb = int(_dr.get('bidQty_CE', 0) or 0)
+                    _ca = int(_dr.get('askQty_CE', 0) or 0)
+                    _pb = int(_dr.get('bidQty_PE', 0) or 0)
+                    _pa = int(_dr.get('askQty_PE', 0) or 0)
+                    _ba = float(_dr.get('BidAskPressure', 0) or 0)
+                    _side = 'Above' if _dsk >= underlying_price else 'Below'
+                    _wall_tag = ''
+                    if _ca > 0 and _cb > 0:
+                        if _ca / max(_cb, 1) > 2: _wall_tag = ' 🧱 Sellers wall'
+                        elif _cb / max(_ca, 1) > 2: _wall_tag = ' 🛡 Buyers wall'
+                    _depth_lines.append(
+                        f"  ₹{_dsk:.0f} ({_side}): "
+                        f"CE Bid {_cb:,} | CE Ask {_ca:,} | "
+                        f"PE Bid {_pb:,} | PE Ask {_pa:,} | "
+                        f"Pressure {_ba:+.0f}{_wall_tag}"
+                    )
+                except Exception:
+                    pass
+            if _depth_lines:
+                depth_block = "\n<b>📉 MARKET DEPTH (Bid/Ask walls per strike):</b>\n" + "\n".join(_depth_lines) + "\n"
+    except Exception:
+        depth_block = ""
 
     # Market Context block: DTE, Max Pain, Straddle, IV Rank, IV Skew, ATR, OI Velocity
     market_ctx_block = ""
@@ -6074,6 +6109,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 <b>━━━ DIRECTION ━━━</b>
 {swing_block}{capping_block}
+<b>━━━ MARKET DEPTH ━━━</b>{depth_block}
 <b>━━━ OI POSITIONING ━━━</b>{unwind_block}{oc_deep_block}"""
 
     # ── Part 2: Deep Analysis + Indices & Stocks at bottom ──
