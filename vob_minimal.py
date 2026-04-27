@@ -4800,7 +4800,7 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
             continue
         # Already alerted this level recently?
         last_alert = alerted.get(label)
-        if last_alert and (datetime.now(pytz.timezone('Asia/Kolkata')) - last_alert).total_seconds() < 300:
+        if last_alert and (datetime.now(pytz.timezone('Asia/Kolkata')) - last_alert).total_seconds() < 1800:
             continue
         sr_clean = sr_type.replace('🔴', '').replace('🟢', '').replace('⚪', '').strip()
         zone_low  = f"₹{level - proximity_pts:.0f}"
@@ -4860,7 +4860,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 continue
             key = f"candle_bull_{level:.0f}"
             last = alerted.get(key)
-            if last and (now - last).total_seconds() < 600:
+            if last and (now - last).total_seconds() < 1800:
                 continue
             msg = (
                 f"🕯 <b>BULLISH CANDLE AT SUPPORT</b>\n"
@@ -4877,7 +4877,7 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
                 continue
             key = f"candle_bear_{level:.0f}"
             last = alerted.get(key)
-            if last and (now - last).total_seconds() < 600:
+            if last and (now - last).total_seconds() < 1800:
                 continue
             msg = (
                 f"🕯 <b>BEARISH CANDLE AT RESISTANCE</b>\n"
@@ -4915,7 +4915,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             key = f"cap_call_{strike:.0f}"
             last = alerted.get(key)
-            if last and (now - last).total_seconds() < 300:
+            if last and (now - last).total_seconds() < 1800:
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
             oi_l = float(r.get('CE_OI', 0) or 0) / 100000
@@ -4943,7 +4943,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             key = f"cap_put_{strike:.0f}"
             last = alerted.get(key)
-            if last and (now - last).total_seconds() < 300:
+            if last and (now - last).total_seconds() < 1800:
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
@@ -5089,7 +5089,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             continue
         key = f"rej_res_{level:.0f}"
         last_alerted = alerted.get(key)
-        if last_alerted and (now - last_alerted).total_seconds() < 600:
+        if last_alerted and (now - last_alerted).total_seconds() < 1800:
             continue
         # Count confirming signals
         signals = []
@@ -5119,7 +5119,7 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
             continue
         key = f"rej_sup_{level:.0f}"
         last_alerted = alerted.get(key)
-        if last_alerted and (now - last_alerted).total_seconds() < 600:
+        if last_alerted and (now - last_alerted).total_seconds() < 1800:
             continue
         signals = []
         if chart_bull:
@@ -6726,7 +6726,7 @@ def show_auto_trade_section(option_data, df_5m, api, db):
                 _now_z = datetime.now(pytz.timezone('Asia/Kolkata'))
                 _zone_cooldown_ok = (
                     _last_zone_alert is None or
-                    (_now_z - _last_zone_alert).total_seconds() > 300 or
+                    (_now_z - _last_zone_alert).total_seconds() > 1800 or
                     _last_zone_type != zone_type
                 )
                 if _zone_cooldown_ok:
@@ -6865,14 +6865,14 @@ def show_auto_trade_section(option_data, df_5m, api, db):
                     st.warning("⚠️ REVERSE SIGNAL detected — consider manual exit")
                     tg_rev = f"⚠️ <b>REVERSE SIGNAL</b> — Active {tt} trade but SELL signal detected. Review manually."
                     _last_rev = st.session_state.get('_last_reverse_alert')
-                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 300:
+                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 1800:
                         send_telegram_message_sync(tg_rev, force=True)
                         st.session_state._last_reverse_alert = datetime.now(pytz.timezone('Asia/Kolkata'))
                 elif tt == 'PUT' and ('BUY' in trade_signal or 'BREAKOUT' in trade_signal.upper()):
                     st.warning("⚠️ REVERSE SIGNAL detected — consider manual exit")
                     tg_rev = f"⚠️ <b>REVERSE SIGNAL</b> — Active {tt} trade but BUY signal detected. Review manually."
                     _last_rev = st.session_state.get('_last_reverse_alert')
-                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 300:
+                    if not _last_rev or (datetime.now(pytz.timezone('Asia/Kolkata')) - _last_rev).total_seconds() > 1800:
                         send_telegram_message_sync(tg_rev, force=True)
                         st.session_state._last_reverse_alert = datetime.now(pytz.timezone('Asia/Kolkata'))
         except Exception:
