@@ -5715,16 +5715,20 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             hi_sent_price = mf.get('highest_sentiment_price', 0)
             hi_sent_dir = mf.get('highest_sentiment_direction', 'Neutral')
             hi_sent_emoji = '🟢' if hi_sent_dir == 'Bullish' else '🔴' if hi_sent_dir == 'Bearish' else '⚪'
-            # Top 3 nodes inline: emoji+range(vol%)+⭐
+            # Top nodes with clear labels
             node_parts = []
             for r in top_nodes[:3]:
                 s_e = '🟢' if r.get('sentiment') == 'Bullish' else '🔴' if r.get('sentiment') == 'Bearish' else '⚪'
-                poc_tag = '⭐' if r.get('is_poc') else ''
-                node_parts.append(f"{s_e}₹{r['bin_low']:.0f}({r['volume_pct']:.0f}%){poc_tag}")
-            nodes_inline = " ".join(node_parts) if node_parts else "—"
+                sent_short = 'Bull' if r.get('sentiment') == 'Bullish' else 'Bear' if r.get('sentiment') == 'Bearish' else 'Neut'
+                poc_tag = ' ⭐POC' if r.get('is_poc') else ''
+                node_parts.append(f"  {s_e} ₹{r['bin_low']:.0f}-{r['bin_high']:.0f} {sent_short} {r['volume_pct']:.0f}% vol{poc_tag}")
+            nodes_inline = "\n".join(node_parts) if node_parts else "  —"
             mf_block = (
-                f"\n💰 Money Flow Profile: POC₹{poc_price:.0f} VA₹{val:.0f}-₹{vah:.0f} "
-                f"Strong:{hi_sent_emoji}₹{hi_sent_price:.0f} | {nodes_inline}\n"
+                f"\n💰 <b>Money Flow Profile:</b>\n"
+                f"  POC ₹{poc_price:.0f} (most traded = price magnet)\n"
+                f"  VAH ₹{vah:.0f} (value area ceiling) | VAL ₹{val:.0f} (value area floor)\n"
+                f"  Strongest sentiment: {hi_sent_emoji} ₹{hi_sent_price:.0f} {hi_sent_dir}\n"
+                f"  Top volume nodes:\n{nodes_inline}\n"
             )
     except Exception:
         mf_block = ""
