@@ -404,7 +404,8 @@ def render_master_signal_image(result, underlying_price, option_data=None):
         t(L+0.01, y-0.004, 'ALIGNMENT  10m | 1h | Pattern', c=CYAN, sz=8.5, w='bold')
         SN = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
               'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
-              'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+              'CRUDE OIL':'CRUDE','USD/INR':'INR',
+              'S&P 500':'SP500','JAPAN 225':'JP225','HANG SENG':'HSI','UK 100':'UK100'}
         PS = {'No Pattern':'NP','Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
               'Hammer':'Ham','Shooting Star':'ShStr','Tweezer Top':'TwTop',
               'Tweezer Bottom':'TwBot','Strong Green Candle':'SGC','Strong Red Candle':'SRC',
@@ -3928,6 +3929,10 @@ def fetch_alignment_data(api):
         ('GOLD', None, None, None, 'GC=F'),
         ('CRUDE OIL', None, None, None, 'CL=F'),
         ('USD/INR', None, None, None, 'INR=X'),
+        ('S&P 500', None, None, None, 'ES=F'),
+        ('JAPAN 225', None, None, None, '^N225'),
+        ('HANG SENG', None, None, None, '^HSI'),
+        ('UK 100', None, None, None, '^FTSE'),
     ]
     alignment = {}
     for name, sec_id, seg, inst, yf_symbol in tickers:
@@ -5124,6 +5129,7 @@ Range: -5 (strong bear) → +5 (strong bull) | 🟥=Bear 🟩=Bull ⚪=Neutral
 <b>🌍 ALIGNMENT CODES (decode signal alignment block)</b>
 N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
 REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
+SP500=S&amp;P500 JP225=Japan225 HSI=HangSeng UK100=FTSE100
 Timeframes: 10m|1h|4h|1D|4D|Pattern → 3+ same = confirmed trend
 NP=NoPattern Ham=Hammer ShStar=ShootingStar
 SGC=StrongGreen SRC=StrongRed BullEng/BearEng BullHar/BearHar
@@ -5318,7 +5324,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
                     'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR',
+                    'S&P 500':'S&P 500','JAPAN 225':'JAPAN 225','HANG SENG':'HANG SENG','UK 100':'UK 100'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
@@ -5331,7 +5338,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     }
     def _ae(s): return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
     align_parts = []
-    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
+    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR','S&P 500','JAPAN 225','HANG SENG','UK 100']:
         data = result.get('alignment', {}).get(name)
         if data is None:
             continue
@@ -6188,11 +6195,11 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow (POC/VAH/VAL), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow (POC/VAH/VAL), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
 GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
 1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
-3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR — bias + Cap/Sup/Range
+3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR / S&P 500 / JAPAN 225 / HANG SENG / UK 100 — bias + Cap/Sup/Range
 4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
 CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
 
@@ -6441,7 +6448,8 @@ def _render_alignment_capping_top():
 
     _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
                     'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR',
+                    'S&P 500':'S&P 500','JAPAN 225':'JAPAN 225','HANG SENG':'HANG SENG','UK 100':'UK 100'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
@@ -6466,7 +6474,7 @@ def _render_alignment_capping_top():
                     st.info("No alignment data yet.")
                 else:
                     _rows = []
-                    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
+                    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR','S&P 500','JAPAN 225','HANG SENG','UK 100']:
                         data = _alignment.get(name)
                         if data is None:
                             continue
@@ -10349,7 +10357,7 @@ def main():
                         st.markdown("### 🕯 Candle Patterns Across Indices")
                         pattern_rows = []
                         # Define display order
-                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
+                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR', 'S&P 500', 'JAPAN 225', 'HANG SENG', 'UK 100']
                         for name in display_order:
                             ad = align_data.get(name)
                             if ad is None:
@@ -10516,7 +10524,7 @@ def main():
                         st.caption("Direct = moves WITH Nifty | Inverse = moves AGAINST Nifty (when inverse falls, Nifty rises)")
 
                         # Classification
-                        direct_instruments = ['SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'GOLD']
+                        direct_instruments = ['SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'GOLD', 'S&P 500', 'JAPAN 225', 'HANG SENG', 'UK 100']
                         inverse_instruments = ['INDIA VIX', 'CRUDE OIL', 'USD/INR']
 
                         nifty_data = align_data.get('NIFTY 50')
