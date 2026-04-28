@@ -5184,7 +5184,9 @@ Total Delta = Buy Vol − Sell Vol | +ve=buyers winning, -ve=sellers
 Cum Delta = running total — rising=buyers accumulating, falling=sellers
 Ratio &gt;1=buyers dominant | &lt;1=sellers dominant
 Divergence = price moves up but delta -ve (or vice versa) → reversal warning
-S/R zone delta = what buyers/sellers did AT key price levels (most important)
+VAH/VAL/POC delta = what buyers/sellers did at Money Flow key levels (most important)
+🟢 +Delta at POC/VAL → buyers defending → confirms support / magnet holding
+🔴 -Delta at POC/VAH → sellers defending → confirms resistance / ceiling holding
 
 <b>📉 MARKET DEPTH per strike</b>
 CB=CE Bid (call buyers) | CA=CE Ask (call sellers)
@@ -5422,7 +5424,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         depth_block = ""
 
-    # Volume Delta block: summary + candles at S/R zones
+    # Volume Delta block: summary + candles at VAH/VAL/POC zones
     vol_delta_block = ""
     try:
         _vd = getattr(st.session_state, '_volume_delta_data', None)
@@ -6186,7 +6188,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow (POC/VAH/VAL), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
 GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
 1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
