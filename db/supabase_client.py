@@ -644,3 +644,33 @@ class SupabaseDB:
             return result.data or []
         except Exception:
             return []
+
+    # ── Telegram cooldown (dedup across restarts) ──
+    def is_tg_cooldown_active(self, msg_hash: str, cooldown_seconds: int = 1800) -> bool:
+        """Return True if msg_hash was sent within the last cooldown_seconds."""
+        try:
+            cutoff = (datetime.now(pytz.UTC) - timedelta(seconds=cooldown_seconds)).isoformat()
+            result = self.client.table('telegram_sent_log') \
+                .select('id') \
+                .eq('msg_hash', msg_hash) \
+                .gte('sent_at', cutoff) \
+                .limit(1) \
+                .execute()
+            return bool(result.data)
+        except Exception:
+            return False
+
+    def log_tg_message(self, msg_hash: str, alert_type: str = '', preview: str = ''):
+        """Insert a sent-message record and purge rows older than 24 h."""
+        try:
+            self.client.table('telegram_sent_log').insert({
+                'msg_hash': msg_hash,
+                'sent_at': datetime.now(pytz.UTC).isoformat(),
+                'alert_type': alert_type[:100] if alert_type else None,
+                'preview': preview[:200] if preview else None,
+            }).execute()
+            # Purge old rows (best-effort)
+            cutoff_24h = (datetime.now(pytz.UTC) - timedelta(hours=24)).isoformat()
+            self.client.table('telegram_sent_log').delete().lt('sent_at', cutoff_24h).execute()
+        except Exception:
+            pass
