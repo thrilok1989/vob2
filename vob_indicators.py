@@ -877,6 +877,148 @@ def calculate_max_pain(df_options, spot_price):
 
     return max_pain_strike, pain_df
 
+def check_trading_signals(df, pivot_settings, option_data, current_price, pivot_proximity=5):
+    if df.empty or option_data is None or len(option_data) == 0 or not current_price:
+        return
+
+    try:
+        df_json = df.to_json()
+        pivots = cached_pivot_calculation(df_json, pivot_settings)
+    except:
+        pivots = PivotIndicator.get_all_pivots(df, pivot_settings)
+
+    pivot_lows = [p['value'] for p in pivots if p['type'] == 'low']
+    reversal_score, reversal_signals, reversal_verdict = ReversalDetector.calculate_reversal_score(df, pivot_lows)
+
+    near_pivot = False
+    pivot_level = None
+
+    for pivot in pivots:
+        if pivot['timeframe'] in ['3M', '5M', '10M', '15M']:
+            price_diff = current_price - pivot['value']
+            if abs(price_diff) <= pivot_proximity:
+                near_pivot = True
+                pivot_level = pivot
+                break
+
+    if near_pivot and len(option_data) > 0:
+        atm_data = option_data[option_data['Zone'] == 'ATM']
+        if not atm_data.empty:
+            row = atm_data.iloc[0]
+            bullish_conditions = {
+                'Support Level': row.get('Level') == 'Support',
+                'ChgOI Bias': row.get('ChgOI_Bias') == 'Bullish',
+                'Volume Bias': row.get('Volume_Bias') == 'Bullish',
+                'AskQty Bias': row.get('AskQty_Bias') == 'Bullish',
+                'BidQty Bias': row.get('BidQty_Bias') == 'Bullish',
+                'Pressure Bias': row.get('PressureBias') == 'Bullish',
+                'Delta Exposure': row.get('DeltaExp') == 'Bullish',
+                'Gamma Exposure': row.get('GammaExp') == 'Bullish'
+            }
+            bearish_conditions = {
+                'Resistance Level': row.get('Level') == 'Resistance',
+                'ChgOI Bias': row.get('ChgOI_Bias') == 'Bearish',
+                'Volume Bias': row.get('Volume_Bias') == 'Bearish',
+                'AskQty Bias': row.get('AskQty_Bias') == 'Bearish',
+                'BidQty Bias': row.get('BidQty_Bias') == 'Bearish',
+                'Pressure Bias': row.get('PressureBias') == 'Bearish',
+                'Delta Exposure': row.get('DeltaExp') == 'Bearish',
+                'Gamma Exposure': row.get('GammaExp') == 'Bearish'
+            }
+            atm_strike = row['Strike']
+            stop_loss_percent = 20
+            ce_chg_oi = row.get('changeinOpenInterest_CE', 0)
+            pe_chg_oi = row.get('changeinOpenInterest_PE', 0)
+            bullish_oi_confirm = pe_chg_oi > 1.5 * ce_chg_oi
+            bearish_oi_confirm = ce_chg_oi > 1.5 * pe_chg_oi
+            reversal_text = f"""
+🔄 <b>REVERSAL DETECTOR:</b>
+• Score: {reversal_signals.get('Reversal_Score', 0)}/6
+• Selling Exhausted: {reversal_signals.get('Selling_Exhausted', 'N/A')}
+• Higher Low: {reversal_signals.get('Higher_Low', 'N/A')}
+• Strong Candle: {reversal_signals.get('Strong_Bullish_Candle', 'N/A')}
+• Volume: {reversal_signals.get('Volume_Signal', 'N/A')}
+• Above VWAP: {reversal_signals.get('Above_VWAP', 'N/A')}
+• {reversal_verdict}"""
+
+            price_diff = current_price - pivot_level['value']
+            near = abs(price_diff) <= pivot_proximity
+            time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
+            pv_tf, pv_val = pivot_level['timeframe'], pivot_level['value']
+            for is_bull, conds, oi_confirm in [
+                (True, bullish_conditions, bullish_oi_confirm),
+                (False, bearish_conditions, bearish_oi_confirm)
+            ]:
+                if not (all(conds.values()) and near):
+                    continue
+                emoji = "🚨" if is_bull else "🔴"
+                opt = "CE" if is_bull else "PE"
+                direction = "CALL" if is_bull else "PUT"
+                mark = "✅" if is_bull else "🔴"
+                trigger_type = "🔥 OI Dominance Trigger" if oi_confirm else "📊 Normal Bias Trigger"
+                conds_text = "\n".join([f"{mark} {k}" for k, v in conds.items() if v])
+                oi_text = f"PE ChgOI {pe_chg_oi:,} vs CE ChgOI {ce_chg_oi:,}" if is_bull else f"CE ChgOI {ce_chg_oi:,} vs PE ChgOI {pe_chg_oi:,}"
+                message = f"""{emoji} <b>NIFTY {direction} SIGNAL ALERT</b> {emoji}
+📍 <b>Spot:</b> ₹{current_price:.2f} ({'ABOVE' if price_diff > 0 else 'BELOW'} Pivot by {price_diff:+.2f}pts)
+📌 <b>Near Pivot:</b> {pv_tf} at ₹{pv_val:.2f}
+🎯 <b>ATM Strike:</b> {atm_strike}
+<b>{mark} {'BULLISH' if is_bull else 'BEARISH'} CONDITIONS MET:</b>
+{conds_text}
+⚡ <b>{trigger_type}</b>
+⚡ <b>OI:</b> {oi_text}
+{reversal_text}
+📋 <b>REVIEW:</b> {atm_strike} {opt} | SL: {stop_loss_percent}% | Manual verification required
+🕐 Time: {time_str}"""
+                # Telegram disabled for reversal signals (noise reduction)
+                break
+
+def check_atm_verdict_alert(df_summary, underlying_price):
+    """ATM verdict alert — display only, no Telegram."""
+    if df_summary is None or len(df_summary) == 0 or not underlying_price:
+        return
+
+    atm_data = df_summary[df_summary['Zone'] == 'ATM']
+    if atm_data.empty:
+        return
+
+    row = atm_data.iloc[0]
+    verdict = row.get('Verdict', 'Neutral')
+    atm_strike = row.get('Strike', 0)
+    bias_score = row.get('BiasScore', 0)
+
+    if verdict not in ['Strong Bullish', 'Strong Bearish']:
+        return
+
+    alert_key = f"atm_verdict_{atm_strike}_{verdict}"
+    if 'last_atm_verdict_alert' not in st.session_state:
+        st.session_state.last_atm_verdict_alert = None
+
+    if st.session_state.last_atm_verdict_alert == alert_key:
+        return
+
+    _g = row.get
+    ce_oi, pe_oi = _g('openInterest_CE', 0), _g('openInterest_PE', 0)
+    ce_chg_oi, pe_chg_oi = _g('changeinOpenInterest_CE', 0), _g('changeinOpenInterest_PE', 0)
+    is_bull = verdict == 'Strong Bullish'
+    emoji = "🟢🟢🟢" if is_bull else "🔴🔴🔴"
+    direction = "BULLISH" if is_bull else "BEARISH"
+    opt = "CE" if is_bull else "PE"
+    message = f"""{emoji} <b>ATM STRIKE STRONG {direction} ALERT</b> {emoji}
+📍 <b>Spot Price:</b> ₹{underlying_price:.2f}
+🎯 <b>ATM Strike:</b> {atm_strike}
+📊 <b>Verdict:</b> {verdict} (Score: {bias_score})
+<b>📈 BIAS BREAKDOWN:</b>
+• OI: {_g('OI_Bias','N/A')} • ChgOI: {_g('ChgOI_Bias','N/A')} • Volume: {_g('Volume_Bias','N/A')}
+• Delta Exp: {_g('DeltaExp','N/A')} • Gamma Exp: {_g('GammaExp','N/A')} • Pressure: {_g('PressureBias','N/A')}
+<b>📊 OI DATA:</b>
+• CE OI: {ce_oi/100000:.1f}L | PE OI: {pe_oi/100000:.1f}L
+• CE ΔOI: {ce_chg_oi/1000:.1f}K | PE ΔOI: {pe_chg_oi/1000:.1f}K
+<b>⚡ SIGNALS:</b>
+• Operator Entry: {_g('Operator_Entry','N/A')} • Scalp/Momentum: {_g('Scalp_Moment','N/A')}
+📋 <b>SUGGESTED REVIEW:</b> {atm_strike} {opt} | Manual verification required
+🕐 Time: {datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')}"""
+    st.session_state.last_atm_verdict_alert = alert_key
+
 def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
     if df_summary is None or df_summary.empty:
         return None
@@ -948,7 +1090,6 @@ def calculate_dealer_gex(df_summary, spot_price, contract_multiplier=25):
 
     except Exception as e:
         return None
-
 
 def check_gex_alert(gex_data, df_summary, underlying_price):
     if gex_data is None or 'gex_history' not in st.session_state:
@@ -1053,7 +1194,6 @@ def check_gex_alert(gex_data, df_summary, underlying_price):
     except Exception as e:
         pass
 
-
 def calculate_pcr_gex_confluence(pcr_value, gex_data, zone='ATM'):
     if gex_data is None:
         return "⚪ N/A", "No GEX Data", 0
@@ -1092,7 +1232,6 @@ def calculate_pcr_gex_confluence(pcr_value, gex_data, zone='ATM'):
     else:
         return "⚪ NEUTRAL", "Mixed Signals", 0
 
-
 def calculate_exact_time_to_expiry(expiry_date_str):
     try:
         expiry_date = datetime.strptime(expiry_date_str, "%Y-%m-%d").replace(hour=15, minute=30)
@@ -1122,7 +1261,6 @@ def get_iv_fallback(df, strike_price):
     except:
         return 15, 15
 
-
 def calculate_greeks(option_type, S, K, T, r, sigma):
     try:
         d1 = (math.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * math.sqrt(T))
@@ -1135,7 +1273,6 @@ def calculate_greeks(option_type, S, K, T, r, sigma):
         return round(delta, 4), round(gamma, 4), round(vega, 4), round(theta, 4), round(rho, 4)
     except:
         return 0, 0, 0, 0, 0
-
 
 def final_verdict(score):
     if score >= 4:
@@ -1160,7 +1297,6 @@ def delta_volume_bias(price, volume, chg_oi):
         return "Bearish"
     else:
         return "Neutral"
-
 
 def calculate_bid_ask_pressure(call_bid_qty, call_ask_qty, put_bid_qty, put_ask_qty):
     pressure = (call_bid_qty - call_ask_qty) + (put_ask_qty - put_bid_qty)
@@ -1188,7 +1324,6 @@ weights = {
     "PressureBias": 1,
 }
 
-
 def determine_level(row):
     ce_oi = row.get('openInterest_CE', 0)
     pe_oi = row.get('openInterest_PE', 0)
@@ -1198,7 +1333,6 @@ def determine_level(row):
         return "Resistance"
     else:
         return "Neutral"
-
 
 _CG = 'background-color: #90EE90; color: black'
 _CR = 'background-color: #FFB6C1; color: black'
@@ -1249,7 +1383,6 @@ def color_score(val):
 def highlight_atm_row(row):
     return [''] * len(row)
 
-
 def process_candle_data(data, interval):
     if not data or 'open' not in data:
         return pd.DataFrame()
@@ -1267,63 +1400,6 @@ def process_candle_data(data, interval):
     df['datetime'] = pd.to_datetime(df['timestamp'], unit='s').dt.tz_localize('UTC').dt.tz_convert(ist)
 
     return df
-
-
-def calculate_pcr_sr_level(pcr, reference_strike):
-    """PCR-based Support/Resistance level.
-    PCR ≤ 0.7 → Resistance offset below/above strike.
-    0.8–1.7   → Neutral.
-    PCR ≥ 1.8 → Support offset below/above strike.
-    """
-    pcr = round(pcr, 2)
-    if pcr <= 0.7:
-        # Map PCR → offset using linear interpolation between anchor points
-        anchors = [(0.3, -20), (0.4, -10), (0.5, 0), (0.6, 10), (0.7, 20)]
-        if pcr <= 0.3:
-            offset = -20
-        elif pcr >= 0.7:
-            offset = 20
-        else:
-            offset = -20
-            for i in range(len(anchors) - 1):
-                p0, o0 = anchors[i]; p1, o1 = anchors[i + 1]
-                if p0 <= pcr <= p1:
-                    offset = o0 + (pcr - p0) / (p1 - p0) * (o1 - o0)
-                    break
-        level = reference_strike + offset
-        interpretation = (
-            f"Resistance at ₹{level:.0f} (below ATM — strong cap)"  if offset < 0 else
-            f"Resistance at ₹{level:.0f} (above ATM — moderate cap)" if offset > 0 else
-            f"Resistance at ATM ₹{level:.0f}"
-        )
-        return {'type': 'Resistance 🔴', 'level': level, 'offset': offset, 'interpretation': interpretation}
-
-    elif pcr <= 1.7:  # 0.71–1.7 all neutral
-        return {'type': 'Neutral ⚪', 'level': reference_strike, 'offset': 0,
-                'interpretation': f"Neutral — no clear S/R offset (PCR {pcr:.2f})"}
-
-    else:  # pcr >= 1.8
-        anchors = [(1.8, -20), (2.0, -10), (2.5, 0), (3.0, 10), (3.5, 20)]
-        if pcr <= 1.8:
-            offset = -20
-        elif pcr >= 3.5:
-            offset = 20
-        else:
-            offset = -20
-            for i in range(len(anchors) - 1):
-                p0, o0 = anchors[i]; p1, o1 = anchors[i + 1]
-                if p0 <= pcr <= p1:
-                    offset = o0 + (pcr - p0) / (p1 - p0) * (o1 - o0)
-                    break
-        level = reference_strike + offset
-        interpretation = (
-            f"Support at ₹{level:.0f} (below ATM — strong floor)" if offset < 0 else
-            f"Support at ₹{level:.0f} (above ATM — elevated floor)" if offset > 0 else
-            f"Support at ATM ₹{level:.0f}"
-        )
-        return {'type': 'Support 🟢', 'level': level, 'offset': offset, 'interpretation': interpretation}
-
-
 
 def detect_candle_patterns(df, lookback=5):
     """Detect candlestick patterns from last few candles using Nifty price action chart."""
@@ -1786,5 +1862,4 @@ def detect_ltp_trap(df, delta_length=10, delta_thresh=1.5):
         'vwap': round(vwap, 2), 'delta_ma': round(delta_ma, 4),
         'price_vs_vwap': 'Above' if last_close > vwap else 'Below',
     }
-
 
