@@ -4483,6 +4483,22 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
     elif oi_sig == 'Volatile':
         reasons.append("OI Trend: Volatile (Both Covering)")
 
+    # 8b. Decapping / Depeg (intraday OI reduction at dominant wall)
+    _dc = getattr(st.session_state, '_decapping', None)
+    _dp = getattr(st.session_state, '_depeg', None)
+    if _dc:
+        if candle['direction'] == 'Bullish':
+            score += 1
+            reasons.append(f"DECAPPING ₹{_dc['strike']:.0f} CE OI -{_dc['shed_pct']:.1f}% → ceiling lifting (+1)")
+        else:
+            reasons.append(f"DECAPPING ₹{_dc['strike']:.0f} CE OI -{_dc['shed_pct']:.1f}% (ceiling weakening)")
+    if _dp:
+        if candle['direction'] == 'Bearish':
+            score -= 1
+            reasons.append(f"DEPEG ₹{_dp['strike']:.0f} PE OI -{_dp['shed_pct']:.1f}% → floor dropping (-1)")
+        else:
+            reasons.append(f"DEPEG ₹{_dp['strike']:.0f} PE OI -{_dp['shed_pct']:.1f}% (floor weakening)")
+
     # 9. VIDYA Trend (from Pine Script)
     vidya_data = calculate_vidya(df)
     if vidya_data['trend'] == 'Bullish' and candle['direction'] == 'Bullish':
@@ -5027,6 +5043,50 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
     return None
 
 
+def send_decapping_alert(underlying_price):
+    """Fire a Telegram alert when decapping (CE OI shedding at dominant resistance) or
+    depeg (PE OI shedding at dominant support) is detected. Cooldown: 10 min per strike."""
+    _dc = getattr(st.session_state, '_decapping', None)
+    _dp = getattr(st.session_state, '_depeg', None)
+    if not _dc and not _dp:
+        return None
+
+    _alerted = st.session_state.setdefault('_decap_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+    msgs = []
+
+    if _dc:
+        _key = f"decap_{_dc['strike']:.0f}"
+        _last = _alerted.get(_key)
+        if not _last or (now - _last).total_seconds() > 600:
+            msgs.append(
+                f"⚡ <b>DECAPPING ₹{_dc['strike']:.0f}</b>\n"
+                f"CE OI shed <b>{_dc['shed_pct']:.1f}%</b> "
+                f"({_dc['prev_oi_l']:.1f}L → {_dc['oi_l']:.1f}L)\n"
+                f"→ Ceiling at ₹{_dc['strike']:.0f} is <b>lifting</b> — breakout risk ↑\n"
+                f"Spot ₹{underlying_price:.0f} | {time_str}"
+            )
+            _alerted[_key] = now
+
+    if _dp:
+        _key = f"depeg_{_dp['strike']:.0f}"
+        _last = _alerted.get(_key)
+        if not _last or (now - _last).total_seconds() > 600:
+            msgs.append(
+                f"⚡ <b>DEPEG ₹{_dp['strike']:.0f}</b>\n"
+                f"PE OI shed <b>{_dp['shed_pct']:.1f}%</b> "
+                f"({_dp['prev_oi_l']:.1f}L → {_dp['oi_l']:.1f}L)\n"
+                f"→ Floor at ₹{_dp['strike']:.0f} is <b>dropping</b> — breakdown risk ↑\n"
+                f"Spot ₹{underlying_price:.0f} | {time_str}"
+            )
+            _alerted[_key] = now
+
+    if msgs:
+        return "\n\n".join(msgs)
+    return None
+
+
 def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
     """Detect and alert price rejection at ceiling (resistance) or floor (support).
 
@@ -5303,9 +5363,7 @@ Triple POC P1/P2/P3 clustered = very strong magnet
 VOB=Volume Order Blocks | HVP=High Volume Pivots
 IVR 🔥≥70%=sell favoured | 🧊≤30%=buy favoured
 Skew 🔴&gt;1.1=put fear | 🟢&lt;0.9=call greed | ATR14=SL size
-Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up | RISK-OFF=defensives up
-
-⚠️ CRITICAL INSTRUCTION: Do NOT reply with appreciation, feedback, suggestions, or commentary about this guide. Do NOT say "Great system" or offer improvements. Simply reply with exactly one line: <b>Guide received. Ready to analyze signals.</b> Nothing else."""
+Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up | RISK-OFF=defensives up"""
 
     return [part1, part2]
 
@@ -6286,6 +6344,22 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
+    # ── Decapping / Depeg block ──
+    _dc = getattr(st.session_state, '_decapping', None)
+    _dp = getattr(st.session_state, '_depeg', None)
+    _decap_lines = []
+    if _dc:
+        _decap_lines.append(
+            f"⚡ DECAPPING ₹{_dc['strike']:.0f} CE OI -{_dc['shed_pct']:.1f}% "
+            f"({_dc['prev_oi_l']:.1f}L→{_dc['oi_l']:.1f}L) → ceiling lifting"
+        )
+    if _dp:
+        _decap_lines.append(
+            f"⚡ DEPEG ₹{_dp['strike']:.0f} PE OI -{_dp['shed_pct']:.1f}% "
+            f"({_dp['prev_oi_l']:.1f}L→{_dp['oi_l']:.1f}L) → floor dropping"
+        )
+    decap_block = ("\n" + "\n".join(_decap_lines)) if _decap_lines else ""
+
     # ── Part 1: Signal + Direction + S/R + OI Positioning ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
     #         future swing → S/R analysis → OI positioning (winding + option chain verdict)
@@ -6295,7 +6369,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
 📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
-📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
+📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}{decap_block}
 
 <b>📍 DIRECTION</b>
 {swing_block}{capping_block}
@@ -8590,6 +8664,58 @@ def main():
                         except Exception:
                             pass
                     st.session_state._sa_result = sa_result
+                    # ── Decapping / Depeg: track OI across snapshots ──
+                    try:
+                        _adf2 = sa_result.get('analysis_df')
+                        if _adf2 is not None and not _adf2.empty and sa_underlying:
+                            _prev_snap = dict(getattr(st.session_state, '_prev_strike_oi', {}))
+                            _decap = None
+                            _depeg = None
+                            # Dominant resistance = highest CE_OI above spot
+                            _r_df = _adf2[_adf2['Strike'] > sa_underlying].sort_values('CE_OI', ascending=False)
+                            if not _r_df.empty:
+                                _rr = _r_df.iloc[0]
+                                _rsk = str(int(_rr['Strike']))
+                                _cur_ce = float(_rr['CE_OI'])
+                                _prev_ce = _prev_snap.get(_rsk, {}).get('ce_oi')
+                                if _prev_ce and _cur_ce < _prev_ce and _prev_ce > 50000:
+                                    _shed = (_prev_ce - _cur_ce) / _prev_ce * 100
+                                    _decap = {
+                                        'strike': float(_rr['Strike']),
+                                        'shed_pct': _shed,
+                                        'oi_l': _cur_ce / 100000,
+                                        'prev_oi_l': _prev_ce / 100000,
+                                        'activity': str(_rr.get('Call_Activity', '')),
+                                    }
+                            # Dominant support = highest PE_OI below spot
+                            _s_df = _adf2[_adf2['Strike'] < sa_underlying].sort_values('PE_OI', ascending=False)
+                            if not _s_df.empty:
+                                _ss = _s_df.iloc[0]
+                                _ssk = str(int(_ss['Strike']))
+                                _cur_pe = float(_ss['PE_OI'])
+                                _prev_pe = _prev_snap.get(_ssk, {}).get('pe_oi')
+                                if _prev_pe and _cur_pe < _prev_pe and _prev_pe > 50000:
+                                    _shed = (_prev_pe - _cur_pe) / _prev_pe * 100
+                                    _depeg = {
+                                        'strike': float(_ss['Strike']),
+                                        'shed_pct': _shed,
+                                        'oi_l': _cur_pe / 100000,
+                                        'prev_oi_l': _prev_pe / 100000,
+                                        'activity': str(_ss.get('Put_Activity', '')),
+                                    }
+                            # Update full snapshot for all strikes
+                            _new_snap = {}
+                            for _, _row2 in _adf2.iterrows():
+                                _sk2 = str(int(_row2['Strike']))
+                                _new_snap[_sk2] = {
+                                    'ce_oi': float(_row2.get('CE_OI', 0)),
+                                    'pe_oi': float(_row2.get('PE_OI', 0)),
+                                }
+                            st.session_state._prev_strike_oi = _new_snap
+                            st.session_state._decapping = _decap
+                            st.session_state._depeg = _depeg
+                    except Exception:
+                        pass
                     analysis_df = sa_result['analysis_df']
                     # Market Bias Banner
                     bias = sa_result['market_bias']
@@ -8612,6 +8738,21 @@ def main():
                     # Bias signals
                     for sig in sa_result['bias_signals']:
                         st.caption(f"• {sig}")
+                    # Decapping / Depeg alert banners
+                    _dc = getattr(st.session_state, '_decapping', None)
+                    _dp = getattr(st.session_state, '_depeg', None)
+                    if _dc:
+                        st.markdown(
+                            f'<div style="background:#ff990020;border:2px solid #ff9900;border-radius:8px;padding:10px 14px;margin:6px 0;">'
+                            f'⚡ <b>DECAPPING ₹{_dc["strike"]:.0f}</b> — CE OI shed <b>{_dc["shed_pct"]:.1f}%</b> '
+                            f'({_dc["prev_oi_l"]:.1f}L → {_dc["oi_l"]:.1f}L) → ceiling lifting → breakout risk ↑'
+                            f'</div>', unsafe_allow_html=True)
+                    if _dp:
+                        st.markdown(
+                            f'<div style="background:#ff444420;border:2px solid #ff4444;border-radius:8px;padding:10px 14px;margin:6px 0;">'
+                            f'⚡ <b>DEPEG ₹{_dp["strike"]:.0f}</b> — PE OI shed <b>{_dp["shed_pct"]:.1f}%</b> '
+                            f'({_dp["prev_oi_l"]:.1f}L → {_dp["oi_l"]:.1f}L) → floor dropping → breakdown risk ↑'
+                            f'</div>', unsafe_allow_html=True)
                     # Top Resistance & Support
                     sa_col1, sa_col2 = st.columns(2)
                     with sa_col1:
@@ -10182,6 +10323,13 @@ def main():
                         if _sa_c is not None:
                             _h = send_capping_at_sr_alert(_sa_c, option_data['underlying'])
                             if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
+
+                    # Decapping / Depeg alert
+                    try:
+                        _h = send_decapping_alert(option_data['underlying'])
+                        if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
