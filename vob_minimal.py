@@ -5444,14 +5444,17 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 f"  Buy Vol: {_fmt_vol(_buy_v)} | Sell Vol: {_fmt_vol(_sell_v)}\n"
                 f"  Ratio: {_d_rat:.2f} | Divergences: {_divg}\n"
             )
-            # Delta at S/R zones: find candles where close is within 30 pts of any S/R level
-            _sr_levels = (result.get('resistance_levels', [])[:2] +
-                          result.get('support_levels', [])[:2])
+            # Delta at VAH / VAL / POC zones from Money Flow Profile
+            _mf = getattr(st.session_state, '_money_flow_data', None)
             _vd_df = _vd.get('df')
-            if _vd_df is not None and not _vd_df.empty and _sr_levels:
+            if _vd_df is not None and not _vd_df.empty and _mf:
+                _poc = _mf.get('poc_price', 0)
+                _vah = _mf.get('value_area_high', 0)
+                _val = _mf.get('value_area_low', 0)
+                _mf_levels = [(l, n) for l, n in [(_poc,'POC'), (_vah,'VAH'), (_val,'VAL')] if l]
                 _zone_lines = []
-                for _lvl in _sr_levels:
-                    _near = _vd_df[abs(_vd_df['close'] - _lvl) <= 30].tail(2)
+                for _lvl, _lbl in _mf_levels:
+                    _near = _vd_df[abs(_vd_df['close'] - _lvl) <= 25].tail(2)
                     for _, _c in _near.iterrows():
                         _cd = int(_c.get('delta', 0))
                         try:
@@ -5459,13 +5462,12 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                         except Exception:
                             _ct = str(_c.get('datetime', ''))[-13:-8]
                         _ce = '🟢' if _cd > 0 else '🔴'
-                        _typ = 'R' if _lvl in result.get('resistance_levels', []) else 'S'
                         _zone_lines.append(
-                            f"  {_ce} ₹{_lvl:.0f}({_typ}) @{_ct} "
+                            f"  {_ce} {_lbl}₹{_lvl:.0f} @{_ct} "
                             f"Δ:{_fmt_vol(_cd)} B:{_fmt_vol(int(_c.get('buy_volume',0)))} S:{_fmt_vol(int(_c.get('sell_volume',0)))}"
                         )
                 if _zone_lines:
-                    vol_delta_block += "<b>  Delta at S/R Zones:</b>\n" + "\n".join(_zone_lines[:4]) + "\n"
+                    vol_delta_block += "<b>  Delta at VAH/VAL/POC:</b>\n" + "\n".join(_zone_lines[:6]) + "\n"
     except Exception:
         vol_delta_block = ""
 
