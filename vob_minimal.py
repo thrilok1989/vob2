@@ -3653,35 +3653,86 @@ def detect_candle_patterns(df, lookback=5):
     }
 
 def detect_order_blocks(df, lookback=20):
-    """Detect bullish and bearish order blocks."""
-    if df is None or len(df) < lookback:
-        return {'bullish_ob': None, 'bearish_ob': None}
-    recent = df.tail(lookback).copy()
-    bullish_ob = None
-    bearish_ob = None
+    """LuxAlgo Order Block Detector (Python port).
 
-    for i in range(1, len(recent) - 2):
-        curr = recent.iloc[i]
-        nxt = recent.iloc[i + 1]
-        nxt2 = recent.iloc[i + 2] if i + 2 < len(recent) else None
-        # Bullish OB: last red candle before strong up move
-        is_red = curr['close'] < curr['open']
-        if is_red and nxt['close'] > nxt['open']:
-            up_move = nxt['close'] - curr['low']
-            avg_range = recent['high'].mean() - recent['low'].mean()
-            if up_move > avg_range * 1.5:
-                bullish_ob = {'low': curr['low'], 'high': curr['high'],
-                              'time': recent.index[i] if hasattr(recent.index[i], 'strftime') else i}
-        # Bearish OB: last green candle before strong down move
-        is_green = curr['close'] > curr['open']
-        if is_green and nxt['close'] < nxt['open']:
-            down_move = curr['high'] - nxt['close']
-            avg_range = recent['high'].mean() - recent['low'].mean()
-            if down_move > avg_range * 1.5:
-                bearish_ob = {'low': curr['low'], 'high': curr['high'],
-                              'time': recent.index[i] if hasattr(recent.index[i], 'strftime') else i}
+    Bullish OB: volume pivot high during upswing → demand zone (support)
+    Bearish OB: volume pivot high during downswing → supply zone (resistance)
+    Mitigation: OB is removed when price wicks through the zone bottom/top.
+    Returns up to 3 active (non-mitigated) OBs of each type, most recent first.
+    """
+    length = 5
+    ext_last = 3
+    if df is None or len(df) < length * 2 + 2:
+        return {'bullish_obs': [], 'bearish_obs': [],
+                'bullish_ob': None, 'bearish_ob': None}
 
-    return {'bullish_ob': bullish_ob, 'bearish_ob': bearish_ob}
+    df2 = df.reset_index(drop=True).copy()
+    n = len(df2)
+    h  = df2['high'].values.astype(float)
+    lo = df2['low'].values.astype(float)
+    c  = df2['close'].values.astype(float)
+    v  = df2['volume'].values.astype(float)
+    hl2 = (h + lo) / 2.0
+
+    # ── Oscillator: tracks whether we're in an upswing (os=1) or downswing (os=0) ──
+    # os=0 when high[length] bars ago > highest(high, length) now → was higher → downswing
+    # os=1 when low[length] bars ago  < lowest(low,  length) now → was lower  → upswing
+    os = np.zeros(n, dtype=int)
+    for i in range(length, n):
+        win_h = h[i - length + 1: i + 1]
+        win_l = lo[i - length + 1: i + 1]
+        if len(win_h) == 0:
+            os[i] = os[i - 1]
+            continue
+        upper = np.max(win_h)
+        lower = np.min(win_l)
+        if h[i - length] > upper:
+            os[i] = 0
+        elif lo[i - length] < lower:
+            os[i] = 1
+        else:
+            os[i] = os[i - 1] if i > 0 else 0
+
+    # ── Volume pivot high: volume[pivot_idx] is max in window [pivot_idx-length .. pivot_idx+length] ──
+    bull_obs, bear_obs = [], []
+    for i in range(length * 2, n):
+        pivot_idx = i - length
+        v_win = v[max(0, pivot_idx - length): min(n, pivot_idx + length + 1)]
+        if len(v_win) == 0 or v[pivot_idx] == 0:
+            continue
+        if v[pivot_idx] < np.max(v_win):
+            continue
+        # Volume pivot confirmed — check direction at bar i
+        bar_time = df2.iloc[pivot_idx].get('datetime', pivot_idx)
+        if os[i] == 1:     # upswing → bullish OB (demand zone below)
+            bull_obs.append({'low': lo[pivot_idx], 'high': hl2[pivot_idx],
+                             'avg': (lo[pivot_idx] + hl2[pivot_idx]) / 2,
+                             'bar_idx': pivot_idx, 'time': bar_time, 'type': 'bullish'})
+        elif os[i] == 0:   # downswing → bearish OB (supply zone above)
+            bear_obs.append({'low': hl2[pivot_idx], 'high': h[pivot_idx],
+                             'avg': (hl2[pivot_idx] + h[pivot_idx]) / 2,
+                             'bar_idx': pivot_idx, 'time': bar_time, 'type': 'bearish'})
+
+    # ── Mitigation: remove OBs where price has already wicked through ──
+    target_bull = np.min(lo[-length:]) if len(lo) >= length else lo[-1]   # lowest wick
+    target_bear = np.max(h[-length:])  if len(h)  >= length else h[-1]    # highest wick
+    active_bull = [ob for ob in bull_obs if target_bull >= ob['low']]     # not yet broken below
+    active_bear = [ob for ob in bear_obs if target_bear <= ob['high']]    # not yet broken above
+
+    # Keep most recent ext_last
+    active_bull = sorted(active_bull, key=lambda x: x['bar_idx'], reverse=True)[:ext_last]
+    active_bear = sorted(active_bear, key=lambda x: x['bar_idx'], reverse=True)[:ext_last]
+
+    # Backward-compat: expose closest single OB as bullish_ob / bearish_ob
+    closest_bull = active_bull[0] if active_bull else None
+    closest_bear = active_bear[0] if active_bear else None
+
+    return {
+        'bullish_obs':  active_bull,
+        'bearish_obs':  active_bear,
+        'bullish_ob':   closest_bull,
+        'bearish_ob':   closest_bear,
+    }
 
 def detect_volume_spike(df, lookback=5):
     """Check if current candle has volume spike vs recent average."""
@@ -5087,6 +5138,43 @@ def send_decapping_alert(underlying_price):
     return None
 
 
+def send_ob_zone_alert(ob_data, underlying_price, proximity_pts=30):
+    """Fire a Telegram alert when price enters an active Order Block zone. Cooldown: 15 min per zone."""
+    if not ob_data:
+        return None
+    _alerted = st.session_state.setdefault('_ob_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+    msgs = []
+
+    for _obs, _emoji, _label, _action in [
+        (ob_data.get('bullish_obs', []), '🟩', 'BULLISH', 'BUY — demand zone holding'),
+        (ob_data.get('bearish_obs', []), '🟥', 'BEARISH', 'SELL — supply zone holding'),
+    ]:
+        for _ob in _obs:
+            _ob_lo, _ob_hi, _ob_avg = _ob['low'], _ob['high'], _ob['avg']
+            # Price inside or within proximity_pts of the OB zone
+            _inside = _ob_lo <= underlying_price <= _ob_hi
+            _near   = abs(underlying_price - _ob_avg) <= proximity_pts
+            if not (_inside or _near):
+                continue
+            _key = f"ob_{_label}_{_ob_lo:.0f}_{_ob_hi:.0f}"
+            _last = _alerted.get(_key)
+            if _last and (now - _last).total_seconds() < 900:
+                continue
+            _status = '⚡ Price INSIDE zone' if _inside else f'⚡ Price {abs(underlying_price - _ob_avg):.0f}pts from zone'
+            msgs.append(
+                f"{_emoji} <b>ORDER BLOCK DETECTED — {_label} OB</b>\n"
+                f"Zone: ₹{_ob_lo:.0f} – ₹{_ob_hi:.0f} | Avg ₹{_ob_avg:.0f}\n"
+                f"{_status} | Spot ₹{underlying_price:.0f}\n"
+                f"Action: {_action}\n"
+                f"{time_str}"
+            )
+            _alerted[_key] = now
+
+    return "\n\n".join(msgs) if msgs else None
+
+
 def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
     """Detect and alert price rejection at ceiling (resistance) or floor (support).
 
@@ -6341,8 +6429,24 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob = result.get('order_blocks', {})
     _net_gex = gex.get('net_gex', 0)
     _gex_action = "→sell ceiling/buy floor" if _net_gex > 0 else "→follow momentum" if _net_gex < 0 else "→wait"
-    _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
-    _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
+    # ── Order Block block for msg_part1 ──
+    _ob_lines = []
+    for _bobs, _emoji, _label in [
+        (_ob.get('bullish_obs', []), '🟩', 'Demand'),
+        (_ob.get('bearish_obs', []), '🟥', 'Supply'),
+    ]:
+        for _b in _bobs[:2]:
+            _dist = abs(underlying_price - _b['avg'])
+            _b_time = ''
+            try:
+                _b_time = f" @{pd.to_datetime(_b['time']).strftime('%H:%M')}"
+            except Exception:
+                pass
+            _ob_lines.append(
+                f"{_emoji} OB {_label} ₹{_b['low']:.0f}-₹{_b['high']:.0f} "
+                f"(avg ₹{_b['avg']:.0f}, {_dist:.0f}pts away{_b_time})"
+            )
+    ob_block = ("\n🔲 <b>ORDER BLOCKS (LuxAlgo):</b>\n" + "\n".join(_ob_lines) + "\n") if _ob_lines else ""
 
     # ── Decapping / Depeg block ──
     _dc = getattr(st.session_state, '_decapping', None)
@@ -6372,7 +6476,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}{decap_block}
 
 <b>📍 DIRECTION</b>
-{swing_block}{capping_block}
+{swing_block}{ob_block}{capping_block}
 <b>📉 MARKET DEPTH</b>{depth_block}
 <b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
 <b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}"""
@@ -6795,8 +6899,18 @@ def _render_vol_delta_chart():
     """Render Buy Volume vs Sell Volume over time, same style as per-strike OI chart."""
     import plotly.graph_objects as go
     vd = getattr(st.session_state, '_volume_delta_data', None)
+    # Fallback: compute from _df_5m if session data not yet populated
     if vd is None or vd.get('df') is None:
-        st.info("⚡ Volume Delta chart builds after the first chart load. Please wait...")
+        _fallback_df = getattr(st.session_state, '_df_5m', None)
+        if _fallback_df is not None and not _fallback_df.empty:
+            try:
+                vd = calculate_volume_delta(_fallback_df)
+                if vd:
+                    st.session_state._volume_delta_data = vd
+            except Exception:
+                vd = None
+    if vd is None or vd.get('df') is None:
+        st.info("⚡ Volume Delta builds after first chart load — refresh once to populate.")
         return
     try:
         df = vd['df'].copy()
@@ -7634,10 +7748,10 @@ def main():
 
     # Fill Per-Strike OI chart right below auto trade section
     with _per_strike_oi_container:
-        with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
-            _render_per_strike_oi_top()
         with st.expander("⚡ Buy Volume vs Sell Volume (Delta Chart)", expanded=True):
             _render_vol_delta_chart()
+        with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
+            _render_per_strike_oi_top()
 
     # Fill Alignment + Index/Stock Capping below Per-Strike OI
     with _align_cap_container:
@@ -10333,6 +10447,14 @@ def main():
                     except Exception:
                         pass
 
+                    # Order Block zone alert
+                    try:
+                        _ob_data = master.get('order_blocks', {})
+                        _h = send_ob_zone_alert(_ob_data, option_data['underlying'])
+                        if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
+
                     # Rejection / bounce at strongest wall
                     try:
                         _h = send_rejection_alert(
@@ -10435,6 +10557,23 @@ def main():
                             st.markdown(f"🟥 ₹{r:.0f}")
                         for s in master['support_levels'][:3]:
                             st.markdown(f"🟩 ₹{s:.0f}")
+
+                        st.markdown("#### 🔲 Order Blocks (LuxAlgo)")
+                        _ob_ui = master.get('order_blocks', {})
+                        _current_p = option_data.get('underlying', 0)
+                        for _bobs, _em, _lbl in [
+                            (_ob_ui.get('bullish_obs', []), '🟩', 'Demand'),
+                            (_ob_ui.get('bearish_obs', []), '🟥', 'Supply'),
+                        ]:
+                            for _bb in _bobs[:2]:
+                                _dist = abs(_current_p - _bb['avg'])
+                                _inside = _bb['low'] <= _current_p <= _bb['high']
+                                _flag = ' ⚡IN ZONE' if _inside else f" {_dist:.0f}pts"
+                                st.markdown(
+                                    f'{_em} **{_lbl}** ₹{_bb["low"]:.0f}–₹{_bb["high"]:.0f}'
+                                    f'<span style="font-size:11px;color:#aaa;">{_flag}</span>',
+                                    unsafe_allow_html=True
+                                )
 
                     with ms_col3:
                         st.markdown("#### 📉 VIX")
