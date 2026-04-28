@@ -404,7 +404,8 @@ def render_master_signal_image(result, underlying_price, option_data=None):
         t(L+0.01, y-0.004, 'ALIGNMENT  10m | 1h | Pattern', c=CYAN, sz=8.5, w='bold')
         SN = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
               'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
-              'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+              'CRUDE OIL':'CRUDE','USD/INR':'INR',
+              'S&P 500':'SP500','JAPAN 225':'JP225','HANG SENG':'HSI','UK 100':'UK100'}
         PS = {'No Pattern':'NP','Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
               'Hammer':'Ham','Shooting Star':'ShStr','Tweezer Top':'TwTop',
               'Tweezer Bottom':'TwBot','Strong Green Candle':'SGC','Strong Red Candle':'SRC',
@@ -3911,6 +3912,87 @@ def _fetch_yf_intraday(symbol: str, interval: str = "1m", period: str = "1d", pr
     except Exception:
         return None
 
+def compute_sector_rotation():
+    """Fetch NSE sector indices via yfinance, compute 10m + 1h bias and rank by performance."""
+    _sectors = [
+        ('AUTO',     '^CNXAUTO'),
+        ('PHARMA',   '^CNXPHARMA'),
+        ('FMCG',     '^CNXFMCG'),
+        ('METAL',    '^CNXMETAL'),
+        ('REALTY',   '^CNXREALTY'),
+        ('ENERGY',   '^CNXENERGY'),
+        ('PSU BANK', '^CNXPSUBANK'),
+        ('INFRA',    '^CNXINFRA'),
+        ('MEDIA',    '^CNXMEDIA'),
+        ('IT',       '^CNXIT'),
+        ('BANK',     '^NSEBANK'),
+    ]
+    results = []
+    for sec_name, yf_sym in _sectors:
+        try:
+            raw = _fetch_yf_intraday(yf_sym, interval="1m", period="2d")
+            if not raw or 'open' not in raw:
+                continue
+            df = process_candle_data(raw, "1")
+            if df.empty:
+                continue
+            ltp = float(df.iloc[-1]['close'])
+            # Day open = first candle of today
+            import pytz as _ptz
+            _ist = _ptz.timezone('Asia/Kolkata')
+            _today = datetime.now(_ist).date()
+            df_today = df[df['datetime'].dt.date == _today]
+            if df_today.empty:
+                df_today = df.tail(200)
+            day_open = float(df_today.iloc[0]['open'])
+            day_chg_pct = (ltp - day_open) / day_open * 100 if day_open else 0
+
+            # 10m sentiment: last 10 candles
+            def _sent(sub):
+                if len(sub) < 2: return 'N/A'
+                c0, c1 = sub.iloc[0]['close'], sub.iloc[-1]['close']
+                if c1 > c0 * 1.0005: return 'Bullish'
+                if c1 < c0 * 0.9995: return 'Bearish'
+                return 'Neutral'
+            s10 = _sent(df_today.tail(10))
+            # 1h sentiment: last 60 candles
+            s1h = _sent(df_today.tail(60))
+
+            results.append({
+                'name': sec_name, 'ltp': ltp,
+                'day_chg_pct': day_chg_pct,
+                's10': s10, 's1h': s1h,
+            })
+        except Exception:
+            pass
+
+    if not results:
+        return None
+
+    results.sort(key=lambda x: x['day_chg_pct'], reverse=True)
+    leading  = [r for r in results if r['day_chg_pct'] > 0][:3]
+    lagging  = [r for r in results if r['day_chg_pct'] < 0][-3:][::-1]
+    # Rotation bias: if cyclicals (METAL/AUTO/REALTY/BANK/ENERGY) top = risk-on
+    cyclicals = {'AUTO', 'METAL', 'REALTY', 'BANK', 'ENERGY', 'INFRA'}
+    defensives = {'PHARMA', 'FMCG', 'IT', 'MEDIA'}
+    top3_names = {r['name'] for r in leading}
+    cyc_count = len(top3_names & cyclicals)
+    def_count = len(top3_names & defensives)
+    if cyc_count >= 2:
+        rotation_bias = 'RISK-ON 🟢 (cyclicals leading → bullish for NIFTY)'
+    elif def_count >= 2:
+        rotation_bias = 'RISK-OFF 🔴 (defensives leading → cautious/bearish)'
+    else:
+        rotation_bias = 'MIXED ⚪ (no clear rotation)'
+
+    return {
+        'leading': leading,
+        'lagging': lagging,
+        'all': results,
+        'rotation_bias': rotation_bias,
+    }
+
+
 def fetch_alignment_data(api):
     """Fetch candle data for SENSEX, BANKNIFTY, NIFTY IT, RELIANCE, ICICI, VIX.
     Detect candle patterns, compute 10m/1h/4h sentiment for each."""
@@ -3928,6 +4010,10 @@ def fetch_alignment_data(api):
         ('GOLD', None, None, None, 'GC=F'),
         ('CRUDE OIL', None, None, None, 'CL=F'),
         ('USD/INR', None, None, None, 'INR=X'),
+        ('S&P 500', None, None, None, 'ES=F'),       # E-mini S&P futures (24h)
+        ('JAPAN 225', None, None, None, 'NKD=F'),    # CME E-mini Nikkei futures (24h)
+        ('HANG SENG', None, None, None, '^HSI'),     # Cash (best available on yfinance)
+        ('UK 100', None, None, None, '^FTSE'),       # Cash (best available on yfinance)
     ]
     alignment = {}
     for name, sec_id, seg, inst, yf_symbol in tickers:
@@ -4104,6 +4190,13 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
             if alignment:
                 st.session_state.alignment_data = alignment
                 st.session_state.alignment_last_fetch = ist_now
+            # Fetch sector rotation alongside alignment (same cadence)
+            try:
+                _sr = compute_sector_rotation()
+                if _sr:
+                    st.session_state._sector_rotation = _sr
+            except Exception:
+                pass
         alignment = st.session_state.alignment_data
 
         # Also add NIFTY's own sentiment from the main df (5-min chart)
@@ -5124,6 +5217,7 @@ Range: -5 (strong bear) → +5 (strong bull) | 🟥=Bear 🟩=Bull ⚪=Neutral
 <b>🌍 ALIGNMENT CODES (decode signal alignment block)</b>
 N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
 REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
+SP500=S&amp;P500 JP225=Japan225 HSI=HangSeng UK100=FTSE100
 Timeframes: 10m|1h|4h|1D|4D|Pattern → 3+ same = confirmed trend
 NP=NoPattern Ham=Hammer ShStar=ShootingStar
 SGC=StrongGreen SRC=StrongRed BullEng/BearEng BullHar/BearHar
@@ -5154,7 +5248,14 @@ Parallel Bear = PE unwind + CE build → strong SELL signal
 <b>📡 MARKET MODE (live GEX in every signal)</b>
 GEX +ve(+XXL) → RANGE → sell ceiling / buy floor
 GEX -ve(-XXL) → TREND → follow momentum, no counter
-Confirm with VIDYA direction | 🧊 No depth wall = No trade"""
+Confirm with VIDYA direction | 🧊 No depth wall = No trade
+
+<b>🔄 SECTOR ROTATION (in every signal)</b>
+RISK-ON 🟢 = cyclicals lead (AUTO/METAL/REALTY/BANK/ENERGY) → bullish for NIFTY
+RISK-OFF 🔴 = defensives lead (PHARMA/FMCG/IT/MEDIA) → cautious/bearish for NIFTY
+MIXED ⚪ = no clear rotation → wait for alignment
+10m/1h = last 10/60 candle bias per sector (🟢Bullish ⚪Neutral 🔴Bearish)
+👉 RISK-ON + GEX +ve → buy floor | RISK-OFF + GEX -ve → sell ceiling"""
 
     part2 = """🟡 <b>NIFTY SIGNAL GUIDE (REFERENCE)</b>
 
@@ -5202,6 +5303,7 @@ Triple POC P1/P2/P3 clustered = very strong magnet
 VOB=Volume Order Blocks | HVP=High Volume Pivots
 IVR 🔥≥70%=sell favoured | 🧊≤30%=buy favoured
 Skew 🔴&gt;1.1=put fear | 🟢&lt;0.9=call greed | ATR14=SL size
+Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up | RISK-OFF=defensives up
 
 ⚠️ CRITICAL INSTRUCTION: Do NOT reply with appreciation, feedback, suggestions, or commentary about this guide. Do NOT say "Great system" or offer improvements. Simply reply with exactly one line: <b>Guide received. Ready to analyze signals.</b> Nothing else."""
 
@@ -5318,7 +5420,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
                     'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR',
+                    'S&P 500':'S&P 500','JAPAN 225':'JAPAN 225','HANG SENG':'HANG SENG','UK 100':'UK 100'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
@@ -5331,7 +5434,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     }
     def _ae(s): return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
     align_parts = []
-    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
+    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR','S&P 500','JAPAN 225','HANG SENG','UK 100']:
         data = result.get('alignment', {}).get(name)
         if data is None:
             continue
@@ -6027,6 +6130,31 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     _mi_bias_block = ("\n<b>📡 Index/Stock Capping:</b>\n" + "\n".join(_mi_lines) + "\n") if _mi_lines else ""
 
+    # ── Sector Rotation Block ──
+    sector_rotation_block = ""
+    try:
+        _sr = getattr(st.session_state, '_sector_rotation', None)
+        if _sr:
+            def _se(s): return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
+            _leading  = _sr.get('leading', [])
+            _lagging  = _sr.get('lagging', [])
+            _rbias    = _sr.get('rotation_bias', '—')
+            _lead_str = " ".join(
+                f"{_se(r['s10'])}{r['name']}{r['day_chg_pct']:+.1f}%(10m{_se(r['s10'])} 1h{_se(r['s1h'])})"
+                for r in _leading
+            )
+            _lag_str  = " ".join(
+                f"{_se(r['s10'])}{r['name']}{r['day_chg_pct']:+.1f}%(10m{_se(r['s10'])} 1h{_se(r['s1h'])})"
+                for r in _lagging
+            )
+            sector_rotation_block = (
+                f"\n<b>🔄 SECTOR ROTATION:</b> {_rbias}\n"
+                f"  Lead: {_lead_str if _lead_str else '—'}\n"
+                f"  Lag:  {_lag_str if _lag_str else '—'}\n"
+            )
+    except Exception:
+        sector_rotation_block = ""
+
     # ── Comprehensive S/R Block — all data per level ──
     capping_block = ""
     try:
@@ -6183,17 +6311,18 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 <b>📊 MARKET CONTEXT</b>{market_ctx_block}
 <b>⚡ VOLUME DELTA</b>{vol_delta_block}
 <b>📈 VPFR / POC / MONEY FLOW</b>{vpfr_block}{poc_block}{mf_block}
-<b>🔄 PRICE STRUCTURE</b>{price_action_block}
+<b>🔄 PRICE STRUCTURE</b>{price_action_block}{sector_rotation_block}
 <b>🌍 INDICES &amp; STOCKS</b>
 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow (POC/VAH/VAL), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow (POC/VAH/VAL), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
 GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
 1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
-3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR — bias + Cap/Sup/Range
-4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
+3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR / S&P 500 futures / JAPAN 225 / HANG SENG / UK 100 — bias + Cap/Sup/Range
+4. Sector Rotation: which sectors leading/lagging (10m+1h bias) → is it RISK-ON (cyclicals up) or RISK-OFF (defensives up)?
+5. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
 CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
 
     message = msg_part1  # used for Gemini analysis context
@@ -6441,7 +6570,8 @@ def _render_alignment_capping_top():
 
     _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
                     'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR',
+                    'S&P 500':'S&P 500','JAPAN 225':'JAPAN 225','HANG SENG':'HANG SENG','UK 100':'UK 100'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
@@ -6466,7 +6596,7 @@ def _render_alignment_capping_top():
                     st.info("No alignment data yet.")
                 else:
                     _rows = []
-                    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
+                    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR','S&P 500','JAPAN 225','HANG SENG','UK 100']:
                         data = _alignment.get(name)
                         if data is None:
                             continue
@@ -6562,6 +6692,29 @@ def _render_alignment_capping_top():
                                 st.markdown("**🟢 Support:** " + " | ".join([f"₹{int(r['Strike'])}" for _, r in _top_s.iterrows()]))
                 except Exception as _e:
                     st.caption(f"Capping render error: {_e}")
+
+    # ── Sector Rotation panel (full width below alignment+capping) ──
+    _sr_data = getattr(st.session_state, '_sector_rotation', None)
+    with st.expander("🔄 Sector Rotation & Bias (10m | 1h)", expanded=False):
+        if _sr_data is None:
+            st.info("Sector rotation data loads with alignment (every 2 min).")
+        else:
+            _bias = _sr_data.get('rotation_bias', '—')
+            st.markdown(f"**Rotation Bias:** {_bias}")
+            _all = _sr_data.get('all', [])
+            if _all:
+                _s10_e = lambda s: '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
+                _rows_md = []
+                for r in _all:
+                    _chg = r.get('day_chg_pct', 0)
+                    _chg_e = '🟢' if _chg > 0 else '🔴' if _chg < 0 else '⚪'
+                    _rows_md.append(
+                        f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
+                        f'<b style="display:inline-block;min-width:70px;">{r["name"]}</b> '
+                        f'{_chg_e}{_chg:+.2f}% &nbsp; 10m:{_s10_e(r["s10"])} 1h:{_s10_e(r["s1h"])}'
+                        f'</div>'
+                    )
+                st.markdown("\n".join(_rows_md), unsafe_allow_html=True)
 
 
 def _render_vol_delta_chart():
@@ -10349,7 +10502,7 @@ def main():
                         st.markdown("### 🕯 Candle Patterns Across Indices")
                         pattern_rows = []
                         # Define display order
-                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
+                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR', 'S&P 500', 'JAPAN 225', 'HANG SENG', 'UK 100']
                         for name in display_order:
                             ad = align_data.get(name)
                             if ad is None:
@@ -10516,7 +10669,7 @@ def main():
                         st.caption("Direct = moves WITH Nifty | Inverse = moves AGAINST Nifty (when inverse falls, Nifty rises)")
 
                         # Classification
-                        direct_instruments = ['SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'GOLD']
+                        direct_instruments = ['SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'GOLD', 'S&P 500', 'JAPAN 225', 'HANG SENG', 'UK 100']
                         inverse_instruments = ['INDIA VIX', 'CRUDE OIL', 'USD/INR']
 
                         nifty_data = align_data.get('NIFTY 50')
