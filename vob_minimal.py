@@ -5043,6 +5043,50 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
     return None
 
 
+def send_decapping_alert(underlying_price):
+    """Fire a Telegram alert when decapping (CE OI shedding at dominant resistance) or
+    depeg (PE OI shedding at dominant support) is detected. Cooldown: 10 min per strike."""
+    _dc = getattr(st.session_state, '_decapping', None)
+    _dp = getattr(st.session_state, '_depeg', None)
+    if not _dc and not _dp:
+        return None
+
+    _alerted = st.session_state.setdefault('_decap_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+    msgs = []
+
+    if _dc:
+        _key = f"decap_{_dc['strike']:.0f}"
+        _last = _alerted.get(_key)
+        if not _last or (now - _last).total_seconds() > 600:
+            msgs.append(
+                f"⚡ <b>DECAPPING ₹{_dc['strike']:.0f}</b>\n"
+                f"CE OI shed <b>{_dc['shed_pct']:.1f}%</b> "
+                f"({_dc['prev_oi_l']:.1f}L → {_dc['oi_l']:.1f}L)\n"
+                f"→ Ceiling at ₹{_dc['strike']:.0f} is <b>lifting</b> — breakout risk ↑\n"
+                f"Spot ₹{underlying_price:.0f} | {time_str}"
+            )
+            _alerted[_key] = now
+
+    if _dp:
+        _key = f"depeg_{_dp['strike']:.0f}"
+        _last = _alerted.get(_key)
+        if not _last or (now - _last).total_seconds() > 600:
+            msgs.append(
+                f"⚡ <b>DEPEG ₹{_dp['strike']:.0f}</b>\n"
+                f"PE OI shed <b>{_dp['shed_pct']:.1f}%</b> "
+                f"({_dp['prev_oi_l']:.1f}L → {_dp['oi_l']:.1f}L)\n"
+                f"→ Floor at ₹{_dp['strike']:.0f} is <b>dropping</b> — breakdown risk ↑\n"
+                f"Spot ₹{underlying_price:.0f} | {time_str}"
+            )
+            _alerted[_key] = now
+
+    if msgs:
+        return "\n\n".join(msgs)
+    return None
+
+
 def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
     """Detect and alert price rejection at ceiling (resistance) or floor (support).
 
@@ -10279,6 +10323,13 @@ def main():
                         if _sa_c is not None:
                             _h = send_capping_at_sr_alert(_sa_c, option_data['underlying'])
                             if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
+
+                    # Decapping / Depeg alert
+                    try:
+                        _h = send_decapping_alert(option_data['underlying'])
+                        if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
