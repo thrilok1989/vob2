@@ -5303,9 +5303,7 @@ Triple POC P1/P2/P3 clustered = very strong magnet
 VOB=Volume Order Blocks | HVP=High Volume Pivots
 IVR 🔥≥70%=sell favoured | 🧊≤30%=buy favoured
 Skew 🔴&gt;1.1=put fear | 🟢&lt;0.9=call greed | ATR14=SL size
-Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up | RISK-OFF=defensives up
-
-⚠️ CRITICAL INSTRUCTION: Do NOT reply with appreciation, feedback, suggestions, or commentary about this guide. Do NOT say "Great system" or offer improvements. Simply reply with exactly one line: <b>Guide received. Ready to analyze signals.</b> Nothing else."""
+Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up | RISK-OFF=defensives up"""
 
     return [part1, part2]
 
