@@ -5095,11 +5095,9 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
 
 
 def send_decapping_alert(underlying_price):
-    """Fire a Telegram alert when decapping (CE OI shedding at dominant resistance) or
-    depeg (PE OI shedding at dominant support) is detected. Cooldown: 10 min per strike."""
-    _dc = getattr(st.session_state, '_decapping', None)
-    _dp = getattr(st.session_state, '_depeg', None)
-    if not _dc and not _dp:
+    """Fire Telegram alert when any ATM±2 strike shows CE/PE OI shedding. Cooldown: 10 min per strike."""
+    _decap_atm = getattr(st.session_state, '_decap_atm_data', [])
+    if not _decap_atm:
         return None
 
     _alerted = st.session_state.setdefault('_decap_alerted', {})
@@ -5107,35 +5105,30 @@ def send_decapping_alert(underlying_price):
     time_str = now.strftime('%H:%M:%S IST')
     msgs = []
 
-    if _dc:
-        _key = f"decap_{_dc['strike']:.0f}"
-        _last = _alerted.get(_key)
-        if not _last or (now - _last).total_seconds() > 600:
-            msgs.append(
-                f"⚡ <b>DECAPPING ₹{_dc['strike']:.0f}</b>\n"
-                f"CE OI shed <b>{_dc['shed_pct']:.1f}%</b> "
-                f"({_dc['prev_oi_l']:.1f}L → {_dc['oi_l']:.1f}L)\n"
-                f"→ Ceiling at ₹{_dc['strike']:.0f} is <b>lifting</b> — breakout risk ↑\n"
-                f"Spot ₹{underlying_price:.0f} | {time_str}"
-            )
-            _alerted[_key] = now
+    for _e in _decap_atm:
+        if _e.get('ce_decapping'):
+            _key = f"decap_ce_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>DECAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"CE OI shed <b>{_e['ce_shed_pct']:.1f}%</b> "
+                    f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                    f"→ Ceiling lifting → breakout risk ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
 
-    if _dp:
-        _key = f"depeg_{_dp['strike']:.0f}"
-        _last = _alerted.get(_key)
-        if not _last or (now - _last).total_seconds() > 600:
-            msgs.append(
-                f"⚡ <b>DEPEG ₹{_dp['strike']:.0f}</b>\n"
-                f"PE OI shed <b>{_dp['shed_pct']:.1f}%</b> "
-                f"({_dp['prev_oi_l']:.1f}L → {_dp['oi_l']:.1f}L)\n"
-                f"→ Floor at ₹{_dp['strike']:.0f} is <b>dropping</b> — breakdown risk ↑\n"
-                f"Spot ₹{underlying_price:.0f} | {time_str}"
-            )
-            _alerted[_key] = now
+        if _e.get('pe_depeg'):
+            _key = f"depeg_pe_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>DEPEG {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"PE OI shed <b>{_e['pe_shed_pct']:.1f}%</b> "
+                    f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                    f"→ Floor dropping → breakdown risk ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
 
-    if msgs:
-        return "\n\n".join(msgs)
-    return None
+    return "\n\n".join(msgs) if msgs else None
 
 
 def send_ob_zone_alert(ob_data, underlying_price, proximity_pts=30):
@@ -6448,21 +6441,16 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             )
     ob_block = ("\n🔲 <b>ORDER BLOCKS (LuxAlgo):</b>\n" + "\n".join(_ob_lines) + "\n") if _ob_lines else ""
 
-    # ── Decapping / Depeg block ──
-    _dc = getattr(st.session_state, '_decapping', None)
-    _dp = getattr(st.session_state, '_depeg', None)
+    # ── Decapping / Depeg block (ATM±2 per-strike) ──
+    _decap_atm = getattr(st.session_state, '_decap_atm_data', [])
     _decap_lines = []
-    if _dc:
-        _decap_lines.append(
-            f"  ⚡ DECAPPING ₹{_dc['strike']:.0f} — CE OI shed {_dc['shed_pct']:.1f}% "
-            f"({_dc['prev_oi_l']:.1f}L→{_dc['oi_l']:.1f}L) → ceiling lifting → breakout ↑"
-        )
-    if _dp:
-        _decap_lines.append(
-            f"  ⚡ DEPEG ₹{_dp['strike']:.0f} — PE OI shed {_dp['shed_pct']:.1f}% "
-            f"({_dp['prev_oi_l']:.1f}L→{_dp['oi_l']:.1f}L) → floor dropping → breakdown ↓"
-        )
-    decap_block = ("\n<b>🔓 DECAPPING / DEPEG:</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
+    for _e in _decap_atm:
+        _ce_str = (f"CE:{_e['ce_oi_l']:.1f}L(−{_e['ce_shed_pct']:.1f}%⚡)"
+                   if _e.get('ce_decapping') else f"CE:{_e['ce_oi_l']:.1f}L")
+        _pe_str = (f"PE:{_e['pe_oi_l']:.1f}L(−{_e['pe_shed_pct']:.1f}%⚡)"
+                   if _e.get('pe_depeg') else f"PE:{_e['pe_oi_l']:.1f}L")
+        _decap_lines.append(f"  {_e['label']} ₹{_e['strike']:.0f}: {_ce_str} | {_pe_str}")
+    decap_block = ("\n<b>🔓 DECAPPING/DEPEG (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
 
     # ── Part 1: Signal + Direction + S/R + OI Positioning ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
@@ -8778,46 +8766,67 @@ def main():
                         except Exception:
                             pass
                     st.session_state._sa_result = sa_result
-                    # ── Decapping / Depeg: track OI across snapshots ──
+                    # ── Decapping / Depeg: track OI for ATM±2 strikes across snapshots ──
                     try:
                         _adf2 = sa_result.get('analysis_df')
                         if _adf2 is not None and not _adf2.empty and sa_underlying:
                             _prev_snap = dict(getattr(st.session_state, '_prev_strike_oi', {}))
-                            _decap = None
-                            _depeg = None
-                            # Dominant resistance = highest CE_OI above spot
-                            _r_df = _adf2[_adf2['Strike'] > sa_underlying].sort_values('CE_OI', ascending=False)
-                            if not _r_df.empty:
-                                _rr = _r_df.iloc[0]
-                                _rsk = str(int(_rr['Strike']))
-                                _cur_ce = float(_rr['CE_OI'])
-                                _prev_ce = _prev_snap.get(_rsk, {}).get('ce_oi')
-                                if _prev_ce and _cur_ce < _prev_ce and _prev_ce > 50000:
+
+                            # Determine ATM strike and gap from the analysis df
+                            _all_sks = sorted(_adf2['Strike'].unique())
+                            _atm_sk  = min(_all_sks, key=lambda x: abs(x - sa_underlying))
+                            _gaps    = [_all_sks[i+1] - _all_sks[i] for i in range(len(_all_sks)-1)]
+                            _gap     = int(min(_gaps)) if _gaps else 50
+
+                            _decap_atm_list = []
+                            _dominant_decap = None
+                            _dominant_depeg = None
+
+                            for _off in [-2, -1, 0, 1, 2]:
+                                _tsk    = _atm_sk + _off * _gap
+                                _closest = min(_all_sks, key=lambda x: abs(x - _tsk))
+                                if abs(_closest - _tsk) > _gap * 0.6:
+                                    continue
+                                _sk_str  = str(int(_closest))
+                                _row     = _adf2[_adf2['Strike'] == _closest]
+                                if _row.empty:
+                                    continue
+                                _rv      = _row.iloc[0]
+                                _cur_ce  = float(_rv.get('CE_OI', 0))
+                                _cur_pe  = float(_rv.get('PE_OI', 0))
+                                _prev_ce = _prev_snap.get(_sk_str, {}).get('ce_oi', 0)
+                                _prev_pe = _prev_snap.get(_sk_str, {}).get('pe_oi', 0)
+                                _lbl     = f'ATM{_off:+d}' if _off != 0 else 'ATM'
+
+                                _entry = {
+                                    'strike': float(_closest), 'label': _lbl, 'offset': _off,
+                                    'ce_oi_l': _cur_ce / 100000, 'pe_oi_l': _cur_pe / 100000,
+                                    'ce_decapping': False, 'pe_depeg': False,
+                                    'ce_shed_pct': 0.0, 'pe_shed_pct': 0.0,
+                                }
+                                if _prev_ce > 50000 and _cur_ce < _prev_ce:
                                     _shed = (_prev_ce - _cur_ce) / _prev_ce * 100
-                                    _decap = {
-                                        'strike': float(_rr['Strike']),
-                                        'shed_pct': _shed,
-                                        'oi_l': _cur_ce / 100000,
-                                        'prev_oi_l': _prev_ce / 100000,
-                                        'activity': str(_rr.get('Call_Activity', '')),
-                                    }
-                            # Dominant support = highest PE_OI below spot
-                            _s_df = _adf2[_adf2['Strike'] < sa_underlying].sort_values('PE_OI', ascending=False)
-                            if not _s_df.empty:
-                                _ss = _s_df.iloc[0]
-                                _ssk = str(int(_ss['Strike']))
-                                _cur_pe = float(_ss['PE_OI'])
-                                _prev_pe = _prev_snap.get(_ssk, {}).get('pe_oi')
-                                if _prev_pe and _cur_pe < _prev_pe and _prev_pe > 50000:
+                                    _entry.update({'ce_decapping': True, 'ce_shed_pct': _shed,
+                                                   'prev_ce_oi_l': _prev_ce / 100000})
+                                    if _off > 0 and (_dominant_decap is None or _shed > _dominant_decap['shed_pct']):
+                                        _dominant_decap = {
+                                            'strike': float(_closest), 'shed_pct': _shed,
+                                            'oi_l': _cur_ce / 100000, 'prev_oi_l': _prev_ce / 100000,
+                                            'activity': str(_rv.get('Call_Activity', '')),
+                                        }
+                                if _prev_pe > 50000 and _cur_pe < _prev_pe:
                                     _shed = (_prev_pe - _cur_pe) / _prev_pe * 100
-                                    _depeg = {
-                                        'strike': float(_ss['Strike']),
-                                        'shed_pct': _shed,
-                                        'oi_l': _cur_pe / 100000,
-                                        'prev_oi_l': _prev_pe / 100000,
-                                        'activity': str(_ss.get('Put_Activity', '')),
-                                    }
-                            # Update full snapshot for all strikes
+                                    _entry.update({'pe_depeg': True, 'pe_shed_pct': _shed,
+                                                   'prev_pe_oi_l': _prev_pe / 100000})
+                                    if _off < 0 and (_dominant_depeg is None or _shed > _dominant_depeg['shed_pct']):
+                                        _dominant_depeg = {
+                                            'strike': float(_closest), 'shed_pct': _shed,
+                                            'oi_l': _cur_pe / 100000, 'prev_oi_l': _prev_pe / 100000,
+                                            'activity': str(_rv.get('Put_Activity', '')),
+                                        }
+                                _decap_atm_list.append(_entry)
+
+                            # Update snapshot for all strikes
                             _new_snap = {}
                             for _, _row2 in _adf2.iterrows():
                                 _sk2 = str(int(_row2['Strike']))
@@ -8826,8 +8835,9 @@ def main():
                                     'pe_oi': float(_row2.get('PE_OI', 0)),
                                 }
                             st.session_state._prev_strike_oi = _new_snap
-                            st.session_state._decapping = _decap
-                            st.session_state._depeg = _depeg
+                            st.session_state._decap_atm_data = _decap_atm_list
+                            st.session_state._decapping = _dominant_decap  # backward compat
+                            st.session_state._depeg     = _dominant_depeg  # backward compat
                     except Exception:
                         pass
                     analysis_df = sa_result['analysis_df']
@@ -8852,21 +8862,26 @@ def main():
                     # Bias signals
                     for sig in sa_result['bias_signals']:
                         st.caption(f"• {sig}")
-                    # Decapping / Depeg alert banners
-                    _dc = getattr(st.session_state, '_decapping', None)
-                    _dp = getattr(st.session_state, '_depeg', None)
-                    if _dc:
-                        st.markdown(
-                            f'<div style="background:#ff990020;border:2px solid #ff9900;border-radius:8px;padding:10px 14px;margin:6px 0;">'
-                            f'⚡ <b>DECAPPING ₹{_dc["strike"]:.0f}</b> — CE OI shed <b>{_dc["shed_pct"]:.1f}%</b> '
-                            f'({_dc["prev_oi_l"]:.1f}L → {_dc["oi_l"]:.1f}L) → ceiling lifting → breakout risk ↑'
-                            f'</div>', unsafe_allow_html=True)
-                    if _dp:
-                        st.markdown(
-                            f'<div style="background:#ff444420;border:2px solid #ff4444;border-radius:8px;padding:10px 14px;margin:6px 0;">'
-                            f'⚡ <b>DEPEG ₹{_dp["strike"]:.0f}</b> — PE OI shed <b>{_dp["shed_pct"]:.1f}%</b> '
-                            f'({_dp["prev_oi_l"]:.1f}L → {_dp["oi_l"]:.1f}L) → floor dropping → breakdown risk ↑'
-                            f'</div>', unsafe_allow_html=True)
+                    # Decapping / Depeg — ATM±2 per-strike table
+                    _decap_atm_ui = getattr(st.session_state, '_decap_atm_data', [])
+                    if _decap_atm_ui:
+                        st.markdown("**🔓 Decapping / Depeg Monitor (ATM±2)**")
+                        _dc_cols = st.columns(len(_decap_atm_ui))
+                        for _ci, _de in enumerate(_decap_atm_ui):
+                            with _dc_cols[_ci]:
+                                _bg = '#ff990030' if _de.get('ce_decapping') else ('#ff444430' if _de.get('pe_depeg') else '#1e1e1e')
+                                _bdr = '#ff9900' if _de.get('ce_decapping') else ('#ff4444' if _de.get('pe_depeg') else '#444')
+                                _ce_txt = (f"CE: {_de['ce_oi_l']:.1f}L<br>⚡−{_de['ce_shed_pct']:.1f}%"
+                                           if _de.get('ce_decapping') else f"CE: {_de['ce_oi_l']:.1f}L")
+                                _pe_txt = (f"PE: {_de['pe_oi_l']:.1f}L<br>⚡−{_de['pe_shed_pct']:.1f}%"
+                                           if _de.get('pe_depeg') else f"PE: {_de['pe_oi_l']:.1f}L")
+                                st.markdown(
+                                    f'<div style="background:{_bg};border:1.5px solid {_bdr};border-radius:6px;'
+                                    f'padding:6px 8px;text-align:center;font-family:monospace;font-size:12px;">'
+                                    f'<b>{_de["label"]}</b><br>₹{_de["strike"]:.0f}<br>'
+                                    f'{_ce_txt}<br>{_pe_txt}</div>',
+                                    unsafe_allow_html=True
+                                )
                     # Top Resistance & Support
                     sa_col1, sa_col2 = st.columns(2)
                     with sa_col1:
