@@ -6454,15 +6454,15 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _decap_lines = []
     if _dc:
         _decap_lines.append(
-            f"⚡ DECAPPING ₹{_dc['strike']:.0f} CE OI -{_dc['shed_pct']:.1f}% "
-            f"({_dc['prev_oi_l']:.1f}L→{_dc['oi_l']:.1f}L) → ceiling lifting"
+            f"  ⚡ DECAPPING ₹{_dc['strike']:.0f} — CE OI shed {_dc['shed_pct']:.1f}% "
+            f"({_dc['prev_oi_l']:.1f}L→{_dc['oi_l']:.1f}L) → ceiling lifting → breakout ↑"
         )
     if _dp:
         _decap_lines.append(
-            f"⚡ DEPEG ₹{_dp['strike']:.0f} PE OI -{_dp['shed_pct']:.1f}% "
-            f"({_dp['prev_oi_l']:.1f}L→{_dp['oi_l']:.1f}L) → floor dropping"
+            f"  ⚡ DEPEG ₹{_dp['strike']:.0f} — PE OI shed {_dp['shed_pct']:.1f}% "
+            f"({_dp['prev_oi_l']:.1f}L→{_dp['oi_l']:.1f}L) → floor dropping → breakdown ↓"
         )
-    decap_block = ("\n" + "\n".join(_decap_lines)) if _decap_lines else ""
+    decap_block = ("\n<b>🔓 DECAPPING / DEPEG:</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
 
     # ── Part 1: Signal + Direction + S/R + OI Positioning ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
@@ -6473,10 +6473,10 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
 📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
-📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}{decap_block}
-
+📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
+{decap_block}{ob_block}
 <b>📍 DIRECTION</b>
-{swing_block}{ob_block}{capping_block}
+{swing_block}{capping_block}
 <b>📉 MARKET DEPTH</b>{depth_block}
 <b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
 <b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}"""
