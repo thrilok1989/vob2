@@ -404,7 +404,8 @@ def render_master_signal_image(result, underlying_price, option_data=None):
         t(L+0.01, y-0.004, 'ALIGNMENT  10m | 1h | Pattern', c=CYAN, sz=8.5, w='bold')
         SN = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
               'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
-              'CRUDE OIL':'CRUDE','USD/INR':'INR'}
+              'CRUDE OIL':'CRUDE','USD/INR':'INR',
+              'S&P 500':'SP500','JAPAN 225':'JP225','HANG SENG':'HSI','UK 100':'UK100'}
         PS = {'No Pattern':'NP','Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
               'Hammer':'Ham','Shooting Star':'ShStr','Tweezer Top':'TwTop',
               'Tweezer Bottom':'TwBot','Strong Green Candle':'SGC','Strong Red Candle':'SRC',
@@ -3652,35 +3653,86 @@ def detect_candle_patterns(df, lookback=5):
     }
 
 def detect_order_blocks(df, lookback=20):
-    """Detect bullish and bearish order blocks."""
-    if df is None or len(df) < lookback:
-        return {'bullish_ob': None, 'bearish_ob': None}
-    recent = df.tail(lookback).copy()
-    bullish_ob = None
-    bearish_ob = None
+    """LuxAlgo Order Block Detector (Python port).
 
-    for i in range(1, len(recent) - 2):
-        curr = recent.iloc[i]
-        nxt = recent.iloc[i + 1]
-        nxt2 = recent.iloc[i + 2] if i + 2 < len(recent) else None
-        # Bullish OB: last red candle before strong up move
-        is_red = curr['close'] < curr['open']
-        if is_red and nxt['close'] > nxt['open']:
-            up_move = nxt['close'] - curr['low']
-            avg_range = recent['high'].mean() - recent['low'].mean()
-            if up_move > avg_range * 1.5:
-                bullish_ob = {'low': curr['low'], 'high': curr['high'],
-                              'time': recent.index[i] if hasattr(recent.index[i], 'strftime') else i}
-        # Bearish OB: last green candle before strong down move
-        is_green = curr['close'] > curr['open']
-        if is_green and nxt['close'] < nxt['open']:
-            down_move = curr['high'] - nxt['close']
-            avg_range = recent['high'].mean() - recent['low'].mean()
-            if down_move > avg_range * 1.5:
-                bearish_ob = {'low': curr['low'], 'high': curr['high'],
-                              'time': recent.index[i] if hasattr(recent.index[i], 'strftime') else i}
+    Bullish OB: volume pivot high during upswing → demand zone (support)
+    Bearish OB: volume pivot high during downswing → supply zone (resistance)
+    Mitigation: OB is removed when price wicks through the zone bottom/top.
+    Returns up to 3 active (non-mitigated) OBs of each type, most recent first.
+    """
+    length = 5
+    ext_last = 3
+    if df is None or len(df) < length * 2 + 2:
+        return {'bullish_obs': [], 'bearish_obs': [],
+                'bullish_ob': None, 'bearish_ob': None}
 
-    return {'bullish_ob': bullish_ob, 'bearish_ob': bearish_ob}
+    df2 = df.reset_index(drop=True).copy()
+    n = len(df2)
+    h  = df2['high'].values.astype(float)
+    lo = df2['low'].values.astype(float)
+    c  = df2['close'].values.astype(float)
+    v  = df2['volume'].values.astype(float)
+    hl2 = (h + lo) / 2.0
+
+    # ── Oscillator: tracks whether we're in an upswing (os=1) or downswing (os=0) ──
+    # os=0 when high[length] bars ago > highest(high, length) now → was higher → downswing
+    # os=1 when low[length] bars ago  < lowest(low,  length) now → was lower  → upswing
+    os = np.zeros(n, dtype=int)
+    for i in range(length, n):
+        win_h = h[i - length + 1: i + 1]
+        win_l = lo[i - length + 1: i + 1]
+        if len(win_h) == 0:
+            os[i] = os[i - 1]
+            continue
+        upper = np.max(win_h)
+        lower = np.min(win_l)
+        if h[i - length] > upper:
+            os[i] = 0
+        elif lo[i - length] < lower:
+            os[i] = 1
+        else:
+            os[i] = os[i - 1] if i > 0 else 0
+
+    # ── Volume pivot high: volume[pivot_idx] is max in window [pivot_idx-length .. pivot_idx+length] ──
+    bull_obs, bear_obs = [], []
+    for i in range(length * 2, n):
+        pivot_idx = i - length
+        v_win = v[max(0, pivot_idx - length): min(n, pivot_idx + length + 1)]
+        if len(v_win) == 0 or v[pivot_idx] == 0:
+            continue
+        if v[pivot_idx] < np.max(v_win):
+            continue
+        # Volume pivot confirmed — check direction at bar i
+        bar_time = df2.iloc[pivot_idx].get('datetime', pivot_idx)
+        if os[i] == 1:     # upswing → bullish OB (demand zone below)
+            bull_obs.append({'low': lo[pivot_idx], 'high': hl2[pivot_idx],
+                             'avg': (lo[pivot_idx] + hl2[pivot_idx]) / 2,
+                             'bar_idx': pivot_idx, 'time': bar_time, 'type': 'bullish'})
+        elif os[i] == 0:   # downswing → bearish OB (supply zone above)
+            bear_obs.append({'low': hl2[pivot_idx], 'high': h[pivot_idx],
+                             'avg': (hl2[pivot_idx] + h[pivot_idx]) / 2,
+                             'bar_idx': pivot_idx, 'time': bar_time, 'type': 'bearish'})
+
+    # ── Mitigation: remove OBs where price has already wicked through ──
+    target_bull = np.min(lo[-length:]) if len(lo) >= length else lo[-1]   # lowest wick
+    target_bear = np.max(h[-length:])  if len(h)  >= length else h[-1]    # highest wick
+    active_bull = [ob for ob in bull_obs if target_bull >= ob['low']]     # not yet broken below
+    active_bear = [ob for ob in bear_obs if target_bear <= ob['high']]    # not yet broken above
+
+    # Keep most recent ext_last
+    active_bull = sorted(active_bull, key=lambda x: x['bar_idx'], reverse=True)[:ext_last]
+    active_bear = sorted(active_bear, key=lambda x: x['bar_idx'], reverse=True)[:ext_last]
+
+    # Backward-compat: expose closest single OB as bullish_ob / bearish_ob
+    closest_bull = active_bull[0] if active_bull else None
+    closest_bear = active_bear[0] if active_bear else None
+
+    return {
+        'bullish_obs':  active_bull,
+        'bearish_obs':  active_bear,
+        'bullish_ob':   closest_bull,
+        'bearish_ob':   closest_bear,
+    }
 
 def detect_volume_spike(df, lookback=5):
     """Check if current candle has volume spike vs recent average."""
@@ -3911,6 +3963,87 @@ def _fetch_yf_intraday(symbol: str, interval: str = "1m", period: str = "1d", pr
     except Exception:
         return None
 
+def compute_sector_rotation():
+    """Fetch NSE sector indices via yfinance, compute 10m + 1h bias and rank by performance."""
+    _sectors = [
+        ('AUTO',     '^CNXAUTO'),
+        ('PHARMA',   '^CNXPHARMA'),
+        ('FMCG',     '^CNXFMCG'),
+        ('METAL',    '^CNXMETAL'),
+        ('REALTY',   '^CNXREALTY'),
+        ('ENERGY',   '^CNXENERGY'),
+        ('PSU BANK', '^CNXPSUBANK'),
+        ('INFRA',    '^CNXINFRA'),
+        ('MEDIA',    '^CNXMEDIA'),
+        ('IT',       '^CNXIT'),
+        ('BANK',     '^NSEBANK'),
+    ]
+    results = []
+    for sec_name, yf_sym in _sectors:
+        try:
+            raw = _fetch_yf_intraday(yf_sym, interval="1m", period="2d")
+            if not raw or 'open' not in raw:
+                continue
+            df = process_candle_data(raw, "1")
+            if df.empty:
+                continue
+            ltp = float(df.iloc[-1]['close'])
+            # Day open = first candle of today
+            import pytz as _ptz
+            _ist = _ptz.timezone('Asia/Kolkata')
+            _today = datetime.now(_ist).date()
+            df_today = df[df['datetime'].dt.date == _today]
+            if df_today.empty:
+                df_today = df.tail(200)
+            day_open = float(df_today.iloc[0]['open'])
+            day_chg_pct = (ltp - day_open) / day_open * 100 if day_open else 0
+
+            # 10m sentiment: last 10 candles
+            def _sent(sub):
+                if len(sub) < 2: return 'N/A'
+                c0, c1 = sub.iloc[0]['close'], sub.iloc[-1]['close']
+                if c1 > c0 * 1.0005: return 'Bullish'
+                if c1 < c0 * 0.9995: return 'Bearish'
+                return 'Neutral'
+            s10 = _sent(df_today.tail(10))
+            # 1h sentiment: last 60 candles
+            s1h = _sent(df_today.tail(60))
+
+            results.append({
+                'name': sec_name, 'ltp': ltp,
+                'day_chg_pct': day_chg_pct,
+                's10': s10, 's1h': s1h,
+            })
+        except Exception:
+            pass
+
+    if not results:
+        return None
+
+    results.sort(key=lambda x: x['day_chg_pct'], reverse=True)
+    leading  = [r for r in results if r['day_chg_pct'] > 0][:3]
+    lagging  = [r for r in results if r['day_chg_pct'] < 0][-3:][::-1]
+    # Rotation bias: if cyclicals (METAL/AUTO/REALTY/BANK/ENERGY) top = risk-on
+    cyclicals = {'AUTO', 'METAL', 'REALTY', 'BANK', 'ENERGY', 'INFRA'}
+    defensives = {'PHARMA', 'FMCG', 'IT', 'MEDIA'}
+    top3_names = {r['name'] for r in leading}
+    cyc_count = len(top3_names & cyclicals)
+    def_count = len(top3_names & defensives)
+    if cyc_count >= 2:
+        rotation_bias = 'RISK-ON 🟢 (cyclicals leading → bullish for NIFTY)'
+    elif def_count >= 2:
+        rotation_bias = 'RISK-OFF 🔴 (defensives leading → cautious/bearish)'
+    else:
+        rotation_bias = 'MIXED ⚪ (no clear rotation)'
+
+    return {
+        'leading': leading,
+        'lagging': lagging,
+        'all': results,
+        'rotation_bias': rotation_bias,
+    }
+
+
 def fetch_alignment_data(api):
     """Fetch candle data for SENSEX, BANKNIFTY, NIFTY IT, RELIANCE, ICICI, VIX.
     Detect candle patterns, compute 10m/1h/4h sentiment for each."""
@@ -3928,6 +4061,10 @@ def fetch_alignment_data(api):
         ('GOLD', None, None, None, 'GC=F'),
         ('CRUDE OIL', None, None, None, 'CL=F'),
         ('USD/INR', None, None, None, 'INR=X'),
+        ('S&P 500', None, None, None, 'ES=F'),       # E-mini S&P futures (24h)
+        ('JAPAN 225', None, None, None, 'NKD=F'),    # CME E-mini Nikkei futures (24h)
+        ('HANG SENG', None, None, None, '^HSI'),     # Cash (best available on yfinance)
+        ('UK 100', None, None, None, '^FTSE'),       # Cash (best available on yfinance)
     ]
     alignment = {}
     for name, sec_id, seg, inst, yf_symbol in tickers:
@@ -4104,6 +4241,13 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
             if alignment:
                 st.session_state.alignment_data = alignment
                 st.session_state.alignment_last_fetch = ist_now
+            # Fetch sector rotation alongside alignment (same cadence)
+            try:
+                _sr = compute_sector_rotation()
+                if _sr:
+                    st.session_state._sector_rotation = _sr
+            except Exception:
+                pass
         alignment = st.session_state.alignment_data
 
         # Also add NIFTY's own sentiment from the main df (5-min chart)
@@ -4389,6 +4533,22 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
         reasons.append("OI Trend: Range (Both Support & Resistance Building)")
     elif oi_sig == 'Volatile':
         reasons.append("OI Trend: Volatile (Both Covering)")
+
+    # 8b. Decapping / Depeg (intraday OI reduction at dominant wall)
+    _dc = getattr(st.session_state, '_decapping', None)
+    _dp = getattr(st.session_state, '_depeg', None)
+    if _dc:
+        if candle['direction'] == 'Bullish':
+            score += 1
+            reasons.append(f"DECAPPING ₹{_dc['strike']:.0f} CE OI -{_dc['shed_pct']:.1f}% → ceiling lifting (+1)")
+        else:
+            reasons.append(f"DECAPPING ₹{_dc['strike']:.0f} CE OI -{_dc['shed_pct']:.1f}% (ceiling weakening)")
+    if _dp:
+        if candle['direction'] == 'Bearish':
+            score -= 1
+            reasons.append(f"DEPEG ₹{_dp['strike']:.0f} PE OI -{_dp['shed_pct']:.1f}% → floor dropping (-1)")
+        else:
+            reasons.append(f"DEPEG ₹{_dp['strike']:.0f} PE OI -{_dp['shed_pct']:.1f}% (floor weakening)")
 
     # 9. VIDYA Trend (from Pine Script)
     vidya_data = calculate_vidya(df)
@@ -4934,6 +5094,80 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
     return None
 
 
+def send_decapping_alert(underlying_price):
+    """Fire Telegram alert when any ATM±2 strike shows CE/PE OI shedding. Cooldown: 10 min per strike."""
+    _decap_atm = getattr(st.session_state, '_decap_atm_data', [])
+    if not _decap_atm:
+        return None
+
+    _alerted = st.session_state.setdefault('_decap_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+    msgs = []
+
+    for _e in _decap_atm:
+        if _e.get('ce_decapping'):
+            _key = f"decap_ce_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>DECAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"CE OI shed <b>{_e['ce_shed_pct']:.1f}%</b> "
+                    f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                    f"→ Ceiling lifting → breakout risk ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
+
+        if _e.get('pe_depeg'):
+            _key = f"depeg_pe_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>DEPEG {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"PE OI shed <b>{_e['pe_shed_pct']:.1f}%</b> "
+                    f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                    f"→ Floor dropping → breakdown risk ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
+
+    return "\n\n".join(msgs) if msgs else None
+
+
+def send_ob_zone_alert(ob_data, underlying_price, proximity_pts=30):
+    """Fire a Telegram alert when price enters an active Order Block zone. Cooldown: 15 min per zone."""
+    if not ob_data:
+        return None
+    _alerted = st.session_state.setdefault('_ob_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+    msgs = []
+
+    for _obs, _emoji, _label, _action in [
+        (ob_data.get('bullish_obs', []), '🟩', 'BULLISH', 'BUY — demand zone holding'),
+        (ob_data.get('bearish_obs', []), '🟥', 'BEARISH', 'SELL — supply zone holding'),
+    ]:
+        for _ob in _obs:
+            _ob_lo, _ob_hi, _ob_avg = _ob['low'], _ob['high'], _ob['avg']
+            # Price inside or within proximity_pts of the OB zone
+            _inside = _ob_lo <= underlying_price <= _ob_hi
+            _near   = abs(underlying_price - _ob_avg) <= proximity_pts
+            if not (_inside or _near):
+                continue
+            _key = f"ob_{_label}_{_ob_lo:.0f}_{_ob_hi:.0f}"
+            _last = _alerted.get(_key)
+            if _last and (now - _last).total_seconds() < 900:
+                continue
+            _status = '⚡ Price INSIDE zone' if _inside else f'⚡ Price {abs(underlying_price - _ob_avg):.0f}pts from zone'
+            msgs.append(
+                f"{_emoji} <b>ORDER BLOCK DETECTED — {_label} OB</b>\n"
+                f"Zone: ₹{_ob_lo:.0f} – ₹{_ob_hi:.0f} | Avg ₹{_ob_avg:.0f}\n"
+                f"{_status} | Spot ₹{underlying_price:.0f}\n"
+                f"Action: {_action}\n"
+                f"{time_str}"
+            )
+            _alerted[_key] = now
+
+    return "\n\n".join(msgs) if msgs else None
+
+
 def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
     """Detect and alert price rejection at ceiling (resistance) or floor (support).
 
@@ -5106,74 +5340,111 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
 
 def generate_ai_context_message():
     """One-time AI context/glossary — split into two messages to stay under 4096 chars."""
-    part1 = """🟡 <b>NIFTY SIGNAL GUIDE (1/2)</b>
-(Send once at day start)
+    part1 = """🟡 <b>NIFTY SIGNAL GUIDE (EXECUTION)</b>
 
 <b>📋 ALERT TYPES</b>
-⚠️ PCR PROXIMITY = price within ±25 pts of PCR S/R level
-🕯 CANDLE AT S/R = bullish candle at support / bearish at resistance
-🟥 CALL CAPPING = CE writers capping → SELL zone 🔥=vol confirmed
-🟩 PUT SUPPORT = PE writers defending → BUY zone 🔥=vol confirmed
-🔴 REJECTION AT CEILING = 2/3 signals: chart wick + OC ChgOI + depth
-🟢 BOUNCE AT FLOOR = 2/3 signals: chart wick + OC ChgOI + depth
-→ Every alert sends: alert header + Part 1 (signal data) + Part 2 (AI prompt)
+⚠️ PCR NEAR LEVEL → price near S/R (±25 pts)
+🕯 CANDLE AT LEVEL → confirmation candle
+🟥 CALL CAPPING 🔥 → SELL zone (CE writers capping)
+🟩 PUT SUPPORT 🔥 → BUY zone (PE writers defending)
+🔴 REJECTION (CEILING) → SELL trigger
+🟢 BOUNCE (FLOOR) → BUY trigger
+👉 No trade without 2 confirmations minimum
 
-<b>📋 SIGNAL SCORE</b>
-Score: -5(strong bear) to +5(strong bull)
-🟥 CALL CAPPING / 🟩 PUT CAPPING = OC writers confirmed at wall
-🎨 🟢=Bullish 🔴=Bearish ⚪=Neutral ⚫=No data
+<b>📊 SIGNAL SCORE</b>
+Range: -5 (strong bear) → +5 (strong bull) | 🟥=Bear 🟩=Bull ⚪=Neutral
+👉 Use as bias filter only — not entry trigger
 
-<b>🌍 ALIGNMENT (10m|1h|4h|1D|4D|Pat):</b>
+<b>🌍 ALIGNMENT CODES (decode signal alignment block)</b>
 N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
 REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
-NP=NoPattern Ham=Hammer ShStar=ShootingStar SGC=StrongGreen
-SRC=StrongRed BullEng/BearEng=Engulfing BullHar/BearHar=Harami
+SP500=S&amp;P500 JP225=Japan225 HSI=HangSeng UK100=FTSE100
+Timeframes: 10m|1h|4h|1D|4D|Pattern → 3+ same = confirmed trend
+NP=NoPattern Ham=Hammer ShStar=ShootingStar
+SGC=StrongGreen SRC=StrongRed BullEng/BearEng BullHar/BearHar
 
-<b>🔬 STRIKE ANALYSIS (ATM±2):</b>
-Line1: ATM±N ₹Strike | PCR | S/R:₹level(offset) | Cap OI | Score
-  PCR≤0.7=Resistance(offset:-20→+20) | 0.71-1.7=Neutral | ≥1.8=Support(offset:-20→+20)
-  Offset = pts from strike where wall is felt
-Line2: 📌Depth R/S ₹chartprice→₹strike(wallQty) | Δ Γ Θ Greeks
-  BA=bid-ask pressure (+ve=buyers -ve=sellers)
-  E=Entry(Bull/Bear/NoEnt) Mv=RUp/RDn=real FkUp/FkDn=reversal
-Line3: CE/PE bid-ask qty | COI=ChangeOI OI=build/unwind
+<b>🔬 STRIKE ANALYSIS CODES (ATM±2)</b>
+PCR≤0.7=Resistance | 0.71–1.7=Neutral | ≥1.8=Support
+CB=CE Bid | CA=CE Ask | PB=PE Bid | PA=PE Ask
+P=Pressure (+ve=buyers -ve=sellers) | BA=Bid-Ask pressure
+Depth &gt;5K=major wall | &lt;500=breakable | 🧱=Sell wall 🛡=Buy wall
 
-<b>🌐 MARKET CONTEXT</b>
-DTE=days to expiry | ⚠️Rollover=≤5 days
-MaxPain=price magnet near expiry | Straddle=ATM CE+PE cost
-IVR 🔥≥70%=sell favoured 🧊≤30%=buy favoured
-Skew 🔴&gt;1.1=put fear 🟢&lt;0.9=call greed | ATR14=SL guide"""
+<b>🧱 ENTRY LOGIC</b>
+🔴 SELL (CEILING) — all must align:
+• Call OI highest (wall) | Market Depth: CA &gt;5K | Delta negative | Wick rejection
+👉 Entry: At ceiling stall | SL: Above ceiling
 
-    part2 = """🟡 <b>NIFTY SIGNAL GUIDE (2/2)</b>
+🟢 BUY (FLOOR) — all must align:
+• Put OI highest (support) | Market Depth: PB &gt;5K | Delta positive | Wick bounce
+👉 Entry: At floor stall | SL: Below floor
 
-<b>📊 DATA BLOCKS</b>
-GEX +ve=range -ve=trending | Flip=gamma flip level
-VIDYA: adaptive trend | -ve%=falling +ve%=rising
-VPFR: POC=most traded | VAH/VAL=value area (3 TFs: 30/60/180 bars)
-Triple POC P1/P2/P3: clustered = strong confluence magnet
-🌀 Swing: SwH/SwL=last highs/lows | →Target=projected swing
-OI Winding: CE/PE build🟢/unwind🔴 | Par=parallel activity
-Money Flow: POC=peak vol node ⭐ | sentiment at price clusters
-VWAP=vol avg (below=bearish context) | LTP Trap=fake breakout
+<b>🔄 OI WINDING / UNWINDING (in every signal)</b>
+CE Build(resist↑) = call writers adding → ceiling stronger
+CE Unwind(resist↓) = call writers exiting → ceiling may break
+PE Build(supp↑) = put writers adding → floor stronger
+PE Unwind(supp↓) = put writers exiting → floor may break
+Parallel Bull = CE unwind + PE build → strong BUY signal
+Parallel Bear = PE unwind + CE build → strong SELL signal
+
+<b>📡 MARKET MODE (live GEX in every signal)</b>
+GEX +ve(+XXL) → RANGE → sell ceiling / buy floor
+GEX -ve(-XXL) → TREND → follow momentum, no counter
+Confirm with VIDYA direction | 🧊 No depth wall = No trade
+
+<b>🔄 SECTOR ROTATION (in every signal)</b>
+RISK-ON 🟢 = cyclicals lead (AUTO/METAL/REALTY/BANK/ENERGY) → bullish for NIFTY
+RISK-OFF 🔴 = defensives lead (PHARMA/FMCG/IT/MEDIA) → cautious/bearish for NIFTY
+MIXED ⚪ = no clear rotation → wait for alignment
+10m/1h = last 10/60 candle bias per sector (🟢Bullish ⚪Neutral 🔴Bearish)
+👉 RISK-ON + GEX +ve → buy floor | RISK-OFF + GEX -ve → sell ceiling"""
+
+    part2 = """🟡 <b>NIFTY SIGNAL GUIDE (REFERENCE)</b>
+
+<b>⚠️ CRITICAL RULES</b>
+1. GEX -ve + VIDYA trend → DO NOT FADE
+2. Market Depth &lt;500 qty → weak level → expect break
+3. DTE ≤5 → MaxPain magnet (price pulls toward max pain)
+4. Straddle &gt;&gt; ATR → big move already priced in
+5. PCR ≤0.7 near ATM+1 → heavy resistance above
+6. Delta divergence → price ≠ delta direction → reversal warning
+
+<b>🚫 NO TRADE ZONE</b>
+Alignment mixed | GEX neutral | No depth walls | Delta ≈ 0
+= Sit out — this is your edge
+
+<b>💰 MONEY FLOW PROFILE (in every signal)</b>
+POC (Point of Control) = price with most volume = magnet (price always revisits)
+VAH (Value Area High) = upper boundary of 70% vol zone → acts as ceiling/resistance
+VAL (Value Area Low) = lower boundary of 70% vol zone → acts as floor/support
+Strongest node = price range where buyers/sellers dominated most
+🟢 Bullish node = buyers controlled → bounce zone | 🔴 Bearish = sellers → rejection zone
+⭐ = POC node (highest vol = strongest magnet)
+👉 Price between VAL–VAH = fair value | Below VAL = undervalued | Above VAH = overvalued
+
+<b>⚡ VOLUME DELTA</b>
+Total Delta = Buy Vol − Sell Vol | +ve=buyers winning, -ve=sellers
+Cum Delta = running total — rising=buyers accumulating, falling=sellers
+Ratio &gt;1=buyers dominant | &lt;1=sellers dominant
+Divergence = price moves up but delta -ve (or vice versa) → reversal warning
+VAH/VAL/POC delta = what buyers/sellers did at Money Flow key levels (most important)
+🟢 +Delta at POC/VAL → buyers defending → confirms support / magnet holding
+🔴 -Delta at POC/VAH → sellers defending → confirms resistance / ceiling holding
+
+<b>📉 MARKET DEPTH per strike</b>
+CB=CE Bid (call buyers) | CA=CE Ask (call sellers)
+PB=PE Bid (put buyers) | PA=PE Ask (put sellers)
+🧱 Sellers wall: CA &gt; 2×CB → ceiling strong, expect rejection
+🛡 Buyers wall: PB &gt; 2×PA → floor strong, expect bounce
+
+<b>📦 OTHER TERMS</b>
+GEX Flip = level where market shifts range↔trend
+VIDYA -ve%=falling trend | +ve%=rising trend
+VPFR: 3 timeframe POC/VAH/VAL confluence = strong zone
+Triple POC P1/P2/P3 clustered = very strong magnet
 VOB=Volume Order Blocks | HVP=High Volume Pivots
-📡 Capping: {bias}N50/BNF/REL/ICICI 🟥R₹cap 🟩S₹sup 📍=near 🔥=vol
-
-<b>🧱 CEILING / FLOOR LOGIC (AI prompt step 2)</b>
-Strongest CEILING = highest CE OI strike + depth ask wall + VPFR VAH near strike + MF POC
-Strongest FLOOR = highest PE OI strike + depth bid wall + VPFR VAL near strike + MF POC
-Entry AT ceiling for SELL / AT floor for BUY — where price stalls and won't break
-SL just above ceiling for SELL / just below floor for BUY
-
-<b>📈 RULES</b>
-1. Alignment 3+ same 1h+4h+1D = confirmed trend
-2. GEX neg + VIDYA bear = trending — do NOT fade
-3. Depth qty &gt;5K = major wall | &lt;500 = breakable
-4. BA neg + Mv=RDn = confirmed bear entry
-5. PCR≤0.7 at ATM+1 + Γ🔴 = heavy gamma resistance above
-6. 🔴REJECT at ceiling + OC ChgOI building = high conviction SELL
-7. 🟢BOUNCE at floor + OC ChgOI building = high conviction BUY
-8. DTE≤5 ⚠️Rollover: MaxPain magnet — avoid counter-MaxPain
-9. Straddle wide vs ATR = big move priced → widen targets"""
+IVR 🔥≥70%=sell favoured | 🧊≤30%=buy favoured
+Skew 🔴&gt;1.1=put fear | 🟢&lt;0.9=call greed | ATR14=SL size
+Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up | RISK-OFF=defensives up"""
 
     return [part1, part2]
 
@@ -5288,7 +5559,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
                     'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR',
+                    'S&P 500':'S&P 500','JAPAN 225':'JAPAN 225','HANG SENG':'HANG SENG','UK 100':'UK 100'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
@@ -5301,7 +5573,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     }
     def _ae(s): return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
     align_parts = []
-    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
+    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR','S&P 500','JAPAN 225','HANG SENG','UK 100']:
         data = result.get('alignment', {}).get(name)
         if data is None:
             continue
@@ -5352,13 +5624,96 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _uv_e = '🔴' if 'BEAR' in _uv.upper() else '🟢' if 'BULL' in _uv.upper() else '⚪'
             unwind_block = (
                 f"\n<b>🔄 OI Wind/Unwind:</b> {_uv_e} {_uv}\n"
-                f"  CE: Unw🔴{uw['ce_unwind_count']} Bld🟢{uw['ce_build_count']} | "
-                f"PE: Unw🔴{uw['pe_unwind_count']} Bld🟢{uw['pe_build_count']} | "
-                f"Par:{uw['parallel_count']}(B{uw['bull_parallel']}|R{uw['bear_parallel']})\n"
-                f"  Top PE Unw:{uw['pe_unwind_top']} | Top CE Bld:{uw['ce_build_top']}\n"
+                f"  CE: Unwind🔴{uw['ce_unwind_count']}(resist↓) | Build🟢{uw['ce_build_count']}(resist↑)\n"
+                f"  PE: Unwind🔴{uw['pe_unwind_count']}(supp↓) | Build🟢{uw['pe_build_count']}(supp↑)\n"
+                f"  Parallel:{uw['parallel_count']}(Bull:{uw['bull_parallel']} Bear:{uw['bear_parallel']})\n"
+                f"  PE Unwind:{uw['pe_unwind_top']}\n"
+                f"  CE Build:{uw['ce_build_top']}\n"
             )
     except Exception:
         unwind_block = ""
+
+    # Market Depth block: top bid/ask walls from ATM±2 strikes
+    depth_block = ""
+    try:
+        _df_d = option_data.get('df_summary') if option_data else None
+        if _df_d is not None and not _df_d.empty:
+            _depth_lines = []
+            for _, _dr in _df_d.iterrows():
+                try:
+                    _dsk = float(_dr.get('Strike', 0) or 0)
+                    if abs(_dsk - underlying_price) > 200:
+                        continue
+                    _cb = int(_dr.get('bidQty_CE', 0) or 0)
+                    _ca = int(_dr.get('askQty_CE', 0) or 0)
+                    _pb = int(_dr.get('bidQty_PE', 0) or 0)
+                    _pa = int(_dr.get('askQty_PE', 0) or 0)
+                    _ba = float(_dr.get('BidAskPressure', 0) or 0)
+                    _side = 'Above' if _dsk >= underlying_price else 'Below'
+                    _wall_tag = ''
+                    if _ca > 0 and _cb > 0:
+                        if _ca / max(_cb, 1) > 2: _wall_tag = ' 🧱Sell'
+                        elif _cb / max(_ca, 1) > 2: _wall_tag = ' 🛡Buy'
+                    _arrow = '↑' if _dsk >= underlying_price else '↓'
+                    def _fk(v): return f"{v/1000:.1f}K" if abs(v) >= 1000 else str(v)
+                    _depth_lines.append(
+                        f"  ₹{_dsk:.0f}{_arrow} CB:{_fk(_cb)} CA:{_fk(_ca)} PB:{_fk(_pb)} PA:{_fk(_pa)} P:{_ba:+.0f}{_wall_tag}"
+                    )
+                except Exception:
+                    pass
+            if _depth_lines:
+                depth_block = "\n<b>📉 MARKET DEPTH:</b>\n" + "\n".join(_depth_lines) + "\n"
+    except Exception:
+        depth_block = ""
+
+    # Volume Delta block: summary + candles at VAH/VAL/POC zones
+    vol_delta_block = ""
+    try:
+        _vd = getattr(st.session_state, '_volume_delta_data', None)
+        if _vd and _vd.get('summary'):
+            _vds = _vd['summary']
+            _bias_e = '🟢' if _vds.get('bias') == 'Bullish' else '🔴' if _vds.get('bias') == 'Bearish' else '⚪'
+            def _fmt_vol(v):
+                v = int(v or 0)
+                return f"{v/1000000:.1f}M" if abs(v) >= 1000000 else f"{v/1000:.0f}K"
+            _tot_d  = int(_vds.get('total_delta', 0))
+            _buy_v  = int(_vds.get('total_buy_volume', 0))
+            _sell_v = int(_vds.get('total_sell_volume', 0))
+            _d_rat  = float(_vds.get('delta_ratio', 0))
+            _cum_d  = int(_vds.get('cum_delta_last', 0))
+            _divg   = int(_vds.get('divergence_bars', 0))
+            vol_delta_block = (
+                f"\n<b>⚡ VOLUME DELTA:</b> {_bias_e} {_vds.get('bias','N/A')}\n"
+                f"  Delta: {_fmt_vol(_tot_d)} | Cum Delta: {_fmt_vol(_cum_d)}\n"
+                f"  Buy Vol: {_fmt_vol(_buy_v)} | Sell Vol: {_fmt_vol(_sell_v)}\n"
+                f"  Ratio: {_d_rat:.2f} | Divergences: {_divg}\n"
+            )
+            # Delta at VAH / VAL / POC zones from Money Flow Profile
+            _mf = getattr(st.session_state, '_money_flow_data', None)
+            _vd_df = _vd.get('df')
+            if _vd_df is not None and not _vd_df.empty and _mf:
+                _poc = _mf.get('poc_price', 0)
+                _vah = _mf.get('value_area_high', 0)
+                _val = _mf.get('value_area_low', 0)
+                _mf_levels = [(l, n) for l, n in [(_poc,'POC'), (_vah,'VAH'), (_val,'VAL')] if l]
+                _zone_lines = []
+                for _lvl, _lbl in _mf_levels:
+                    _near = _vd_df[abs(_vd_df['close'] - _lvl) <= 25].tail(2)
+                    for _, _c in _near.iterrows():
+                        _cd = int(_c.get('delta', 0))
+                        try:
+                            _ct = pd.to_datetime(_c.get('datetime')).strftime('%H:%M')
+                        except Exception:
+                            _ct = str(_c.get('datetime', ''))[-13:-8]
+                        _ce = '🟢' if _cd > 0 else '🔴'
+                        _zone_lines.append(
+                            f"  {_ce} {_lbl}₹{_lvl:.0f} @{_ct} "
+                            f"Δ:{_fmt_vol(_cd)} B:{_fmt_vol(int(_c.get('buy_volume',0)))} S:{_fmt_vol(int(_c.get('sell_volume',0)))}"
+                        )
+                if _zone_lines:
+                    vol_delta_block += "<b>  Delta at VAH/VAL/POC:</b>\n" + "\n".join(_zone_lines[:6]) + "\n"
+    except Exception:
+        vol_delta_block = ""
 
     # Market Context block: DTE, Max Pain, Straddle, IV Rank, IV Skew, ATR, OI Velocity
     market_ctx_block = ""
@@ -5603,16 +5958,20 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             hi_sent_price = mf.get('highest_sentiment_price', 0)
             hi_sent_dir = mf.get('highest_sentiment_direction', 'Neutral')
             hi_sent_emoji = '🟢' if hi_sent_dir == 'Bullish' else '🔴' if hi_sent_dir == 'Bearish' else '⚪'
-            # Top 3 nodes inline: emoji+range(vol%)+⭐
+            # Top nodes with clear labels
             node_parts = []
             for r in top_nodes[:3]:
                 s_e = '🟢' if r.get('sentiment') == 'Bullish' else '🔴' if r.get('sentiment') == 'Bearish' else '⚪'
-                poc_tag = '⭐' if r.get('is_poc') else ''
-                node_parts.append(f"{s_e}₹{r['bin_low']:.0f}({r['volume_pct']:.0f}%){poc_tag}")
-            nodes_inline = " ".join(node_parts) if node_parts else "—"
+                sent_short = 'Bull' if r.get('sentiment') == 'Bullish' else 'Bear' if r.get('sentiment') == 'Bearish' else 'Neut'
+                poc_tag = ' ⭐POC' if r.get('is_poc') else ''
+                node_parts.append(f"  {s_e} ₹{r['bin_low']:.0f}-{r['bin_high']:.0f} {sent_short} {r['volume_pct']:.0f}% vol{poc_tag}")
+            nodes_inline = "\n".join(node_parts) if node_parts else "  —"
             mf_block = (
-                f"\n💰 Money Flow Profile: POC₹{poc_price:.0f} VA₹{val:.0f}-₹{vah:.0f} "
-                f"Strong:{hi_sent_emoji}₹{hi_sent_price:.0f} | {nodes_inline}\n"
+                f"\n💰 <b>Money Flow Profile:</b>\n"
+                f"  POC ₹{poc_price:.0f} (most traded = price magnet)\n"
+                f"  VAH ₹{vah:.0f} (value area ceiling) | VAL ₹{val:.0f} (value area floor)\n"
+                f"  Strongest sentiment: {hi_sent_emoji} ₹{hi_sent_price:.0f} {hi_sent_dir}\n"
+                f"  Top volume nodes:\n{nodes_inline}\n"
             )
     except Exception:
         mf_block = ""
@@ -5910,6 +6269,31 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     _mi_bias_block = ("\n<b>📡 Index/Stock Capping:</b>\n" + "\n".join(_mi_lines) + "\n") if _mi_lines else ""
 
+    # ── Sector Rotation Block ──
+    sector_rotation_block = ""
+    try:
+        _sr = getattr(st.session_state, '_sector_rotation', None)
+        if _sr:
+            def _se(s): return '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
+            _leading  = _sr.get('leading', [])
+            _lagging  = _sr.get('lagging', [])
+            _rbias    = _sr.get('rotation_bias', '—')
+            _lead_str = " ".join(
+                f"{_se(r['s10'])}{r['name']}{r['day_chg_pct']:+.1f}%(10m{_se(r['s10'])} 1h{_se(r['s1h'])})"
+                for r in _leading
+            )
+            _lag_str  = " ".join(
+                f"{_se(r['s10'])}{r['name']}{r['day_chg_pct']:+.1f}%(10m{_se(r['s10'])} 1h{_se(r['s1h'])})"
+                for r in _lagging
+            )
+            sector_rotation_block = (
+                f"\n<b>🔄 SECTOR ROTATION:</b> {_rbias}\n"
+                f"  Lead: {_lead_str if _lead_str else '—'}\n"
+                f"  Lag:  {_lag_str if _lag_str else '—'}\n"
+            )
+    except Exception:
+        sector_rotation_block = ""
+
     # ── Comprehensive S/R Block — all data per level ──
     capping_block = ""
     try:
@@ -6036,8 +6420,37 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _oit = result.get('oi_trend', {})
     _vid = result.get('vidya', {})
     _ob = result.get('order_blocks', {})
-    _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
-    _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
+    _net_gex = gex.get('net_gex', 0)
+    _gex_action = "→sell ceiling/buy floor" if _net_gex > 0 else "→follow momentum" if _net_gex < 0 else "→wait"
+    # ── Order Block block for msg_part1 ──
+    _ob_lines = []
+    for _bobs, _emoji, _label in [
+        (_ob.get('bullish_obs', []), '🟩', 'Demand'),
+        (_ob.get('bearish_obs', []), '🟥', 'Supply'),
+    ]:
+        for _b in _bobs[:2]:
+            _dist = abs(underlying_price - _b['avg'])
+            _b_time = ''
+            try:
+                _b_time = f" @{pd.to_datetime(_b['time']).strftime('%H:%M')}"
+            except Exception:
+                pass
+            _ob_lines.append(
+                f"{_emoji} OB {_label} ₹{_b['low']:.0f}-₹{_b['high']:.0f} "
+                f"(avg ₹{_b['avg']:.0f}, {_dist:.0f}pts away{_b_time})"
+            )
+    ob_block = ("\n🔲 <b>ORDER BLOCKS (LuxAlgo):</b>\n" + "\n".join(_ob_lines) + "\n") if _ob_lines else ""
+
+    # ── Decapping / Depeg block (ATM±2 per-strike) ──
+    _decap_atm = getattr(st.session_state, '_decap_atm_data', [])
+    _decap_lines = []
+    for _e in _decap_atm:
+        _ce_str = (f"CE:{_e['ce_oi_l']:.1f}L(−{_e['ce_shed_pct']:.1f}%⚡)"
+                   if _e.get('ce_decapping') else f"CE:{_e['ce_oi_l']:.1f}L")
+        _pe_str = (f"PE:{_e['pe_oi_l']:.1f}L(−{_e['pe_shed_pct']:.1f}%⚡)"
+                   if _e.get('pe_depeg') else f"PE:{_e['pe_oi_l']:.1f}L")
+        _decap_lines.append(f"  {_e['label']} ₹{_e['strike']:.0f}: {_ce_str} | {_pe_str}")
+    decap_block = ("\n<b>🔓 DECAPPING/DEPEG (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
 
     # ── Part 1: Signal + Direction + S/R + OI Positioning ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
@@ -6045,38 +6458,38 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
-<b>━━━ PRICE ACTION ━━━</b>
-🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x
-📍 {loc_text}
-
-<b>━━━ GAMMA &amp; SENTIMENT ━━━</b>
-🔮 GEX: {gex['net_gex']:+.0f}L | Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'} | Mode:{gex['market_mode']}
-📊 PCR×GEX: {result['pcr_gex']['badge']}
-📉 VIX:{float(vix.get('vix',0)):.2f} {vix.get('direction','')} | VIDYA:{_vid.get('trend','N/A')} {_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
+🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
+🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
+📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
-
-<b>━━━ DIRECTION ━━━</b>
+{decap_block}{ob_block}
+<b>📍 DIRECTION</b>
 {swing_block}{capping_block}
-<b>━━━ OI POSITIONING ━━━</b>{unwind_block}{oc_deep_block}"""
+<b>📉 MARKET DEPTH</b>{depth_block}
+<b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
+<b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}"""
 
     # ── Part 2: Deep Analysis + Indices & Stocks at bottom ──
     # Layout: header → market context → vpfr/triple POC/money flow → strike analysis →
     #         price action (vwap/vob/hvp) → indices & stocks (alignment + capping) → AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
 
-<b>━━━ MARKET CONTEXT ━━━</b>{market_ctx_block}
-<b>━━━ VOLUME &amp; LIQUIDITY PROFILE ━━━</b>{vpfr_block}{poc_block}{mf_block}
-<b>━━━ STRIKE-LEVEL DEEP DIVE ━━━</b>{strike_analysis_block}
-<b>━━━ PRICE STRUCTURE ━━━</b>{price_action_block}
-<b>━━━ INDICES &amp; STOCKS ━━━</b>
-🌍 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
+<b>📊 MARKET CONTEXT</b>{market_ctx_block}
+<b>⚡ VOLUME DELTA</b>{vol_delta_block}
+<b>📈 VPFR / POC / MONEY FLOW</b>{vpfr_block}{poc_block}{mf_block}
+<b>🔄 PRICE STRUCTURE</b>{price_action_block}{sector_rotation_block}
+<b>🌍 INDICES &amp; STOCKS</b>
+<b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR — 10m|1h|4h|1D|4D). SHORT answers:
-1. Market structure: bull/bear/range + reason
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow (POC/VAH/VAL), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
+GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
+1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
-3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS — bias + Cap/Sup/Range
-4. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL</code>"""
+3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR / S&P 500 futures / JAPAN 225 / HANG SENG / UK 100 — bias + Cap/Sup/Range
+4. Sector Rotation: which sectors leading/lagging (10m+1h bias) → is it RISK-ON (cyclicals up) or RISK-OFF (defensives up)?
+5. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
+CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
 
     message = msg_part1  # used for Gemini analysis context
 
@@ -6323,7 +6736,8 @@ def _render_alignment_capping_top():
 
     _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
                     'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
-                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR'}
+                    'CRUDE OIL':'CRUDE OIL','USD/INR':'USD/INR',
+                    'S&P 500':'S&P 500','JAPAN 225':'JAPAN 225','HANG SENG':'HANG SENG','UK 100':'UK 100'}
     _pat_short = {
         'No Pattern':'NP','Doji':'Doji','Hammer':'Ham','Shooting Star':'ShStar',
         'Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
@@ -6348,7 +6762,7 @@ def _render_alignment_capping_top():
                     st.info("No alignment data yet.")
                 else:
                     _rows = []
-                    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
+                    for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR','S&P 500','JAPAN 225','HANG SENG','UK 100']:
                         data = _alignment.get(name)
                         if data is None:
                             continue
@@ -6444,6 +6858,116 @@ def _render_alignment_capping_top():
                                 st.markdown("**🟢 Support:** " + " | ".join([f"₹{int(r['Strike'])}" for _, r in _top_s.iterrows()]))
                 except Exception as _e:
                     st.caption(f"Capping render error: {_e}")
+
+    # ── Sector Rotation panel (full width below alignment+capping) ──
+    _sr_data = getattr(st.session_state, '_sector_rotation', None)
+    with st.expander("🔄 Sector Rotation & Bias (10m | 1h)", expanded=False):
+        if _sr_data is None:
+            st.info("Sector rotation data loads with alignment (every 2 min).")
+        else:
+            _bias = _sr_data.get('rotation_bias', '—')
+            st.markdown(f"**Rotation Bias:** {_bias}")
+            _all = _sr_data.get('all', [])
+            if _all:
+                _s10_e = lambda s: '🟢' if s == 'Bullish' else '🔴' if s == 'Bearish' else '⚪'
+                _rows_md = []
+                for r in _all:
+                    _chg = r.get('day_chg_pct', 0)
+                    _chg_e = '🟢' if _chg > 0 else '🔴' if _chg < 0 else '⚪'
+                    _rows_md.append(
+                        f'<div style="font-family:monospace;font-size:13px;padding:1px 0;">'
+                        f'<b style="display:inline-block;min-width:70px;">{r["name"]}</b> '
+                        f'{_chg_e}{_chg:+.2f}% &nbsp; 10m:{_s10_e(r["s10"])} 1h:{_s10_e(r["s1h"])}'
+                        f'</div>'
+                    )
+                st.markdown("\n".join(_rows_md), unsafe_allow_html=True)
+
+
+def _render_vol_delta_chart():
+    """Render Buy Volume vs Sell Volume over time, same style as per-strike OI chart."""
+    import plotly.graph_objects as go
+    vd = getattr(st.session_state, '_volume_delta_data', None)
+    # Fallback: compute from _df_5m if session data not yet populated
+    if vd is None or vd.get('df') is None:
+        _fallback_df = getattr(st.session_state, '_df_5m', None)
+        if _fallback_df is not None and not _fallback_df.empty:
+            try:
+                vd = calculate_volume_delta(_fallback_df)
+                if vd:
+                    st.session_state._volume_delta_data = vd
+            except Exception:
+                vd = None
+    if vd is None or vd.get('df') is None:
+        st.info("⚡ Volume Delta builds after first chart load — refresh once to populate.")
+        return
+    try:
+        df = vd['df'].copy()
+        if df.empty:
+            st.info("No Volume Delta data yet.")
+            return
+        df['datetime'] = pd.to_datetime(df['datetime'])
+        vds = vd.get('summary', {})
+        bias = vds.get('bias', 'N/A')
+        bias_e = '🟢' if bias == 'Bullish' else '🔴' if bias == 'Bearish' else '⚪'
+        tot_d = int(vds.get('total_delta', 0))
+        d_rat = float(vds.get('delta_ratio', 1))
+
+        fig = go.Figure()
+        # Buy Volume bars (green)
+        fig.add_trace(go.Bar(
+            x=df['datetime'], y=df['buy_volume'],
+            name='Buy Volume', marker_color='#089981',
+            opacity=0.85
+        ))
+        # Sell Volume bars (red, negative direction for mirror effect)
+        fig.add_trace(go.Bar(
+            x=df['datetime'], y=-df['sell_volume'],
+            name='Sell Volume', marker_color='#f23645',
+            opacity=0.85
+        ))
+        # Cumulative delta line on secondary y
+        fig.add_trace(go.Scatter(
+            x=df['datetime'], y=df['cum_delta'],
+            name='Cum Delta', mode='lines',
+            line=dict(color='#FFD700', width=2, dash='dot'),
+            yaxis='y2'
+        ))
+        # Divergence markers
+        div_df = df[df['divergence'] == True] if 'divergence' in df.columns else pd.DataFrame()
+        if not div_df.empty:
+            fig.add_trace(go.Scatter(
+                x=div_df['datetime'], y=div_df['delta'],
+                mode='markers', name='Divergence',
+                marker=dict(symbol='diamond', size=10, color='#FF6B35',
+                            line=dict(color='white', width=1)),
+                yaxis='y'
+            ))
+        fig.update_layout(
+            title=f'⚡ Buy vs Sell Volume | {bias_e} {bias} | Delta: {tot_d:+,} | Ratio: {d_rat:.2f}x',
+            template='plotly_dark',
+            height=320,
+            barmode='overlay',
+            showlegend=True,
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+            margin=dict(l=10, r=60, t=80, b=20),
+            xaxis=dict(tickformat='%H:%M', title='Time'),
+            yaxis=dict(title='Volume', zeroline=True, zerolinecolor='#555'),
+            yaxis2=dict(title='Cum Delta', overlaying='y', side='right',
+                        showgrid=False, zeroline=True, zerolinecolor='#FFD70060'),
+            plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+        # Summary metrics row
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Total Delta", f"{tot_d:+,}", delta=bias,
+                  delta_color="normal" if bias == 'Bullish' else "inverse")
+        m2.metric("Buy Volume", f"{int(vds.get('total_buy_volume', 0)):,}")
+        m3.metric("Sell Volume", f"{int(vds.get('total_sell_volume', 0)):,}")
+        m4.metric("Delta Ratio", f"{d_rat:.2f}x")
+        m5.metric("Divergences", f"{int(vds.get('divergence_bars', 0))}")
+    except Exception as e:
+        st.caption(f"Volume Delta chart error: {e}")
 
 
 def _render_per_strike_oi_top():
@@ -7212,6 +7736,8 @@ def main():
 
     # Fill Per-Strike OI chart right below auto trade section
     with _per_strike_oi_container:
+        with st.expander("⚡ Buy Volume vs Sell Volume (Delta Chart)", expanded=True):
+            _render_vol_delta_chart()
         with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
             _render_per_strike_oi_top()
 
@@ -7367,6 +7893,7 @@ def main():
             st.session_state._money_flow_data = money_flow_data
             try:
                 volume_delta_data = calculate_volume_delta(df)
+                st.session_state._volume_delta_data = volume_delta_data
             except Exception as e:
                 st.caption(f"⚠️ Volume Delta error: {str(e)[:80]}")
                 volume_delta_data = None
@@ -8239,6 +8766,80 @@ def main():
                         except Exception:
                             pass
                     st.session_state._sa_result = sa_result
+                    # ── Decapping / Depeg: track OI for ATM±2 strikes across snapshots ──
+                    try:
+                        _adf2 = sa_result.get('analysis_df')
+                        if _adf2 is not None and not _adf2.empty and sa_underlying:
+                            _prev_snap = dict(getattr(st.session_state, '_prev_strike_oi', {}))
+
+                            # Determine ATM strike and gap from the analysis df
+                            _all_sks = sorted(_adf2['Strike'].unique())
+                            _atm_sk  = min(_all_sks, key=lambda x: abs(x - sa_underlying))
+                            _gaps    = [_all_sks[i+1] - _all_sks[i] for i in range(len(_all_sks)-1)]
+                            _gap     = int(min(_gaps)) if _gaps else 50
+
+                            _decap_atm_list = []
+                            _dominant_decap = None
+                            _dominant_depeg = None
+
+                            for _off in [-2, -1, 0, 1, 2]:
+                                _tsk    = _atm_sk + _off * _gap
+                                _closest = min(_all_sks, key=lambda x: abs(x - _tsk))
+                                if abs(_closest - _tsk) > _gap * 0.6:
+                                    continue
+                                _sk_str  = str(int(_closest))
+                                _row     = _adf2[_adf2['Strike'] == _closest]
+                                if _row.empty:
+                                    continue
+                                _rv      = _row.iloc[0]
+                                _cur_ce  = float(_rv.get('CE_OI', 0))
+                                _cur_pe  = float(_rv.get('PE_OI', 0))
+                                _prev_ce = _prev_snap.get(_sk_str, {}).get('ce_oi', 0)
+                                _prev_pe = _prev_snap.get(_sk_str, {}).get('pe_oi', 0)
+                                _lbl     = f'ATM{_off:+d}' if _off != 0 else 'ATM'
+
+                                _entry = {
+                                    'strike': float(_closest), 'label': _lbl, 'offset': _off,
+                                    'ce_oi_l': _cur_ce / 100000, 'pe_oi_l': _cur_pe / 100000,
+                                    'ce_decapping': False, 'pe_depeg': False,
+                                    'ce_shed_pct': 0.0, 'pe_shed_pct': 0.0,
+                                }
+                                if _prev_ce > 50000 and _cur_ce < _prev_ce:
+                                    _shed = (_prev_ce - _cur_ce) / _prev_ce * 100
+                                    _entry.update({'ce_decapping': True, 'ce_shed_pct': _shed,
+                                                   'prev_ce_oi_l': _prev_ce / 100000})
+                                    if _off > 0 and (_dominant_decap is None or _shed > _dominant_decap['shed_pct']):
+                                        _dominant_decap = {
+                                            'strike': float(_closest), 'shed_pct': _shed,
+                                            'oi_l': _cur_ce / 100000, 'prev_oi_l': _prev_ce / 100000,
+                                            'activity': str(_rv.get('Call_Activity', '')),
+                                        }
+                                if _prev_pe > 50000 and _cur_pe < _prev_pe:
+                                    _shed = (_prev_pe - _cur_pe) / _prev_pe * 100
+                                    _entry.update({'pe_depeg': True, 'pe_shed_pct': _shed,
+                                                   'prev_pe_oi_l': _prev_pe / 100000})
+                                    if _off < 0 and (_dominant_depeg is None or _shed > _dominant_depeg['shed_pct']):
+                                        _dominant_depeg = {
+                                            'strike': float(_closest), 'shed_pct': _shed,
+                                            'oi_l': _cur_pe / 100000, 'prev_oi_l': _prev_pe / 100000,
+                                            'activity': str(_rv.get('Put_Activity', '')),
+                                        }
+                                _decap_atm_list.append(_entry)
+
+                            # Update snapshot for all strikes
+                            _new_snap = {}
+                            for _, _row2 in _adf2.iterrows():
+                                _sk2 = str(int(_row2['Strike']))
+                                _new_snap[_sk2] = {
+                                    'ce_oi': float(_row2.get('CE_OI', 0)),
+                                    'pe_oi': float(_row2.get('PE_OI', 0)),
+                                }
+                            st.session_state._prev_strike_oi = _new_snap
+                            st.session_state._decap_atm_data = _decap_atm_list
+                            st.session_state._decapping = _dominant_decap  # backward compat
+                            st.session_state._depeg     = _dominant_depeg  # backward compat
+                    except Exception:
+                        pass
                     analysis_df = sa_result['analysis_df']
                     # Market Bias Banner
                     bias = sa_result['market_bias']
@@ -8261,6 +8862,26 @@ def main():
                     # Bias signals
                     for sig in sa_result['bias_signals']:
                         st.caption(f"• {sig}")
+                    # Decapping / Depeg — ATM±2 per-strike table
+                    _decap_atm_ui = getattr(st.session_state, '_decap_atm_data', [])
+                    if _decap_atm_ui:
+                        st.markdown("**🔓 Decapping / Depeg Monitor (ATM±2)**")
+                        _dc_cols = st.columns(len(_decap_atm_ui))
+                        for _ci, _de in enumerate(_decap_atm_ui):
+                            with _dc_cols[_ci]:
+                                _bg = '#ff990030' if _de.get('ce_decapping') else ('#ff444430' if _de.get('pe_depeg') else '#1e1e1e')
+                                _bdr = '#ff9900' if _de.get('ce_decapping') else ('#ff4444' if _de.get('pe_depeg') else '#444')
+                                _ce_txt = (f"CE: {_de['ce_oi_l']:.1f}L<br>⚡−{_de['ce_shed_pct']:.1f}%"
+                                           if _de.get('ce_decapping') else f"CE: {_de['ce_oi_l']:.1f}L")
+                                _pe_txt = (f"PE: {_de['pe_oi_l']:.1f}L<br>⚡−{_de['pe_shed_pct']:.1f}%"
+                                           if _de.get('pe_depeg') else f"PE: {_de['pe_oi_l']:.1f}L")
+                                st.markdown(
+                                    f'<div style="background:{_bg};border:1.5px solid {_bdr};border-radius:6px;'
+                                    f'padding:6px 8px;text-align:center;font-family:monospace;font-size:12px;">'
+                                    f'<b>{_de["label"]}</b><br>₹{_de["strike"]:.0f}<br>'
+                                    f'{_ce_txt}<br>{_pe_txt}</div>',
+                                    unsafe_allow_html=True
+                                )
                     # Top Resistance & Support
                     sa_col1, sa_col2 = st.columns(2)
                     with sa_col1:
@@ -9834,6 +10455,21 @@ def main():
                     except Exception:
                         pass
 
+                    # Decapping / Depeg alert
+                    try:
+                        _h = send_decapping_alert(option_data['underlying'])
+                        if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
+
+                    # Order Block zone alert
+                    try:
+                        _ob_data = master.get('order_blocks', {})
+                        _h = send_ob_zone_alert(_ob_data, option_data['underlying'])
+                        if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
+
                     # Rejection / bounce at strongest wall
                     try:
                         _h = send_rejection_alert(
@@ -9936,6 +10572,23 @@ def main():
                             st.markdown(f"🟥 ₹{r:.0f}")
                         for s in master['support_levels'][:3]:
                             st.markdown(f"🟩 ₹{s:.0f}")
+
+                        st.markdown("#### 🔲 Order Blocks (LuxAlgo)")
+                        _ob_ui = master.get('order_blocks', {})
+                        _current_p = option_data.get('underlying', 0)
+                        for _bobs, _em, _lbl in [
+                            (_ob_ui.get('bullish_obs', []), '🟩', 'Demand'),
+                            (_ob_ui.get('bearish_obs', []), '🟥', 'Supply'),
+                        ]:
+                            for _bb in _bobs[:2]:
+                                _dist = abs(_current_p - _bb['avg'])
+                                _inside = _bb['low'] <= _current_p <= _bb['high']
+                                _flag = ' ⚡IN ZONE' if _inside else f" {_dist:.0f}pts"
+                                st.markdown(
+                                    f'{_em} **{_lbl}** ₹{_bb["low"]:.0f}–₹{_bb["high"]:.0f}'
+                                    f'<span style="font-size:11px;color:#aaa;">{_flag}</span>',
+                                    unsafe_allow_html=True
+                                )
 
                     with ms_col3:
                         st.markdown("#### 📉 VIX")
@@ -10151,7 +10804,7 @@ def main():
                         st.markdown("### 🕯 Candle Patterns Across Indices")
                         pattern_rows = []
                         # Define display order
-                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR']
+                        display_order = ['NIFTY 50', 'SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'INDIA VIX', 'GOLD', 'CRUDE OIL', 'USD/INR', 'S&P 500', 'JAPAN 225', 'HANG SENG', 'UK 100']
                         for name in display_order:
                             ad = align_data.get(name)
                             if ad is None:
@@ -10318,7 +10971,7 @@ def main():
                         st.caption("Direct = moves WITH Nifty | Inverse = moves AGAINST Nifty (when inverse falls, Nifty rises)")
 
                         # Classification
-                        direct_instruments = ['SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'GOLD']
+                        direct_instruments = ['SENSEX', 'BANKNIFTY', 'NIFTY IT', 'RELIANCE', 'ICICIBANK', 'GOLD', 'S&P 500', 'JAPAN 225', 'HANG SENG', 'UK 100']
                         inverse_instruments = ['INDIA VIX', 'CRUDE OIL', 'USD/INR']
 
                         nifty_data = align_data.get('NIFTY 50')
