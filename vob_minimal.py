@@ -7369,6 +7369,24 @@ def show_auto_trade_section(option_data, df_5m, api, db):
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
 
+    # ── View selector (sidebar): switch between main analyzer and Seller's Perspective ──
+    _view_choice = st.sidebar.radio(
+        "🧭 View",
+        ["📊 Main Analyzer", "🎯 Seller's Perspective"],
+        index=0,
+        key="_main_view_selector",
+        help="Switch between the main analyzer and the Seller's Perspective screener (data is shared).",
+    )
+    if _view_choice == "🎯 Seller's Perspective":
+        try:
+            from seller_perspective import render_seller_perspective_tab
+            render_seller_perspective_tab()
+        except Exception as _sp_err:
+            st.error(f"Failed to load Seller's Perspective view: {_sp_err}")
+            import traceback
+            st.code(traceback.format_exc())
+        return
+
     # ── Top-of-page buttons ──
     _btn_col1, _btn_col2 = st.columns(2)
     with _btn_col1:
