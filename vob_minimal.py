@@ -6369,19 +6369,20 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _decap_lines = []
     for _e in _decap_atm:
         if _e.get('ce_decapping'):
-            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L(−{_e['ce_shed_pct']:.1f}%⚡)"
+            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L ⚡DECAP −{_e['ce_shed_pct']:.1f}%"
         elif _e.get('ce_capping'):
-            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L(+{_e['ce_built_pct']:.1f}%🧱)"
+            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L 🧱CAP +{_e['ce_built_pct']:.1f}%"
         else:
             _ce_str = f"CE:{_e['ce_oi_l']:.1f}L"
         if _e.get('pe_depeg'):
-            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L(−{_e['pe_shed_pct']:.1f}%⚡)"
+            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L ⚡DEPEG −{_e['pe_shed_pct']:.1f}%"
         elif _e.get('pe_capping'):
-            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L(+{_e['pe_built_pct']:.1f}%🛡)"
+            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L 🛡CAP +{_e['pe_built_pct']:.1f}%"
         else:
             _pe_str = f"PE:{_e['pe_oi_l']:.1f}L"
         _decap_lines.append(f"  {_e['label']} ₹{_e['strike']:.0f}: {_ce_str} | {_pe_str}")
-    decap_block = ("\n<b>🔓 OI CAPPING/DECAPPING (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
+    decap_legend = "<i>🧱CAP=CE writers building (ceiling↑) | 🛡CAP=PE writers building (floor↑) | ⚡DECAP=CE shed (ceiling↓) | ⚡DEPEG=PE shed (floor↓)</i>"
+    decap_block = ("\n<b>🔓 OI CAPPING/DECAPPING (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n" + decap_legend + "\n") if _decap_lines else ""
 
     # ── Verbose CAPPING / DECAPPING detail block (per-strike multi-line) ──
     _cap_detail_lines = []
@@ -7368,6 +7369,24 @@ def show_auto_trade_section(option_data, df_5m, api, db):
 
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
+
+    # ── View selector (sidebar): switch between main analyzer and Seller's Perspective ──
+    _view_choice = st.sidebar.radio(
+        "🧭 View",
+        ["📊 Main Analyzer", "🎯 Seller's Perspective"],
+        index=0,
+        key="_main_view_selector",
+        help="Switch between the main analyzer and the Seller's Perspective screener (data is shared).",
+    )
+    if _view_choice == "🎯 Seller's Perspective":
+        try:
+            from seller_perspective import render_seller_perspective_tab
+            render_seller_perspective_tab()
+        except Exception as _sp_err:
+            st.error(f"Failed to load Seller's Perspective view: {_sp_err}")
+            import traceback
+            st.code(traceback.format_exc())
+        return
 
     # ── Top-of-page buttons ──
     _btn_col1, _btn_col2 = st.columns(2)
@@ -10430,12 +10449,9 @@ def main():
                     except Exception:
                         pass
 
-                    # Decapping / Depeg alert
-                    try:
-                        _h = send_decapping_alert(option_data['underlying'])
-                        if _h: _send_with_header(_h)
-                    except Exception:
-                        pass
+                    # Decapping / Depeg: now embedded inside the master signal
+                    # message (cap_detail_block). Standalone alert removed to
+                    # avoid duplicating the same info on Telegram.
 
                     # Order Block zone alert
                     try:
