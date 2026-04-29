@@ -4843,8 +4843,60 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
 
 
 def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
-    """Fire when sudden call capping or put support is detected at S/R. Cooldown 5 min per strike."""
+    """Fire when sudden call capping or put support is detected at S/R. Cooldown 5 min per strike.
+    Includes ATM±2-style per-strike breakdown for the detected strike and its neighbors."""
     def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+    def _b(v): return '🟢' if str(v) == 'Bullish' else '🔴' if str(v) == 'Bearish' else '⚪'
+    def _fk(v):
+        try:
+            n = float(v or 0)
+            return f"{n/1000:.1f}K" if abs(n) >= 1000 else str(int(n))
+        except Exception:
+            return '—'
+
+    def _build_strike_block(adf, focus_strike, underlying_price, is_resistance):
+        """Build ATM±2-style block for focus strike ± 1 neighbor using adf data."""
+        all_strikes = sorted(adf['Strike'].unique())
+        try:
+            fi = all_strikes.index(focus_strike)
+        except ValueError:
+            fi = -1
+        lines = []
+        for i in range(max(0, fi - 1), min(len(all_strikes), fi + 2)):
+            sk = float(all_strikes[i])
+            rows = adf[adf['Strike'] == sk]
+            if rows.empty:
+                continue
+            r = rows.iloc[0]
+            rel = sk - underlying_price
+            rel_str = f"{rel:+.0f}pts"
+            focus = sk == focus_strike
+            prefix = '🟥' if (focus and is_resistance) else '🟩' if (focus and not is_resistance) else '⬜'
+            ce_oi  = float(r.get('CE_OI',  0) or 0) / 100000
+            pe_oi  = float(r.get('PE_OI',  0) or 0) / 100000
+            ce_chg = float(r.get('CE_ChgOI', 0) or 0) / 1000
+            pe_chg = float(r.get('PE_ChgOI', 0) or 0) / 1000
+            ce_ltp = float(r.get('CE_LTP', 0) or 0)
+            pe_ltp = float(r.get('PE_LTP', 0) or 0)
+            ba     = _e(str(r.get('BidAskPressure', 0) or 0))
+            d_b    = _b(r.get('Delta_Bias', ''))
+            g_b    = _b(r.get('Gamma_Bias', ''))
+            ce_bid = _fk(r.get('bidQty_CE', 0))
+            ce_ask = _fk(r.get('askQty_CE', 0))
+            pe_bid = _fk(r.get('bidQty_PE', 0))
+            pe_ask = _fk(r.get('askQty_PE', 0))
+            ce_act = _e(str(r.get('Call_Activity', 'Normal')).replace('Writing (Vol Confirmed)', '🔥WrtVC')
+                        .replace('Writing (Resistance)', 'WrtR').replace('Writing (Support)', 'WrtS').replace('Unwinding', 'Unw'))
+            pe_act = _e(str(r.get('Put_Activity', 'Normal')).replace('Writing (Vol Confirmed)', '🔥WrtVC')
+                        .replace('Writing (Resistance)', 'WrtR').replace('Writing (Support)', 'WrtS').replace('Unwinding', 'Unw'))
+            l1 = (f"{prefix} <b>₹{sk:.0f}</b>({rel_str}) "
+                  f"CE:{ce_oi:.1f}L/{ce_chg:+.0f}K/₹{ce_ltp:.0f} "
+                  f"PE:{pe_oi:.1f}L/{pe_chg:+.0f}K/₹{pe_ltp:.0f}")
+            l2 = f"  Δ{d_b}Γ{g_b} BA:{ba} | CE B:{ce_bid} A:{ce_ask} | PE B:{pe_bid} A:{pe_ask}"
+            l3 = f"  CE:{ce_act} | PE:{pe_act}"
+            lines.append(l1 + "\n" + l2 + "\n" + l3)
+        return "\n".join(lines) if lines else ""
+
     if sa_result is None:
         return
     adf = sa_result.get('analysis_df')
@@ -4870,12 +4922,15 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
             oi_l = float(r.get('CE_OI', 0) or 0) / 100000
+            chg_k = float(r.get('CE_ChgOI', 0) or 0) / 1000
+            strike_block = _build_strike_block(adf, strike, underlying_price, is_resistance=True)
             msg = (
                 f"🟥 <b>CALL CAPPING AT RESISTANCE</b> {vol_tag}\n"
                 f"🕐 {time_str}\n"
                 f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
-                f"CE OI: {oi_l:.1f}L | Class: {_e(r.get('Call_Class',''))}\n"
-                f"📌 CE writers capping here — watch for reversal / SELL setup"
+                f"CE OI: {oi_l:.1f}L | ChgOI: {chg_k:+.0f}K | Class: {_e(r.get('Call_Class',''))}\n"
+                f"\n<b>📊 ATM±1 Strike Analysis:</b>\n{strike_block}\n"
+                f"\n📌 CE writers capping here — watch for reversal / SELL setup"
             )
             alerted[key] = now
             return msg
@@ -4898,12 +4953,15 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
+            chg_k = float(r.get('PE_ChgOI', 0) or 0) / 1000
+            strike_block = _build_strike_block(adf, strike, underlying_price, is_resistance=False)
             msg = (
-                f"🟩 <b>PUT SUPPORT AT SUPPORT</b> {vol_tag}\n"
+                f"🟩 <b>PUT SUPPORT AT FLOOR</b> {vol_tag}\n"
                 f"🕐 {time_str}\n"
                 f"Strike: <b>₹{strike:.0f}</b> | Spot: ₹{underlying_price:.0f} ({abs(underlying_price-strike):.0f} pts away)\n"
-                f"PE OI: {oi_l:.1f}L | Class: {_e(r.get('Put_Class',''))}\n"
-                f"📌 PE writers defending here — watch for bounce / BUY setup"
+                f"PE OI: {oi_l:.1f}L | ChgOI: {chg_k:+.0f}K | Class: {_e(r.get('Put_Class',''))}\n"
+                f"\n<b>📊 ATM±1 Strike Analysis:</b>\n{strike_block}\n"
+                f"\n📌 PE writers defending here — watch for bounce / BUY setup"
             )
             alerted[key] = now
             return msg
@@ -5917,6 +5975,66 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _ob_b = f"₹{int(_ob['bullish_ob']['low'])}-{int(_ob['bullish_ob']['high'])}" if _ob.get('bullish_ob') else '—'
     _ob_r = f"₹{int(_ob['bearish_ob']['low'])}-{int(_ob['bearish_ob']['high'])}" if _ob.get('bearish_ob') else '—'
 
+    # Active capping/support block from current sa_result — shows which strikes are live
+    active_cap_block = ""
+    try:
+        _sa_live = getattr(st.session_state, '_sa_result', None)
+        _adf_live = (_sa_live or {}).get('analysis_df')
+        if _adf_live is not None:
+            def _b2(v): return '🟢' if str(v) == 'Bullish' else '🔴' if str(v) == 'Bearish' else '⚪'
+            def _fk2(v):
+                try:
+                    n = float(v or 0)
+                    return f"{n/1000:.1f}K" if abs(n) >= 1000 else str(int(n))
+                except Exception:
+                    return '—'
+            def _esc2(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
+            cap_lines = []
+            # Resistance (call capping)
+            for _, _cr in _adf_live[
+                _adf_live['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance']) &
+                _adf_live['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)'])
+            ].iterrows():
+                _sk = float(_cr['Strike'])
+                _rel = _sk - underlying_price
+                _ce_oi  = float(_cr.get('CE_OI',  0) or 0) / 100000
+                _ce_chg = float(_cr.get('CE_ChgOI', 0) or 0) / 1000
+                _ce_ltp = float(_cr.get('CE_LTP', 0) or 0)
+                _ba     = _esc2(str(_cr.get('BidAskPressure', 0) or 0))
+                _d_b    = _b2(_cr.get('Delta_Bias', ''))
+                _g_b    = _b2(_cr.get('Gamma_Bias', ''))
+                _ce_bid = _fk2(_cr.get('bidQty_CE', 0))
+                _ce_ask = _fk2(_cr.get('askQty_CE', 0))
+                _vt = '🔥' if _cr.get('CE_Vol_High', False) else ''
+                cap_lines.append(
+                    f"🟥{_vt} <b>₹{_sk:.0f}</b>({_rel:+.0f}pts) CE:{_ce_oi:.1f}L/{_ce_chg:+.0f}K/₹{_ce_ltp:.0f} "
+                    f"Δ{_d_b}Γ{_g_b} BA:{_ba} B:{_ce_bid} A:{_ce_ask}"
+                )
+            # Support (put support)
+            for _, _cs in _adf_live[
+                _adf_live['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
+                _adf_live['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)'])
+            ].iterrows():
+                _sk = float(_cs['Strike'])
+                _rel = _sk - underlying_price
+                _pe_oi  = float(_cs.get('PE_OI',  0) or 0) / 100000
+                _pe_chg = float(_cs.get('PE_ChgOI', 0) or 0) / 1000
+                _pe_ltp = float(_cs.get('PE_LTP', 0) or 0)
+                _ba     = _esc2(str(_cs.get('BidAskPressure', 0) or 0))
+                _d_b    = _b2(_cs.get('Delta_Bias', ''))
+                _g_b    = _b2(_cs.get('Gamma_Bias', ''))
+                _pe_bid = _fk2(_cs.get('bidQty_PE', 0))
+                _pe_ask = _fk2(_cs.get('askQty_PE', 0))
+                _vt = '🔥' if _cs.get('PE_Vol_High', False) else ''
+                cap_lines.append(
+                    f"🟩{_vt} <b>₹{_sk:.0f}</b>({_rel:+.0f}pts) PE:{_pe_oi:.1f}L/{_pe_chg:+.0f}K/₹{_pe_ltp:.0f} "
+                    f"Δ{_d_b}Γ{_g_b} BA:{_ba} B:{_pe_bid} A:{_pe_ask}"
+                )
+            if cap_lines:
+                active_cap_block = "\n<b>🧱 Active Capping/Support:</b>\n" + "\n".join(cap_lines) + "\n"
+    except Exception:
+        active_cap_block = ""
+
     # Part 1 — core signal
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
@@ -5932,7 +6050,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
     # Part 2 — detailed blocks + AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
-{_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
+{active_cap_block}{_mi_bias_block}{vpfr_block}{market_ctx_block}{poc_swing_block}{strike_analysis_block}{price_action_block}{mf_block}{unwind_block}{oc_deep_block}
 🟡 <code>Analyze ALL data above: signal/score, GEX, VIX+VIDYA, OI ATM, alignment (N50/SENSEX/BNF/IT/REL/ICICI/GOLD/CRUDE/INR — 10m|1h|4h|1D|4D), 📡 capping (bias+R/S per instrument), VPFR, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Triple POC, Future Swing, Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, delta vol, money flow, OI winding. SHORT answers:
 1. Market structure: bull/bear/range + reason
 2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
