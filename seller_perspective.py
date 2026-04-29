@@ -30,7 +30,6 @@ from math import log, sqrt
 from scipy.stats import norm
 from supabase import create_client, Client
 import os
-from dotenv import load_dotenv
 import json
 
 # Import advanced market depth analysis
