@@ -6953,7 +6953,7 @@ def _render_vol_delta_chart():
             xaxis=dict(tickformat='%H:%M', title='Time'),
             yaxis=dict(title='Volume', zeroline=True, zerolinecolor='#555'),
             yaxis2=dict(title='Cum Delta', overlaying='y', side='right',
-                        showgrid=False, zeroline=True, zerolinecolor='#FFD70060'),
+                        showgrid=False, zeroline=True, zerolinecolor='rgba(255,215,0,0.38)'),
             plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
         )
         st.plotly_chart(fig, use_container_width=True)
