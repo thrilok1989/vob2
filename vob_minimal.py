@@ -7526,7 +7526,7 @@ def main():
         "15 min": "15"
     }
 
-    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "5 min")
+    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "1 min")
     selected_timeframe = st.sidebar.selectbox(
         "Select Timeframe",
         list(timeframes.keys()),
