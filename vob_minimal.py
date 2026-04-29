@@ -2712,6 +2712,11 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         return {'underlying': None, 'df_summary': None, 'expiry_dates': expiry_dates, 'expiry': None, 'sr_data': [], 'max_pain_strike': None, 'styled_df': None, 'df_display': None, 'display_cols': [], 'bias_cols': [], 'total_ce_change': 0, 'total_pe_change': 0}
 
     data = option_chain_data['data']
+    # Cache raw Dhan option-chain payload (last_price + oc) in session state
+    # so the Seller's Perspective tab can reuse it without a duplicate API call.
+    _raw_cache = st.session_state.setdefault('_cached_raw_chain', {})
+    _raw_cache[expiry] = data
+    st.session_state['_cached_raw_chain_latest'] = {'expiry': expiry, 'data': data}
     underlying = data['last_price']
 
     oc_data = data['oc']
@@ -7367,27 +7372,7 @@ def show_auto_trade_section(option_data, df_5m, api, db):
             st.info("No trades today.")
 
 
-def main():
-    st.title("📈 Nifty Trading & Options Analyzer")
-
-    # ── View selector (sidebar): switch between main analyzer and Seller's Perspective ──
-    _view_choice = st.sidebar.radio(
-        "🧭 View",
-        ["📊 Main Analyzer", "🎯 Seller's Perspective"],
-        index=0,
-        key="_main_view_selector",
-        help="Switch between the main analyzer and the Seller's Perspective screener (data is shared).",
-    )
-    if _view_choice == "🎯 Seller's Perspective":
-        try:
-            from seller_perspective import render_seller_perspective_tab
-            render_seller_perspective_tab()
-        except Exception as _sp_err:
-            st.error(f"Failed to load Seller's Perspective view: {_sp_err}")
-            import traceback
-            st.code(traceback.format_exc())
-        return
-
+def _render_main_analyzer():
     # ── Top-of-page buttons ──
     _btn_col1, _btn_col2 = st.columns(2)
     with _btn_col1:
@@ -11933,6 +11918,22 @@ def main():
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist).strftime("%Y-%m-%d %H:%M:%S IST")
     st.sidebar.info(f"Last Updated: {current_time}")
+
+
+def main():
+    st.title("📈 Nifty Trading & Options Analyzer")
+    _main_tab, _seller_tab = st.tabs(["📊 Main Analyzer", "🎯 Seller's Perspective"])
+    with _seller_tab:
+        try:
+            from seller_perspective import render_seller_perspective_tab
+            render_seller_perspective_tab()
+        except Exception as _sp_err:
+            st.error(f"Failed to load Seller's Perspective view: {_sp_err}")
+            import traceback
+            st.code(traceback.format_exc())
+    with _main_tab:
+        _render_main_analyzer()
+
 
 if __name__ == "__main__":
     main()
