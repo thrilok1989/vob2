@@ -447,7 +447,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-            msg = f"🟩 PUT SUPPORT ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            msg = f"🟩 PUT WRITING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     except Exception:
@@ -487,6 +487,28 @@ def send_decapping_alert(underlying_price):
                     f"PE OI shed <b>{_e['pe_shed_pct']:.1f}%</b> "
                     f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
                     f"→ Floor dropping → breakdown risk ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
+
+        if _e.get('ce_capping') and _e.get('ce_built_pct', 0) >= 1.0:
+            _key = f"cap_ce_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>CALL CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"CE OI built <b>{_e['ce_built_pct']:.1f}%</b> "
+                    f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                    f"→ Ceiling forming → resistance ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
+
+        if _e.get('pe_capping') and _e.get('pe_built_pct', 0) >= 1.0:
+            _key = f"cap_pe_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>PUT CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"PE OI built <b>{_e['pe_built_pct']:.1f}%</b> "
+                    f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                    f"→ Floor forming → support ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
                 )
                 _alerted[_key] = now
 

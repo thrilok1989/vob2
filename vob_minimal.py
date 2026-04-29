@@ -5086,7 +5086,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-            msg = f"🟩 PUT SUPPORT ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            msg = f"🟩 PUT WRITING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     except Exception:
@@ -5125,6 +5125,28 @@ def send_decapping_alert(underlying_price):
                     f"PE OI shed <b>{_e['pe_shed_pct']:.1f}%</b> "
                     f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
                     f"→ Floor dropping → breakdown risk ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
+
+        if _e.get('ce_capping') and _e.get('ce_built_pct', 0) >= 1.0:
+            _key = f"cap_ce_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>CALL CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"CE OI built <b>{_e['ce_built_pct']:.1f}%</b> "
+                    f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                    f"→ Ceiling forming → resistance ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
+
+        if _e.get('pe_capping') and _e.get('pe_built_pct', 0) >= 1.0:
+            _key = f"cap_pe_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>PUT CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"PE OI built <b>{_e['pe_built_pct']:.1f}%</b> "
+                    f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                    f"→ Floor forming → support ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
                 )
                 _alerted[_key] = now
 
@@ -6294,128 +6316,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     except Exception:
         sector_rotation_block = ""
 
-    # ── Comprehensive S/R Block — all data per level ──
     capping_block = ""
-    try:
-        _sa_cap = getattr(st.session_state, '_sa_result', None)
-        _mf_cap = getattr(st.session_state, '_money_flow_data', None)
-        _vpfr_c = result.get('vpfr', {}) or {}
-        _gex_c  = result.get('gex', {}) or {}
-        _flip   = _gex_c.get('gamma_flip')
-
-        def _nearest_vpfr(level):
-            """Return closest VPFR label and distance for a given price level."""
-            best, best_d = None, 9999
-            for _tf, _lbl in [('short','S30'),('medium','M60'),('long','L180')]:
-                _vd = _vpfr_c.get(_tf) or {}
-                for _k, _klbl in [('poc','POC'),('vah','VAH'),('val','VAL')]:
-                    _v = _vd.get(_k)
-                    if _v:
-                        _d = abs(level - _v)
-                        if _d < best_d:
-                            best_d, best = _d, f"{_lbl} {_klbl}₹{_v:.0f}({_d:.0f}pts)"
-            return best or "—"
-
-        def _mf_prox(level):
-            """Return money flow proximity string for a given price level."""
-            if not _mf_cap:
-                return "—"
-            parts = []
-            _poc = _mf_cap.get('poc_price', 0)
-            _vah = _mf_cap.get('value_area_high', 0)
-            _val = _mf_cap.get('value_area_low', 0)
-            if _poc and abs(level - _poc) <= 50:
-                parts.append(f"POC₹{_poc:.0f}({abs(level-_poc):.0f}pts)")
-            if _vah and abs(level - _vah) <= 50:
-                parts.append(f"VAH₹{_vah:.0f}({abs(level-_vah):.0f}pts)")
-            if _val and abs(level - _val) <= 50:
-                parts.append(f"VAL₹{_val:.0f}({abs(level-_val):.0f}pts)")
-            return " ".join(parts) if parts else "—"
-
-        def _gex_prox(level):
-            if _flip:
-                return f"Flip₹{_flip:.0f}({abs(level-_flip):.0f}pts)"
-            return "—"
-
-        if _sa_cap is not None:
-            _adf = _sa_cap.get('analysis_df')
-            if _adf is not None and not _adf.empty:
-                _sr_lines = []
-
-                # ── RESISTANCE levels ──
-                _cap_rows = _adf[
-                    _adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance', 'Moderate Resistance']) &
-                    _adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)', 'Short Building'])
-                ].sort_values('CE_OI', ascending=False).head(3)
-
-                if not _cap_rows.empty:
-                    _sr_lines.append("\n🔴 <b>RESISTANCE LEVELS</b>")
-                    for _, r in _cap_rows.iterrows():
-                        _sk   = float(r['Strike'])
-                        _vt   = "🔥Vol" if r.get('CE_Vol_High', False) else "📊"
-                        _oi   = r.get('CE_OI', 0) / 100000
-                        _chg  = r.get('CE_ChgOI', 0) / 1000
-                        _ltp  = r.get('CE_LTP', 0)
-                        _cls  = r.get('Call_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
-                        _act  = r.get('Call_Activity', '')
-                        _bid  = int(r.get('bidQty_CE', 0) or 0)
-                        _ask  = int(r.get('askQty_CE', 0) or 0)
-                        _ba   = float(r.get('BidAskPressure', 0) or 0)
-                        # Bid/Ask wall interpretation
-                        _wall = ''
-                        if _ask > 0 and _bid > 0:
-                            _ratio = _ask / max(_bid, 1)
-                            if _ratio > 2: _wall = ' 🧱Sellers strong'
-                            elif _ratio < 0.5: _wall = ' 🛡Buyers strong'
-                        _dist = _sk - underlying_price
-                        _sr_lines.append(
-                            f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'above' if _dist>0 else 'below'} spot\n"
-                            f"  ├ 📊 Capping: OI {_oi:.1f}L | ChgOI {_chg:+.0f}K | LTP ₹{_ltp:.0f} | Activity: {_act}\n"
-                            f"  ├ 📉 Market Depth: Bid {_bid:,} qty | Ask {_ask:,} qty | Pressure {_ba:+.0f}{_wall}\n"
-                            f"  ├ 📈 VPFR Confluence: {_nearest_vpfr(_sk)}\n"
-                            f"  ├ 🔮 GEX: {_gex_prox(_sk)}\n"
-                            f"  └ 💰 Money Flow: {_mf_prox(_sk)}"
-                        )
-
-                # ── SUPPORT levels ──
-                _sup_rows = _adf[
-                    _adf['Put_Class'].isin(['High Conviction Support', 'Strong Support', 'Moderate Support']) &
-                    _adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)', 'Short Building'])
-                ].sort_values('PE_OI', ascending=False).head(3)
-
-                if not _sup_rows.empty:
-                    _sr_lines.append("\n🟢 <b>SUPPORT LEVELS</b>")
-                    for _, r in _sup_rows.iterrows():
-                        _sk   = float(r['Strike'])
-                        _vt   = "🔥Vol" if r.get('PE_Vol_High', False) else "📊"
-                        _oi   = r.get('PE_OI', 0) / 100000
-                        _chg  = r.get('PE_ChgOI', 0) / 1000
-                        _ltp  = r.get('PE_LTP', 0)
-                        _cls  = r.get('Put_Class', '').replace('High Conviction ','HC ').replace('Strong ','Str ').replace('Moderate ','Mod ')
-                        _act  = r.get('Put_Activity', '')
-                        _bid  = int(r.get('bidQty_PE', 0) or 0)
-                        _ask  = int(r.get('askQty_PE', 0) or 0)
-                        _ba   = float(r.get('BidAskPressure', 0) or 0)
-                        _wall = ''
-                        if _ask > 0 and _bid > 0:
-                            _ratio = _bid / max(_ask, 1)
-                            if _ratio > 2: _wall = ' 🛡Buyers strong'
-                            elif _ratio < 0.5: _wall = ' 🧱Sellers strong'
-                        _dist = underlying_price - _sk
-                        _sr_lines.append(
-                            f"  ┌ <b>₹{_sk:.0f}</b> {_vt} {_cls} | {abs(_dist):.0f}pts {'below' if _dist>0 else 'above'} spot\n"
-                            f"  ├ 📊 Support: OI {_oi:.1f}L | ChgOI {_chg:+.0f}K | LTP ₹{_ltp:.0f} | Activity: {_act}\n"
-                            f"  ├ 📉 Market Depth: Bid {_bid:,} qty | Ask {_ask:,} qty | Pressure {_ba:+.0f}{_wall}\n"
-                            f"  ├ 📈 VPFR Confluence: {_nearest_vpfr(_sk)}\n"
-                            f"  ├ 🔮 GEX: {_gex_prox(_sk)}\n"
-                            f"  └ 💰 Money Flow: {_mf_prox(_sk)}"
-                        )
-
-                if _sr_lines:
-                    capping_block = "\n<b>━━━ S/R ANALYSIS ━━━</b>" + "\n".join(_sr_lines) + "\n"
-    except Exception:
-        capping_block = ""
-
 
     _oit = result.get('oi_trend', {})
     _vid = result.get('vidya', {})
@@ -6441,20 +6342,83 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             )
     ob_block = ("\n🔲 <b>ORDER BLOCKS (LuxAlgo):</b>\n" + "\n".join(_ob_lines) + "\n") if _ob_lines else ""
 
-    # ── Decapping / Depeg block (ATM±2 per-strike) ──
+    # ── Verbose Order Block detail block (zones price is inside or near) ──
+    _ob_detail_lines = []
+    for _bobs, _emoji, _label, _action in [
+        (_ob.get('bullish_obs', []), '🟩', 'BULLISH', 'BUY — demand zone holding'),
+        (_ob.get('bearish_obs', []), '🟥', 'BEARISH', 'SELL — supply zone holding'),
+    ]:
+        for _b in _bobs[:2]:
+            _ob_lo, _ob_hi, _ob_avg = _b['low'], _b['high'], _b['avg']
+            _inside = _ob_lo <= underlying_price <= _ob_hi
+            _dist   = abs(underlying_price - _ob_avg)
+            _near   = _dist <= 30
+            if not (_inside or _near):
+                continue
+            _status = '⚡ Price INSIDE zone' if _inside else f'⚡ Price {_dist:.0f}pts from zone'
+            _ob_detail_lines.append(
+                f"{_emoji} <b>ORDER BLOCK DETECTED — {_label} OB</b>\n"
+                f"Zone: ₹{_ob_lo:.0f} – ₹{_ob_hi:.0f} | Avg ₹{_ob_avg:.0f}\n"
+                f"{_status} | Spot ₹{underlying_price:.0f}\n"
+                f"Action: {_action}"
+            )
+    ob_detail_block = ("\n" + "\n\n".join(_ob_detail_lines) + f"\n<i>{time_str}</i>\n") if _ob_detail_lines else ""
+
+    # ── Capping / Decapping / Depeg block (ATM±2 per-strike) ──
     _decap_atm = getattr(st.session_state, '_decap_atm_data', [])
     _decap_lines = []
     for _e in _decap_atm:
-        _ce_str = (f"CE:{_e['ce_oi_l']:.1f}L(−{_e['ce_shed_pct']:.1f}%⚡)"
-                   if _e.get('ce_decapping') else f"CE:{_e['ce_oi_l']:.1f}L")
-        _pe_str = (f"PE:{_e['pe_oi_l']:.1f}L(−{_e['pe_shed_pct']:.1f}%⚡)"
-                   if _e.get('pe_depeg') else f"PE:{_e['pe_oi_l']:.1f}L")
+        if _e.get('ce_decapping'):
+            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L(−{_e['ce_shed_pct']:.1f}%⚡)"
+        elif _e.get('ce_capping'):
+            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L(+{_e['ce_built_pct']:.1f}%🧱)"
+        else:
+            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L"
+        if _e.get('pe_depeg'):
+            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L(−{_e['pe_shed_pct']:.1f}%⚡)"
+        elif _e.get('pe_capping'):
+            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L(+{_e['pe_built_pct']:.1f}%🛡)"
+        else:
+            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L"
         _decap_lines.append(f"  {_e['label']} ₹{_e['strike']:.0f}: {_ce_str} | {_pe_str}")
-    decap_block = ("\n<b>🔓 DECAPPING/DEPEG (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
+    decap_block = ("\n<b>🔓 OI CAPPING/DECAPPING (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
 
-    # ── Part 1: Signal + Direction + S/R + OI Positioning ──
+    # ── Verbose CAPPING / DECAPPING detail block (per-strike multi-line) ──
+    _cap_detail_lines = []
+    for _e in _decap_atm:
+        if _e.get('ce_capping') and _e.get('ce_built_pct', 0) >= 1.0:
+            _cap_detail_lines.append(
+                f"⚡ <b>CALL CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                f"CE OI built <b>{_e['ce_built_pct']:.1f}%</b> "
+                f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                f"→ Ceiling forming → resistance ↑"
+            )
+        if _e.get('pe_capping') and _e.get('pe_built_pct', 0) >= 1.0:
+            _cap_detail_lines.append(
+                f"⚡ <b>PUT CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                f"PE OI built <b>{_e['pe_built_pct']:.1f}%</b> "
+                f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                f"→ Floor forming → support ↑"
+            )
+        if _e.get('ce_decapping'):
+            _cap_detail_lines.append(
+                f"⚡ <b>DECAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                f"CE OI shed <b>{_e['ce_shed_pct']:.1f}%</b> "
+                f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                f"→ Ceiling lifting → breakout risk ↑"
+            )
+        if _e.get('pe_depeg'):
+            _cap_detail_lines.append(
+                f"⚡ <b>DEPEG {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                f"PE OI shed <b>{_e['pe_shed_pct']:.1f}%</b> "
+                f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                f"→ Floor dropping → breakdown risk ↑"
+            )
+    cap_detail_block = ("\n" + "\n\n".join(_cap_detail_lines) + f"\n<i>Spot ₹{underlying_price:.0f} | {time_str}</i>\n") if _cap_detail_lines else ""
+
+    # ── Part 1: Snapshot + Direction + Depth + Context + Volume Delta ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
-    #         future swing → S/R analysis → OI positioning (winding + option chain verdict)
+    #         capping/OB detail → direction → market depth → market context → volume delta
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
@@ -6462,36 +6426,37 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
 📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
-{decap_block}{ob_block}
+{decap_block}{cap_detail_block}{ob_block}{ob_detail_block}
 <b>📍 DIRECTION</b>
 {swing_block}{capping_block}
 <b>📉 MARKET DEPTH</b>{depth_block}
-<b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
-<b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}"""
+<b>📊 MARKET CONTEXT</b>{market_ctx_block}
+<b>⚡ VOLUME DELTA</b>{vol_delta_block}"""
 
-    # ── Part 2: Deep Analysis + Indices & Stocks at bottom ──
-    # Layout: header → market context → vpfr/triple POC/money flow → strike analysis →
-    #         price action (vwap/vob/hvp) → indices & stocks (alignment + capping) → AI prompt
+    # ── Part 2: Per-strike + OI Positioning + VPFR/MF + Price Structure + Indices ──
+    # Layout: header → strike analysis ATM±2 → OI positioning → vpfr/triple POC/money flow →
+    #         price action (vwap/vob/hvp) + sector rotation → indices & stocks → AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
 
-<b>📊 MARKET CONTEXT</b>{market_ctx_block}
-<b>⚡ VOLUME DELTA</b>{vol_delta_block}
+<b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
+<b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}
 <b>📈 VPFR / POC / MONEY FLOW</b>{vpfr_block}{poc_block}{mf_block}
 <b>🔄 PRICE STRUCTURE</b>{price_action_block}{sector_rotation_block}
 <b>🌍 INDICES &amp; STOCKS</b>
 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow (POC/VAH/VAL), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, OI capping/decapping/depeg per-strike (ATM±2 CE/PE build & shed with %), Order Block zones (BULLISH/BEARISH OB — inside or near), Market Depth (bid/ask walls at ATM±2), Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), OI winding/positioning, option chain verdict, VPFR, Triple POC, Money Flow (POC/VAH/VAL), LTP trap+VWAP, VOB, HVP, Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
 GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
 1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
-2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
+2. Strongest wall: strike + OI + capping/decapping state + market depth (bid/ask wall) + VPFR confluence (POC/VAH/VAL) + Money Flow Profile POC + why (this is the ceiling/floor where price stalls)
 3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR / S&P 500 futures / JAPAN 225 / HANG SENG / UK 100 — bias + Cap/Sup/Range
 4. Sector Rotation: which sectors leading/lagging (10m+1h bias) → is it RISK-ON (cyclicals up) or RISK-OFF (defensives up)?
 5. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
 CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
 
-    message = msg_part1  # used for Gemini analysis context
+    # Feed full signal (both parts, excluding the trailing AI-prompt code block) to Gemini
+    message = msg_part1 + "\n\n" + msg_part2.split("🟡 <code>")[0]
 
     # Send Part 1 (with optional alert header prepended) then Part 2
     _part1_out = (alert_header + "\n\n" + msg_part1) if alert_header else msg_part1
@@ -6953,7 +6918,7 @@ def _render_vol_delta_chart():
             xaxis=dict(tickformat='%H:%M', title='Time'),
             yaxis=dict(title='Volume', zeroline=True, zerolinecolor='#555'),
             yaxis2=dict(title='Cum Delta', overlaying='y', side='right',
-                        showgrid=False, zeroline=True, zerolinecolor='#FFD70060'),
+                        showgrid=False, zeroline=True, zerolinecolor='rgba(255,215,0,0.38)'),
             plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
         )
         st.plotly_chart(fig, use_container_width=True)
@@ -7562,7 +7527,7 @@ def main():
         "15 min": "15"
     }
 
-    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "5 min")
+    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "1 min")
     selected_timeframe = st.sidebar.selectbox(
         "Select Timeframe",
         list(timeframes.keys()),
@@ -8803,6 +8768,8 @@ def main():
                                     'ce_oi_l': _cur_ce / 100000, 'pe_oi_l': _cur_pe / 100000,
                                     'ce_decapping': False, 'pe_depeg': False,
                                     'ce_shed_pct': 0.0, 'pe_shed_pct': 0.0,
+                                    'ce_capping': False, 'pe_capping': False,
+                                    'ce_built_pct': 0.0, 'pe_built_pct': 0.0,
                                 }
                                 if _prev_ce > 50000 and _cur_ce < _prev_ce:
                                     _shed = (_prev_ce - _cur_ce) / _prev_ce * 100
@@ -8814,6 +8781,10 @@ def main():
                                             'oi_l': _cur_ce / 100000, 'prev_oi_l': _prev_ce / 100000,
                                             'activity': str(_rv.get('Call_Activity', '')),
                                         }
+                                elif _prev_ce > 50000 and _cur_ce > _prev_ce:
+                                    _built = (_cur_ce - _prev_ce) / _prev_ce * 100
+                                    _entry.update({'ce_capping': True, 'ce_built_pct': _built,
+                                                   'prev_ce_oi_l': _prev_ce / 100000})
                                 if _prev_pe > 50000 and _cur_pe < _prev_pe:
                                     _shed = (_prev_pe - _cur_pe) / _prev_pe * 100
                                     _entry.update({'pe_depeg': True, 'pe_shed_pct': _shed,
@@ -8824,6 +8795,10 @@ def main():
                                             'oi_l': _cur_pe / 100000, 'prev_oi_l': _prev_pe / 100000,
                                             'activity': str(_rv.get('Put_Activity', '')),
                                         }
+                                elif _prev_pe > 50000 and _cur_pe > _prev_pe:
+                                    _built = (_cur_pe - _prev_pe) / _prev_pe * 100
+                                    _entry.update({'pe_capping': True, 'pe_built_pct': _built,
+                                                   'prev_pe_oi_l': _prev_pe / 100000})
                                 _decap_atm_list.append(_entry)
 
                             # Update snapshot for all strikes
