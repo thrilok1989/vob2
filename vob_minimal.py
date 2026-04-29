@@ -10448,12 +10448,9 @@ def main():
                     except Exception:
                         pass
 
-                    # Decapping / Depeg alert
-                    try:
-                        _h = send_decapping_alert(option_data['underlying'])
-                        if _h: _send_with_header(_h)
-                    except Exception:
-                        pass
+                    # Decapping / Depeg: now embedded inside the master signal
+                    # message (cap_detail_block). Standalone alert removed to
+                    # avoid duplicating the same info on Telegram.
 
                     # Order Block zone alert
                     try:
