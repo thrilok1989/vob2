@@ -6342,6 +6342,28 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             )
     ob_block = ("\n🔲 <b>ORDER BLOCKS (LuxAlgo):</b>\n" + "\n".join(_ob_lines) + "\n") if _ob_lines else ""
 
+    # ── Verbose Order Block detail block (zones price is inside or near) ──
+    _ob_detail_lines = []
+    for _bobs, _emoji, _label, _action in [
+        (_ob.get('bullish_obs', []), '🟩', 'BULLISH', 'BUY — demand zone holding'),
+        (_ob.get('bearish_obs', []), '🟥', 'BEARISH', 'SELL — supply zone holding'),
+    ]:
+        for _b in _bobs[:2]:
+            _ob_lo, _ob_hi, _ob_avg = _b['low'], _b['high'], _b['avg']
+            _inside = _ob_lo <= underlying_price <= _ob_hi
+            _dist   = abs(underlying_price - _ob_avg)
+            _near   = _dist <= 30
+            if not (_inside or _near):
+                continue
+            _status = '⚡ Price INSIDE zone' if _inside else f'⚡ Price {_dist:.0f}pts from zone'
+            _ob_detail_lines.append(
+                f"{_emoji} <b>ORDER BLOCK DETECTED — {_label} OB</b>\n"
+                f"Zone: ₹{_ob_lo:.0f} – ₹{_ob_hi:.0f} | Avg ₹{_ob_avg:.0f}\n"
+                f"{_status} | Spot ₹{underlying_price:.0f}\n"
+                f"Action: {_action}"
+            )
+    ob_detail_block = ("\n" + "\n\n".join(_ob_detail_lines) + f"\n<i>{time_str}</i>\n") if _ob_detail_lines else ""
+
     # ── Capping / Decapping / Depeg block (ATM±2 per-strike) ──
     _decap_atm = getattr(st.session_state, '_decap_atm_data', [])
     _decap_lines = []
@@ -6404,7 +6426,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
 📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
-{decap_block}{cap_detail_block}{ob_block}
+{decap_block}{cap_detail_block}{ob_block}{ob_detail_block}
 <b>📍 DIRECTION</b>
 {swing_block}{capping_block}
 <b>📉 MARKET DEPTH</b>{depth_block}
