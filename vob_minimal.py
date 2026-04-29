@@ -6369,19 +6369,20 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _decap_lines = []
     for _e in _decap_atm:
         if _e.get('ce_decapping'):
-            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L(−{_e['ce_shed_pct']:.1f}%⚡)"
+            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L ⚡DECAP −{_e['ce_shed_pct']:.1f}%"
         elif _e.get('ce_capping'):
-            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L(+{_e['ce_built_pct']:.1f}%🧱)"
+            _ce_str = f"CE:{_e['ce_oi_l']:.1f}L 🧱CAP +{_e['ce_built_pct']:.1f}%"
         else:
             _ce_str = f"CE:{_e['ce_oi_l']:.1f}L"
         if _e.get('pe_depeg'):
-            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L(−{_e['pe_shed_pct']:.1f}%⚡)"
+            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L ⚡DEPEG −{_e['pe_shed_pct']:.1f}%"
         elif _e.get('pe_capping'):
-            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L(+{_e['pe_built_pct']:.1f}%🛡)"
+            _pe_str = f"PE:{_e['pe_oi_l']:.1f}L 🛡CAP +{_e['pe_built_pct']:.1f}%"
         else:
             _pe_str = f"PE:{_e['pe_oi_l']:.1f}L"
         _decap_lines.append(f"  {_e['label']} ₹{_e['strike']:.0f}: {_ce_str} | {_pe_str}")
-    decap_block = ("\n<b>🔓 OI CAPPING/DECAPPING (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
+    decap_legend = "<i>🧱CAP=CE writers building (ceiling↑) | 🛡CAP=PE writers building (floor↑) | ⚡DECAP=CE shed (ceiling↓) | ⚡DEPEG=PE shed (floor↓)</i>"
+    decap_block = ("\n<b>🔓 OI CAPPING/DECAPPING (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n" + decap_legend + "\n") if _decap_lines else ""
 
     # ── Verbose CAPPING / DECAPPING detail block (per-strike multi-line) ──
     _cap_detail_lines = []
