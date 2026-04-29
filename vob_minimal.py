@@ -5128,6 +5128,28 @@ def send_decapping_alert(underlying_price):
                 )
                 _alerted[_key] = now
 
+        if _e.get('ce_capping') and _e.get('ce_built_pct', 0) >= 1.0:
+            _key = f"cap_ce_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>CALL CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"CE OI built <b>{_e['ce_built_pct']:.1f}%</b> "
+                    f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                    f"→ Ceiling forming → resistance ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
+
+        if _e.get('pe_capping') and _e.get('pe_built_pct', 0) >= 1.0:
+            _key = f"cap_pe_{_e['strike']:.0f}"
+            if not _alerted.get(_key) or (now - _alerted[_key]).total_seconds() > 600:
+                msgs.append(
+                    f"⚡ <b>PUT CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                    f"PE OI built <b>{_e['pe_built_pct']:.1f}%</b> "
+                    f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                    f"→ Floor forming → support ↑ | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                _alerted[_key] = now
+
     return "\n\n".join(msgs) if msgs else None
 
 
@@ -8803,6 +8825,8 @@ def main():
                                     'ce_oi_l': _cur_ce / 100000, 'pe_oi_l': _cur_pe / 100000,
                                     'ce_decapping': False, 'pe_depeg': False,
                                     'ce_shed_pct': 0.0, 'pe_shed_pct': 0.0,
+                                    'ce_capping': False, 'pe_capping': False,
+                                    'ce_built_pct': 0.0, 'pe_built_pct': 0.0,
                                 }
                                 if _prev_ce > 50000 and _cur_ce < _prev_ce:
                                     _shed = (_prev_ce - _cur_ce) / _prev_ce * 100
@@ -8814,6 +8838,10 @@ def main():
                                             'oi_l': _cur_ce / 100000, 'prev_oi_l': _prev_ce / 100000,
                                             'activity': str(_rv.get('Call_Activity', '')),
                                         }
+                                elif _prev_ce > 50000 and _cur_ce > _prev_ce:
+                                    _built = (_cur_ce - _prev_ce) / _prev_ce * 100
+                                    _entry.update({'ce_capping': True, 'ce_built_pct': _built,
+                                                   'prev_ce_oi_l': _prev_ce / 100000})
                                 if _prev_pe > 50000 and _cur_pe < _prev_pe:
                                     _shed = (_prev_pe - _cur_pe) / _prev_pe * 100
                                     _entry.update({'pe_depeg': True, 'pe_shed_pct': _shed,
@@ -8824,6 +8852,10 @@ def main():
                                             'oi_l': _cur_pe / 100000, 'prev_oi_l': _prev_pe / 100000,
                                             'activity': str(_rv.get('Put_Activity', '')),
                                         }
+                                elif _prev_pe > 50000 and _cur_pe > _prev_pe:
+                                    _built = (_cur_pe - _prev_pe) / _prev_pe * 100
+                                    _entry.update({'pe_capping': True, 'pe_built_pct': _built,
+                                                   'prev_pe_oi_l': _prev_pe / 100000})
                                 _decap_atm_list.append(_entry)
 
                             # Update snapshot for all strikes
