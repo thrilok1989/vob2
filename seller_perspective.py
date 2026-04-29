@@ -4123,6 +4123,7 @@ def compute_oi_velocity_acceleration(history, atm_strike, window_strikes=3):
 # 🎯 MARKET DEPTH ANALYZER (NEW)
 # ============================================
 
+@st.cache_data(ttl=30)
 def get_option_contract_depth(security_id_ce, security_id_pe, strike_price=0, expiry="", exchange_segment="NSE_FNO"):
     """
     Fetch market depth for CE and PE contracts
@@ -4214,6 +4215,7 @@ def get_option_contract_depth(security_id_ce, security_id_pe, strike_price=0, ex
 
     return {"available": False, "error": "Unknown error"}
 
+@st.cache_data(ttl=30)
 def get_market_depth_dhan():
     """
     Fetch Nifty 5-level market depth from Dhan REST API
@@ -5811,9 +5813,24 @@ def get_expiry_list():
         st.warning(f"Expiry list failed: {e}")
         return []
 
-@st.cache_data(ttl=45)  # 45 seconds - faster refresh for option chain data
 def fetch_dhan_option_chain(expiry_date):
-    """Fetch option chain with retry logic and rate limiting"""
+    """Fetch option chain with retry logic and rate limiting.
+
+    Prefers the raw payload already fetched by the main analyzer
+    (cached in st.session_state['_cached_raw_chain']) so the Seller
+    tab does not duplicate the Dhan API call.
+    """
+    # Reuse the main analyzer's cached raw chain when available
+    try:
+        _cache = st.session_state.get('_cached_raw_chain') or {}
+        if expiry_date in _cache and _cache[expiry_date]:
+            return _cache[expiry_date]
+        _latest = st.session_state.get('_cached_raw_chain_latest') or {}
+        if _latest.get('expiry') == expiry_date and _latest.get('data'):
+            return _latest['data']
+    except Exception:
+        pass
+
     max_retries = 3
     retry_delays = [2, 4, 8]  # Exponential backoff: 2s, 4s, 8s
 

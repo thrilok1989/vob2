@@ -2712,6 +2712,11 @@ def analyze_option_chain(selected_expiry=None, pivot_data=None, vob_data=None):
         return {'underlying': None, 'df_summary': None, 'expiry_dates': expiry_dates, 'expiry': None, 'sr_data': [], 'max_pain_strike': None, 'styled_df': None, 'df_display': None, 'display_cols': [], 'bias_cols': [], 'total_ce_change': 0, 'total_pe_change': 0}
 
     data = option_chain_data['data']
+    # Cache raw Dhan option-chain payload (last_price + oc) in session state
+    # so the Seller's Perspective tab can reuse it without a duplicate API call.
+    _raw_cache = st.session_state.setdefault('_cached_raw_chain', {})
+    _raw_cache[expiry] = data
+    st.session_state['_cached_raw_chain_latest'] = {'expiry': expiry, 'data': data}
     underlying = data['last_price']
 
     oc_data = data['oc']
