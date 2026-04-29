@@ -5086,7 +5086,7 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-            msg = f"🟩 PUT SUPPORT ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            msg = f"🟩 PUT WRITING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
             alerted[key] = now
             return msg
     except Exception:
