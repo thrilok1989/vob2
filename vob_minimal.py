@@ -6361,6 +6361,39 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
         _decap_lines.append(f"  {_e['label']} ₹{_e['strike']:.0f}: {_ce_str} | {_pe_str}")
     decap_block = ("\n<b>🔓 OI CAPPING/DECAPPING (ATM±2):</b>\n" + "\n".join(_decap_lines) + "\n") if _decap_lines else ""
 
+    # ── Verbose CAPPING / DECAPPING detail block (per-strike multi-line) ──
+    _cap_detail_lines = []
+    for _e in _decap_atm:
+        if _e.get('ce_capping') and _e.get('ce_built_pct', 0) >= 1.0:
+            _cap_detail_lines.append(
+                f"⚡ <b>CALL CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                f"CE OI built <b>{_e['ce_built_pct']:.1f}%</b> "
+                f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                f"→ Ceiling forming → resistance ↑"
+            )
+        if _e.get('pe_capping') and _e.get('pe_built_pct', 0) >= 1.0:
+            _cap_detail_lines.append(
+                f"⚡ <b>PUT CAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                f"PE OI built <b>{_e['pe_built_pct']:.1f}%</b> "
+                f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                f"→ Floor forming → support ↑"
+            )
+        if _e.get('ce_decapping'):
+            _cap_detail_lines.append(
+                f"⚡ <b>DECAPPING {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                f"CE OI shed <b>{_e['ce_shed_pct']:.1f}%</b> "
+                f"({_e.get('prev_ce_oi_l',0):.1f}L → {_e['ce_oi_l']:.1f}L)\n"
+                f"→ Ceiling lifting → breakout risk ↑"
+            )
+        if _e.get('pe_depeg'):
+            _cap_detail_lines.append(
+                f"⚡ <b>DEPEG {_e['label']} ₹{_e['strike']:.0f}</b>\n"
+                f"PE OI shed <b>{_e['pe_shed_pct']:.1f}%</b> "
+                f"({_e.get('prev_pe_oi_l',0):.1f}L → {_e['pe_oi_l']:.1f}L)\n"
+                f"→ Floor dropping → breakdown risk ↑"
+            )
+    cap_detail_block = ("\n" + "\n\n".join(_cap_detail_lines) + f"\n<i>Spot ₹{underlying_price:.0f} | {time_str}</i>\n") if _cap_detail_lines else ""
+
     # ── Part 1: Signal + Direction + S/R + OI Positioning ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
     #         future swing → S/R analysis → OI positioning (winding + option chain verdict)
@@ -6371,7 +6404,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
 📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
-{decap_block}{ob_block}
+{decap_block}{cap_detail_block}{ob_block}
 <b>📍 DIRECTION</b>
 {swing_block}{capping_block}
 <b>📉 MARKET DEPTH</b>{depth_block}
