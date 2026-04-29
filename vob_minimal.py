@@ -6416,9 +6416,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             )
     cap_detail_block = ("\n" + "\n\n".join(_cap_detail_lines) + f"\n<i>Spot ₹{underlying_price:.0f} | {time_str}</i>\n") if _cap_detail_lines else ""
 
-    # ── Part 1: Signal + Direction + S/R + OI Positioning ──
+    # ── Part 1: Snapshot + Direction + Depth + Context + Volume Delta ──
     # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
-    #         future swing → S/R analysis → OI positioning (winding + option chain verdict)
+    #         capping/OB detail → direction → market depth → market context → volume delta
     msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
 🕐 {time_str} | ₹{underlying_price:.0f}
 
@@ -6430,32 +6430,33 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 <b>📍 DIRECTION</b>
 {swing_block}{capping_block}
 <b>📉 MARKET DEPTH</b>{depth_block}
-<b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
-<b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}"""
+<b>📊 MARKET CONTEXT</b>{market_ctx_block}
+<b>⚡ VOLUME DELTA</b>{vol_delta_block}"""
 
-    # ── Part 2: Deep Analysis + Indices & Stocks at bottom ──
-    # Layout: header → market context → vpfr/triple POC/money flow → strike analysis →
-    #         price action (vwap/vob/hvp) → indices & stocks (alignment + capping) → AI prompt
+    # ── Part 2: Per-strike + OI Positioning + VPFR/MF + Price Structure + Indices ──
+    # Layout: header → strike analysis ATM±2 → OI positioning → vpfr/triple POC/money flow →
+    #         price action (vwap/vob/hvp) + sector rotation → indices & stocks → AI prompt
     msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
 
-<b>📊 MARKET CONTEXT</b>{market_ctx_block}
-<b>⚡ VOLUME DELTA</b>{vol_delta_block}
+<b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
+<b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}
 <b>📈 VPFR / POC / MONEY FLOW</b>{vpfr_block}{poc_block}{mf_block}
 <b>🔄 PRICE STRUCTURE</b>{price_action_block}{sector_rotation_block}
 <b>🌍 INDICES &amp; STOCKS</b>
 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, S/R analysis (per-level OI/depth/VPFR/GEX/MF), OI winding/positioning, option chain verdict, Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), VPFR, Triple POC, Money Flow (POC/VAH/VAL), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), LTP trap+VWAP, VOB, HVP, Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
+🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, OI capping/decapping/depeg per-strike (ATM±2 CE/PE build & shed with %), Order Block zones (BULLISH/BEARISH OB — inside or near), Market Depth (bid/ask walls at ATM±2), Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), OI winding/positioning, option chain verdict, VPFR, Triple POC, Money Flow (POC/VAH/VAL), LTP trap+VWAP, VOB, HVP, Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
 GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
 1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
-2. Strongest wall: strike + OI + market depth (bid/ask wall at strike) + VPFR confluence (POC/VAH/VAL near OI S/R strike) + Money Flow Profile POC alignment + why (this is the ceiling/floor where price stalls)
+2. Strongest wall: strike + OI + capping/decapping state + market depth (bid/ask wall) + VPFR confluence (POC/VAH/VAL) + Money Flow Profile POC + why (this is the ceiling/floor where price stalls)
 3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR / S&P 500 futures / JAPAN 225 / HANG SENG / UK 100 — bias + Cap/Sup/Range
 4. Sector Rotation: which sectors leading/lagging (10m+1h bias) → is it RISK-ON (cyclicals up) or RISK-OFF (defensives up)?
 5. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
 CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
 
-    message = msg_part1  # used for Gemini analysis context
+    # Feed full signal (both parts, excluding the trailing AI-prompt code block) to Gemini
+    message = msg_part1 + "\n\n" + msg_part2.split("🟡 <code>")[0]
 
     # Send Part 1 (with optional alert header prepended) then Part 2
     _part1_out = (alert_header + "\n\n" + msg_part1) if alert_header else msg_part1
