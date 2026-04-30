@@ -11922,17 +11922,7 @@ def _render_main_analyzer():
 
 def main():
     st.title("📈 Nifty Trading & Options Analyzer")
-    _main_tab, _seller_tab = st.tabs(["📊 Main Analyzer", "🎯 Seller's Perspective"])
-    with _seller_tab:
-        try:
-            from seller_perspective import render_seller_perspective_tab
-            render_seller_perspective_tab()
-        except Exception as _sp_err:
-            st.error(f"Failed to load Seller's Perspective view: {_sp_err}")
-            import traceback
-            st.code(traceback.format_exc())
-    with _main_tab:
-        _render_main_analyzer()
+    _render_main_analyzer()
 
 
 if __name__ == "__main__":
