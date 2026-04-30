@@ -5053,6 +5053,8 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
     now = datetime.now(pytz.timezone('Asia/Kolkata'))
     time_str = now.strftime('%H:%M:%S IST')
 
+    msgs = []
+
     # Call capping (resistance)
     try:
         cap_rows = adf[
@@ -5069,13 +5071,12 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
             oi_l = float(r.get('CE_OI', 0) or 0) / 100000
-            msg = f"🟥 CALL CAPPING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            msgs.append(f"🟥 CALL CAPPING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}")
             alerted[key] = now
-            return msg
     except Exception:
         pass
 
-    # Put support
+    # Put writing (support) — checked independently so it is never blocked by call capping
     try:
         sup_rows = adf[
             adf['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
@@ -5091,12 +5092,12 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-            msg = f"🟩 PUT WRITING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            msgs.append(f"🟩 PUT WRITING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}")
             alerted[key] = now
-            return msg
     except Exception:
         pass
-    return None
+
+    return "\n\n".join(msgs) if msgs else None
 
 
 def send_decapping_alert(underlying_price):
@@ -10434,9 +10435,12 @@ def _render_main_analyzer():
                     except Exception:
                         pass
 
-                    # Decapping / Depeg: now embedded inside the master signal
-                    # message (cap_detail_block). Standalone alert removed to
-                    # avoid duplicating the same info on Telegram.
+                    # Decapping / Depeg / ATM±2 capping standalone alerts
+                    try:
+                        _h = send_decapping_alert(option_data['underlying'])
+                        if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
 
                     # Order Block zone alert
                     try:
