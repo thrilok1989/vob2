@@ -4990,9 +4990,9 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
     return None
 
 
-def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
+def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=50):
     """Fire when a bullish candle forms at support or bearish candle forms at resistance.
-    Independent of score — fires on pattern+location match alone. Cooldown 10 min per level."""
+    Independent of score — fires on pattern+location match alone. Cooldown 30 min per level."""
     def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
     direction = candle.get('direction', '')
     pattern = candle.get('pattern', 'No Pattern')
@@ -5001,15 +5001,24 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
     alerted = st.session_state.setdefault('_candle_sr_alerted', {})
     now = datetime.now(pytz.timezone('Asia/Kolkata'))
 
-    # Build candidate levels: PCR S/R + OC levels
+    # Build candidate levels: PCR S/R + OC levels.
+    # Neutral PCR strikes are included as positional S/R (below spot → support, above → resistance)
+    # so alerts fire even when no strike has extreme PCR.
     candidate_supports = []
     candidate_resistances = []
     for s in (pcr_sr_snapshot or []):
         sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+        level = s['level']
         if sr_clean == 'Support':
-            candidate_supports.append(('PCR', s['label'], s['level']))
+            candidate_supports.append(('PCR', s['label'], level))
         elif sr_clean == 'Resistance':
-            candidate_resistances.append(('PCR', s['label'], s['level']))
+            candidate_resistances.append(('PCR', s['label'], level))
+        else:
+            # Neutral strike — use position relative to spot as weak S/R
+            if level <= underlying_price:
+                candidate_supports.append(('PCR-N', s['label'], level))
+            else:
+                candidate_resistances.append(('PCR-N', s['label'], level))
     for lvl in (support_levels or []):
         candidate_supports.append(('OC', f"₹{lvl:.0f}", lvl))
     for lvl in (resistance_levels or []):
@@ -5039,6 +5048,63 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
             alerted[key] = now
             return msg
     return None
+
+
+def send_retest_alert(underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=30):
+    """Fire when spot retests a previously broken S/R level.
+    Tracks which side of each level spot was on last cycle and alerts when it returns to the level."""
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+
+    # Build all S/R candidate levels
+    levels = []
+    for s in (pcr_sr_snapshot or []):
+        sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+        if sr_clean in ('Support', 'Resistance'):
+            levels.append((s['level'], sr_clean, s['label']))
+        else:
+            tag = 'Support' if s['level'] <= underlying_price else 'Resistance'
+            levels.append((s['level'], tag, s['label']))
+    for lvl in (support_levels or []):
+        levels.append((lvl, 'Support', f"₹{lvl:.0f}"))
+    for lvl in (resistance_levels or []):
+        levels.append((lvl, 'Resistance', f"₹{lvl:.0f}"))
+
+    if not levels:
+        return None
+
+    # Session state: track last known side (above/below) for each level
+    _sides = st.session_state.setdefault('_retest_side', {})
+    _alerted = st.session_state.setdefault('_retest_alerted', {})
+    msgs = []
+
+    for level, sr_type, lbl in levels:
+        key = f"{level:.0f}"
+        current_side = 'above' if underlying_price > level else 'below'
+        prev_side = _sides.get(key)
+        _sides[key] = current_side
+
+        if prev_side is None or prev_side == current_side:
+            continue  # no crossover yet, or no history
+
+        # A crossover happened — spot just crossed back to the level (retest)
+        dist = abs(underlying_price - level)
+        if dist > proximity_pts:
+            continue
+
+        last_alert = _alerted.get(key)
+        if last_alert and (now - last_alert).total_seconds() < 900:
+            continue  # 15 min cooldown
+
+        if prev_side == 'above' and current_side == 'below':
+            # Was above resistance, now back below → failed breakout / retest as resistance
+            msgs.append(f"🔁 <b>RETEST (RESISTANCE)</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price returning to resistance — watch for rejection")
+        elif prev_side == 'below' and current_side == 'above':
+            # Was below support, now back above → failed breakdown / retest as support
+            msgs.append(f"🔁 <b>RETEST (SUPPORT)</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price returning to support — watch for bounce")
+        _alerted[key] = now
+
+    return "\n\n".join(msgs) if msgs else None
 
 
 def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
@@ -10426,6 +10492,16 @@ def _render_main_analyzer():
                         _h = send_candle_at_sr_alert(
                             master['candle'], option_data['underlying'],
                             _pcr_s, master.get('support_levels', []), master.get('resistance_levels', []),
+                        )
+                        if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
+
+                    # Retest alert — fires when spot crosses back to a previously broken S/R level
+                    try:
+                        _h = send_retest_alert(
+                            option_data['underlying'], _pcr_s,
+                            master.get('support_levels', []), master.get('resistance_levels', []),
                         )
                         if _h: _send_with_header(_h)
                     except Exception:
