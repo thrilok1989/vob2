@@ -4990,9 +4990,9 @@ def check_pcr_sr_proximity_alert(underlying_price, proximity_pts=25):
     return None
 
 
-def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=25):
+def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=50):
     """Fire when a bullish candle forms at support or bearish candle forms at resistance.
-    Independent of score — fires on pattern+location match alone. Cooldown 10 min per level."""
+    Independent of score — fires on pattern+location match alone. Cooldown 30 min per level."""
     def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
     direction = candle.get('direction', '')
     pattern = candle.get('pattern', 'No Pattern')
@@ -5001,15 +5001,24 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
     alerted = st.session_state.setdefault('_candle_sr_alerted', {})
     now = datetime.now(pytz.timezone('Asia/Kolkata'))
 
-    # Build candidate levels: PCR S/R + OC levels
+    # Build candidate levels: PCR S/R + OC levels.
+    # Neutral PCR strikes are included as positional S/R (below spot → support, above → resistance)
+    # so alerts fire even when no strike has extreme PCR.
     candidate_supports = []
     candidate_resistances = []
     for s in (pcr_sr_snapshot or []):
         sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+        level = s['level']
         if sr_clean == 'Support':
-            candidate_supports.append(('PCR', s['label'], s['level']))
+            candidate_supports.append(('PCR', s['label'], level))
         elif sr_clean == 'Resistance':
-            candidate_resistances.append(('PCR', s['label'], s['level']))
+            candidate_resistances.append(('PCR', s['label'], level))
+        else:
+            # Neutral strike — use position relative to spot as weak S/R
+            if level <= underlying_price:
+                candidate_supports.append(('PCR-N', s['label'], level))
+            else:
+                candidate_resistances.append(('PCR-N', s['label'], level))
     for lvl in (support_levels or []):
         candidate_supports.append(('OC', f"₹{lvl:.0f}", lvl))
     for lvl in (resistance_levels or []):
@@ -5041,6 +5050,70 @@ def send_candle_at_sr_alert(candle, underlying_price, pcr_sr_snapshot, support_l
     return None
 
 
+def send_retest_alert(underlying_price, pcr_sr_snapshot, support_levels, resistance_levels, proximity_pts=30):
+    """Fire when spot retests a previously broken S/R level.
+    Tracks which side of each level spot was on last cycle and alerts when it returns to the level."""
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    time_str = now.strftime('%H:%M:%S IST')
+
+    # Build all S/R candidate levels
+    levels = []
+    for s in (pcr_sr_snapshot or []):
+        sr_clean = s['type'].replace('🔴','').replace('🟢','').replace('⚪','').strip()
+        if sr_clean in ('Support', 'Resistance'):
+            levels.append((s['level'], sr_clean, s['label']))
+        else:
+            tag = 'Support' if s['level'] <= underlying_price else 'Resistance'
+            levels.append((s['level'], tag, s['label']))
+    for lvl in (support_levels or []):
+        levels.append((lvl, 'Support', f"₹{lvl:.0f}"))
+    for lvl in (resistance_levels or []):
+        levels.append((lvl, 'Resistance', f"₹{lvl:.0f}"))
+
+    if not levels:
+        return None
+
+    # Session state: track last known side (above/below) for each level
+    _sides = st.session_state.setdefault('_retest_side', {})
+    _alerted = st.session_state.setdefault('_retest_alerted', {})
+    msgs = []
+
+    for level, sr_type, lbl in levels:
+        key = f"{level:.0f}"
+        current_side = 'above' if underlying_price > level else 'below'
+        prev_side = _sides.get(key)
+        _sides[key] = current_side
+
+        if prev_side is None or prev_side == current_side:
+            continue  # no crossover yet, or no history
+
+        # A crossover happened — spot just crossed back to the level (retest)
+        dist = abs(underlying_price - level)
+        if dist > proximity_pts:
+            continue
+
+        last_alert = _alerted.get(key)
+        if last_alert and (now - last_alert).total_seconds() < 900:
+            continue  # 15 min cooldown
+
+        if prev_side == 'above' and current_side == 'below':
+            # Price just dropped below the level
+            if sr_type == 'Support':
+                msgs.append(f"🔴 <b>BREAKDOWN</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price broke below support — breakdown risk ↑")
+            else:
+                msgs.append(f"🔁 <b>RETEST (RESISTANCE)</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price returning to resistance from above — watch for rejection")
+            _alerted[key] = now
+        elif prev_side == 'below' and current_side == 'above':
+            # Price just rose above the level
+            if sr_type == 'Resistance':
+                msgs.append(f"🚀 <b>BREAKOUT</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price broke above resistance — breakout risk ↑")
+            else:
+                msgs.append(f"🔁 <b>RETEST (SUPPORT)</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price returning to support from below — watch for bounce")
+            _alerted[key] = now
+
+    return "\n\n".join(msgs) if msgs else None
+
+
 def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
     """Fire when sudden call capping or put support is detected at S/R. Cooldown 5 min per strike."""
     def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
@@ -5052,6 +5125,8 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
     alerted = st.session_state.setdefault('_capping_sr_alerted', {})
     now = datetime.now(pytz.timezone('Asia/Kolkata'))
     time_str = now.strftime('%H:%M:%S IST')
+
+    msgs = []
 
     # Call capping (resistance)
     try:
@@ -5069,13 +5144,12 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
             oi_l = float(r.get('CE_OI', 0) or 0) / 100000
-            msg = f"🟥 CALL CAPPING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            msgs.append(f"🟥 CALL CAPPING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}")
             alerted[key] = now
-            return msg
     except Exception:
         pass
 
-    # Put support
+    # Put writing (support) — checked independently so it is never blocked by call capping
     try:
         sup_rows = adf[
             adf['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
@@ -5091,12 +5165,12 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
                 continue
             vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
             oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-            msg = f"🟩 PUT WRITING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            msgs.append(f"🟩 PUT WRITING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}")
             alerted[key] = now
-            return msg
     except Exception:
         pass
-    return None
+
+    return "\n\n".join(msgs) if msgs else None
 
 
 def send_decapping_alert(underlying_price):
@@ -6422,10 +6496,8 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             )
     cap_detail_block = ("\n" + "\n\n".join(_cap_detail_lines) + f"\n<i>Spot ₹{underlying_price:.0f} | {time_str}</i>\n") if _cap_detail_lines else ""
 
-    # ── Part 1: Snapshot + Direction + Depth + Context + Volume Delta ──
-    # Layout: header → time/spot → candle/vol/loc → gamma/sentiment → OI ATM →
-    #         capping/OB detail → direction → market depth → market context → volume delta
-    msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']}
+    # ── Part 1/3: Header + Candle + GEX + PCR/VIX/VIDYA + OI ATM + Decap/Cap/OB + Direction ──
+    msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']} (1/3)
 🕐 {time_str} | ₹{underlying_price:.0f}
 
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
@@ -6434,25 +6506,27 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 {decap_block}{cap_detail_block}{ob_block}{ob_detail_block}
 <b>📍 DIRECTION</b>
-{swing_block}{capping_block}
+{swing_block}{capping_block}"""
+
+    # ── Part 2/3: Market Depth + Market Context + Volume Delta + Strike Analysis + OI Positioning ──
+    msg_part2 = f"""{signal_emoji} <b>DETAIL (2/3)</b> | {result['signal']} | {time_str}
+
 <b>📉 MARKET DEPTH</b>{depth_block}
 <b>📊 MARKET CONTEXT</b>{market_ctx_block}
-<b>⚡ VOLUME DELTA</b>{vol_delta_block}"""
-
-    # ── Part 2: Per-strike + OI Positioning + VPFR/MF + Price Structure + Indices ──
-    # Layout: header → strike analysis ATM±2 → OI positioning → vpfr/triple POC/money flow →
-    #         price action (vwap/vob/hvp) + sector rotation → indices & stocks → AI prompt
-    msg_part2 = f"""{signal_emoji} <b>DETAIL (2/2)</b> | {result['signal']} | {time_str}
-
+<b>⚡ VOLUME DELTA</b>{vol_delta_block}
 <b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
-<b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}
+<b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}"""
+
+    # ── Part 3/3: VPFR/POC/MF + Price Structure + Sector Rotation + Indices + AI prompt ──
+    msg_part3 = f"""{signal_emoji} <b>DETAIL (3/3)</b> | {result['signal']} | {time_str}
+
 <b>📈 VPFR / POC / MONEY FLOW</b>{vpfr_block}{poc_block}{mf_block}
 <b>🔄 PRICE STRUCTURE</b>{price_action_block}{sector_rotation_block}
 <b>🌍 INDICES &amp; STOCKS</b>
 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
 {_mi_bias_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, OI capping/decapping/depeg per-strike (ATM±2 CE/PE build & shed with %), Order Block zones (BULLISH/BEARISH OB — inside or near), Market Depth (bid/ask walls at ATM±2), Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), OI winding/positioning, option chain verdict, VPFR, Triple POC, Money Flow (POC/VAH/VAL), LTP trap+VWAP, VOB, HVP, Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
+🟡 <code>Analyze ALL data above (Part 1 + Part 2 + Part 3): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, OI capping/decapping/depeg per-strike (ATM±2 CE/PE build & shed with %), Order Block zones (BULLISH/BEARISH OB — inside or near), Market Depth (bid/ask walls at ATM±2), Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), OI winding/positioning, option chain verdict, VPFR, Triple POC, Money Flow (POC/VAH/VAL), LTP trap+VWAP, VOB, HVP, Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
 GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
 1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
 2. Strongest wall: strike + OI + capping/decapping state + market depth (bid/ask wall) + VPFR confluence (POC/VAH/VAL) + Money Flow Profile POC + why (this is the ceiling/floor where price stalls)
@@ -6461,10 +6535,10 @@ GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell
 5. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
 CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
 
-    # Feed full signal (both parts, excluding the trailing AI-prompt code block) to Gemini
-    message = msg_part1 + "\n\n" + msg_part2.split("🟡 <code>")[0]
+    # Feed all 3 parts (excluding AI-prompt code block) to Gemini
+    message = msg_part1 + "\n\n" + msg_part2 + "\n\n" + msg_part3.split("🟡 <code>")[0]
 
-    # Send Part 1 (with optional alert header prepended) then Part 2
+    # Send Part 1 (with optional alert header prepended), then Part 2, then Part 3
     _part1_out = (alert_header + "\n\n" + msg_part1) if alert_header else msg_part1
     try:
         send_telegram_message_sync(_part1_out, force=force)
@@ -6474,6 +6548,10 @@ CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
         send_telegram_message_sync(msg_part2, force=force)
     except Exception as _txt_err:
         st.warning(f"Telegram Part 2 send error: {_txt_err}")
+    try:
+        send_telegram_message_sync(msg_part3, force=force)
+    except Exception as _txt_err:
+        st.warning(f"Telegram Part 3 send error: {_txt_err}")
 
     # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
@@ -10426,6 +10504,16 @@ def _render_main_analyzer():
                     except Exception:
                         pass
 
+                    # Retest alert — fires when spot crosses back to a previously broken S/R level
+                    try:
+                        _h = send_retest_alert(
+                            option_data['underlying'], _pcr_s,
+                            master.get('support_levels', []), master.get('resistance_levels', []),
+                        )
+                        if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
+
                     # Capping at S/R alert
                     try:
                         if _sa_c is not None:
@@ -10434,9 +10522,12 @@ def _render_main_analyzer():
                     except Exception:
                         pass
 
-                    # Decapping / Depeg: now embedded inside the master signal
-                    # message (cap_detail_block). Standalone alert removed to
-                    # avoid duplicating the same info on Telegram.
+                    # Decapping / Depeg / ATM±2 capping standalone alerts
+                    try:
+                        _h = send_decapping_alert(option_data['underlying'])
+                        if _h: _send_with_header(_h)
+                    except Exception:
+                        pass
 
                     # Order Block zone alert
                     try:
