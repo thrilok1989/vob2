@@ -2123,40 +2123,12 @@ def generate_telegram_signal_option3(entry_signal, spot, seller_bias_result, sel
 """
     return message
 
-def check_and_send_signal(entry_signal, spot, seller_bias_result, seller_max_pain, 
-                         nearest_sup, nearest_res, moment_metrics, seller_breakout_index, 
+def check_and_send_signal(entry_signal, spot, seller_bias_result, seller_max_pain,
+                         nearest_sup, nearest_res, moment_metrics, seller_breakout_index,
                          expiry, expiry_spike_data, atm_bias=None, support_bias=None, resistance_bias=None):
+    """Disabled: Seller's Perspective NIFTY OPTION TRADE SETUP Telegram alert
+    has been removed. Returning None keeps existing call sites intact.
     """
-    Check if a new signal is generated and return it (simulated)
-    Returns signal message if new signal, None otherwise
-    """
-    # Store previous signal in session state
-    if "last_signal" not in st.session_state:
-        st.session_state["last_signal"] = None
-    
-    # Check if we have a valid signal
-    if entry_signal["position_type"] != "NEUTRAL" and entry_signal["confidence"] >= 40:
-        current_signal = f"{entry_signal['position_type']}_{entry_signal['optimal_entry_price']:.0f}"
-        
-        # Check if this is a new signal (different from last one)
-        if st.session_state["last_signal"] != current_signal:
-            # Generate Telegram message
-            telegram_msg = generate_telegram_signal_option3(
-                entry_signal, spot, seller_bias_result, 
-                seller_max_pain, nearest_sup, nearest_res, 
-                moment_metrics, seller_breakout_index, expiry, expiry_spike_data,
-                atm_bias, support_bias, resistance_bias
-            )
-            
-            if telegram_msg:
-                # Update last signal
-                st.session_state["last_signal"] = current_signal
-                return telegram_msg
-    
-    # Reset if signal is gone
-    elif st.session_state["last_signal"] is not None:
-        st.session_state["last_signal"] = None
-    
     return None
 
 # -----------------------
