@@ -114,7 +114,16 @@ def generate_simulated_depth():
     """
     Generate simulated depth for demo/testing
     """
-    spot_price = get_nifty_spot_price()
+    # Read spot from main analyzer's session_state cache; fall back to a default.
+    spot_price = (
+        st.session_state.get('_last_underlying')
+        or (st.session_state.get('_cached_option_data') or {}).get('underlying')
+        or 0
+    )
+    try:
+        spot_price = float(spot_price)
+    except (TypeError, ValueError):
+        spot_price = 0
     if spot_price == 0:
         spot_price = 22500  # Default
 
