@@ -5097,12 +5097,19 @@ def send_retest_alert(underlying_price, pcr_sr_snapshot, support_levels, resista
             continue  # 15 min cooldown
 
         if prev_side == 'above' and current_side == 'below':
-            # Was above resistance, now back below → failed breakout / retest as resistance
-            msgs.append(f"🔁 <b>RETEST (RESISTANCE)</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price returning to resistance — watch for rejection")
+            # Price just dropped below the level
+            if sr_type == 'Support':
+                msgs.append(f"🔴 <b>BREAKDOWN</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price broke below support — breakdown risk ↑")
+            else:
+                msgs.append(f"🔁 <b>RETEST (RESISTANCE)</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price returning to resistance from above — watch for rejection")
+            _alerted[key] = now
         elif prev_side == 'below' and current_side == 'above':
-            # Was below support, now back above → failed breakdown / retest as support
-            msgs.append(f"🔁 <b>RETEST (SUPPORT)</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price returning to support — watch for bounce")
-        _alerted[key] = now
+            # Price just rose above the level
+            if sr_type == 'Resistance':
+                msgs.append(f"🚀 <b>BREAKOUT</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price broke above resistance — breakout risk ↑")
+            else:
+                msgs.append(f"🔁 <b>RETEST (SUPPORT)</b> ₹{level:.0f} | Spot ₹{underlying_price:.0f} | {lbl} | {time_str}\n→ Price returning to support from below — watch for bounce")
+            _alerted[key] = now
 
     return "\n\n".join(msgs) if msgs else None
 
