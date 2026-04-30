@@ -11911,6 +11911,21 @@ def _render_main_analyzer():
         except Exception as e:
             st.caption(f"Signal history loading... ({str(e)[:50]})")
 
+    # ── Market Depth Analyzer (Order Book) — lean extraction from seller_perspective ──
+    try:
+        _od = locals().get('option_data') or {}
+        _spot_md = _od.get('underlying') if _od else None
+        _expiry_md = _od.get('expiry') if _od else ""
+        _atm_md = locals().get('atm_strike')
+        if _atm_md is None and _spot_md:
+            _atm_md = round(_spot_md / 50) * 50
+        if _spot_md:
+            with st.expander("📊 Market Depth Analyzer (Order Book)", expanded=False):
+                from seller_features import render_market_depth_tab
+                render_market_depth_tab(_spot_md, _atm_md, expiry=_expiry_md or "", strike_gap=50)
+    except Exception as _md_err:
+        st.caption(f"Market Depth Analyzer unavailable: {_md_err}")
+
     if show_analytics:
         st.markdown("---")
         display_analytics_dashboard(db)
