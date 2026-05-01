@@ -4557,6 +4557,24 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
 
     # 9. VIDYA Trend (from Pine Script)
     vidya_data = calculate_vidya(df)
+    # Zone-specific buy/sell volume since S/R zone entry (resets when price enters new zone)
+    try:
+        _reset_dt_v = st.session_state.get('_sr_zone_reset_dt')
+        if _reset_dt_v is not None and not df.empty and 'datetime' in df.columns:
+            _zone_df_v = df[df['datetime'] >= _reset_dt_v]
+            if not _zone_df_v.empty:
+                _src_v  = _zone_df_v['close'].values.astype(float)
+                _opn_v  = _zone_df_v['open'].values.astype(float)
+                _vol_v  = _zone_df_v['volume'].values.astype(float)
+                _z_buy  = float(np.sum(_vol_v[_src_v > _opn_v]))
+                _z_sell = float(np.sum(_vol_v[_src_v < _opn_v]))
+                _z_avg  = (_z_buy + _z_sell) / 2 if (_z_buy + _z_sell) > 0 else 1
+                vidya_data['zone_buy_vol']   = int(_z_buy)
+                vidya_data['zone_sell_vol']  = int(_z_sell)
+                vidya_data['zone_delta_pct'] = round((_z_buy - _z_sell) / _z_avg * 100, 1)
+                vidya_data['zone_candles']   = len(_zone_df_v)
+    except Exception:
+        pass
     if vidya_data['trend'] == 'Bullish' and candle['direction'] == 'Bullish':
         score += 1
         reasons.append(f"VIDYA Trend: Bullish (Delta: {vidya_data['delta_pct']:+.0f}%)")
@@ -5444,19 +5462,30 @@ def generate_ai_context_message():
     part1 = """🟡 <b>NIFTY SIGNAL GUIDE (EXECUTION)</b>
 
 <b>📋 ALERT TYPES</b>
-⚠️ PCR NEAR LEVEL → price near S/R (±25 pts)
-🕯 CANDLE AT LEVEL → confirmation candle
-🟥 CALL CAPPING 🔥 → SELL zone (CE writers capping)
-🟩 PUT SUPPORT 🔥 → BUY zone (PE writers defending)
-🔴 REJECTION (CEILING) → SELL trigger
-🟢 BOUNCE (FLOOR) → BUY trigger
+⚠️ PCR NEAR LEVEL → price within ±50 pts of S/R level
+🕯 CANDLE AT S/R → confirmation candle at support or resistance
+🟥 CALL CAPPING 🔥 → CE writers building OI near spot → ceiling forming
+🟩 PUT WRITING 🔥 → PE writers building OI near spot → floor forming
+⚡ CALL CAPPING (ATM±2) → CE OI built ≥1% → ceiling strengthening
+⚡ PUT CAPPING (ATM±2) → PE OI built ≥1% → floor strengthening
+⚡ DECAPPING → CE OI shedding → ceiling lifting → breakout risk ↑
+⚡ DEPEG → PE OI shedding → floor dropping → breakdown risk ↑
+🔴 REJECTION (CEILING) → bearish candle + OI wall + depth confirm → SELL
+🟢 BOUNCE (FLOOR) → bullish candle + OI wall + depth confirm → BUY
+🔁 RETEST (SUPPORT) → price returned to support from below → watch for bounce
+🔁 RETEST (RESISTANCE) → price returned to resistance from above → watch for rejection
+🚀 BREAKOUT → price crossed above resistance → follow momentum
+🔴 BREAKDOWN → price crossed below support → follow momentum
 👉 No trade without 2 confirmations minimum
 
-<b>📊 SIGNAL SCORE</b>
-Range: -5 (strong bear) → +5 (strong bull) | 🟥=Bear 🟩=Bull ⚪=Neutral
-👉 Use as bias filter only — not entry trigger
+<b>📊 SIGNAL (3 MESSAGES per signal)</b>
+1/3 = Header + Candle + GEX + PCR/VIX/VIDYA + OI ATM + Decap/Cap/OB + Direction
+2/3 = Market Depth + Context + Volume Delta + Strike Analysis ATM±2 + OI Positioning
+3/3 = VPFR/POC/MF + Price Structure + Sector Rotation + Indices/Alignment + AI Prompt
+Score: -5 (strong bear) → +5 (strong bull) | 🟥=Bear 🟩=Bull ⚪=Neutral
+👉 Use score as bias filter only — not entry trigger
 
-<b>🌍 ALIGNMENT CODES (decode signal alignment block)</b>
+<b>🌍 ALIGNMENT CODES</b>
 N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
 REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
 SP500=S&amp;P500 JP225=Japan225 HSI=HangSeng UK100=FTSE100
@@ -5471,81 +5500,81 @@ P=Pressure (+ve=buyers -ve=sellers) | BA=Bid-Ask pressure
 Depth &gt;5K=major wall | &lt;500=breakable | 🧱=Sell wall 🛡=Buy wall
 
 <b>🧱 ENTRY LOGIC</b>
-🔴 SELL (CEILING) — all must align:
-• Call OI highest (wall) | Market Depth: CA &gt;5K | Delta negative | Wick rejection
-👉 Entry: At ceiling stall | SL: Above ceiling
+🔴 SELL (CEILING): Call OI highest | CA &gt;5K depth | Delta -ve | Wick rejection
+🟢 BUY (FLOOR): Put OI highest | PB &gt;5K depth | Delta +ve | Wick bounce
+👉 Entry at stall | SL just beyond level
 
-🟢 BUY (FLOOR) — all must align:
-• Put OI highest (support) | Market Depth: PB &gt;5K | Delta positive | Wick bounce
-👉 Entry: At floor stall | SL: Below floor
+<b>🔄 OI WINDING / UNWINDING</b>
+CE Build(resist↑)=call writers adding→ceiling stronger
+CE Unwind(resist↓)=call writers exiting→ceiling may break
+PE Build(supp↑)=put writers adding→floor stronger
+PE Unwind(supp↓)=put writers exiting→floor may break
+Parallel Bull=CE unwind+PE build→strong BUY
+Parallel Bear=PE unwind+CE build→strong SELL
 
-<b>🔄 OI WINDING / UNWINDING (in every signal)</b>
-CE Build(resist↑) = call writers adding → ceiling stronger
-CE Unwind(resist↓) = call writers exiting → ceiling may break
-PE Build(supp↑) = put writers adding → floor stronger
-PE Unwind(supp↓) = put writers exiting → floor may break
-Parallel Bull = CE unwind + PE build → strong BUY signal
-Parallel Bear = PE unwind + CE build → strong SELL signal
-
-<b>📡 MARKET MODE (live GEX in every signal)</b>
-GEX +ve(+XXL) → RANGE → sell ceiling / buy floor
-GEX -ve(-XXL) → TREND → follow momentum, no counter
+<b>📡 MARKET MODE (GEX in every signal)</b>
+GEX +ve → RANGE → sell ceiling / buy floor
+GEX -ve → TREND → follow momentum, no counter-trade
 Confirm with VIDYA direction | 🧊 No depth wall = No trade
 
-<b>🔄 SECTOR ROTATION (in every signal)</b>
-RISK-ON 🟢 = cyclicals lead (AUTO/METAL/REALTY/BANK/ENERGY) → bullish for NIFTY
-RISK-OFF 🔴 = defensives lead (PHARMA/FMCG/IT/MEDIA) → cautious/bearish for NIFTY
-MIXED ⚪ = no clear rotation → wait for alignment
-10m/1h = last 10/60 candle bias per sector (🟢Bullish ⚪Neutral 🔴Bearish)
-👉 RISK-ON + GEX +ve → buy floor | RISK-OFF + GEX -ve → sell ceiling"""
+<b>🔄 SECTOR ROTATION</b>
+RISK-ON 🟢=cyclicals lead(AUTO/METAL/REALTY/BANK)→bullish NIFTY
+RISK-OFF 🔴=defensives lead(PHARMA/FMCG/IT)→cautious/bearish
+MIXED ⚪=no clear rotation→wait
+👉 RISK-ON+GEX+ve→buy floor | RISK-OFF+GEX-ve→sell ceiling"""
 
     part2 = """🟡 <b>NIFTY SIGNAL GUIDE (REFERENCE)</b>
 
 <b>⚠️ CRITICAL RULES</b>
 1. GEX -ve + VIDYA trend → DO NOT FADE
 2. Market Depth &lt;500 qty → weak level → expect break
-3. DTE ≤5 → MaxPain magnet (price pulls toward max pain)
+3. DTE ≤5 → MaxPain magnet active
 4. Straddle &gt;&gt; ATR → big move already priced in
 5. PCR ≤0.7 near ATM+1 → heavy resistance above
 6. Delta divergence → price ≠ delta direction → reversal warning
+7. BREAKOUT alert + DECAPPING = high conviction breakout
+8. BREAKDOWN alert + DEPEG = high conviction breakdown
 
 <b>🚫 NO TRADE ZONE</b>
 Alignment mixed | GEX neutral | No depth walls | Delta ≈ 0
 = Sit out — this is your edge
 
-<b>💰 MONEY FLOW PROFILE (in every signal)</b>
-POC (Point of Control) = price with most volume = magnet (price always revisits)
-VAH (Value Area High) = upper boundary of 70% vol zone → acts as ceiling/resistance
-VAL (Value Area Low) = lower boundary of 70% vol zone → acts as floor/support
-Strongest node = price range where buyers/sellers dominated most
-🟢 Bullish node = buyers controlled → bounce zone | 🔴 Bearish = sellers → rejection zone
-⭐ = POC node (highest vol = strongest magnet)
-👉 Price between VAL–VAH = fair value | Below VAL = undervalued | Above VAH = overvalued
+<b>♻️ ZONE RESET (Volume Delta + VIDYA)</b>
+When price enters within 30 pts of S/R level:
+→ Volume Delta resets to 0 — shows only what buyers/sellers did AT the zone
+→ VIDYA zone bias resets — shows fresh buy/sell vol since zone entry
+Header shows: ⚡ VOLUME DELTA ♻️ Zone (Nc) where N = candles since reset
+VIDYA line shows: Zone(Nc) B:XXK S:XXK Δ±XX%
+Use zone delta to judge conviction: +ve = buyers defending / -ve = sellers attacking
+Resets again when price moves to a different S/R level (&gt;50 pts away then returns)
+
+<b>💰 MONEY FLOW PROFILE</b>
+POC = price with most volume = magnet (price always revisits)
+VAH = upper boundary of 70% vol zone → resistance
+VAL = lower boundary of 70% vol zone → support
+🟢 +Delta at POC/VAL → buyers defending → support holding
+🔴 -Delta at POC/VAH → sellers defending → resistance holding
+Price below VAL = undervalued | above VAH = overvalued
 
 <b>⚡ VOLUME DELTA</b>
-Total Delta = Buy Vol − Sell Vol | +ve=buyers winning, -ve=sellers
-Cum Delta = running total — rising=buyers accumulating, falling=sellers
-Ratio &gt;1=buyers dominant | &lt;1=sellers dominant
-Divergence = price moves up but delta -ve (or vice versa) → reversal warning
-VAH/VAL/POC delta = what buyers/sellers did at Money Flow key levels (most important)
-🟢 +Delta at POC/VAL → buyers defending → confirms support / magnet holding
-🔴 -Delta at POC/VAH → sellers defending → confirms resistance / ceiling holding
+Total Delta = Buy Vol − Sell Vol | +ve=buyers, -ve=sellers
+Cum Delta rising=buyers accumulating | falling=sellers
+Divergence: price up but delta -ve → reversal warning
+Zone Delta (♻️) = fresh delta since zone entry = most actionable
 
 <b>📉 MARKET DEPTH per strike</b>
-CB=CE Bid (call buyers) | CA=CE Ask (call sellers)
-PB=PE Bid (put buyers) | PA=PE Ask (put sellers)
-🧱 Sellers wall: CA &gt; 2×CB → ceiling strong, expect rejection
-🛡 Buyers wall: PB &gt; 2×PA → floor strong, expect bounce
+🧱 CA &gt; 2×CB → ceiling strong, expect rejection
+🛡 PB &gt; 2×PA → floor strong, expect bounce
 
 <b>📦 OTHER TERMS</b>
 GEX Flip = level where market shifts range↔trend
-VIDYA -ve%=falling trend | +ve%=rising trend
+VIDYA +ve%=rising trend | -ve%=falling | ▲▼=fresh cross
 VPFR: 3 timeframe POC/VAH/VAL confluence = strong zone
 Triple POC P1/P2/P3 clustered = very strong magnet
 VOB=Volume Order Blocks | HVP=High Volume Pivots
 IVR 🔥≥70%=sell favoured | 🧊≤30%=buy favoured
 Skew 🔴&gt;1.1=put fear | 🟢&lt;0.9=call greed | ATR14=SL size
-Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up | RISK-OFF=defensives up"""
+Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up"""
 
     return [part1, part2]
 
@@ -5777,14 +5806,20 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             def _fmt_vol(v):
                 v = int(v or 0)
                 return f"{v/1000000:.1f}M" if abs(v) >= 1000000 else f"{v/1000:.0f}K"
-            _tot_d  = int(_vds.get('total_delta', 0))
-            _buy_v  = int(_vds.get('total_buy_volume', 0))
-            _sell_v = int(_vds.get('total_sell_volume', 0))
-            _d_rat  = float(_vds.get('delta_ratio', 0))
-            _cum_d  = int(_vds.get('cum_delta_last', 0))
-            _divg   = int(_vds.get('divergence_bars', 0))
+            # Use zone-window stats when near S/R, overall stats otherwise
+            _vdz = _vd.get('zone_summary') if _vd.get('zone_reset') else None
+            _vds_active = _vdz if _vdz else _vds
+            _zn   = _vd.get('zone_candles', 0) if _vdz else 0
+            _hdr  = f"⚡ VOLUME DELTA ♻️ Zone ({_zn}c)" if _vdz else "⚡ VOLUME DELTA"
+            _tot_d  = int(_vds_active.get('total_delta', 0))
+            _buy_v  = int(_vds_active.get('total_buy_volume', 0))
+            _sell_v = int(_vds_active.get('total_sell_volume', 0))
+            _d_rat  = float(_vds.get('delta_ratio', 0))        # ratio always from full data
+            _cum_d  = int(_vds_active.get('cum_delta_last', 0))
+            _divg   = int(_vds.get('divergence_bars', 0))       # divergences from full data
+            _active_e = '🟢' if _tot_d > 0 else '🔴' if _tot_d < 0 else _bias_e
             vol_delta_block = (
-                f"\n<b>⚡ VOLUME DELTA:</b> {_bias_e} {_vds.get('bias','N/A')}\n"
+                f"\n<b>{_hdr}:</b> {_active_e} {_vds.get('bias','N/A')}\n"
                 f"  Delta: {_fmt_vol(_tot_d)} | Cum Delta: {_fmt_vol(_cum_d)}\n"
                 f"  Buy Vol: {_fmt_vol(_buy_v)} | Sell Vol: {_fmt_vol(_sell_v)}\n"
                 f"  Ratio: {_d_rat:.2f} | Divergences: {_divg}\n"
@@ -6400,6 +6435,18 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _oit = result.get('oi_trend', {})
     _vid = result.get('vidya', {})
     _ob = result.get('order_blocks', {})
+    # When near S/R zone use zone-specific VIDYA delta; otherwise use overall delta
+    _vid_in_zone = bool(_vid.get('zone_candles'))
+    if _vid_in_zone:
+        _zb = _vid.get('zone_buy_vol', 0)
+        _zs = _vid.get('zone_sell_vol', 0)
+        _zd = _vid.get('zone_delta_pct', 0)
+        _zn = _vid.get('zone_candles', 0)
+        _vid_delta_str  = f"{_zd:+.0f}%"
+        _vid_zone_suffix = f" ♻️Zone({_zn}c) B:{_zb//1000}K S:{_zs//1000}K"
+    else:
+        _vid_delta_str   = f"{_vid.get('delta_pct', 0):+.0f}%"
+        _vid_zone_suffix = ""
     _net_gex = gex.get('net_gex', 0)
     _gex_action = "→sell ceiling/buy floor" if _net_gex > 0 else "→follow momentum" if _net_gex < 0 else "→wait"
     # ── Order Block block for msg_part1 ──
@@ -6502,7 +6549,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
-📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
+📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid_delta_str}{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}{_vid_zone_suffix}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 {decap_block}{cap_detail_block}{ob_block}{ob_detail_block}
 <b>📍 DIRECTION</b>
@@ -7928,6 +7975,28 @@ def _render_main_analyzer():
                 db.upsert_detected_patterns(patterns_to_store)
         except Exception:
             pass
+        # ── S/R Zone proximity: detect when price enters a new zone and reset counters ──
+        try:
+            _pcr_snap_z = getattr(st.session_state, '_pcr_sr_snapshot', [])
+            _spot_z = current_price or (float(df.iloc[-1]['close']) if not df.empty else 0)
+            if _spot_z and _pcr_snap_z:
+                _zone_levels = [s['level'] for s in _pcr_snap_z]
+                _nearest_z = min(_zone_levels, key=lambda l: abs(_spot_z - l))
+                _zone_dist  = abs(_spot_z - _nearest_z)
+                _prev_zone  = st.session_state.get('_sr_active_zone_level')
+                _prev_in    = st.session_state.get('_sr_in_zone', False)
+                if _zone_dist <= 30:
+                    _zone_key = round(_nearest_z, 0)
+                    if not _prev_in or _zone_key != _prev_zone:
+                        # Entered a new zone — store the last candle datetime as reset anchor
+                        st.session_state._sr_active_zone_level = _zone_key
+                        st.session_state._sr_in_zone = True
+                        if not df.empty and 'datetime' in df.columns:
+                            st.session_state._sr_zone_reset_dt = df.iloc[-1]['datetime']
+                elif _zone_dist > 50:
+                    st.session_state._sr_in_zone = False
+        except Exception:
+            pass
         # ── Compute Money Flow Profile & Volume Delta ──
         money_flow_data = None
         volume_delta_data = None
@@ -7940,6 +8009,36 @@ def _render_main_analyzer():
             st.session_state._money_flow_data = money_flow_data
             try:
                 volume_delta_data = calculate_volume_delta(df)
+                # Compute zone-window stats separately — original summary/df untouched
+                # so overall data remains visible alongside zone data.
+                _reset_dt_vd = st.session_state.get('_sr_zone_reset_dt')
+                if volume_delta_data is not None and volume_delta_data.get('df') is not None and _reset_dt_vd is not None:
+                    try:
+                        _vd_df_orig = volume_delta_data['df']
+                        _reset_mask = _vd_df_orig['datetime'] >= _reset_dt_vd
+                        if _reset_mask.any():
+                            _rpos = int(_reset_mask.values.argmax())
+                            _zone_rows = _vd_df_orig.iloc[_rpos:]
+                            # Build a zone-rebased cum_delta as a separate column
+                            _baseline = int(_vd_df_orig['cum_delta'].iloc[_rpos - 1]) if _rpos > 0 else 0
+                            _vd_df_z = _vd_df_orig.copy()
+                            _vd_df_z['zone_cum_delta'] = 0
+                            _vd_df_z.iloc[_rpos:, _vd_df_z.columns.get_loc('zone_cum_delta')] = (
+                                _vd_df_z.iloc[_rpos:]['cum_delta'] - _baseline
+                            ).values
+                            volume_delta_data = dict(volume_delta_data)
+                            volume_delta_data['df'] = _vd_df_z
+                            # Zone summary stored separately — original summary preserved
+                            volume_delta_data['zone_summary'] = {
+                                'cum_delta_last':   int(_vd_df_z['zone_cum_delta'].iloc[-1]),
+                                'total_buy_volume': int(_zone_rows['buy_volume'].sum()),
+                                'total_sell_volume':int(_zone_rows['sell_volume'].sum()),
+                                'total_delta':      int(_zone_rows['delta'].sum()),
+                            }
+                            volume_delta_data['zone_reset']   = True
+                            volume_delta_data['zone_candles'] = len(_zone_rows)
+                    except Exception:
+                        pass
                 st.session_state._volume_delta_data = volume_delta_data
             except Exception as e:
                 st.caption(f"⚠️ Volume Delta error: {str(e)[:80]}")
