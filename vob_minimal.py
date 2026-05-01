@@ -5462,19 +5462,30 @@ def generate_ai_context_message():
     part1 = """🟡 <b>NIFTY SIGNAL GUIDE (EXECUTION)</b>
 
 <b>📋 ALERT TYPES</b>
-⚠️ PCR NEAR LEVEL → price near S/R (±25 pts)
-🕯 CANDLE AT LEVEL → confirmation candle
-🟥 CALL CAPPING 🔥 → SELL zone (CE writers capping)
-🟩 PUT SUPPORT 🔥 → BUY zone (PE writers defending)
-🔴 REJECTION (CEILING) → SELL trigger
-🟢 BOUNCE (FLOOR) → BUY trigger
+⚠️ PCR NEAR LEVEL → price within ±50 pts of S/R level
+🕯 CANDLE AT S/R → confirmation candle at support or resistance
+🟥 CALL CAPPING 🔥 → CE writers building OI near spot → ceiling forming
+🟩 PUT WRITING 🔥 → PE writers building OI near spot → floor forming
+⚡ CALL CAPPING (ATM±2) → CE OI built ≥1% → ceiling strengthening
+⚡ PUT CAPPING (ATM±2) → PE OI built ≥1% → floor strengthening
+⚡ DECAPPING → CE OI shedding → ceiling lifting → breakout risk ↑
+⚡ DEPEG → PE OI shedding → floor dropping → breakdown risk ↑
+🔴 REJECTION (CEILING) → bearish candle + OI wall + depth confirm → SELL
+🟢 BOUNCE (FLOOR) → bullish candle + OI wall + depth confirm → BUY
+🔁 RETEST (SUPPORT) → price returned to support from below → watch for bounce
+🔁 RETEST (RESISTANCE) → price returned to resistance from above → watch for rejection
+🚀 BREAKOUT → price crossed above resistance → follow momentum
+🔴 BREAKDOWN → price crossed below support → follow momentum
 👉 No trade without 2 confirmations minimum
 
-<b>📊 SIGNAL SCORE</b>
-Range: -5 (strong bear) → +5 (strong bull) | 🟥=Bear 🟩=Bull ⚪=Neutral
-👉 Use as bias filter only — not entry trigger
+<b>📊 SIGNAL (3 MESSAGES per signal)</b>
+1/3 = Header + Candle + GEX + PCR/VIX/VIDYA + OI ATM + Decap/Cap/OB + Direction
+2/3 = Market Depth + Context + Volume Delta + Strike Analysis ATM±2 + OI Positioning
+3/3 = VPFR/POC/MF + Price Structure + Sector Rotation + Indices/Alignment + AI Prompt
+Score: -5 (strong bear) → +5 (strong bull) | 🟥=Bear 🟩=Bull ⚪=Neutral
+👉 Use score as bias filter only — not entry trigger
 
-<b>🌍 ALIGNMENT CODES (decode signal alignment block)</b>
+<b>🌍 ALIGNMENT CODES</b>
 N50=Nifty50 SENS=Sensex BNF=BankNifty IT=NiftyIT
 REL=Reliance ICICI=ICICIBank VIX=IndiaVIX GOLD CRUDE INR
 SP500=S&amp;P500 JP225=Japan225 HSI=HangSeng UK100=FTSE100
@@ -5489,81 +5500,81 @@ P=Pressure (+ve=buyers -ve=sellers) | BA=Bid-Ask pressure
 Depth &gt;5K=major wall | &lt;500=breakable | 🧱=Sell wall 🛡=Buy wall
 
 <b>🧱 ENTRY LOGIC</b>
-🔴 SELL (CEILING) — all must align:
-• Call OI highest (wall) | Market Depth: CA &gt;5K | Delta negative | Wick rejection
-👉 Entry: At ceiling stall | SL: Above ceiling
+🔴 SELL (CEILING): Call OI highest | CA &gt;5K depth | Delta -ve | Wick rejection
+🟢 BUY (FLOOR): Put OI highest | PB &gt;5K depth | Delta +ve | Wick bounce
+👉 Entry at stall | SL just beyond level
 
-🟢 BUY (FLOOR) — all must align:
-• Put OI highest (support) | Market Depth: PB &gt;5K | Delta positive | Wick bounce
-👉 Entry: At floor stall | SL: Below floor
+<b>🔄 OI WINDING / UNWINDING</b>
+CE Build(resist↑)=call writers adding→ceiling stronger
+CE Unwind(resist↓)=call writers exiting→ceiling may break
+PE Build(supp↑)=put writers adding→floor stronger
+PE Unwind(supp↓)=put writers exiting→floor may break
+Parallel Bull=CE unwind+PE build→strong BUY
+Parallel Bear=PE unwind+CE build→strong SELL
 
-<b>🔄 OI WINDING / UNWINDING (in every signal)</b>
-CE Build(resist↑) = call writers adding → ceiling stronger
-CE Unwind(resist↓) = call writers exiting → ceiling may break
-PE Build(supp↑) = put writers adding → floor stronger
-PE Unwind(supp↓) = put writers exiting → floor may break
-Parallel Bull = CE unwind + PE build → strong BUY signal
-Parallel Bear = PE unwind + CE build → strong SELL signal
-
-<b>📡 MARKET MODE (live GEX in every signal)</b>
-GEX +ve(+XXL) → RANGE → sell ceiling / buy floor
-GEX -ve(-XXL) → TREND → follow momentum, no counter
+<b>📡 MARKET MODE (GEX in every signal)</b>
+GEX +ve → RANGE → sell ceiling / buy floor
+GEX -ve → TREND → follow momentum, no counter-trade
 Confirm with VIDYA direction | 🧊 No depth wall = No trade
 
-<b>🔄 SECTOR ROTATION (in every signal)</b>
-RISK-ON 🟢 = cyclicals lead (AUTO/METAL/REALTY/BANK/ENERGY) → bullish for NIFTY
-RISK-OFF 🔴 = defensives lead (PHARMA/FMCG/IT/MEDIA) → cautious/bearish for NIFTY
-MIXED ⚪ = no clear rotation → wait for alignment
-10m/1h = last 10/60 candle bias per sector (🟢Bullish ⚪Neutral 🔴Bearish)
-👉 RISK-ON + GEX +ve → buy floor | RISK-OFF + GEX -ve → sell ceiling"""
+<b>🔄 SECTOR ROTATION</b>
+RISK-ON 🟢=cyclicals lead(AUTO/METAL/REALTY/BANK)→bullish NIFTY
+RISK-OFF 🔴=defensives lead(PHARMA/FMCG/IT)→cautious/bearish
+MIXED ⚪=no clear rotation→wait
+👉 RISK-ON+GEX+ve→buy floor | RISK-OFF+GEX-ve→sell ceiling"""
 
     part2 = """🟡 <b>NIFTY SIGNAL GUIDE (REFERENCE)</b>
 
 <b>⚠️ CRITICAL RULES</b>
 1. GEX -ve + VIDYA trend → DO NOT FADE
 2. Market Depth &lt;500 qty → weak level → expect break
-3. DTE ≤5 → MaxPain magnet (price pulls toward max pain)
+3. DTE ≤5 → MaxPain magnet active
 4. Straddle &gt;&gt; ATR → big move already priced in
 5. PCR ≤0.7 near ATM+1 → heavy resistance above
 6. Delta divergence → price ≠ delta direction → reversal warning
+7. BREAKOUT alert + DECAPPING = high conviction breakout
+8. BREAKDOWN alert + DEPEG = high conviction breakdown
 
 <b>🚫 NO TRADE ZONE</b>
 Alignment mixed | GEX neutral | No depth walls | Delta ≈ 0
 = Sit out — this is your edge
 
-<b>💰 MONEY FLOW PROFILE (in every signal)</b>
-POC (Point of Control) = price with most volume = magnet (price always revisits)
-VAH (Value Area High) = upper boundary of 70% vol zone → acts as ceiling/resistance
-VAL (Value Area Low) = lower boundary of 70% vol zone → acts as floor/support
-Strongest node = price range where buyers/sellers dominated most
-🟢 Bullish node = buyers controlled → bounce zone | 🔴 Bearish = sellers → rejection zone
-⭐ = POC node (highest vol = strongest magnet)
-👉 Price between VAL–VAH = fair value | Below VAL = undervalued | Above VAH = overvalued
+<b>♻️ ZONE RESET (Volume Delta + VIDYA)</b>
+When price enters within 30 pts of S/R level:
+→ Volume Delta resets to 0 — shows only what buyers/sellers did AT the zone
+→ VIDYA zone bias resets — shows fresh buy/sell vol since zone entry
+Header shows: ⚡ VOLUME DELTA ♻️ Zone (Nc) where N = candles since reset
+VIDYA line shows: Zone(Nc) B:XXK S:XXK Δ±XX%
+Use zone delta to judge conviction: +ve = buyers defending / -ve = sellers attacking
+Resets again when price moves to a different S/R level (&gt;50 pts away then returns)
+
+<b>💰 MONEY FLOW PROFILE</b>
+POC = price with most volume = magnet (price always revisits)
+VAH = upper boundary of 70% vol zone → resistance
+VAL = lower boundary of 70% vol zone → support
+🟢 +Delta at POC/VAL → buyers defending → support holding
+🔴 -Delta at POC/VAH → sellers defending → resistance holding
+Price below VAL = undervalued | above VAH = overvalued
 
 <b>⚡ VOLUME DELTA</b>
-Total Delta = Buy Vol − Sell Vol | +ve=buyers winning, -ve=sellers
-Cum Delta = running total — rising=buyers accumulating, falling=sellers
-Ratio &gt;1=buyers dominant | &lt;1=sellers dominant
-Divergence = price moves up but delta -ve (or vice versa) → reversal warning
-VAH/VAL/POC delta = what buyers/sellers did at Money Flow key levels (most important)
-🟢 +Delta at POC/VAL → buyers defending → confirms support / magnet holding
-🔴 -Delta at POC/VAH → sellers defending → confirms resistance / ceiling holding
+Total Delta = Buy Vol − Sell Vol | +ve=buyers, -ve=sellers
+Cum Delta rising=buyers accumulating | falling=sellers
+Divergence: price up but delta -ve → reversal warning
+Zone Delta (♻️) = fresh delta since zone entry = most actionable
 
 <b>📉 MARKET DEPTH per strike</b>
-CB=CE Bid (call buyers) | CA=CE Ask (call sellers)
-PB=PE Bid (put buyers) | PA=PE Ask (put sellers)
-🧱 Sellers wall: CA &gt; 2×CB → ceiling strong, expect rejection
-🛡 Buyers wall: PB &gt; 2×PA → floor strong, expect bounce
+🧱 CA &gt; 2×CB → ceiling strong, expect rejection
+🛡 PB &gt; 2×PA → floor strong, expect bounce
 
 <b>📦 OTHER TERMS</b>
 GEX Flip = level where market shifts range↔trend
-VIDYA -ve%=falling trend | +ve%=rising trend
+VIDYA +ve%=rising trend | -ve%=falling | ▲▼=fresh cross
 VPFR: 3 timeframe POC/VAH/VAL confluence = strong zone
 Triple POC P1/P2/P3 clustered = very strong magnet
 VOB=Volume Order Blocks | HVP=High Volume Pivots
 IVR 🔥≥70%=sell favoured | 🧊≤30%=buy favoured
 Skew 🔴&gt;1.1=put fear | 🟢&lt;0.9=call greed | ATR14=SL size
-Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up | RISK-OFF=defensives up"""
+Lead/Lag sectors = day%change ranked | RISK-ON=cyclicals up"""
 
     return [part1, part2]
 
