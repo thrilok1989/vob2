@@ -5814,12 +5814,13 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _tot_d  = int(_vds_active.get('total_delta', 0))
             _buy_v  = int(_vds_active.get('total_buy_volume', 0))
             _sell_v = int(_vds_active.get('total_sell_volume', 0))
-            _d_rat  = float(_vds.get('delta_ratio', 0))        # ratio always from full data
+            _d_rat  = float(_vds_active.get('delta_ratio', 0))
             _cum_d  = int(_vds_active.get('cum_delta_last', 0))
-            _divg   = int(_vds.get('divergence_bars', 0))       # divergences from full data
+            _divg   = int(_vds_active.get('divergence_bars', 0))
+            _active_bias = _vds_active.get('bias', _vds.get('bias', 'N/A'))
             _active_e = '🟢' if _tot_d > 0 else '🔴' if _tot_d < 0 else _bias_e
             vol_delta_block = (
-                f"\n<b>{_hdr}:</b> {_active_e} {_vds.get('bias','N/A')}\n"
+                f"\n<b>{_hdr}:</b> {_active_e} {_active_bias}\n"
                 f"  Delta: {_fmt_vol(_tot_d)} | Cum Delta: {_fmt_vol(_cum_d)}\n"
                 f"  Buy Vol: {_fmt_vol(_buy_v)} | Sell Vol: {_fmt_vol(_sell_v)}\n"
                 f"  Ratio: {_d_rat:.2f} | Divergences: {_divg}\n"
@@ -8028,12 +8029,20 @@ def _render_main_analyzer():
                             ).values
                             volume_delta_data = dict(volume_delta_data)
                             volume_delta_data['df'] = _vd_df_z
-                            # Zone summary stored separately — original summary preserved
+                            # Zone summary — all fields computed from zone rows only
+                            _z_buy  = int(_zone_rows['buy_volume'].sum())
+                            _z_sell = int(_zone_rows['sell_volume'].sum())
+                            _z_tot  = int(_zone_rows['delta'].sum())
+                            _z_divg = int(_zone_rows['divergence'].sum()) if 'divergence' in _zone_rows.columns else 0
+                            _z_rat  = round(_z_buy / _z_sell, 2) if _z_sell > 0 else 0
                             volume_delta_data['zone_summary'] = {
                                 'cum_delta_last':   int(_vd_df_z['zone_cum_delta'].iloc[-1]),
-                                'total_buy_volume': int(_zone_rows['buy_volume'].sum()),
-                                'total_sell_volume':int(_zone_rows['sell_volume'].sum()),
-                                'total_delta':      int(_zone_rows['delta'].sum()),
+                                'total_buy_volume': _z_buy,
+                                'total_sell_volume':_z_sell,
+                                'total_delta':      _z_tot,
+                                'delta_ratio':      _z_rat,
+                                'divergence_bars':  _z_divg,
+                                'bias': 'Bullish' if _z_tot > 0 else 'Bearish' if _z_tot < 0 else 'Neutral',
                             }
                             volume_delta_data['zone_reset']   = True
                             volume_delta_data['zone_candles'] = len(_zone_rows)
