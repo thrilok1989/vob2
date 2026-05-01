@@ -4557,6 +4557,24 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
 
     # 9. VIDYA Trend (from Pine Script)
     vidya_data = calculate_vidya(df)
+    # Zone-specific buy/sell volume since S/R zone entry (resets when price enters new zone)
+    try:
+        _reset_dt_v = st.session_state.get('_sr_zone_reset_dt')
+        if _reset_dt_v is not None and not df.empty and 'datetime' in df.columns:
+            _zone_df_v = df[df['datetime'] >= _reset_dt_v]
+            if not _zone_df_v.empty:
+                _src_v  = _zone_df_v['close'].values.astype(float)
+                _opn_v  = _zone_df_v['open'].values.astype(float)
+                _vol_v  = _zone_df_v['volume'].values.astype(float)
+                _z_buy  = float(np.sum(_vol_v[_src_v > _opn_v]))
+                _z_sell = float(np.sum(_vol_v[_src_v < _opn_v]))
+                _z_avg  = (_z_buy + _z_sell) / 2 if (_z_buy + _z_sell) > 0 else 1
+                vidya_data['zone_buy_vol']   = int(_z_buy)
+                vidya_data['zone_sell_vol']  = int(_z_sell)
+                vidya_data['zone_delta_pct'] = round((_z_buy - _z_sell) / _z_avg * 100, 1)
+                vidya_data['zone_candles']   = len(_zone_df_v)
+    except Exception:
+        pass
     if vidya_data['trend'] == 'Bullish' and candle['direction'] == 'Bullish':
         score += 1
         reasons.append(f"VIDYA Trend: Bullish (Delta: {vidya_data['delta_pct']:+.0f}%)")
@@ -5783,8 +5801,9 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _d_rat  = float(_vds.get('delta_ratio', 0))
             _cum_d  = int(_vds.get('cum_delta_last', 0))
             _divg   = int(_vds.get('divergence_bars', 0))
+            _zone_tag = f" ♻️ Zone-Reset ({_vd.get('zone_candles',0)}c)" if _vd.get('zone_reset') else ""
             vol_delta_block = (
-                f"\n<b>⚡ VOLUME DELTA:</b> {_bias_e} {_vds.get('bias','N/A')}\n"
+                f"\n<b>⚡ VOLUME DELTA{_zone_tag}:</b> {_bias_e} {_vds.get('bias','N/A')}\n"
                 f"  Delta: {_fmt_vol(_tot_d)} | Cum Delta: {_fmt_vol(_cum_d)}\n"
                 f"  Buy Vol: {_fmt_vol(_buy_v)} | Sell Vol: {_fmt_vol(_sell_v)}\n"
                 f"  Ratio: {_d_rat:.2f} | Divergences: {_divg}\n"
@@ -6400,6 +6419,14 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _oit = result.get('oi_trend', {})
     _vid = result.get('vidya', {})
     _ob = result.get('order_blocks', {})
+    # Zone VIDYA suffix: show zone-specific delta if price is at S/R zone
+    _vid_zone_suffix = ""
+    if _vid.get('zone_candles'):
+        _zb = _vid.get('zone_buy_vol', 0)
+        _zs = _vid.get('zone_sell_vol', 0)
+        _zd = _vid.get('zone_delta_pct', 0)
+        _zn = _vid.get('zone_candles', 0)
+        _vid_zone_suffix = f" | 📍Zone({_zn}c) B:{_zb//1000}K S:{_zs//1000}K Δ{_zd:+.0f}%"
     _net_gex = gex.get('net_gex', 0)
     _gex_action = "→sell ceiling/buy floor" if _net_gex > 0 else "→follow momentum" if _net_gex < 0 else "→wait"
     # ── Order Block block for msg_part1 ──
@@ -6502,7 +6529,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
-📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}
+📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}{_vid_zone_suffix}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 {decap_block}{cap_detail_block}{ob_block}{ob_detail_block}
 <b>📍 DIRECTION</b>
@@ -7928,6 +7955,28 @@ def _render_main_analyzer():
                 db.upsert_detected_patterns(patterns_to_store)
         except Exception:
             pass
+        # ── S/R Zone proximity: detect when price enters a new zone and reset counters ──
+        try:
+            _pcr_snap_z = getattr(st.session_state, '_pcr_sr_snapshot', [])
+            _spot_z = current_price or (float(df.iloc[-1]['close']) if not df.empty else 0)
+            if _spot_z and _pcr_snap_z:
+                _zone_levels = [s['level'] for s in _pcr_snap_z]
+                _nearest_z = min(_zone_levels, key=lambda l: abs(_spot_z - l))
+                _zone_dist  = abs(_spot_z - _nearest_z)
+                _prev_zone  = st.session_state.get('_sr_active_zone_level')
+                _prev_in    = st.session_state.get('_sr_in_zone', False)
+                if _zone_dist <= 30:
+                    _zone_key = round(_nearest_z, 0)
+                    if not _prev_in or _zone_key != _prev_zone:
+                        # Entered a new zone — store the last candle datetime as reset anchor
+                        st.session_state._sr_active_zone_level = _zone_key
+                        st.session_state._sr_in_zone = True
+                        if not df.empty and 'datetime' in df.columns:
+                            st.session_state._sr_zone_reset_dt = df.iloc[-1]['datetime']
+                elif _zone_dist > 50:
+                    st.session_state._sr_in_zone = False
+        except Exception:
+            pass
         # ── Compute Money Flow Profile & Volume Delta ──
         money_flow_data = None
         volume_delta_data = None
@@ -7940,6 +7989,33 @@ def _render_main_analyzer():
             st.session_state._money_flow_data = money_flow_data
             try:
                 volume_delta_data = calculate_volume_delta(df)
+                # Rebase cum_delta to zero at S/R zone entry so volume accumulation
+                # shows only what happened since price entered the zone.
+                _reset_dt_vd = st.session_state.get('_sr_zone_reset_dt')
+                if volume_delta_data is not None and volume_delta_data.get('df') is not None and _reset_dt_vd is not None:
+                    try:
+                        _vd_df = volume_delta_data['df'].copy()
+                        _reset_mask = _vd_df['datetime'] >= _reset_dt_vd
+                        if _reset_mask.any():
+                            _rpos = int(_reset_mask.values.argmax())
+                            _baseline = int(_vd_df['cum_delta'].iloc[_rpos - 1]) if _rpos > 0 else 0
+                            _cd_col = _vd_df.columns.get_loc('cum_delta')
+                            _vd_df.iloc[_rpos:, _cd_col] = _vd_df.iloc[_rpos:, _cd_col] - _baseline
+                            _vd_df.iloc[:_rpos, _cd_col] = 0
+                            # Update summary to reflect zone-window only
+                            _zone_rows = _vd_df.iloc[_rpos:]
+                            _vds_z = dict(volume_delta_data.get('summary') or {})
+                            _vds_z['cum_delta_last']    = int(_vd_df['cum_delta'].iloc[-1])
+                            _vds_z['total_buy_volume']  = int(_zone_rows['buy_volume'].sum())
+                            _vds_z['total_sell_volume'] = int(_zone_rows['sell_volume'].sum())
+                            _vds_z['total_delta']       = int(_zone_rows['delta'].sum())
+                            volume_delta_data = dict(volume_delta_data)
+                            volume_delta_data['df']      = _vd_df
+                            volume_delta_data['summary'] = _vds_z
+                            volume_delta_data['zone_reset'] = True
+                            volume_delta_data['zone_candles'] = len(_zone_rows)
+                    except Exception:
+                        pass
                 st.session_state._volume_delta_data = volume_delta_data
             except Exception as e:
                 st.caption(f"⚠️ Volume Delta error: {str(e)[:80]}")
