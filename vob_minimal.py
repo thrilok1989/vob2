@@ -5795,32 +5795,24 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             def _fmt_vol(v):
                 v = int(v or 0)
                 return f"{v/1000000:.1f}M" if abs(v) >= 1000000 else f"{v/1000:.0f}K"
-            _tot_d  = int(_vds.get('total_delta', 0))
-            _buy_v  = int(_vds.get('total_buy_volume', 0))
-            _sell_v = int(_vds.get('total_sell_volume', 0))
-            _d_rat  = float(_vds.get('delta_ratio', 0))
-            _cum_d  = int(_vds.get('cum_delta_last', 0))
-            _divg   = int(_vds.get('divergence_bars', 0))
+            # Use zone-window stats when near S/R, overall stats otherwise
+            _vdz = _vd.get('zone_summary') if _vd.get('zone_reset') else None
+            _vds_active = _vdz if _vdz else _vds
+            _zn   = _vd.get('zone_candles', 0) if _vdz else 0
+            _hdr  = f"⚡ VOLUME DELTA ♻️ Zone ({_zn}c)" if _vdz else "⚡ VOLUME DELTA"
+            _tot_d  = int(_vds_active.get('total_delta', 0))
+            _buy_v  = int(_vds_active.get('total_buy_volume', 0))
+            _sell_v = int(_vds_active.get('total_sell_volume', 0))
+            _d_rat  = float(_vds.get('delta_ratio', 0))        # ratio always from full data
+            _cum_d  = int(_vds_active.get('cum_delta_last', 0))
+            _divg   = int(_vds.get('divergence_bars', 0))       # divergences from full data
+            _active_e = '🟢' if _tot_d > 0 else '🔴' if _tot_d < 0 else _bias_e
             vol_delta_block = (
-                f"\n<b>⚡ VOLUME DELTA (Overall):</b> {_bias_e} {_vds.get('bias','N/A')}\n"
+                f"\n<b>{_hdr}:</b> {_active_e} {_vds.get('bias','N/A')}\n"
                 f"  Delta: {_fmt_vol(_tot_d)} | Cum Delta: {_fmt_vol(_cum_d)}\n"
                 f"  Buy Vol: {_fmt_vol(_buy_v)} | Sell Vol: {_fmt_vol(_sell_v)}\n"
                 f"  Ratio: {_d_rat:.2f} | Divergences: {_divg}\n"
             )
-            # Zone-window stats (shown only when price is near S/R)
-            _vdz = _vd.get('zone_summary')
-            if _vdz and _vd.get('zone_reset'):
-                _zn   = _vd.get('zone_candles', 0)
-                _z_td = int(_vdz.get('total_delta', 0))
-                _z_bv = int(_vdz.get('total_buy_volume', 0))
-                _z_sv = int(_vdz.get('total_sell_volume', 0))
-                _z_cd = int(_vdz.get('cum_delta_last', 0))
-                _z_e  = '🟢' if _z_td > 0 else '🔴' if _z_td < 0 else '⚪'
-                vol_delta_block += (
-                    f"<b>♻️ ZONE DELTA ({_zn}c since zone entry):</b> {_z_e}\n"
-                    f"  Delta: {_fmt_vol(_z_td)} | Cum Delta: {_fmt_vol(_z_cd)}\n"
-                    f"  Buy Vol: {_fmt_vol(_z_bv)} | Sell Vol: {_fmt_vol(_z_sv)}\n"
-                )
             # Delta at VAH / VAL / POC zones from Money Flow Profile
             _mf = getattr(st.session_state, '_money_flow_data', None)
             _vd_df = _vd.get('df')
@@ -6432,14 +6424,18 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
     _oit = result.get('oi_trend', {})
     _vid = result.get('vidya', {})
     _ob = result.get('order_blocks', {})
-    # Zone VIDYA suffix: show zone-specific delta if price is at S/R zone
-    _vid_zone_suffix = ""
-    if _vid.get('zone_candles'):
+    # When near S/R zone use zone-specific VIDYA delta; otherwise use overall delta
+    _vid_in_zone = bool(_vid.get('zone_candles'))
+    if _vid_in_zone:
         _zb = _vid.get('zone_buy_vol', 0)
         _zs = _vid.get('zone_sell_vol', 0)
         _zd = _vid.get('zone_delta_pct', 0)
         _zn = _vid.get('zone_candles', 0)
-        _vid_zone_suffix = f" | 📍Zone({_zn}c) B:{_zb//1000}K S:{_zs//1000}K Δ{_zd:+.0f}%"
+        _vid_delta_str  = f"{_zd:+.0f}%"
+        _vid_zone_suffix = f" ♻️Zone({_zn}c) B:{_zb//1000}K S:{_zs//1000}K"
+    else:
+        _vid_delta_str   = f"{_vid.get('delta_pct', 0):+.0f}%"
+        _vid_zone_suffix = ""
     _net_gex = gex.get('net_gex', 0)
     _gex_action = "→sell ceiling/buy floor" if _net_gex > 0 else "→follow momentum" if _net_gex < 0 else "→wait"
     # ── Order Block block for msg_part1 ──
@@ -6542,7 +6538,7 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
 
 🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
-📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid.get('delta_pct',0):+.0f}%{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}{_vid_zone_suffix}
+📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid_delta_str}{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}{_vid_zone_suffix}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
 {decap_block}{cap_detail_block}{ob_block}{ob_detail_block}
 <b>📍 DIRECTION</b>
