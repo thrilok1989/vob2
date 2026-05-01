@@ -5801,13 +5801,26 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             _d_rat  = float(_vds.get('delta_ratio', 0))
             _cum_d  = int(_vds.get('cum_delta_last', 0))
             _divg   = int(_vds.get('divergence_bars', 0))
-            _zone_tag = f" ♻️ Zone-Reset ({_vd.get('zone_candles',0)}c)" if _vd.get('zone_reset') else ""
             vol_delta_block = (
-                f"\n<b>⚡ VOLUME DELTA{_zone_tag}:</b> {_bias_e} {_vds.get('bias','N/A')}\n"
+                f"\n<b>⚡ VOLUME DELTA (Overall):</b> {_bias_e} {_vds.get('bias','N/A')}\n"
                 f"  Delta: {_fmt_vol(_tot_d)} | Cum Delta: {_fmt_vol(_cum_d)}\n"
                 f"  Buy Vol: {_fmt_vol(_buy_v)} | Sell Vol: {_fmt_vol(_sell_v)}\n"
                 f"  Ratio: {_d_rat:.2f} | Divergences: {_divg}\n"
             )
+            # Zone-window stats (shown only when price is near S/R)
+            _vdz = _vd.get('zone_summary')
+            if _vdz and _vd.get('zone_reset'):
+                _zn   = _vd.get('zone_candles', 0)
+                _z_td = int(_vdz.get('total_delta', 0))
+                _z_bv = int(_vdz.get('total_buy_volume', 0))
+                _z_sv = int(_vdz.get('total_sell_volume', 0))
+                _z_cd = int(_vdz.get('cum_delta_last', 0))
+                _z_e  = '🟢' if _z_td > 0 else '🔴' if _z_td < 0 else '⚪'
+                vol_delta_block += (
+                    f"<b>♻️ ZONE DELTA ({_zn}c since zone entry):</b> {_z_e}\n"
+                    f"  Delta: {_fmt_vol(_z_td)} | Cum Delta: {_fmt_vol(_z_cd)}\n"
+                    f"  Buy Vol: {_fmt_vol(_z_bv)} | Sell Vol: {_fmt_vol(_z_sv)}\n"
+                )
             # Delta at VAH / VAL / POC zones from Money Flow Profile
             _mf = getattr(st.session_state, '_money_flow_data', None)
             _vd_df = _vd.get('df')
@@ -7989,30 +8002,33 @@ def _render_main_analyzer():
             st.session_state._money_flow_data = money_flow_data
             try:
                 volume_delta_data = calculate_volume_delta(df)
-                # Rebase cum_delta to zero at S/R zone entry so volume accumulation
-                # shows only what happened since price entered the zone.
+                # Compute zone-window stats separately — original summary/df untouched
+                # so overall data remains visible alongside zone data.
                 _reset_dt_vd = st.session_state.get('_sr_zone_reset_dt')
                 if volume_delta_data is not None and volume_delta_data.get('df') is not None and _reset_dt_vd is not None:
                     try:
-                        _vd_df = volume_delta_data['df'].copy()
-                        _reset_mask = _vd_df['datetime'] >= _reset_dt_vd
+                        _vd_df_orig = volume_delta_data['df']
+                        _reset_mask = _vd_df_orig['datetime'] >= _reset_dt_vd
                         if _reset_mask.any():
                             _rpos = int(_reset_mask.values.argmax())
-                            _baseline = int(_vd_df['cum_delta'].iloc[_rpos - 1]) if _rpos > 0 else 0
-                            _cd_col = _vd_df.columns.get_loc('cum_delta')
-                            _vd_df.iloc[_rpos:, _cd_col] = _vd_df.iloc[_rpos:, _cd_col] - _baseline
-                            _vd_df.iloc[:_rpos, _cd_col] = 0
-                            # Update summary to reflect zone-window only
-                            _zone_rows = _vd_df.iloc[_rpos:]
-                            _vds_z = dict(volume_delta_data.get('summary') or {})
-                            _vds_z['cum_delta_last']    = int(_vd_df['cum_delta'].iloc[-1])
-                            _vds_z['total_buy_volume']  = int(_zone_rows['buy_volume'].sum())
-                            _vds_z['total_sell_volume'] = int(_zone_rows['sell_volume'].sum())
-                            _vds_z['total_delta']       = int(_zone_rows['delta'].sum())
+                            _zone_rows = _vd_df_orig.iloc[_rpos:]
+                            # Build a zone-rebased cum_delta as a separate column
+                            _baseline = int(_vd_df_orig['cum_delta'].iloc[_rpos - 1]) if _rpos > 0 else 0
+                            _vd_df_z = _vd_df_orig.copy()
+                            _vd_df_z['zone_cum_delta'] = 0
+                            _vd_df_z.iloc[_rpos:, _vd_df_z.columns.get_loc('zone_cum_delta')] = (
+                                _vd_df_z.iloc[_rpos:]['cum_delta'] - _baseline
+                            ).values
                             volume_delta_data = dict(volume_delta_data)
-                            volume_delta_data['df']      = _vd_df
-                            volume_delta_data['summary'] = _vds_z
-                            volume_delta_data['zone_reset'] = True
+                            volume_delta_data['df'] = _vd_df_z
+                            # Zone summary stored separately — original summary preserved
+                            volume_delta_data['zone_summary'] = {
+                                'cum_delta_last':   int(_vd_df_z['zone_cum_delta'].iloc[-1]),
+                                'total_buy_volume': int(_zone_rows['buy_volume'].sum()),
+                                'total_sell_volume':int(_zone_rows['sell_volume'].sum()),
+                                'total_delta':      int(_zone_rows['delta'].sum()),
+                            }
+                            volume_delta_data['zone_reset']   = True
                             volume_delta_data['zone_candles'] = len(_zone_rows)
                     except Exception:
                         pass
