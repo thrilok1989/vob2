@@ -6981,7 +6981,7 @@ def _render_alignment_capping_top():
 
 
 def _render_vol_delta_chart():
-    """Render Buy Volume vs Sell Volume over time, same style as per-strike OI chart."""
+    """Render Buy Volume vs Sell Volume as time-series lines, styled like Per-Strike Call vs Put OI."""
     import plotly.graph_objects as go
     vd = getattr(st.session_state, '_volume_delta_data', None)
     # Fallback: compute from _df_5m if session data not yet populated
@@ -7009,51 +7009,74 @@ def _render_vol_delta_chart():
         tot_d = int(vds.get('total_delta', 0))
         d_rat = float(vds.get('delta_ratio', 1))
 
+        st.markdown(f"**📈 {len(df)} data points | Volume in K | {bias_e} {bias} | Delta: {tot_d:+,} | Ratio: {d_rat:.2f}x**")
+
+        cur_buy = float(df['buy_volume'].iloc[-1]) / 1000 if len(df) else 0
+        cur_sell = float(df['sell_volume'].iloc[-1]) / 1000 if len(df) else 0
+
         fig = go.Figure()
-        # Buy Volume bars (green)
-        fig.add_trace(go.Bar(
-            x=df['datetime'], y=df['buy_volume'],
-            name='Buy Volume', marker_color='#089981',
-            opacity=0.85
-        ))
-        # Sell Volume bars (red, negative direction for mirror effect)
-        fig.add_trace(go.Bar(
-            x=df['datetime'], y=-df['sell_volume'],
-            name='Sell Volume', marker_color='#f23645',
-            opacity=0.85
-        ))
-        # Cumulative delta line on secondary y
+        # Buy Volume line (green) — same styling as PE OI line
         fig.add_trace(go.Scatter(
-            x=df['datetime'], y=df['cum_delta'],
-            name='Cum Delta', mode='lines',
-            line=dict(color='#FFD700', width=2, dash='dot'),
-            yaxis='y2'
+            x=df['datetime'], y=df['buy_volume'] / 1000,
+            mode='lines+markers', name='Buy Volume',
+            line=dict(color='#00cc66', width=2), marker=dict(size=3),
         ))
-        # Divergence markers
+        # Sell Volume line (red) — same styling as CE OI line
+        fig.add_trace(go.Scatter(
+            x=df['datetime'], y=df['sell_volume'] / 1000,
+            mode='lines+markers', name='Sell Volume',
+            line=dict(color='#ff4444', width=2), marker=dict(size=3),
+        ))
+        # Divergence markers on the same axis
         div_df = df[df['divergence'] == True] if 'divergence' in df.columns else pd.DataFrame()
         if not div_df.empty:
             fig.add_trace(go.Scatter(
-                x=div_df['datetime'], y=div_df['delta'],
+                x=div_df['datetime'],
+                y=(div_df['buy_volume'].clip(lower=0) + div_df['sell_volume'].clip(lower=0)) / 2000,
                 mode='markers', name='Divergence',
-                marker=dict(symbol='diamond', size=10, color='#FF6B35',
+                marker=dict(symbol='diamond', size=8, color='#FF6B35',
                             line=dict(color='white', width=1)),
-                yaxis='y'
             ))
+
         fig.update_layout(
-            title=f'⚡ Buy vs Sell Volume | {bias_e} {bias} | Delta: {tot_d:+,} | Ratio: {d_rat:.2f}x',
+            title=f'⚡ Buy vs Sell Volume<br>Buy: {cur_buy:.1f}K | Sell: {cur_sell:.1f}K',
             template='plotly_dark',
-            height=320,
-            barmode='overlay',
+            height=260,
             showlegend=True,
-            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
-            margin=dict(l=10, r=60, t=80, b=20),
-            xaxis=dict(tickformat='%H:%M', title='Time'),
-            yaxis=dict(title='Volume', zeroline=True, zerolinecolor='#555'),
-            yaxis2=dict(title='Cum Delta', overlaying='y', side='right',
-                        showgrid=False, zeroline=True, zerolinecolor='rgba(255,215,0,0.38)'),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=8)),
+            margin=dict(l=5, r=5, t=80, b=20),
+            xaxis=dict(tickformat='%H:%M', title=''),
+            yaxis=dict(title='Volume (K)'),
             plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
         )
         st.plotly_chart(fig, use_container_width=True)
+
+        # Signal badges — mirror the OI chart's strength readouts
+        if len(df) >= 3:
+            buy_s = df['buy_volume']; sell_s = df['sell_volume']
+            buy_chg = buy_s.iloc[-1] - buy_s.iloc[0]; sell_chg = sell_s.iloc[-1] - sell_s.iloc[0]
+            buy_pct = (buy_chg / buy_s.iloc[0] * 100) if buy_s.iloc[0] > 0 else 0
+            sell_pct = (sell_chg / sell_s.iloc[0] * 100) if sell_s.iloc[0] > 0 else 0
+            if buy_chg > 0:
+                st.success(f"Buy Pressure Building (Buy +{buy_pct:.1f}%)")
+            elif buy_chg < 0:
+                st.error(f"Buy Pressure Weakening (Buy {buy_pct:.1f}%)")
+            if sell_chg > 0:
+                st.error(f"Sell Pressure Building (Sell +{sell_pct:.1f}%)")
+            elif sell_chg < 0:
+                st.success(f"Sell Pressure Weakening (Sell {sell_pct:.1f}%)")
+
+            vol_diff_k = abs(cur_buy - cur_sell)
+            if cur_buy > cur_sell:
+                r = cur_buy / cur_sell if cur_sell > 0 else 0
+                c = '#00ff88' if r >= 2.0 else '#00cc66'
+                lbl = 'STRONG BUY DOMINANCE' if r >= 2.0 else 'MODERATE BUY DOMINANCE'
+                st.markdown(f'<div style="background:{c}30;padding:6px;border-radius:6px;border-left:3px solid {c};font-size:12px;"><b style="color:{c};">{lbl}</b> | Buy {cur_buy:.1f}K vs Sell {cur_sell:.1f}K | Diff:{vol_diff_k:.1f}K | Ratio:{r:.1f}x</div>', unsafe_allow_html=True)
+            elif cur_sell > cur_buy:
+                r = cur_sell / cur_buy if cur_buy > 0 else 0
+                c = '#ff4444' if r >= 2.0 else '#cc4444'
+                lbl = 'STRONG SELL DOMINANCE' if r >= 2.0 else 'MODERATE SELL DOMINANCE'
+                st.markdown(f'<div style="background:{c}30;padding:6px;border-radius:6px;border-left:3px solid {c};font-size:12px;"><b style="color:{c};">{lbl}</b> | Sell {cur_sell:.1f}K vs Buy {cur_buy:.1f}K | Diff:{vol_diff_k:.1f}K | Ratio:{r:.1f}x</div>', unsafe_allow_html=True)
 
         # Summary metrics row
         m1, m2, m3, m4, m5 = st.columns(5)
