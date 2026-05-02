@@ -12125,6 +12125,473 @@ def _render_main_analyzer():
     except Exception as _md_err:
         st.caption(f"Market Depth Analyzer unavailable: {_md_err}")
 
+    # ── Expiry Day Spike + All-Day Spike — copied from seller_perspective.py ──
+    try:
+        _od_sp = locals().get('option_data') or {}
+        _spot_sp = _od_sp.get('underlying') if _od_sp else None
+        _atm_sp = _od_sp.get('atm_strike') if _od_sp else None
+        if _atm_sp is None and _spot_sp:
+            _atm_sp = round(_spot_sp / 50) * 50
+        _expiry_sp = _od_sp.get('expiry') if _od_sp else ""
+
+        # Build a merged_df with seller_perspective column names from df_atm8
+        _df_src = _od_sp.get('df_atm8') if _od_sp else None
+        if _df_src is None or getattr(_df_src, 'empty', True):
+            _df_src = _od_sp.get('df_atm4') if _od_sp else None
+        if _df_src is None or getattr(_df_src, 'empty', True):
+            _df_src = _od_sp.get('df_summary') if _od_sp else None
+
+        if _spot_sp and _expiry_sp and _df_src is not None and not _df_src.empty:
+            _merged = _df_src.copy()
+            _rename_map = {
+                'openInterest_CE': 'OI_CE',
+                'openInterest_PE': 'OI_PE',
+                'changeinOpenInterest_CE': 'Chg_OI_CE',
+                'changeinOpenInterest_PE': 'Chg_OI_PE',
+                'lastPrice_CE': 'LTP_CE',
+                'lastPrice_PE': 'LTP_PE',
+            }
+            for _src, _dst in _rename_map.items():
+                if _src in _merged.columns and _dst not in _merged.columns:
+                    _merged[_dst] = _merged[_src]
+            for _c in ('OI_CE', 'OI_PE', 'Chg_OI_CE', 'Chg_OI_PE', 'LTP_CE', 'LTP_PE'):
+                if _c not in _merged.columns:
+                    _merged[_c] = 0
+
+            # Compute days_to_expiry in calendar days
+            try:
+                _exp_dt = datetime.strptime(_expiry_sp, "%Y-%m-%d").replace(
+                    hour=15, minute=30, tzinfo=pytz.timezone('Asia/Kolkata'))
+                _now_ist = datetime.now(pytz.timezone('Asia/Kolkata'))
+                _days_to_expiry = max(0.0, (_exp_dt - _now_ist).total_seconds() / 86400.0)
+            except Exception:
+                _days_to_expiry = 0.0
+
+            from seller_perspective import (
+                detect_expiry_spikes,
+                detect_all_market_spikes,
+                detect_violent_unwinding,
+                calculate_gamma_exposure_spike,
+                predict_expiry_pinning_probability,
+                get_historical_expiry_patterns,
+                calculate_seller_max_pain,
+            )
+
+            expiry_spike_data = detect_expiry_spikes(
+                _merged, _spot_sp, _atm_sp, _days_to_expiry, _expiry_sp)
+            violent_unwinding_signals = detect_violent_unwinding(_merged, _spot_sp, _atm_sp)
+            gamma_spike_risk = calculate_gamma_exposure_spike(None, _days_to_expiry)
+            seller_max_pain = calculate_seller_max_pain(_merged) or {}
+            _max_pain_strike = seller_max_pain.get("max_pain_strike")
+            # Nearest support/resistance from S/R data
+            _sr = _od_sp.get('sr_data', []) or []
+            _sup_lvls = sorted(
+                [r.get('Level') for r in _sr if r.get('Type', '').lower().startswith('support') and r.get('Level') and r.get('Level') < _spot_sp],
+                key=lambda x: abs(x - _spot_sp))
+            _res_lvls = sorted(
+                [r.get('Level') for r in _sr if r.get('Type', '').lower().startswith('resistance') and r.get('Level') and r.get('Level') > _spot_sp],
+                key=lambda x: abs(x - _spot_sp))
+            _nearest_sup = _sup_lvls[0] if _sup_lvls else None
+            _nearest_res = _res_lvls[0] if _res_lvls else None
+            pinning_probability = predict_expiry_pinning_probability(
+                _spot_sp, _max_pain_strike, _nearest_sup, _nearest_res)
+
+            spot = _spot_sp
+            atm_strike = _atm_sp
+            expiry = _expiry_sp
+            days_to_expiry = _days_to_expiry
+            merged = _merged
+            total_gex_net = None
+
+            with st.expander("📅 Expiry Day Spike Detector", expanded=False):
+                # ─── Copied from seller_perspective.py SUB-TAB 6: EXPIRY ANALYSIS ───
+                st.markdown("## 📅 EXPIRY DATE SPIKE DETECTOR")
+
+                spike_col1, spike_col2, spike_col3 = st.columns([2, 1, 1])
+
+                with spike_col1:
+                    st.markdown(f"""
+                    <div style="
+                        background: linear-gradient(135deg, #2e1a1a 0%, #3e2a2a 100%);
+                        padding: 20px;
+                        border-radius: 12px;
+                        border: 3px solid {expiry_spike_data['color']};
+                        margin: 10px 0;
+                    ">
+                        <h3 style='color:{expiry_spike_data["color"]}; margin:0;'>📅 EXPIRY SPIKE ALERT</h3>
+                        <div style='font-size: 2.5rem; color:{expiry_spike_data["color"]}; font-weight:900; margin:10px 0;'>
+                            {expiry_spike_data["probability"]}%
+                        </div>
+                        <div style='font-size: 1.3rem; color:#ffffff; margin:5px 0;'>
+                            {expiry_spike_data["intensity"]}
+                        </div>
+                        <div style='font-size: 1.1rem; color:#ffcc00; margin:5px 0;'>
+                            Type: {expiry_spike_data["type"]}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with spike_col2:
+                    st.markdown(f"""
+                    <div style="
+                        background: rgba(0,0,0,0.3);
+                        padding: 15px;
+                        border-radius: 10px;
+                        text-align: center;
+                    ">
+                        <div style='font-size: 0.9rem; color:#cccccc;'>Days to Expiry</div>
+                        <div style='font-size: 2rem; color:#ff9900; font-weight:700;'>
+                            {expiry_spike_data['days_to_expiry']:.1f}
+                        </div>
+                        <div style='font-size: 0.8rem; color:#aaaaaa;'>
+                            {expiry}
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with spike_col3:
+                    st.markdown(f"""
+                    <div style="
+                        background: rgba(0,0,0,0.3);
+                        padding: 15px;
+                        border-radius: 10px;
+                        text-align: center;
+                    ">
+                        <div style='font-size: 0.9rem; color:#cccccc;'>Spike Score</div>
+                        <div style='font-size: 2rem; color:#ff00ff; font-weight:700;'>
+                            {expiry_spike_data['score']}/100
+                        </div>
+                        <div style='font-size: 0.8rem; color:#aaaaaa;'>
+                            Detection Factors
+                        </div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                with st.expander("🔍 View Spike Detection Factors", expanded=False):
+                    col_factors1, col_factors2 = st.columns(2)
+
+                    with col_factors1:
+                        st.markdown("### ⚠️ Spike Triggers")
+                        for factor in expiry_spike_data["factors"]:
+                            st.markdown(f"• {factor}")
+
+                        if violent_unwinding_signals:
+                            st.markdown("### 🚨 Violent Unwinding")
+                            for signal in violent_unwinding_signals:
+                                st.markdown(f"• {signal}")
+
+                    with col_factors2:
+                        st.markdown("### 🎯 Key Levels")
+                        if expiry_spike_data["key_levels"]:
+                            for level in expiry_spike_data["key_levels"]:
+                                st.markdown(f"• {level}")
+                        else:
+                            st.info("No extreme levels detected")
+
+                        support_range = expiry_spike_data.get("support_spike_range", {})
+                        resistance_range = expiry_spike_data.get("resistance_spike_range", {})
+
+                        if support_range.get("start") is not None or resistance_range.get("start") is not None:
+                            st.markdown("### 📊 Spike Strike Price Range")
+
+                            if support_range.get("start") is not None:
+                                st.markdown(f"""
+                                <div style='background: rgba(0,255,0,0.1); border-left: 3px solid #00ff00; padding: 10px; margin: 5px 0; border-radius: 5px;'>
+                                    <strong style='color:#00ff00;'>🛡️ SUPPORT SPIKE RANGE</strong><br/>
+                                    <span style='color:#ffffff;'>Start: ₹{support_range['start']:,} → End: ₹{support_range['end']:,}</span><br/>
+                                    <span style='color:#aaaaaa; font-size: 0.85em;'>
+                                        Strikes: {', '.join([f"₹{s:,}" for s in support_range['strikes'][:5]])}
+                                        {f"... (+{len(support_range['strikes'])-5} more)" if len(support_range['strikes']) > 5 else ""}
+                                    </span><br/>
+                                    <span style='color:#66b3ff; font-size: 0.85em;'>Total PUT OI: {support_range['total_oi']:,}</span>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                            if resistance_range.get("start") is not None:
+                                st.markdown(f"""
+                                <div style='background: rgba(255,0,0,0.1); border-left: 3px solid #ff4444; padding: 10px; margin: 5px 0; border-radius: 5px;'>
+                                    <strong style='color:#ff4444;'>🚧 RESISTANCE SPIKE RANGE</strong><br/>
+                                    <span style='color:#ffffff;'>Start: ₹{resistance_range['start']:,} → End: ₹{resistance_range['end']:,}</span><br/>
+                                    <span style='color:#aaaaaa; font-size: 0.85em;'>
+                                        Strikes: {', '.join([f"₹{s:,}" for s in resistance_range['strikes'][:5]])}
+                                        {f"... (+{len(resistance_range['strikes'])-5} more)" if len(resistance_range['strikes']) > 5 else ""}
+                                    </span><br/>
+                                    <span style='color:#66b3ff; font-size: 0.85em;'>Total CALL OI: {resistance_range['total_oi']:,}</span>
+                                </div>
+                                """, unsafe_allow_html=True)
+
+                        if gamma_spike_risk["score"] > 0:
+                            st.markdown(f"### ⚡ Gamma Spike Risk")
+                            st.markdown(f"• {gamma_spike_risk['message']}")
+                            st.markdown(f"• Risk Level: {gamma_spike_risk['risk']}")
+
+                        if pinning_probability > 0:
+                            st.markdown(f"### 📍 Pinning Probability")
+                            st.markdown(f"• {pinning_probability}% chance of price getting stuck")
+
+                if days_to_expiry <= 3:
+                    st.markdown("### 📊 Historical Expiry Patterns")
+                    patterns = get_historical_expiry_patterns()
+
+                    pattern_cols = st.columns(len(patterns))
+
+                    for idx, (pattern_name, pattern_data) in enumerate(patterns.items()):
+                        with pattern_cols[idx]:
+                            prob_color = "#ff4444" if pattern_data["probability"] > 0.6 else "#ff9900" if pattern_data["probability"] > 0.4 else "#66b3ff"
+                            st.markdown(f"""
+                            <div style="
+                                background: #1a1f2e;
+                                padding: 15px;
+                                border-radius: 8px;
+                                border-left: 3px solid {prob_color};
+                                margin: 5px 0;
+                            ">
+                                <div style='font-size: 0.9rem; color:#cccccc;'>{pattern_name.replace('_', ' ').title()}</div>
+                                <div style='font-size: 1.5rem; color:{prob_color}; font-weight:700;'>
+                                    {pattern_data['probability']:.0%}
+                                </div>
+                                <div style='font-size: 0.8rem; color:#aaaaaa; margin-top:5px;'>
+                                    {pattern_data['description']}
+                                </div>
+                            </div>
+                            """, unsafe_allow_html=True)
+
+                st.markdown("### 🎯 Expiry Day Trading Strategy")
+
+                if expiry_spike_data["probability"] > 60:
+                    st.warning("""
+                    **HIGH SPIKE PROBABILITY - AGGRESSIVE STRATEGY:**
+                    - Expect sharp moves (100-200 point swings)
+                    - Use wider stops (1.5-2x normal)
+                    - Consider straddles/strangles if IV not too high
+                    - Avoid deep ITM options (gamma risk)
+                    - Focus on 10:30-11:30 AM and 2:30-3:00 PM windows
+                    """)
+                elif expiry_spike_data["probability"] > 40:
+                    st.info("""
+                    **MODERATE SPIKE RISK - BALANCED STRATEGY:**
+                    - Expect moderate volatility
+                    - Use normal stops with 20% buffer
+                    - Prefer ATM/1st OTM strikes
+                    - Watch Max Pain level closely
+                    - Be ready to exit early
+                    """)
+                else:
+                    st.success("""
+                    **LOW SPIKE RISK - NORMAL STRATEGY:**
+                    - Normal trading rules apply
+                    - Standard stop losses
+                    - Focus on technical levels
+                    - Watch for last-hour moves
+                    """)
+
+                if days_to_expiry <= 2:
+                    st.markdown(f"""
+                    <div style="
+                        background: linear-gradient(135deg, #1a2e2e 0%, #2a3e3e 100%);
+                        padding: 15px;
+                        border-radius: 10px;
+                        border: 2px solid #00ffff;
+                        margin: 10px 0;
+                    ">
+                        <h4 style='color:#00ffff; margin:0;'>⚠️ GAMMA RISK ZONE ACTIVE</h4>
+                        <p style='color:#ffffff; margin:5px 0;'>
+                            Days to expiry ≤ 2: Gamma exposure amplifies price moves.
+                            Market makers' hedging can cause exaggerated swings.
+                        </p>
+                        <p style='color:#ffcc00; margin:5px 0;'>
+                            🎯 Watch: {', '.join(expiry_spike_data['key_levels'][:3]) if expiry_spike_data['key_levels'] else 'ATM ±100 points'}
+                        </p>
+                    </div>
+                    """, unsafe_allow_html=True)
+
+                else:
+                    st.info(f"""
+                    ### 📅 Expiry Spike Detector (Inactive)
+
+                    **Reason:** {expiry_spike_data['message']}
+
+                    Spike detection activates when expiry is ≤5 days away.
+
+                    Current expiry: **{expiry}**
+                    Days to expiry: **{days_to_expiry:.1f}**
+
+                    *Check back closer to expiry for spike alerts*
+                    """)
+
+            with st.expander("🎯 All-Day Spike Detector", expanded=False):
+                # ─── Copied from seller_perspective.py SUB-TAB 7: ALL-DAY SPIKE DETECTOR ───
+                st.markdown("## 🎯 ALL-DAY SPIKE DETECTOR")
+                st.caption("Detects Support, Resistance, Opening, Breakout, Momentum & Squeeze spikes on ANY trading day")
+
+                try:
+                    spike_result = detect_all_market_spikes(
+                        merged_df=merged,
+                        spot=spot,
+                        atm_strike=atm_strike,
+                        days_to_expiry=days_to_expiry,
+                        total_gex_net=total_gex_net
+                    )
+
+                    st.session_state['all_day_spike_result'] = {
+                        'primary_spike': spike_result.get('primary_spike', {}),
+                        'active_spikes': spike_result.get('all_spikes', []),
+                        'active_spike_count': spike_result.get('active_spike_count', 0),
+                        'overall_spike_probability': spike_result.get('primary_spike', {}).get('probability', 0),
+                        'dominant_direction': spike_result.get('primary_spike', {}).get('direction', 'NEUTRAL'),
+                        'support_spike': spike_result.get('support_spike', {}),
+                        'resistance_spike': spike_result.get('resistance_spike', {}),
+                        'time_analysis': spike_result.get('time_analysis', {}),
+                        'recommendation': spike_result.get('recommendation', ''),
+                        'key_levels': spike_result.get('key_levels', {}),
+                        'timestamp': datetime.now().isoformat()
+                    }
+
+                    col_main1, col_main2, col_main3 = st.columns(3)
+
+                    with col_main1:
+                        primary_type = spike_result["primary_spike"]["type"].replace("_", " ").title()
+                        primary_score = spike_result["primary_spike"]["score"]
+                        primary_prob = spike_result["primary_spike"]["probability"]
+
+                        color = "#00ff00" if "support" in primary_type.lower() else "#ff4444" if "resistance" in primary_type.lower() else "#ffaa00"
+
+                        st.markdown(f"""
+                        <div style="background: linear-gradient(135deg, {color}22, {color}44);
+                                    border: 2px solid {color};
+                                    border-radius: 10px;
+                                    padding: 15px;
+                                    text-align: center;">
+                            <div style="font-size: 0.9rem; color: #aaa;">PRIMARY SPIKE</div>
+                            <div style="font-size: 1.5rem; font-weight: 700; color: {color};">{primary_type}</div>
+                            <div style="font-size: 2rem; font-weight: 900; color: {color};">{primary_score}%</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with col_main2:
+                        st.metric("Active Spikes", spike_result["active_spike_count"])
+                        st.metric("Current Phase", spike_result["time_analysis"]["current_phase"])
+
+                    with col_main3:
+                        direction = spike_result["primary_spike"]["direction"]
+                        if direction == "UP":
+                            st.success(f"⬆️ Direction: **{direction}** - Look for LONG")
+                        elif direction == "DOWN":
+                            st.error(f"⬇️ Direction: **{direction}** - Look for SHORT")
+                        else:
+                            st.info("↔️ Direction: **NEUTRAL**")
+
+                    st.markdown("---")
+
+                    st.markdown("### 📊 All Spike Types")
+
+                    row1_col1, row1_col2, row1_col3 = st.columns(3)
+
+                    with row1_col1:
+                        ss = spike_result["spikes"]["support_spike"]
+                        st.markdown(f"""
+                        <div style="background: #1a2e1a; border-radius: 8px; padding: 10px; border-left: 4px solid {'#00ff00' if ss['active'] else '#444'};">
+                            <div style="font-weight: 600;">🟢 SUPPORT SPIKE</div>
+                            <div style="font-size: 1.5rem; color: {'#00ff00' if ss['active'] else '#666'};">{ss['score']}%</div>
+                            <div style="font-size: 0.8rem; color: #aaa;">Level: ₹{ss['level']:,} ({ss['distance_percent']:.2f}% away)</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with row1_col2:
+                        rs = spike_result["spikes"]["resistance_spike"]
+                        st.markdown(f"""
+                        <div style="background: #2e1a1a; border-radius: 8px; padding: 10px; border-left: 4px solid {'#ff4444' if rs['active'] else '#444'};">
+                            <div style="font-weight: 600;">🔴 RESISTANCE SPIKE</div>
+                            <div style="font-size: 1.5rem; color: {'#ff4444' if rs['active'] else '#666'};">{rs['score']}%</div>
+                            <div style="font-size: 0.8rem; color: #aaa;">Level: ₹{rs['level']:,} ({rs['distance_percent']:.2f}% away)</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with row1_col3:
+                        os_spike = spike_result["spikes"]["opening_spike"]
+                        os_color = "#00ff00" if os_spike.get("direction") == "UP" else "#ff4444" if os_spike.get("direction") == "DOWN" else "#666"
+                        st.markdown(f"""
+                        <div style="background: #1a1f2e; border-radius: 8px; padding: 10px; border-left: 4px solid {'#ffaa00' if os_spike['active'] else '#444'};">
+                            <div style="font-weight: 600;">🌅 OPENING SPIKE</div>
+                            <div style="font-size: 1.5rem; color: {'#ffaa00' if os_spike['active'] else '#666'};">{os_spike['score']}%</div>
+                            <div style="font-size: 0.8rem; color: #aaa;">Direction: {os_spike.get('direction', 'N/A')} | Gap: ₹{os_spike.get('expected_gap', 0):,}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    row2_col1, row2_col2, row2_col3 = st.columns(3)
+
+                    with row2_col1:
+                        bs = spike_result["spikes"]["breakout_spike"]
+                        st.markdown(f"""
+                        <div style="background: #2e2e1a; border-radius: 8px; padding: 10px; border-left: 4px solid {'#ffff00' if bs['active'] else '#444'};">
+                            <div style="font-weight: 600;">🚀 BREAKOUT SPIKE</div>
+                            <div style="font-size: 1.5rem; color: {'#ffff00' if bs['active'] else '#666'};">{bs['score']}%</div>
+                            <div style="font-size: 0.8rem; color: #aaa;">Direction: {bs.get('direction', 'N/A')}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with row2_col2:
+                        ms = spike_result["spikes"]["momentum_spike"]
+                        st.markdown(f"""
+                        <div style="background: #1a2e2e; border-radius: 8px; padding: 10px; border-left: 4px solid {'#00ffff' if ms['active'] else '#444'};">
+                            <div style="font-weight: 600;">💨 MOMENTUM SPIKE</div>
+                            <div style="font-size: 1.5rem; color: {'#00ffff' if ms['active'] else '#666'};">{ms['score']}%</div>
+                            <div style="font-size: 0.8rem; color: #aaa;">Direction: {ms.get('direction', 'N/A')}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    with row2_col3:
+                        sq = spike_result["spikes"]["squeeze_spike"]
+                        st.markdown(f"""
+                        <div style="background: #2e1a2e; border-radius: 8px; padding: 10px; border-left: 4px solid {'#ff00ff' if sq['active'] else '#444'};">
+                            <div style="font-weight: 600;">🔥 SQUEEZE SPIKE</div>
+                            <div style="font-size: 1.5rem; color: {'#ff00ff' if sq['active'] else '#666'};">{sq['score']}%</div>
+                            <div style="font-size: 0.8rem; color: #aaa;">Type: {sq.get('type', 'N/A')}</div>
+                        </div>
+                        """, unsafe_allow_html=True)
+
+                    st.markdown("---")
+
+                    st.markdown("### 🎯 Key Levels")
+                    level_col1, level_col2, level_col3 = st.columns(3)
+
+                    with level_col1:
+                        st.markdown("**Support Levels:**")
+                        for sup in spike_result["key_levels"]["support"][:3]:
+                            st.write(f"₹{sup['level']:,} ({sup['strength']}) - OI: {sup['oi']:,}")
+
+                    with level_col2:
+                        st.markdown("**Resistance Levels:**")
+                        for res in spike_result["key_levels"]["resistance"][:3]:
+                            st.write(f"₹{res['level']:,} ({res['strength']}) - OI: {res['oi']:,}")
+
+                    with level_col3:
+                        st.metric("Max Pain", f"₹{spike_result['key_levels']['max_pain']:,}")
+                        st.metric("ATM Strike", f"₹{spike_result['key_levels']['atm']:,}")
+
+                    st.markdown("---")
+                    st.markdown("### 💡 Recommendation")
+                    recommendation = spike_result["summary"]["recommendation"]
+                    if "SUPPORT" in recommendation or "UP" in recommendation or "LONG" in recommendation:
+                        st.success(recommendation)
+                    elif "RESISTANCE" in recommendation or "DOWN" in recommendation or "SHORT" in recommendation:
+                        st.error(recommendation)
+                    else:
+                        st.info(recommendation)
+
+                    if spike_result["active_spikes"]:
+                        with st.expander("📋 Spike Factors Details", expanded=False):
+                            for spike in spike_result["active_spikes"]:
+                                st.markdown(f"**{spike['name'].replace('_', ' ').title()}** (Score: {spike['score']})")
+                                for factor in spike["data"].get("factors", []):
+                                    st.write(f"  • {factor}")
+
+                except Exception as e:
+                    st.error(f"⚠️ Spike detection error: {str(e)}")
+                    st.info("Spike detector requires merged option chain data.")
+    except Exception as _sp_err:
+        st.caption(f"Spike detectors unavailable: {_sp_err}")
+
     if show_analytics:
         st.markdown("---")
         display_analytics_dashboard(db)
