@@ -9302,7 +9302,8 @@ def _render_main_analyzer():
                     pcr_extract_cols = ['Strike', 'Zone', 'PCR', 'PCR_Signal',
                                                                    'openInterest_CE', 'openInterest_PE']
                     for _chg_col in ['changeinOpenInterest_CE', 'changeinOpenInterest_PE',
-                                      'lastPrice_CE', 'lastPrice_PE']:
+                                      'lastPrice_CE', 'lastPrice_PE',
+                                      'totalTradedVolume_CE', 'totalTradedVolume_PE']:
                         if _chg_col in df_summary.columns:
                             pcr_extract_cols.append(_chg_col)
                     pcr_df = df_summary.iloc[start_idx:end_idx][pcr_extract_cols].copy()
