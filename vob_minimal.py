@@ -7585,7 +7585,11 @@ def _render_main_analyzer():
                           ('chgoi_history', []), ('chgoi_last_valid_data', None),
                           ('chgoi_current_strikes', []),
                           ('vol_history', []), ('vol_last_valid_data', None),
-                          ('vol_current_strikes', [])]:
+                          ('vol_current_strikes', []),
+                          ('bid_history', []), ('bid_last_valid_data', None),
+                          ('bid_current_strikes', []),
+                          ('ask_history', []), ('ask_last_valid_data', None),
+                          ('ask_current_strikes', [])]:
         if key not in st.session_state:
             st.session_state[key] = default
 
@@ -7635,6 +7639,41 @@ def _render_main_analyzer():
                         entry[str(int(row['strike_price']))] = float(row['net_gex'])
                     st.session_state.gex_history.append(entry)
                 st.session_state.gex_history = st.session_state.gex_history[-200:]
+        except Exception:
+            pass
+
+    # Hydrate bid/ask/vol histories from Supabase on cold start
+    if not st.session_state.bid_history and not st.session_state.ask_history and not st.session_state.vol_history:
+        try:
+            ba_db_df = db.get_bid_ask_history()
+            if not ba_db_df.empty and 'timestamp' in ba_db_df.columns:
+                ba_db_df['timestamp'] = pd.to_datetime(ba_db_df['timestamp'])
+                grouped = ba_db_df.groupby('timestamp')
+                _strikes_seen = set()
+                for ts, group in grouped:
+                    bid_e = {'time': ts.to_pydatetime()}
+                    ask_e = {'time': ts.to_pydatetime()}
+                    vol_e = {'time': ts.to_pydatetime()}
+                    for _, row in group.iterrows():
+                        strike_label = str(int(row['strike_price']))
+                        _strikes_seen.add(int(row['strike_price']))
+                        bid_e[f'{strike_label}_CE'] = int(row.get('bid_qty_ce', 0) or 0)
+                        bid_e[f'{strike_label}_PE'] = int(row.get('bid_qty_pe', 0) or 0)
+                        ask_e[f'{strike_label}_CE'] = int(row.get('ask_qty_ce', 0) or 0)
+                        ask_e[f'{strike_label}_PE'] = int(row.get('ask_qty_pe', 0) or 0)
+                        vol_e[f'{strike_label}_CE'] = int(row.get('volume_ce', 0) or 0)
+                        vol_e[f'{strike_label}_PE'] = int(row.get('volume_pe', 0) or 0)
+                    st.session_state.bid_history.append(bid_e)
+                    st.session_state.ask_history.append(ask_e)
+                    st.session_state.vol_history.append(vol_e)
+                st.session_state.bid_history = st.session_state.bid_history[-200:]
+                st.session_state.ask_history = st.session_state.ask_history[-200:]
+                st.session_state.vol_history = st.session_state.vol_history[-200:]
+                if _strikes_seen:
+                    _strikes_sorted = sorted(_strikes_seen)
+                    st.session_state.bid_current_strikes = _strikes_sorted
+                    st.session_state.ask_current_strikes = _strikes_sorted
+                    st.session_state.vol_current_strikes = _strikes_sorted
         except Exception:
             pass
 
@@ -9302,7 +9341,10 @@ def _render_main_analyzer():
                     pcr_extract_cols = ['Strike', 'Zone', 'PCR', 'PCR_Signal',
                                                                    'openInterest_CE', 'openInterest_PE']
                     for _chg_col in ['changeinOpenInterest_CE', 'changeinOpenInterest_PE',
-                                      'lastPrice_CE', 'lastPrice_PE']:
+                                      'lastPrice_CE', 'lastPrice_PE',
+                                      'totalTradedVolume_CE', 'totalTradedVolume_PE',
+                                      'bidQty_CE', 'bidQty_PE',
+                                      'askQty_CE', 'askQty_PE']:
                         if _chg_col in df_summary.columns:
                             pcr_extract_cols.append(_chg_col)
                     pcr_df = df_summary.iloc[start_idx:end_idx][pcr_extract_cols].copy()
@@ -9345,10 +9387,34 @@ def _render_main_analyzer():
                                     db.upsert_pcr_history(pcr_records)
                             except Exception:
                                 pass
+                            # Persist Bid/Ask + Volume per-strike to Supabase
+                            try:
+                                expiry_for_ba = option_data.get('expiry', selected_expiry) if option_data else selected_expiry
+                                _atm_for_ba = float(atm_strike) if 'atm_strike' in dir() else 0
+                                ba_records = []
+                                for _, row in pcr_df.iterrows():
+                                    ba_records.append({
+                                        'timestamp': current_time,
+                                        'expiry': expiry_for_ba,
+                                        'strike': float(row['Strike']),
+                                        'atm_strike': _atm_for_ba,
+                                        'bid_qty_ce': int(row.get('bidQty_CE', 0) or 0),
+                                        'bid_qty_pe': int(row.get('bidQty_PE', 0) or 0),
+                                        'ask_qty_ce': int(row.get('askQty_CE', 0) or 0),
+                                        'ask_qty_pe': int(row.get('askQty_PE', 0) or 0),
+                                        'volume_ce': int(row.get('totalTradedVolume_CE', 0) or 0),
+                                        'volume_pe': int(row.get('totalTradedVolume_PE', 0) or 0),
+                                    })
+                                if ba_records:
+                                    db.upsert_bid_ask_history(ba_records)
+                            except Exception:
+                                pass
                             # Collect OI history for ATM ± 2 strikes
                             oi_entry = {'time': current_time}
                             chgoi_entry = {'time': current_time}
                             vol_entry = {'time': current_time}
+                            bid_entry = {'time': current_time}
+                            ask_entry = {'time': current_time}
                             for _, row in pcr_df.iterrows():
                                 strike_label = str(int(row['Strike']))
                                 oi_entry[f'{strike_label}_CE'] = int(row.get('openInterest_CE', 0) or 0)
@@ -9359,6 +9425,10 @@ def _render_main_analyzer():
                                 chgoi_entry[f'{strike_label}_PE'] = int(row.get('changeinOpenInterest_PE', 0) or 0)
                                 vol_entry[f'{strike_label}_CE'] = int(row.get('totalTradedVolume_CE', 0) or 0)
                                 vol_entry[f'{strike_label}_PE'] = int(row.get('totalTradedVolume_PE', 0) or 0)
+                                bid_entry[f'{strike_label}_CE'] = int(row.get('bidQty_CE', 0) or 0)
+                                bid_entry[f'{strike_label}_PE'] = int(row.get('bidQty_PE', 0) or 0)
+                                ask_entry[f'{strike_label}_CE'] = int(row.get('askQty_CE', 0) or 0)
+                                ask_entry[f'{strike_label}_PE'] = int(row.get('askQty_PE', 0) or 0)
                             st.session_state.oi_history.append(oi_entry)
                             st.session_state.oi_last_valid_data = pcr_df.copy()
                             st.session_state.oi_current_strikes = [int(s) for s in current_strikes]
@@ -9388,6 +9458,16 @@ def _render_main_analyzer():
                             st.session_state.vol_current_strikes = [int(s) for s in current_strikes]
                             if len(st.session_state.vol_history) > 200:
                                 st.session_state.vol_history = st.session_state.vol_history[-200:]
+                            st.session_state.bid_history.append(bid_entry)
+                            st.session_state.bid_last_valid_data = pcr_df.copy()
+                            st.session_state.bid_current_strikes = [int(s) for s in current_strikes]
+                            if len(st.session_state.bid_history) > 200:
+                                st.session_state.bid_history = st.session_state.bid_history[-200:]
+                            st.session_state.ask_history.append(ask_entry)
+                            st.session_state.ask_last_valid_data = pcr_df.copy()
+                            st.session_state.ask_current_strikes = [int(s) for s in current_strikes]
+                            if len(st.session_state.ask_history) > 200:
+                                st.session_state.ask_history = st.session_state.ask_history[-200:]
             except Exception as e:
                 st.caption(f"⚠️ Current fetch issue: {str(e)[:50]}...")
         if len(st.session_state.pcr_history) > 0:
@@ -9947,6 +10027,185 @@ def _render_main_analyzer():
                 st.warning(f"Error displaying Volume charts: {str(e)}")
         else:
             st.info("📊 Volume history will build up as the app refreshes. Please wait for data collection...")
+
+        # ── Per-Strike Bid Qty: Call vs Put (ATM ± 2) ──
+        st.markdown("---")
+        st.markdown("## 🟢 Bid Qty Analysis - Time Series (ATM ± 2)")
+        if len(st.session_state.bid_history) > 0:
+            try:
+                bid_history_df = pd.DataFrame(st.session_state.bid_history)
+                bid_strikes = st.session_state.bid_current_strikes or []
+                if not bid_strikes and st.session_state.bid_last_valid_data is not None:
+                    bid_strikes = [int(s) for s in st.session_state.bid_last_valid_data['Strike'].tolist()]
+                bid_strikes = sorted(bid_strikes)
+                bid_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                if len(bid_strikes) >= 3:
+                    st.markdown("### Per-Strike Call vs Put Bid Qty")
+                    bid_strike_cols = st.columns(min(len(bid_strikes), 5))
+                    for i, strike in enumerate(bid_strikes):
+                        if i >= len(bid_strike_cols):
+                            break
+                        ce_col = f'{strike}_CE'
+                        pe_col = f'{strike}_PE'
+                        with bid_strike_cols[i]:
+                            label = bid_position_labels[i] if i < len(bid_position_labels) else f'Strike {i}'
+                            fig_bid_strike = go.Figure()
+                            if ce_col in bid_history_df.columns:
+                                fig_bid_strike.add_trace(go.Scatter(
+                                    x=bid_history_df['time'],
+                                    y=bid_history_df[ce_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Call Bid',
+                                    line=dict(color='#ff4444', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            if pe_col in bid_history_df.columns:
+                                fig_bid_strike.add_trace(go.Scatter(
+                                    x=bid_history_df['time'],
+                                    y=bid_history_df[pe_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Put Bid',
+                                    line=dict(color='#00cc66', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            cur_ce_bid = bid_history_df[ce_col].iloc[-1] / 1000 if ce_col in bid_history_df.columns and len(bid_history_df) > 0 else 0
+                            cur_pe_bid = bid_history_df[pe_col].iloc[-1] / 1000 if pe_col in bid_history_df.columns and len(bid_history_df) > 0 else 0
+                            ce_inc = pe_inc = False
+                            if len(bid_history_df) >= 2:
+                                prev_ce = bid_history_df[ce_col].iloc[-2] / 1000 if ce_col in bid_history_df.columns else 0
+                                prev_pe = bid_history_df[pe_col].iloc[-2] / 1000 if pe_col in bid_history_df.columns else 0
+                                ce_inc = cur_ce_bid > prev_ce
+                                pe_inc = cur_pe_bid > prev_pe
+                            ce_t = "↑" if ce_inc else "↓"
+                            pe_t = "↑" if pe_inc else "↓"
+                            fig_bid_strike.update_layout(
+                                title=f'{label}<br>₹{strike}<br>CE: {cur_ce_bid:.1f}K{ce_t} | PE: {cur_pe_bid:.1f}K{pe_t}',
+                                template='plotly_dark',
+                                height=280,
+                                showlegend=True,
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                                margin=dict(l=10, r=10, t=80, b=30),
+                                xaxis=dict(tickformat='%H:%M', title=''),
+                                yaxis=dict(title='Bid Qty (K)'),
+                                plot_bgcolor='#1e1e1e',
+                                paper_bgcolor='#1e1e1e'
+                            )
+                            st.plotly_chart(fig_bid_strike, use_container_width=True)
+                            # Signal interpretation: PE bid > CE bid = buyers defending support
+                            if cur_pe_bid > cur_ce_bid * 1.2 and pe_inc:
+                                st.success("PE Bid Building 🟢 (Support)")
+                            elif cur_ce_bid > cur_pe_bid * 1.2 and ce_inc:
+                                st.error("CE Bid Building 🔴 (Resistance Buyers)")
+                            elif ce_inc and not pe_inc:
+                                st.warning("CE Bid Rising")
+                            elif pe_inc and not ce_inc:
+                                st.warning("PE Bid Rising")
+                            else:
+                                st.info("Balanced")
+                else:
+                    st.info("Waiting for ATM ± 2 strike data...")
+                bid_info1, bid_info2 = st.columns([3, 1])
+                with bid_info1:
+                    st.caption(f"📈 {len(st.session_state.bid_history)} data points | Bid Qty values in Thousands (K)")
+                with bid_info2:
+                    if st.button("🗑️ Clear Bid History"):
+                        st.session_state.bid_history = []
+                        st.session_state.bid_last_valid_data = None
+                        st.rerun()
+            except Exception as e:
+                st.warning(f"Error displaying Bid Qty charts: {str(e)}")
+        else:
+            st.info("📊 Bid Qty history will build up as the app refreshes. Please wait for data collection...")
+
+        # ── Per-Strike Ask Qty: Call vs Put (ATM ± 2) ──
+        st.markdown("---")
+        st.markdown("## 🔴 Ask Qty Analysis - Time Series (ATM ± 2)")
+        if len(st.session_state.ask_history) > 0:
+            try:
+                ask_history_df = pd.DataFrame(st.session_state.ask_history)
+                ask_strikes = st.session_state.ask_current_strikes or []
+                if not ask_strikes and st.session_state.ask_last_valid_data is not None:
+                    ask_strikes = [int(s) for s in st.session_state.ask_last_valid_data['Strike'].tolist()]
+                ask_strikes = sorted(ask_strikes)
+                ask_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
+                if len(ask_strikes) >= 3:
+                    st.markdown("### Per-Strike Call vs Put Ask Qty")
+                    ask_strike_cols = st.columns(min(len(ask_strikes), 5))
+                    for i, strike in enumerate(ask_strikes):
+                        if i >= len(ask_strike_cols):
+                            break
+                        ce_col = f'{strike}_CE'
+                        pe_col = f'{strike}_PE'
+                        with ask_strike_cols[i]:
+                            label = ask_position_labels[i] if i < len(ask_position_labels) else f'Strike {i}'
+                            fig_ask_strike = go.Figure()
+                            if ce_col in ask_history_df.columns:
+                                fig_ask_strike.add_trace(go.Scatter(
+                                    x=ask_history_df['time'],
+                                    y=ask_history_df[ce_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Call Ask',
+                                    line=dict(color='#ff4444', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            if pe_col in ask_history_df.columns:
+                                fig_ask_strike.add_trace(go.Scatter(
+                                    x=ask_history_df['time'],
+                                    y=ask_history_df[pe_col] / 1000,
+                                    mode='lines+markers',
+                                    name='Put Ask',
+                                    line=dict(color='#00cc66', width=2),
+                                    marker=dict(size=3),
+                                ))
+                            cur_ce_ask = ask_history_df[ce_col].iloc[-1] / 1000 if ce_col in ask_history_df.columns and len(ask_history_df) > 0 else 0
+                            cur_pe_ask = ask_history_df[pe_col].iloc[-1] / 1000 if pe_col in ask_history_df.columns and len(ask_history_df) > 0 else 0
+                            ce_inc = pe_inc = False
+                            if len(ask_history_df) >= 2:
+                                prev_ce = ask_history_df[ce_col].iloc[-2] / 1000 if ce_col in ask_history_df.columns else 0
+                                prev_pe = ask_history_df[pe_col].iloc[-2] / 1000 if pe_col in ask_history_df.columns else 0
+                                ce_inc = cur_ce_ask > prev_ce
+                                pe_inc = cur_pe_ask > prev_pe
+                            ce_t = "↑" if ce_inc else "↓"
+                            pe_t = "↑" if pe_inc else "↓"
+                            fig_ask_strike.update_layout(
+                                title=f'{label}<br>₹{strike}<br>CE: {cur_ce_ask:.1f}K{ce_t} | PE: {cur_pe_ask:.1f}K{pe_t}',
+                                template='plotly_dark',
+                                height=280,
+                                showlegend=True,
+                                legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
+                                margin=dict(l=10, r=10, t=80, b=30),
+                                xaxis=dict(tickformat='%H:%M', title=''),
+                                yaxis=dict(title='Ask Qty (K)'),
+                                plot_bgcolor='#1e1e1e',
+                                paper_bgcolor='#1e1e1e'
+                            )
+                            st.plotly_chart(fig_ask_strike, use_container_width=True)
+                            # Signal interpretation: CE ask > PE ask = sellers stacking resistance
+                            if cur_ce_ask > cur_pe_ask * 1.2 and ce_inc:
+                                st.error("CE Ask Building 🔴 (Resistance)")
+                            elif cur_pe_ask > cur_ce_ask * 1.2 and pe_inc:
+                                st.success("PE Ask Building 🟢 (Support Sellers)")
+                            elif ce_inc and not pe_inc:
+                                st.warning("CE Ask Rising")
+                            elif pe_inc and not ce_inc:
+                                st.warning("PE Ask Rising")
+                            else:
+                                st.info("Balanced")
+                else:
+                    st.info("Waiting for ATM ± 2 strike data...")
+                ask_info1, ask_info2 = st.columns([3, 1])
+                with ask_info1:
+                    st.caption(f"📈 {len(st.session_state.ask_history)} data points | Ask Qty values in Thousands (K)")
+                with ask_info2:
+                    if st.button("🗑️ Clear Ask History"):
+                        st.session_state.ask_history = []
+                        st.session_state.ask_last_valid_data = None
+                        st.rerun()
+            except Exception as e:
+                st.warning(f"Error displaying Ask Qty charts: {str(e)}")
+        else:
+            st.info("📊 Ask Qty history will build up as the app refreshes. Please wait for data collection...")
+
         st.markdown("---")
         st.markdown("## 📊 Gamma Exposure (GEX) Analysis - Dealer Hedging Flow")
         try:

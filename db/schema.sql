@@ -163,6 +163,26 @@ CREATE TABLE IF NOT EXISTS gex_history (
 );
 CREATE INDEX IF NOT EXISTS idx_gex_day ON gex_history(trading_day);
 
+-- 6b. BID/ASK QTY HISTORY (per-strike order-book quantities + volume)
+CREATE TABLE IF NOT EXISTS bid_ask_history (
+    id BIGSERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ NOT NULL,
+    trading_day DATE NOT NULL,
+    expiry TEXT NOT NULL,
+    strike_price DOUBLE PRECISION NOT NULL,
+    atm_strike DOUBLE PRECISION,
+    bid_qty_ce BIGINT,
+    bid_qty_pe BIGINT,
+    ask_qty_ce BIGINT,
+    ask_qty_pe BIGINT,
+    volume_ce BIGINT,
+    volume_pe BIGINT,
+    data_source TEXT DEFAULT 'computed',
+    update_time TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(timestamp, expiry, strike_price)
+);
+CREATE INDEX IF NOT EXISTS idx_bid_ask_day ON bid_ask_history(trading_day);
+
 -- 7. DETECTED PATTERNS (Chart patterns)
 CREATE TABLE IF NOT EXISTS detected_patterns (
     id BIGSERIAL PRIMARY KEY,
