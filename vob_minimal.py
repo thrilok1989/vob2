@@ -7642,6 +7642,41 @@ def _render_main_analyzer():
         except Exception:
             pass
 
+    # Hydrate bid/ask/vol histories from Supabase on cold start
+    if not st.session_state.bid_history and not st.session_state.ask_history and not st.session_state.vol_history:
+        try:
+            ba_db_df = db.get_bid_ask_history()
+            if not ba_db_df.empty and 'timestamp' in ba_db_df.columns:
+                ba_db_df['timestamp'] = pd.to_datetime(ba_db_df['timestamp'])
+                grouped = ba_db_df.groupby('timestamp')
+                _strikes_seen = set()
+                for ts, group in grouped:
+                    bid_e = {'time': ts.to_pydatetime()}
+                    ask_e = {'time': ts.to_pydatetime()}
+                    vol_e = {'time': ts.to_pydatetime()}
+                    for _, row in group.iterrows():
+                        strike_label = str(int(row['strike_price']))
+                        _strikes_seen.add(int(row['strike_price']))
+                        bid_e[f'{strike_label}_CE'] = int(row.get('bid_qty_ce', 0) or 0)
+                        bid_e[f'{strike_label}_PE'] = int(row.get('bid_qty_pe', 0) or 0)
+                        ask_e[f'{strike_label}_CE'] = int(row.get('ask_qty_ce', 0) or 0)
+                        ask_e[f'{strike_label}_PE'] = int(row.get('ask_qty_pe', 0) or 0)
+                        vol_e[f'{strike_label}_CE'] = int(row.get('volume_ce', 0) or 0)
+                        vol_e[f'{strike_label}_PE'] = int(row.get('volume_pe', 0) or 0)
+                    st.session_state.bid_history.append(bid_e)
+                    st.session_state.ask_history.append(ask_e)
+                    st.session_state.vol_history.append(vol_e)
+                st.session_state.bid_history = st.session_state.bid_history[-200:]
+                st.session_state.ask_history = st.session_state.ask_history[-200:]
+                st.session_state.vol_history = st.session_state.vol_history[-200:]
+                if _strikes_seen:
+                    _strikes_sorted = sorted(_strikes_seen)
+                    st.session_state.bid_current_strikes = _strikes_sorted
+                    st.session_state.ask_current_strikes = _strikes_sorted
+                    st.session_state.vol_current_strikes = _strikes_sorted
+        except Exception:
+            pass
+
     try:
         if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
             st.error("Please configure your Dhan API credentials in Streamlit secrets")
@@ -9350,6 +9385,28 @@ def _render_main_analyzer():
                                     })
                                 if pcr_records:
                                     db.upsert_pcr_history(pcr_records)
+                            except Exception:
+                                pass
+                            # Persist Bid/Ask + Volume per-strike to Supabase
+                            try:
+                                expiry_for_ba = option_data.get('expiry', selected_expiry) if option_data else selected_expiry
+                                _atm_for_ba = float(atm_strike) if 'atm_strike' in dir() else 0
+                                ba_records = []
+                                for _, row in pcr_df.iterrows():
+                                    ba_records.append({
+                                        'timestamp': current_time,
+                                        'expiry': expiry_for_ba,
+                                        'strike': float(row['Strike']),
+                                        'atm_strike': _atm_for_ba,
+                                        'bid_qty_ce': int(row.get('bidQty_CE', 0) or 0),
+                                        'bid_qty_pe': int(row.get('bidQty_PE', 0) or 0),
+                                        'ask_qty_ce': int(row.get('askQty_CE', 0) or 0),
+                                        'ask_qty_pe': int(row.get('askQty_PE', 0) or 0),
+                                        'volume_ce': int(row.get('totalTradedVolume_CE', 0) or 0),
+                                        'volume_pe': int(row.get('totalTradedVolume_PE', 0) or 0),
+                                    })
+                                if ba_records:
+                                    db.upsert_bid_ask_history(ba_records)
                             except Exception:
                                 pass
                             # Collect OI history for ATM ± 2 strikes

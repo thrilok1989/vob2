@@ -308,6 +308,44 @@ class SupabaseDB:
             df = df[df['strike_price'].isin([float(s) for s in strikes])]
         return df
 
+    # ── Bid/Ask Qty History (per-strike order-book + volume) ──
+    def upsert_bid_ask_history(self, entries):
+        if not entries:
+            return
+        now = datetime.now(IST)
+        records = []
+        for e in entries:
+            ts = e.get('timestamp', now)
+            records.append({
+                'timestamp': ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+                'trading_day': now.date().isoformat(),
+                'expiry': e['expiry'],
+                'strike_price': float(e['strike']),
+                'atm_strike': float(e.get('atm_strike', 0)),
+                'bid_qty_ce': int(e.get('bid_qty_ce', 0)),
+                'bid_qty_pe': int(e.get('bid_qty_pe', 0)),
+                'ask_qty_ce': int(e.get('ask_qty_ce', 0)),
+                'ask_qty_pe': int(e.get('ask_qty_pe', 0)),
+                'volume_ce': int(e.get('volume_ce', 0)),
+                'volume_pe': int(e.get('volume_pe', 0)),
+                'data_source': 'computed',
+                'update_time': datetime.now(pytz.UTC).isoformat()
+            })
+        self._safe_upsert('bid_ask_history', records, 'timestamp,expiry,strike_price')
+
+    def get_bid_ask_history(self, trading_day=None, expiry=None, strikes=None):
+        if trading_day is None:
+            trading_day = datetime.now(IST).date().isoformat()
+        def query():
+            q = self.client.table('bid_ask_history').select('*').eq('trading_day', trading_day)
+            if expiry:
+                q = q.eq('expiry', expiry)
+            return q.order('timestamp', desc=False).execute()
+        df = self._safe_query('bid_ask_history', query, {'trading_day': trading_day})
+        if not df.empty and strikes:
+            df = df[df['strike_price'].isin([float(s) for s in strikes])]
+        return df
+
     # ── Detected Patterns ──
     def upsert_detected_patterns(self, patterns):
         if not patterns:
