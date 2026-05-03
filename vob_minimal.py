@@ -7633,17 +7633,29 @@ def _render_main_analyzer():
             if not gex_db_df.empty and 'timestamp' in gex_db_df.columns:
                 gex_db_df['timestamp'] = pd.to_datetime(gex_db_df['timestamp'])
                 grouped = gex_db_df.groupby('timestamp')
+                _gex_strikes = set()
                 for ts, group in grouped:
                     entry = {'time': ts.to_pydatetime(), 'total_gex': float(group['total_gex'].iloc[0])}
                     for _, row in group.iterrows():
-                        entry[str(int(row['strike_price']))] = float(row['net_gex'])
+                        strike_label = str(int(row['strike_price']))
+                        _gex_strikes.add(int(row['strike_price']))
+                        entry[strike_label] = float(row.get('net_gex', 0) or 0)
+                        entry[f'{strike_label}_Call'] = float(row.get('call_gex', 0) or 0)
+                        entry[f'{strike_label}_Put'] = float(row.get('put_gex', 0) or 0)
                     st.session_state.gex_history.append(entry)
                 st.session_state.gex_history = st.session_state.gex_history[-200:]
+                if _gex_strikes:
+                    st.session_state.gex_current_strikes = sorted(_gex_strikes)
         except Exception:
             pass
 
-    # Hydrate bid/ask/vol histories from Supabase on cold start
-    if not st.session_state.bid_history and not st.session_state.ask_history and not st.session_state.vol_history:
+    # Hydrate per-strike histories (bid/ask/vol/oi/chgoi) from Supabase on cold start
+    _need_hydrate = (not st.session_state.bid_history
+                     and not st.session_state.ask_history
+                     and not st.session_state.vol_history
+                     and not st.session_state.oi_history
+                     and not st.session_state.chgoi_history)
+    if _need_hydrate:
         try:
             ba_db_df = db.get_bid_ask_history()
             if not ba_db_df.empty and 'timestamp' in ba_db_df.columns:
@@ -7651,9 +7663,12 @@ def _render_main_analyzer():
                 grouped = ba_db_df.groupby('timestamp')
                 _strikes_seen = set()
                 for ts, group in grouped:
-                    bid_e = {'time': ts.to_pydatetime()}
-                    ask_e = {'time': ts.to_pydatetime()}
-                    vol_e = {'time': ts.to_pydatetime()}
+                    t = ts.to_pydatetime()
+                    bid_e = {'time': t}
+                    ask_e = {'time': t}
+                    vol_e = {'time': t}
+                    oi_e = {'time': t}
+                    chg_e = {'time': t}
                     for _, row in group.iterrows():
                         strike_label = str(int(row['strike_price']))
                         _strikes_seen.add(int(row['strike_price']))
@@ -7663,17 +7678,49 @@ def _render_main_analyzer():
                         ask_e[f'{strike_label}_PE'] = int(row.get('ask_qty_pe', 0) or 0)
                         vol_e[f'{strike_label}_CE'] = int(row.get('volume_ce', 0) or 0)
                         vol_e[f'{strike_label}_PE'] = int(row.get('volume_pe', 0) or 0)
+                        oi_e[f'{strike_label}_CE'] = int(row.get('oi_ce', 0) or 0)
+                        oi_e[f'{strike_label}_PE'] = int(row.get('oi_pe', 0) or 0)
+                        oi_e[f'{strike_label}_CE_LTP'] = float(row.get('ltp_ce', 0) or 0)
+                        oi_e[f'{strike_label}_PE_LTP'] = float(row.get('ltp_pe', 0) or 0)
+                        chg_e[f'{strike_label}_CE'] = int(row.get('chgoi_ce', 0) or 0)
+                        chg_e[f'{strike_label}_PE'] = int(row.get('chgoi_pe', 0) or 0)
                     st.session_state.bid_history.append(bid_e)
                     st.session_state.ask_history.append(ask_e)
                     st.session_state.vol_history.append(vol_e)
+                    st.session_state.oi_history.append(oi_e)
+                    st.session_state.chgoi_history.append(chg_e)
                 st.session_state.bid_history = st.session_state.bid_history[-200:]
                 st.session_state.ask_history = st.session_state.ask_history[-200:]
                 st.session_state.vol_history = st.session_state.vol_history[-200:]
+                st.session_state.oi_history = st.session_state.oi_history[-200:]
+                st.session_state.chgoi_history = st.session_state.chgoi_history[-200:]
                 if _strikes_seen:
                     _strikes_sorted = sorted(_strikes_seen)
                     st.session_state.bid_current_strikes = _strikes_sorted
                     st.session_state.ask_current_strikes = _strikes_sorted
                     st.session_state.vol_current_strikes = _strikes_sorted
+                    st.session_state.oi_current_strikes = _strikes_sorted
+                    st.session_state.chgoi_current_strikes = _strikes_sorted
+        except Exception:
+            pass
+
+    # Hydrate Volume Delta time series from Supabase on cold start
+    if '_volume_delta_data' not in st.session_state or st.session_state.get('_volume_delta_data') is None:
+        try:
+            vd_db_df = db.get_volume_delta_history()
+            if not vd_db_df.empty and 'timestamp' in vd_db_df.columns:
+                vd_db_df['timestamp'] = pd.to_datetime(vd_db_df['timestamp'])
+                vd_db_df = vd_db_df.rename(columns={'timestamp': 'datetime'})
+                vd_db_df = vd_db_df.tail(200).reset_index(drop=True)
+                _summary = {
+                    'total_buy_volume': int(vd_db_df['buy_volume'].sum()),
+                    'total_sell_volume': int(vd_db_df['sell_volume'].sum()),
+                    'total_delta': int(vd_db_df['delta'].sum()),
+                    'delta_ratio': float(vd_db_df['buy_volume'].sum() / max(1, vd_db_df['sell_volume'].sum())),
+                    'divergence_bars': int(vd_db_df['divergence'].sum()),
+                    'bias': vd_db_df['bias'].iloc[-1] if len(vd_db_df) else 'N/A',
+                }
+                st.session_state['_volume_delta_data'] = {'df': vd_db_df, 'summary': _summary}
         except Exception:
             pass
 
@@ -8111,6 +8158,27 @@ def _render_main_analyzer():
                     except Exception:
                         pass
                 st.session_state._volume_delta_data = volume_delta_data
+                # Persist volume delta time series to Supabase for cross-session restore
+                try:
+                    if volume_delta_data and volume_delta_data.get('df') is not None:
+                        _vd_df = volume_delta_data['df']
+                        _vd_summary = volume_delta_data.get('summary', {})
+                        _bias = _vd_summary.get('bias', '')
+                        _vd_records = []
+                        for _, _vrow in _vd_df.tail(50).iterrows():
+                            _vd_records.append({
+                                'timestamp': _vrow['datetime'],
+                                'buy_volume': int(_vrow.get('buy_volume', 0) or 0),
+                                'sell_volume': int(_vrow.get('sell_volume', 0) or 0),
+                                'delta': int(_vrow.get('delta', 0) or 0),
+                                'cum_delta': int(_vrow.get('cum_delta', 0) or 0),
+                                'divergence': bool(_vrow.get('divergence', False)),
+                                'bias': _bias,
+                            })
+                        if _vd_records:
+                            db.upsert_volume_delta_history(_vd_records)
+                except Exception:
+                    pass
             except Exception as e:
                 st.caption(f"⚠️ Volume Delta error: {str(e)[:80]}")
                 volume_delta_data = None
@@ -9387,7 +9455,7 @@ def _render_main_analyzer():
                                     db.upsert_pcr_history(pcr_records)
                             except Exception:
                                 pass
-                            # Persist Bid/Ask + Volume per-strike to Supabase
+                            # Persist full per-strike snapshot (bid/ask/vol/oi/chgoi/ltp) to Supabase
                             try:
                                 expiry_for_ba = option_data.get('expiry', selected_expiry) if option_data else selected_expiry
                                 _atm_for_ba = float(atm_strike) if 'atm_strike' in dir() else 0
@@ -9404,6 +9472,12 @@ def _render_main_analyzer():
                                         'ask_qty_pe': int(row.get('askQty_PE', 0) or 0),
                                         'volume_ce': int(row.get('totalTradedVolume_CE', 0) or 0),
                                         'volume_pe': int(row.get('totalTradedVolume_PE', 0) or 0),
+                                        'oi_ce': int(row.get('openInterest_CE', 0) or 0),
+                                        'oi_pe': int(row.get('openInterest_PE', 0) or 0),
+                                        'chgoi_ce': int(row.get('changeinOpenInterest_CE', 0) or 0),
+                                        'chgoi_pe': int(row.get('changeinOpenInterest_PE', 0) or 0),
+                                        'ltp_ce': float(row.get('lastPrice_CE', 0) or 0),
+                                        'ltp_pe': float(row.get('lastPrice_PE', 0) or 0),
                                     })
                                 if ba_records:
                                     db.upsert_bid_ask_history(ba_records)

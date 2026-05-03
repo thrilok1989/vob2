@@ -308,7 +308,7 @@ class SupabaseDB:
             df = df[df['strike_price'].isin([float(s) for s in strikes])]
         return df
 
-    # ── Bid/Ask Qty History (per-strike order-book + volume) ──
+    # ── Bid/Ask Qty History (per-strike option-chain snapshot) ──
     def upsert_bid_ask_history(self, entries):
         if not entries:
             return
@@ -328,6 +328,12 @@ class SupabaseDB:
                 'ask_qty_pe': int(e.get('ask_qty_pe', 0)),
                 'volume_ce': int(e.get('volume_ce', 0)),
                 'volume_pe': int(e.get('volume_pe', 0)),
+                'oi_ce': int(e.get('oi_ce', 0)),
+                'oi_pe': int(e.get('oi_pe', 0)),
+                'chgoi_ce': int(e.get('chgoi_ce', 0)),
+                'chgoi_pe': int(e.get('chgoi_pe', 0)),
+                'ltp_ce': float(e.get('ltp_ce', 0)),
+                'ltp_pe': float(e.get('ltp_pe', 0)),
                 'data_source': 'computed',
                 'update_time': datetime.now(pytz.UTC).isoformat()
             })
@@ -345,6 +351,37 @@ class SupabaseDB:
         if not df.empty and strikes:
             df = df[df['strike_price'].isin([float(s) for s in strikes])]
         return df
+
+    # ── Volume Delta History (index-level Buy/Sell time series) ──
+    def upsert_volume_delta_history(self, entries, symbol='NIFTY50'):
+        if not entries:
+            return
+        now = datetime.now(IST)
+        records = []
+        for e in entries:
+            ts = e.get('timestamp', now)
+            records.append({
+                'timestamp': ts.isoformat() if hasattr(ts, 'isoformat') else str(ts),
+                'trading_day': now.date().isoformat(),
+                'symbol': symbol,
+                'buy_volume': int(e.get('buy_volume', 0)),
+                'sell_volume': int(e.get('sell_volume', 0)),
+                'delta': int(e.get('delta', 0)),
+                'cum_delta': int(e.get('cum_delta', 0)),
+                'divergence': bool(e.get('divergence', False)),
+                'bias': str(e.get('bias', '')),
+                'update_time': datetime.now(pytz.UTC).isoformat()
+            })
+        self._safe_upsert('volume_delta_history', records, 'timestamp,symbol')
+
+    def get_volume_delta_history(self, trading_day=None, symbol='NIFTY50'):
+        if trading_day is None:
+            trading_day = datetime.now(IST).date().isoformat()
+        def query():
+            return self.client.table('volume_delta_history').select('*') \
+                .eq('trading_day', trading_day).eq('symbol', symbol) \
+                .order('timestamp', desc=False).execute()
+        return self._safe_query('volume_delta_history', query, {'trading_day': trading_day, 'symbol': symbol})
 
     # ── Detected Patterns ──
     def upsert_detected_patterns(self, patterns):
