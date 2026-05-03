@@ -163,7 +163,7 @@ CREATE TABLE IF NOT EXISTS gex_history (
 );
 CREATE INDEX IF NOT EXISTS idx_gex_day ON gex_history(trading_day);
 
--- 6b. BID/ASK QTY HISTORY (per-strike order-book quantities + volume)
+-- 6b. BID/ASK QTY HISTORY (per-strike option-chain snapshot)
 CREATE TABLE IF NOT EXISTS bid_ask_history (
     id BIGSERIAL PRIMARY KEY,
     timestamp TIMESTAMPTZ NOT NULL,
@@ -177,11 +177,34 @@ CREATE TABLE IF NOT EXISTS bid_ask_history (
     ask_qty_pe BIGINT,
     volume_ce BIGINT,
     volume_pe BIGINT,
+    oi_ce BIGINT,
+    oi_pe BIGINT,
+    chgoi_ce BIGINT,
+    chgoi_pe BIGINT,
+    ltp_ce DOUBLE PRECISION,
+    ltp_pe DOUBLE PRECISION,
     data_source TEXT DEFAULT 'computed',
     update_time TIMESTAMPTZ DEFAULT NOW(),
     UNIQUE(timestamp, expiry, strike_price)
 );
 CREATE INDEX IF NOT EXISTS idx_bid_ask_day ON bid_ask_history(trading_day);
+
+-- 6c. VOLUME DELTA HISTORY (index-level Buy/Sell volume time series)
+CREATE TABLE IF NOT EXISTS volume_delta_history (
+    id BIGSERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ NOT NULL,
+    trading_day DATE NOT NULL,
+    symbol TEXT NOT NULL DEFAULT 'NIFTY50',
+    buy_volume BIGINT,
+    sell_volume BIGINT,
+    delta BIGINT,
+    cum_delta BIGINT,
+    divergence BOOLEAN DEFAULT FALSE,
+    bias TEXT,
+    update_time TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE(timestamp, symbol)
+);
+CREATE INDEX IF NOT EXISTS idx_vol_delta_day ON volume_delta_history(trading_day);
 
 -- 7. DETECTED PATTERNS (Chart patterns)
 CREATE TABLE IF NOT EXISTS detected_patterns (
