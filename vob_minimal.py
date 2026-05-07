@@ -10114,7 +10114,7 @@ def _render_main_analyzer():
                 bid_strikes = sorted(bid_strikes)
                 bid_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
                 if len(bid_strikes) >= 3:
-                    st.markdown("### Per-Strike Call vs Put Bid Qty")
+                    st.markdown("### Per-Strike Call vs Put Bid Qty (Cumulative)")
                     bid_strike_cols = st.columns(min(len(bid_strikes), 5))
                     for i, strike in enumerate(bid_strikes):
                         if i >= len(bid_strike_cols):
@@ -10124,48 +10124,52 @@ def _render_main_analyzer():
                         with bid_strike_cols[i]:
                             label = bid_position_labels[i] if i < len(bid_position_labels) else f'Strike {i}'
                             fig_bid_strike = go.Figure()
-                            if ce_col in bid_history_df.columns:
+                            ce_cum = bid_history_df[ce_col].cumsum() / 1000 if ce_col in bid_history_df.columns else None
+                            pe_cum = bid_history_df[pe_col].cumsum() / 1000 if pe_col in bid_history_df.columns else None
+                            if ce_cum is not None:
                                 fig_bid_strike.add_trace(go.Scatter(
                                     x=bid_history_df['time'],
-                                    y=bid_history_df[ce_col] / 1000,
+                                    y=ce_cum,
                                     mode='lines+markers',
-                                    name='Call Bid',
+                                    name='Call Bid (cum)',
                                     line=dict(color='#ff4444', width=2),
                                     marker=dict(size=3),
                                 ))
-                            if pe_col in bid_history_df.columns:
+                            if pe_cum is not None:
                                 fig_bid_strike.add_trace(go.Scatter(
                                     x=bid_history_df['time'],
-                                    y=bid_history_df[pe_col] / 1000,
+                                    y=pe_cum,
                                     mode='lines+markers',
-                                    name='Put Bid',
+                                    name='Put Bid (cum)',
                                     line=dict(color='#00cc66', width=2),
                                     marker=dict(size=3),
                                 ))
-                            cur_ce_bid = bid_history_df[ce_col].iloc[-1] / 1000 if ce_col in bid_history_df.columns and len(bid_history_df) > 0 else 0
-                            cur_pe_bid = bid_history_df[pe_col].iloc[-1] / 1000 if pe_col in bid_history_df.columns and len(bid_history_df) > 0 else 0
+                            cur_ce_bid = float(bid_history_df[ce_col].iloc[-1]) / 1000 if ce_col in bid_history_df.columns and len(bid_history_df) > 0 else 0
+                            cur_pe_bid = float(bid_history_df[pe_col].iloc[-1]) / 1000 if pe_col in bid_history_df.columns and len(bid_history_df) > 0 else 0
+                            cum_ce_total = float(ce_cum.iloc[-1]) if ce_cum is not None and len(ce_cum) > 0 else 0
+                            cum_pe_total = float(pe_cum.iloc[-1]) if pe_cum is not None and len(pe_cum) > 0 else 0
                             ce_inc = pe_inc = False
                             if len(bid_history_df) >= 2:
-                                prev_ce = bid_history_df[ce_col].iloc[-2] / 1000 if ce_col in bid_history_df.columns else 0
-                                prev_pe = bid_history_df[pe_col].iloc[-2] / 1000 if pe_col in bid_history_df.columns else 0
+                                prev_ce = float(bid_history_df[ce_col].iloc[-2]) / 1000 if ce_col in bid_history_df.columns else 0
+                                prev_pe = float(bid_history_df[pe_col].iloc[-2]) / 1000 if pe_col in bid_history_df.columns else 0
                                 ce_inc = cur_ce_bid > prev_ce
                                 pe_inc = cur_pe_bid > prev_pe
                             ce_t = "↑" if ce_inc else "↓"
                             pe_t = "↑" if pe_inc else "↓"
                             fig_bid_strike.update_layout(
-                                title=f'{label}<br>₹{strike}<br>CE: {cur_ce_bid:.1f}K{ce_t} | PE: {cur_pe_bid:.1f}K{pe_t}',
+                                title=f'{label}<br>₹{strike}<br>CE Σ: {cum_ce_total:.1f}K{ce_t} | PE Σ: {cum_pe_total:.1f}K{pe_t}',
                                 template='plotly_dark',
                                 height=280,
                                 showlegend=True,
                                 legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
                                 margin=dict(l=10, r=10, t=80, b=30),
                                 xaxis=dict(tickformat='%H:%M', title=''),
-                                yaxis=dict(title='Bid Qty (K)'),
+                                yaxis=dict(title='Cum Bid Qty (K)'),
                                 plot_bgcolor='#1e1e1e',
                                 paper_bgcolor='#1e1e1e'
                             )
                             st.plotly_chart(fig_bid_strike, use_container_width=True)
-                            # Signal interpretation: PE bid > CE bid = buyers defending support
+                            # Signal: snapshot dominance now (not cumulative)
                             if cur_pe_bid > cur_ce_bid * 1.2 and pe_inc:
                                 st.success("PE Bid Building 🟢 (Support)")
                             elif cur_ce_bid > cur_pe_bid * 1.2 and ce_inc:
@@ -10180,7 +10184,7 @@ def _render_main_analyzer():
                     st.info("Waiting for ATM ± 2 strike data...")
                 bid_info1, bid_info2 = st.columns([3, 1])
                 with bid_info1:
-                    st.caption(f"📈 {len(st.session_state.bid_history)} data points | Bid Qty values in Thousands (K)")
+                    st.caption(f"📈 {len(st.session_state.bid_history)} data points | Cumulative Bid Qty in Thousands (K)")
                 with bid_info2:
                     if st.button("🗑️ Clear Bid History"):
                         st.session_state.bid_history = []
@@ -10203,7 +10207,7 @@ def _render_main_analyzer():
                 ask_strikes = sorted(ask_strikes)
                 ask_position_labels = ['ITM-2', 'ITM-1', 'ATM', 'OTM+1', 'OTM+2']
                 if len(ask_strikes) >= 3:
-                    st.markdown("### Per-Strike Call vs Put Ask Qty")
+                    st.markdown("### Per-Strike Call vs Put Ask Qty (Cumulative)")
                     ask_strike_cols = st.columns(min(len(ask_strikes), 5))
                     for i, strike in enumerate(ask_strikes):
                         if i >= len(ask_strike_cols):
@@ -10213,48 +10217,52 @@ def _render_main_analyzer():
                         with ask_strike_cols[i]:
                             label = ask_position_labels[i] if i < len(ask_position_labels) else f'Strike {i}'
                             fig_ask_strike = go.Figure()
-                            if ce_col in ask_history_df.columns:
+                            ce_cum = ask_history_df[ce_col].cumsum() / 1000 if ce_col in ask_history_df.columns else None
+                            pe_cum = ask_history_df[pe_col].cumsum() / 1000 if pe_col in ask_history_df.columns else None
+                            if ce_cum is not None:
                                 fig_ask_strike.add_trace(go.Scatter(
                                     x=ask_history_df['time'],
-                                    y=ask_history_df[ce_col] / 1000,
+                                    y=ce_cum,
                                     mode='lines+markers',
-                                    name='Call Ask',
+                                    name='Call Ask (cum)',
                                     line=dict(color='#ff4444', width=2),
                                     marker=dict(size=3),
                                 ))
-                            if pe_col in ask_history_df.columns:
+                            if pe_cum is not None:
                                 fig_ask_strike.add_trace(go.Scatter(
                                     x=ask_history_df['time'],
-                                    y=ask_history_df[pe_col] / 1000,
+                                    y=pe_cum,
                                     mode='lines+markers',
-                                    name='Put Ask',
+                                    name='Put Ask (cum)',
                                     line=dict(color='#00cc66', width=2),
                                     marker=dict(size=3),
                                 ))
-                            cur_ce_ask = ask_history_df[ce_col].iloc[-1] / 1000 if ce_col in ask_history_df.columns and len(ask_history_df) > 0 else 0
-                            cur_pe_ask = ask_history_df[pe_col].iloc[-1] / 1000 if pe_col in ask_history_df.columns and len(ask_history_df) > 0 else 0
+                            cur_ce_ask = float(ask_history_df[ce_col].iloc[-1]) / 1000 if ce_col in ask_history_df.columns and len(ask_history_df) > 0 else 0
+                            cur_pe_ask = float(ask_history_df[pe_col].iloc[-1]) / 1000 if pe_col in ask_history_df.columns and len(ask_history_df) > 0 else 0
+                            cum_ce_total = float(ce_cum.iloc[-1]) if ce_cum is not None and len(ce_cum) > 0 else 0
+                            cum_pe_total = float(pe_cum.iloc[-1]) if pe_cum is not None and len(pe_cum) > 0 else 0
                             ce_inc = pe_inc = False
                             if len(ask_history_df) >= 2:
-                                prev_ce = ask_history_df[ce_col].iloc[-2] / 1000 if ce_col in ask_history_df.columns else 0
-                                prev_pe = ask_history_df[pe_col].iloc[-2] / 1000 if pe_col in ask_history_df.columns else 0
+                                prev_ce = float(ask_history_df[ce_col].iloc[-2]) / 1000 if ce_col in ask_history_df.columns else 0
+                                prev_pe = float(ask_history_df[pe_col].iloc[-2]) / 1000 if pe_col in ask_history_df.columns else 0
                                 ce_inc = cur_ce_ask > prev_ce
                                 pe_inc = cur_pe_ask > prev_pe
                             ce_t = "↑" if ce_inc else "↓"
                             pe_t = "↑" if pe_inc else "↓"
                             fig_ask_strike.update_layout(
-                                title=f'{label}<br>₹{strike}<br>CE: {cur_ce_ask:.1f}K{ce_t} | PE: {cur_pe_ask:.1f}K{pe_t}',
+                                title=f'{label}<br>₹{strike}<br>CE Σ: {cum_ce_total:.1f}K{ce_t} | PE Σ: {cum_pe_total:.1f}K{pe_t}',
                                 template='plotly_dark',
                                 height=280,
                                 showlegend=True,
                                 legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1, font=dict(size=9)),
                                 margin=dict(l=10, r=10, t=80, b=30),
                                 xaxis=dict(tickformat='%H:%M', title=''),
-                                yaxis=dict(title='Ask Qty (K)'),
+                                yaxis=dict(title='Cum Ask Qty (K)'),
                                 plot_bgcolor='#1e1e1e',
                                 paper_bgcolor='#1e1e1e'
                             )
                             st.plotly_chart(fig_ask_strike, use_container_width=True)
-                            # Signal interpretation: CE ask > PE ask = sellers stacking resistance
+                            # Signal: snapshot dominance now (not cumulative)
                             if cur_ce_ask > cur_pe_ask * 1.2 and ce_inc:
                                 st.error("CE Ask Building 🔴 (Resistance)")
                             elif cur_pe_ask > cur_ce_ask * 1.2 and pe_inc:
@@ -10269,7 +10277,7 @@ def _render_main_analyzer():
                     st.info("Waiting for ATM ± 2 strike data...")
                 ask_info1, ask_info2 = st.columns([3, 1])
                 with ask_info1:
-                    st.caption(f"📈 {len(st.session_state.ask_history)} data points | Ask Qty values in Thousands (K)")
+                    st.caption(f"📈 {len(st.session_state.ask_history)} data points | Cumulative Ask Qty in Thousands (K)")
                 with ask_info2:
                     if st.button("🗑️ Clear Ask History"):
                         st.session_state.ask_history = []
