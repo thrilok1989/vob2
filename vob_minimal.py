@@ -10132,7 +10132,7 @@ def _render_main_analyzer():
                                     y=ce_cum,
                                     mode='lines+markers',
                                     name='Call Bid (cum)',
-                                    line=dict(color='#ff4444', width=2),
+                                    line=dict(color='#00cc66', width=2),
                                     marker=dict(size=3),
                                 ))
                             if pe_cum is not None:
@@ -10141,7 +10141,7 @@ def _render_main_analyzer():
                                     y=pe_cum,
                                     mode='lines+markers',
                                     name='Put Bid (cum)',
-                                    line=dict(color='#00cc66', width=2),
+                                    line=dict(color='#ff4444', width=2),
                                     marker=dict(size=3),
                                 ))
                             cur_ce_bid = float(bid_history_df[ce_col].iloc[-1]) / 1000 if ce_col in bid_history_df.columns and len(bid_history_df) > 0 else 0
