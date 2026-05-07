@@ -10132,7 +10132,7 @@ def _render_main_analyzer():
                                     y=ce_cum,
                                     mode='lines+markers',
                                     name='Call Bid (cum)',
-                                    line=dict(color='#ff4444', width=2),
+                                    line=dict(color='#00cc66', width=2),
                                     marker=dict(size=3),
                                 ))
                             if pe_cum is not None:
@@ -10141,7 +10141,7 @@ def _render_main_analyzer():
                                     y=pe_cum,
                                     mode='lines+markers',
                                     name='Put Bid (cum)',
-                                    line=dict(color='#00cc66', width=2),
+                                    line=dict(color='#ff4444', width=2),
                                     marker=dict(size=3),
                                 ))
                             cur_ce_bid = float(bid_history_df[ce_col].iloc[-1]) / 1000 if ce_col in bid_history_df.columns and len(bid_history_df) > 0 else 0
@@ -10170,14 +10170,15 @@ def _render_main_analyzer():
                             )
                             st.plotly_chart(fig_bid_strike, use_container_width=True)
                             # Signal: snapshot dominance now (not cumulative)
-                            if cur_pe_bid > cur_ce_bid * 1.2 and pe_inc:
-                                st.success("PE Bid Building 🟢 (Support)")
-                            elif cur_ce_bid > cur_pe_bid * 1.2 and ce_inc:
-                                st.error("CE Bid Building 🔴 (Resistance Buyers)")
+                            # CE Bid = call buyers (bullish bets) → support; PE Bid = put buyers (bearish bets) → resistance
+                            if cur_ce_bid > cur_pe_bid * 1.2 and ce_inc:
+                                st.success("CE Bid Building 🟢 (Bullish — Support)")
+                            elif cur_pe_bid > cur_ce_bid * 1.2 and pe_inc:
+                                st.error("PE Bid Building 🔴 (Bearish — Resistance)")
                             elif ce_inc and not pe_inc:
-                                st.warning("CE Bid Rising")
+                                st.success("CE Bid Rising 🟢")
                             elif pe_inc and not ce_inc:
-                                st.warning("PE Bid Rising")
+                                st.error("PE Bid Rising 🔴")
                             else:
                                 st.info("Balanced")
                 else:
@@ -10263,14 +10264,15 @@ def _render_main_analyzer():
                             )
                             st.plotly_chart(fig_ask_strike, use_container_width=True)
                             # Signal: snapshot dominance now (not cumulative)
+                            # CE Ask = call writers (cap upside) → resistance; PE Ask = put writers (floor downside) → support
                             if cur_ce_ask > cur_pe_ask * 1.2 and ce_inc:
-                                st.error("CE Ask Building 🔴 (Resistance)")
+                                st.error("CE Ask Building 🔴 (Resistance — Call Writers)")
                             elif cur_pe_ask > cur_ce_ask * 1.2 and pe_inc:
-                                st.success("PE Ask Building 🟢 (Support Sellers)")
+                                st.success("PE Ask Building 🟢 (Support — Put Writers)")
                             elif ce_inc and not pe_inc:
-                                st.warning("CE Ask Rising")
+                                st.error("CE Ask Rising 🔴")
                             elif pe_inc and not ce_inc:
-                                st.warning("PE Ask Rising")
+                                st.success("PE Ask Rising 🟢")
                             else:
                                 st.info("Balanced")
                 else:
