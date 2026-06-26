@@ -368,3 +368,107 @@ CREATE INDEX IF NOT EXISTS idx_max_pain_day ON max_pain_history(trading_day);
 -- 11. alerts_history        - All alert records
 -- 12. master_signals        - Master trading signals
 -- 13. max_pain_history      - Max pain strike history
+
+-- =============================================
+-- ADDITIONAL TABLES used by vob_minimal.py
+-- =============================================
+
+-- 14. OC SIGNAL HISTORY (option-chain analysis snapshots)
+CREATE TABLE IF NOT EXISTS oc_signal_history (
+    id BIGSERIAL PRIMARY KEY,
+    timestamp TIMESTAMPTZ NOT NULL UNIQUE,
+    trading_day DATE NOT NULL,
+    spot_price DOUBLE PRECISION,
+    condition TEXT,
+    confidence INTEGER,
+    resistance_strikes JSONB,
+    support_strikes JSONB,
+    active_signals JSONB,
+    breakout_level DOUBLE PRECISION,
+    breakdown_level DOUBLE PRECISION,
+    bias_reasoning JSONB,
+    update_time TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_oc_signal_day ON oc_signal_history(trading_day);
+
+-- 15. TRADE CONFIG (single-row auto-trade zone configuration)
+CREATE TABLE IF NOT EXISTS trade_config (
+    id INTEGER PRIMARY KEY,
+    support_zone_bottom DOUBLE PRECISION,
+    support_zone_top DOUBLE PRECISION,
+    resistance_zone_bottom DOUBLE PRECISION,
+    resistance_zone_top DOUBLE PRECISION,
+    selected_strike DOUBLE PRECISION,
+    call_entry DOUBLE PRECISION,
+    call_target DOUBLE PRECISION,
+    call_sl DOUBLE PRECISION,
+    put_entry DOUBLE PRECISION,
+    put_target DOUBLE PRECISION,
+    put_sl DOUBLE PRECISION,
+    auto_trade_enabled BOOLEAN DEFAULT FALSE,
+    lot_size INTEGER DEFAULT 1,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 16. AUTO TRADES (zone-based auto trade records)
+CREATE TABLE IF NOT EXISTS auto_trades (
+    id BIGSERIAL PRIMARY KEY,
+    trading_day DATE NOT NULL,
+    trade_type TEXT,                 -- CALL / PUT
+    strike DOUBLE PRECISION,
+    security_id TEXT,
+    entry_price DOUBLE PRECISION,
+    target DOUBLE PRECISION,
+    sl DOUBLE PRECISION,
+    lot_size INTEGER DEFAULT 1,
+    status TEXT DEFAULT 'OPEN',      -- OPEN / CLOSED
+    exit_price DOUBLE PRECISION,
+    exit_reason TEXT,                -- TARGET / SL / MANUAL / REVERSE
+    order_id TEXT,
+    entry_time TIMESTAMPTZ,
+    exit_time TIMESTAMPTZ,
+    zone_confirmations TEXT,
+    spot_at_entry DOUBLE PRECISION,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_auto_trades_day ON auto_trades(trading_day);
+CREATE INDEX IF NOT EXISTS idx_auto_trades_status ON auto_trades(status);
+
+-- 17. AUTO OPTION TRADES (standalone auto_option_trader.py trigger persistence)
+CREATE TABLE IF NOT EXISTS auto_option_trades (
+    id TEXT PRIMARY KEY,             -- Dhan client id (one active trigger per account)
+    payload JSONB,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 18. DHAN TICKS (written by ws_worker.py — sub-second LTP + tick-rule cum delta)
+CREATE TABLE IF NOT EXISTS dhan_ticks (
+    id TEXT PRIMARY KEY,             -- "<exchange_segment>:<security_id>"
+    exchange_segment TEXT,
+    security_id INTEGER,
+    ltp DOUBLE PRECISION,
+    cum_delta DOUBLE PRECISION,
+    volume DOUBLE PRECISION,
+    last_trade_qty DOUBLE PRECISION,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dhan_ticks_updated ON dhan_ticks(updated_at);
+
+-- 20. VOB APP STATE (persists composite scores + history across Streamlit restarts)
+CREATE TABLE IF NOT EXISTS vob_app_state (
+    id TEXT PRIMARY KEY,             -- Dhan client id (or 'default')
+    payload JSONB,
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- 19. DHAN SWEEPS (written by ws_worker.py — L2 sweep events for ignition condition)
+CREATE TABLE IF NOT EXISTS dhan_sweeps (
+    id BIGSERIAL PRIMARY KEY,
+    exchange_segment TEXT,
+    security_id INTEGER,
+    direction TEXT,                  -- 'up' | 'down'
+    magnitude DOUBLE PRECISION,      -- size of the swept resting qty
+    detail TEXT,
+    fired_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dhan_sweeps_fired ON dhan_sweeps(fired_at DESC);

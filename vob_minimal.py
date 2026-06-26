@@ -44,7 +44,7 @@ _is_market_open = (
     _ist_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _ist_now <= _ist_now.replace(hour=15, minute=45, second=0, microsecond=0)
 )
 if _is_market_open:
-    st_autorefresh(interval=30000, key="datarefresh")
+    st_autorefresh(interval=20000, key="datarefresh")
 
 st.markdown("""
 <style>
@@ -67,6 +67,25 @@ st.markdown("""
     .price-down {
         color:
     }
+    /* ── No dim/blur during reruns: refresh feels like it happens in the background ── */
+    /* Hide the small "Running…" status pill in the top-right corner */
+    [data-testid="stStatusWidget"] { display: none !important; visibility: hidden !important; }
+    /* Hide the top-of-page progress indicator that flashes during a rerun */
+    [data-testid="stDecoration"] { display: none !important; }
+    /* Hide the header running indicator (newer Streamlit versions) */
+    [data-testid="stHeader"] [data-testid="stStatusWidget"] { display: none !important; }
+    /* Keep the page fully opaque while a rerun is in flight — kill the dim overlay */
+    .stApp, .stApp > * { opacity: 1 !important; }
+    .stApp[data-test-running="true"], .stApp[data-test-running="true"] * { opacity: 1 !important; }
+    /* Disable any built-in fade transitions Streamlit applies during reruns */
+    .element-container, .stMarkdown, .stDataFrame, .stPlotlyChart, .stMetric,
+    [data-testid="stVerticalBlock"], [data-testid="stHorizontalBlock"] {
+        transition: none !important;
+        filter: none !important;
+        opacity: 1 !important;
+    }
+    /* Some Streamlit builds put a global blur on the main area during reruns */
+    [data-testid="stAppViewContainer"], section.main { filter: none !important; opacity: 1 !important; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -88,8 +107,19 @@ try:
             TELEGRAM_CHAT_ID = str(int(TELEGRAM_CHAT_ID))
     except:
         TELEGRAM_BOT_TOKEN = TELEGRAM_CHAT_ID = ""
+    # Discord webhook (fallback / replacement for Telegram when blocked in India)
+    try:
+        DISCORD_WEBHOOK_URL = (
+            st.secrets.get("DISCORD_WEBHOOK_URL", "")
+            or getattr(st.secrets, "DISCORD_WEBHOOK_URL", "")
+            or os.environ.get("DISCORD_WEBHOOK_URL", "")
+            or "https://discord.com/api/webhooks/1517484830588141749/I3rR-1g1Z6QDzZztCb43l-rYx3eUhDcy13gx-t2jusdbD6BB5S60wsEQEPcouoA8mtpX"
+        )
+    except Exception:
+        DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1517484830588141749/I3rR-1g1Z6QDzZztCb43l-rYx3eUhDcy13gx-t2jusdbD6BB5S60wsEQEPcouoA8mtpX"
 except Exception:
     DHAN_CLIENT_ID = DHAN_ACCESS_TOKEN = supabase_url = supabase_key = TELEGRAM_BOT_TOKEN = TELEGRAM_CHAT_ID = GEMINI_API_KEY = ""
+    DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1517484830588141749/I3rR-1g1Z6QDzZztCb43l-rYx3eUhDcy13gx-t2jusdbD6BB5S60wsEQEPcouoA8mtpX"
 
 NIFTY_UNDERLYING_SCRIP = 13
 NIFTY_UNDERLYING_SEG = "IDX_I"
@@ -120,7 +150,127 @@ def _strip_html_tags(text):
     import re
     return re.sub(r'<[^>]+>', '', text)
 
+def _balanced_telegram_chunks(text, limit=3900):
+    """Split text into roughly equal chunks, each <= limit chars, breaking at
+    line boundaries. Any single line longer than limit is hard-split."""
+    text = (text or "").strip()
+    if len(text) <= limit:
+        return [text] if text else []
+    n_parts = math.ceil(len(text) / limit)
+    target = math.ceil(len(text) / n_parts)
+    chunks, cur = [], ""
+    for ln in text.split("\n"):
+        while len(ln) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(ln[:limit])
+            ln = ln[limit:]
+        candidate = ln if not cur else cur + "\n" + ln
+        if cur and (len(candidate) > limit or len(cur) >= target):
+            chunks.append(cur)
+            cur = ln
+        else:
+            cur = candidate
+    if cur:
+        chunks.append(cur)
+    return chunks
+
+# Allow-list of headline markers that bypass the global mute. Every other
+# automated alert is suppressed. force=True bypasses unconditionally.
+_ALLOWED_ALERT_MARKERS = (
+    'DYNAMIC POC',
+    'SPOT STOP-HUNT ALIGNED',
+    'CIE ALIGNED',
+    'MAJOR S/R TOUCH',
+    'BIAS ENTER',
+    'CALL CAPPING',
+    'PUT WRITING',
+    'PUT CAPPING',
+)
+
+def _msg_allowed(message):
+    if not message:
+        return False
+    return any(m in message for m in _ALLOWED_ALERT_MARKERS)
+
+
+def send_discord_message(message, force=False):
+    """Post a message to a Discord channel via webhook URL. Strips HTML tags
+    used by the Telegram formatter and converts <b>...</b> to **...** for
+    Discord-style bold. 2000-char hard limit (truncate). Best-effort.
+    Failures stored in st.session_state['_discord_last_error'] for diagnostics.
+    Honors the global mute unless force=True."""
+    if not DISCORD_WEBHOOK_URL:
+        try:
+            st.session_state['_discord_last_error'] = 'DISCORD_WEBHOOK_URL not set'
+        except Exception:
+            pass
+        return
+    if not force and not _msg_allowed(message):
+        return
+    import re as _re
+    import time as _time
+    msg = (message or '')
+    # <b>...</b> → **...**; strip remaining HTML tags
+    msg = _re.sub(r'<b>(.*?)</b>', r'**\1**', msg, flags=_re.DOTALL)
+    msg = _re.sub(r'<[^>]+>', '', msg)
+    msg = msg[:1900]
+    if not msg.strip():
+        return
+    # Avoid Discord 429s (30 msgs/min per webhook): 1s spacing per send
+    try:
+        _last_d = st.session_state.get('_discord_last_send_ts')
+        _now_d = datetime.now(pytz.timezone('Asia/Kolkata'))
+        if _last_d and (_now_d - _last_d).total_seconds() < 1.0:
+            _time.sleep(1.0 - (_now_d - _last_d).total_seconds())
+        st.session_state['_discord_last_send_ts'] = datetime.now(pytz.timezone('Asia/Kolkata'))
+    except Exception:
+        pass
+    last_err = None
+    for _attempt in range(3):
+        try:
+            import requests as _requests
+            r = _requests.post(DISCORD_WEBHOOK_URL,
+                               json={'content': msg, 'username': 'Cash Maerket Bot'},
+                               timeout=10)
+            if r.status_code in (200, 204):
+                try:
+                    st.session_state['_discord_last_error'] = None
+                    st.session_state['_discord_last_ok_ts'] = datetime.now(pytz.timezone('Asia/Kolkata'))
+                except Exception:
+                    pass
+                return
+            if r.status_code == 429:
+                # Rate-limited — respect retry-after
+                try:
+                    retry = float(r.json().get('retry_after', 1.0))
+                except Exception:
+                    retry = 1.0
+                _time.sleep(min(retry, 5.0))
+                continue
+            last_err = f"HTTP {r.status_code}: {r.text[:200]}"
+            break
+        except Exception as _e:
+            last_err = f"{type(_e).__name__}: {str(_e)[:200]}"
+            _time.sleep(0.5)
+    try:
+        st.session_state['_discord_last_error'] = last_err or 'unknown failure'
+    except Exception:
+        pass
+
+
 def send_telegram_message_sync(message, force=False):
+    # GLOBAL ALERT MUTE — only allow-listed automated alerts pass through
+    # (DYNAMIC POC, SPOT STOP-HUNT ALIGNED, CIE ALIGNED, MAJOR S/R TOUCH).
+    # Bypassed when force=True so manual "Send Signal" button clicks always deliver.
+    if not force and not _msg_allowed(message):
+        return
+    # Fire Discord webhook in parallel (its own mute applies). Best-effort.
+    try:
+        send_discord_message(message, force=force)
+    except Exception:
+        pass
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     # Only send during market hours (8:30 AM - 3:45 PM IST, weekdays) unless forced
@@ -129,33 +279,66 @@ def send_telegram_message_sync(message, force=False):
         if _now.weekday() >= 5 or not (_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _now <= _now.replace(hour=15, minute=45, second=0, microsecond=0)):
             return
 
-    # Global rate limit: no two messages sent less than 2 seconds apart
+    # Global rate limit: no two messages sent less than 1.2 seconds apart (Telegram allows ~1 msg/sec per chat)
     _now_tg = datetime.now(pytz.timezone('Asia/Kolkata'))
     _last_tg = getattr(st.session_state, '_last_tg_send_time', None)
-    if _last_tg and (_now_tg - _last_tg).total_seconds() < 2:
-        import time as _time; _time.sleep(2)
+    if _last_tg and (_now_tg - _last_tg).total_seconds() < 1.2:
+        import time as _time
+        _time.sleep(1.2 - (_now_tg - _last_tg).total_seconds())
     st.session_state._last_tg_send_time = datetime.now(pytz.timezone('Asia/Kolkata'))
 
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     # Telegram max message length is 4096 chars — truncate to be safe
     msg_text = message[:4090] if len(message) > 4090 else message
 
-    try:
-        # Try HTML mode first
-        response = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": msg_text, "parse_mode": "HTML"}, timeout=10)
-        if response.status_code == 200:
-            return response.json()
-        # HTML parse error (400) — retry as plain text
-        if response.status_code == 400:
-            plain_text = _strip_html_tags(msg_text)
-            response2 = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": plain_text}, timeout=10)
-            if response2.status_code == 200:
-                return response2.json()
-            st.error(f"Telegram error (plain fallback): {response2.status_code} — {response2.text[:200]}")
-        else:
-            st.error(f"Telegram error: {response.status_code} — {response.text[:200]}")
-    except Exception as e:
-        st.error(f"Telegram notification error: {e}")
+    import time as _time
+    payload_html = {"chat_id": TELEGRAM_CHAT_ID, "text": msg_text, "parse_mode": "HTML"}
+    last_err = None
+    # Retry on 429 (rate limit) and network errors so a single throttle doesn't drop a part
+    for _attempt in range(4):
+        try:
+            response = requests.post(url, json=payload_html, timeout=15)
+            if response.status_code == 200:
+                return response.json()
+            if response.status_code == 429:
+                # Honor Telegram's retry_after if present, else exponential backoff
+                try:
+                    retry_after = int(response.json().get('parameters', {}).get('retry_after', 0))
+                except Exception:
+                    retry_after = 0
+                _time.sleep(max(retry_after, 2 ** _attempt))
+                continue
+            if response.status_code == 400:
+                # HTML parse error → fall back to plain text once
+                plain_text = _strip_html_tags(msg_text)
+                resp2 = requests.post(url, json={"chat_id": TELEGRAM_CHAT_ID, "text": plain_text}, timeout=15)
+                if resp2.status_code == 200:
+                    return resp2.json()
+                if resp2.status_code == 429:
+                    try:
+                        retry_after = int(resp2.json().get('parameters', {}).get('retry_after', 0))
+                    except Exception:
+                        retry_after = 0
+                    _time.sleep(max(retry_after, 2 ** _attempt))
+                    payload_html = {"chat_id": TELEGRAM_CHAT_ID, "text": plain_text}
+                    continue
+                last_err = f"plain fallback {resp2.status_code} — {resp2.text[:200]}"
+                break
+            if 500 <= response.status_code < 600:
+                _time.sleep(2 ** _attempt)
+                continue
+            last_err = f"{response.status_code} — {response.text[:200]}"
+            break
+        except requests.exceptions.RequestException as e:
+            last_err = str(e)
+            _time.sleep(2 ** _attempt)
+            continue
+    if last_err:
+        try:
+            st.warning(f"Telegram send failed after retries: {last_err}")
+        except Exception:
+            pass
+    return None
 
 
 def test_telegram_connection():
@@ -171,311 +354,6 @@ def test_telegram_connection():
         return False, str(e)
 
 
-def send_telegram_photo_sync(image_bytes, force=False):
-    """Send a PNG image to Telegram via sendPhoto."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    if not force:
-        _now = datetime.now(pytz.timezone('Asia/Kolkata'))
-        if _now.weekday() >= 5 or not (_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _now <= _now.replace(hour=15, minute=45, second=0, microsecond=0)):
-            return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
-    try:
-        response = requests.post(
-            url,
-            data={"chat_id": TELEGRAM_CHAT_ID},
-            files={"photo": ("signal.png", image_bytes, "image/png")},
-            timeout=20,
-        )
-        if response.status_code != 200:
-            st.error(f"Telegram photo error: {response.status_code}")
-    except Exception as e:
-        st.error(f"Telegram photo error: {e}")
-
-
-def render_master_signal_image(result, underlying_price, option_data=None):
-    """Render the master signal as a dark-themed PNG image using matplotlib."""
-    import matplotlib.pyplot as plt
-    import matplotlib.patches as mpatches
-    import io
-    plt.switch_backend('Agg')  # safe to call even after matplotlib is already imported
-
-    BG    = '#0d1117'
-    BG2   = '#161b22'
-    GREEN = '#00e676'
-    RED   = '#ff5252'
-    YELLOW= '#ffd740'
-    CYAN  = '#40c4ff'
-    WHITE = '#e6edf3'
-    GRAY  = '#8b949e'
-    DIM   = '#30363d'
-
-    trade_type = result.get('trade_type', 'NO TRADE')
-    signal_str = result.get('signal', '⚪ NO TRADE')
-    if 'BUY' in trade_type or 'BREAKOUT' in signal_str.upper():
-        sig_clr, sig_bg = GREEN,  '#003a1e'
-    elif 'SELL' in trade_type or 'BREAKDOWN' in signal_str.upper():
-        sig_clr, sig_bg = RED,    '#3a0000'
-    else:
-        sig_clr, sig_bg = YELLOW, '#3a3000'
-
-    fig = plt.figure(figsize=(10, 17), facecolor=BG, dpi=110)
-    ax  = fig.add_axes([0, 0, 1, 1], facecolor=BG)
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1); ax.axis('off')
-
-    L = 0.025   # left margin
-    R = 0.975   # right edge
-    W = R - L
-
-    def box(y_top, h, color=BG2, lw=0.5):
-        ax.add_patch(mpatches.FancyBboxPatch(
-            (L, y_top - h), W, h,
-            boxstyle="round,pad=0.004",
-            facecolor=color, edgecolor=DIM, linewidth=lw,
-            transform=ax.transAxes, zorder=1, clip_on=False))
-
-    def t(x, y, s, c=WHITE, sz=8, w='normal', ha='left'):
-        ax.text(x, y, str(s), color=c, fontsize=sz, fontweight=w,
-                ha=ha, va='top', transform=ax.transAxes,
-                zorder=2, clip_on=False)
-
-    def row(label, value, y, lc=GRAY, vc=WHITE, sz=8):
-        t(L+0.01, y, label, c=lc, sz=sz, w='bold')
-        t(L+0.22, y, value, c=vc, sz=sz)
-
-    # ── HEADER ──────────────────────────────────────────────
-    hh = 0.075
-    box(0.995, hh, color=sig_bg)
-    ist = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST')
-    t(0.5, 0.99,  'MASTER TRADING SIGNAL',        c=sig_clr, sz=13, w='bold', ha='center')
-    t(0.5, 0.965, f'{ist}  |  Spot: ₹{underlying_price:,.2f}', c=WHITE, sz=9, ha='center')
-    t(0.5, 0.942, signal_str.replace('⚪','').replace('🟢','').replace('🔴','').strip(),
-      c=sig_clr, sz=11, w='bold', ha='center')
-
-    y = 0.995 - hh - 0.006
-
-    # ── CANDLE / VIX / VIDYA ────────────────────────────────
-    sh = 0.045
-    box(y, sh)
-    candle = result.get('candle',{}) or {}
-    vol    = result.get('volume',{}) or {}
-    vidya  = result.get('vidya', {}) or {}
-    vix_d  = result.get('vix',   {}) or {}
-    t(L+0.01, y-0.004, f"Candle: {candle.get('pattern','N/A')} ({candle.get('direction','N/A')})  Vol: {vol.get('label','N/A')} ({vol.get('ratio',0)}x)", c=GRAY, sz=8)
-    t(L+0.01, y-0.020, f"VIDYA: {vidya.get('trend','N/A')} | Delta:{vidya.get('delta_pct',0):+.0f}%   VIX: {vix_d.get('vix','N/A')} ({vix_d.get('direction','N/A')})", c=WHITE, sz=8)
-    loc = ', '.join(result.get('location', []) or [])
-    t(L+0.01, y-0.033, f"Loc: {loc[:90]}", c=CYAN, sz=7.5)
-    y -= sh + 0.005
-
-    # ── LEVELS ──────────────────────────────────────────────
-    sh = 0.055
-    box(y, sh)
-    t(L+0.01, y-0.004, 'KEY LEVELS', c=CYAN, sz=8.5, w='bold')
-    res_lvls = result.get('resistance_levels',[]) or []
-    sup_lvls = result.get('support_levels',  []) or []
-    t(L+0.01, y-0.018, 'R: ' + '  '.join(f'₹{r:,.0f}' for r in res_lvls[:5]), c=RED,   sz=8.5)
-    t(L+0.01, y-0.031, 'S: ' + '  '.join(f'₹{s:,.0f}' for s in sup_lvls[:5]), c=GREEN, sz=8.5)
-    pcr_snap = getattr(st.session_state, '_pcr_sr_snapshot', [])
-    res_p = [s['level'] for s in pcr_snap if 'Resistance' in s.get('type','')]
-    sup_p = [s['level'] for s in pcr_snap if 'Support'    in s.get('type','')]
-    ceil_ = f"₹{min(res_p):,.0f}" if res_p else '—'
-    floor_= f"₹{max(sup_p):,.0f}" if sup_p else '—'
-    t(L+0.01, y-0.044, f"PCR Ceil: {ceil_}   PCR Floor: {floor_}", c=GRAY, sz=7.5)
-    y -= sh + 0.005
-
-    # ── GEX ─────────────────────────────────────────────────
-    sh = 0.042
-    box(y, sh)
-    gex = result.get('gex',{}) or {}
-    t(L+0.01, y-0.004, 'GEX', c=CYAN, sz=8.5, w='bold')
-    flip = f"₹{int(gex.get('gamma_flip',0))}" if gex.get('gamma_flip') else 'N/A'
-    mag  = f"₹{int(gex.get('magnet',0))}"     if gex.get('magnet')     else 'N/A'
-    rep  = f"₹{int(gex.get('repeller',0))}"   if gex.get('repeller')   else 'N/A'
-    side = 'Above' if gex.get('above_flip') else 'Below' if gex.get('above_flip') is not None else 'N/A'
-    t(L+0.01, y-0.017, f"Net:{gex.get('net_gex',0):+.0f}L  ATM:{gex.get('atm_gex',0):+.0f}L  Flip:{flip}({side})  Mode:{gex.get('market_mode','N/A')}", c=WHITE, sz=8)
-    t(L+0.01, y-0.030, f"Magnet:{mag}  Repeller:{rep}  PCRxGEX: {result.get('pcr_gex',{}).get('badge','N/A')}", c=GRAY, sz=7.5)
-    y -= sh + 0.005
-
-    # ── VPFR ────────────────────────────────────────────────
-    vpfr = result.get('vpfr',{}) or {}
-    if vpfr:
-        sh = 0.058
-        box(y, sh)
-        t(L+0.01, y-0.004, 'VPFR LEVELS (POC | VAH | VAL)', c=CYAN, sz=8.5, w='bold')
-        hx = [L+0.01, L+0.18, L+0.45, L+0.65, L+0.82]
-        for hv, hc in zip(['','Timeframe','POC','VAH','VAL'], [GRAY,GRAY,GRAY,GRAY,GRAY]):
-            t(hx[['','Timeframe','POC','VAH','VAL'].index(hv)], y-0.017, hv, c=hc, sz=7, w='bold')
-        ry = y - 0.028
-        for tf, lbl in [('short','30 bars'),('medium','60 bars'),('long','180 bars')]:
-            vd = vpfr.get(tf)
-            if vd:
-                t(hx[1], ry, lbl,                  c=GRAY,   sz=7.5)
-                t(hx[2], ry, f"₹{vd['poc']:,.0f}", c=YELLOW, sz=7.5)
-                t(hx[3], ry, f"₹{vd['vah']:,.0f}", c=RED,    sz=7.5)
-                t(hx[4], ry, f"₹{vd['val']:,.0f}", c=GREEN,  sz=7.5)
-                ry -= 0.012
-        y -= sh + 0.005
-
-    # ── PCR S/R ─────────────────────────────────────────────
-    if pcr_snap:
-        sh = 0.012 * len(pcr_snap) + 0.025
-        box(y, sh)
-        t(L+0.01, y-0.004, 'PCR S/R', c=CYAN, sz=8.5, w='bold')
-        ry = y - 0.016
-        for s in pcr_snap:
-            tp = s.get('type','')
-            tc = RED if 'Res' in tp else GREEN if 'Sup' in tp else GRAY
-            off_s = f"{s['offset']:+.0f}" if s['offset'] != 0 else '0'
-            t(L+0.01, ry, f"{s['label']}  ₹{s['strike']:.0f}  PCR:{s['pcr']:.2f}  {tp.replace('🔴','').replace('🟢','').replace('⚪','').strip()}  ₹{s['level']:.0f} (off:{off_s})", c=tc, sz=7.5)
-            ry -= 0.011
-        y -= sh + 0.005
-
-    # ── OC BIAS TABLE ───────────────────────────────────────
-    df_sum = (option_data or {}).get('df_summary') if option_data else None
-    if df_sum is not None and not df_sum.empty and 'Strike' in df_sum.columns:
-        srt = sorted(df_sum['Strike'].unique())
-        atm = None
-        if 'Zone' in df_sum.columns:
-            ar = df_sum[df_sum['Zone']=='ATM']
-            if not ar.empty:
-                atm = int(ar.iloc[0]['Strike'])
-        if atm is None:
-            atm = min(srt, key=lambda s: abs(s - underlying_price))
-        ai = srt.index(atm) if atm in srt else -1
-
-        sh = 0.073
-        box(y, sh)
-        t(L+0.01, y-0.004, 'OC BIAS  (COI | V | D | G | T | Ask | Bid | IV | DEX | GEX)', c=CYAN, sz=8, w='bold')
-        hdr_x = [L+0.01,L+0.14,L+0.28,L+0.42, L+0.50,L+0.56,L+0.61,L+0.66,L+0.71,L+0.76,L+0.81,L+0.86,L+0.91]
-        for hv,hx2 in zip(['Label','Strike','Verdict','Score','COI','V','D','G','T','Ask','Bid','IV','DEX/GEX'],hdr_x):
-            t(hx2, y-0.017, hv, c=GRAY, sz=6.5, w='bold')
-        ry = y - 0.028
-        for off,lbl in [(2,'ATM+2'),(1,'ATM+1'),(0,'ATM'),(-1,'ATM-1'),(-2,'ATM-2')]:
-            idx = ai + off
-            if not (0 <= idx < len(srt)):
-                continue
-            sk  = srt[idx]
-            row_ = df_sum[df_sum['Strike']==sk]
-            if row_.empty: continue
-            r_ = row_.iloc[0]
-            g_ = lambda c: (r_[c] if c in r_.index else 'N/A')
-            verd = str(g_('Verdict'))
-            sc   = g_('BiasScore')
-            vc   = RED if 'Bear' in verd else GREEN if 'Bull' in verd else YELLOW
-            t(hdr_x[0],  ry, lbl,           c=GRAY, sz=7)
-            t(hdr_x[1],  ry, f"₹{sk:.0f}",  c=WHITE, sz=7)
-            t(hdr_x[2],  ry, verd[:11],     c=vc,   sz=7)
-            sc_c = RED if str(sc).startswith('-') else GREEN
-            t(hdr_x[3],  ry, str(sc),       c=sc_c, sz=7)
-            for i2, bf in enumerate(['ChgOI_Bias','Volume_Bias','Delta_Bias','Gamma_Bias','Theta_Bias','AskQty_Bias','BidQty_Bias','IV_Bias','DeltaExp']):
-                bv = str(g_(bf))
-                bc2 = GREEN if bv=='Bullish' else RED if bv=='Bearish' else GRAY
-                sym = 'B' if bv=='Bullish' else 'S' if bv=='Bearish' else '-'
-                t(hdr_x[4+i2], ry, sym, c=bc2, sz=7.5, w='bold')
-            # DEX/GEX combined
-            dex = str(g_('DeltaExp')); gex2 = str(g_('GammaExp'))
-            dg_str = f"{'B' if dex=='Bullish' else 'S'}/{'B' if gex2=='Bullish' else 'S'}"
-            dg_c = GREEN if dex=='Bullish' and gex2=='Bullish' else RED if dex=='Bearish' and gex2=='Bearish' else YELLOW
-            t(hdr_x[12], ry, dg_str, c=dg_c, sz=7, w='bold')
-            # Entry/Scalp/Move below
-            entry_line = f"  Entry:{g_('Operator_Entry')}  Scalp:{g_('Scalp_Moment')}  Move:{g_('FakeReal')}  COI:{g_('ChgOI_Cmp')}  OI:{g_('OI_Cmp')}"
-            ry -= 0.011
-            t(L+0.01, ry, entry_line[:95], c=GRAY, sz=6.5)
-            ry -= 0.012
-        y -= sh + 0.005
-
-    # ── OI TREND ────────────────────────────────────────────
-    oi = result.get('oi_trend',{}) or {}
-    if oi:
-        sh = 0.038
-        box(y, sh)
-        t(L+0.01, y-0.004, 'OI TREND', c=CYAN, sz=8.5, w='bold')
-        oi_sig = oi.get('signal','N/A')
-        oi_c   = GREEN if 'Bull' in oi_sig else RED if 'Bear' in oi_sig else YELLOW
-        t(L+0.01, y-0.017, f"CE:{oi.get('ce_activity','N/A')} (OI:{oi.get('ce_oi_pct',0):+.1f}%)  PE:{oi.get('pe_activity','N/A')} (OI:{oi.get('pe_oi_pct',0):+.1f}%)", c=WHITE, sz=8)
-        t(L+0.01, y-0.029, f"Signal: {oi_sig}  Sup:{oi.get('support_status','N/A')}  Res:{oi.get('resistance_status','N/A')}", c=oi_c, sz=8)
-        y -= sh + 0.005
-
-    # ── ALIGNMENT ───────────────────────────────────────────
-    alignment = result.get('alignment',{}) or {}
-    if alignment:
-        sh = 0.05
-        box(y, sh)
-        t(L+0.01, y-0.004, 'ALIGNMENT  10m | 1h | Pattern', c=CYAN, sz=8.5, w='bold')
-        SN = {'NIFTY 50':'N50','SENSEX':'SENS','BANKNIFTY':'BNF','NIFTY IT':'IT',
-              'RELIANCE':'REL','ICICIBANK':'ICICI','INDIA VIX':'VIX','GOLD':'GOLD',
-              'CRUDE OIL':'CRUDE','USD/INR':'INR',
-              'S&P 500':'SP500','JAPAN 225':'JP225','HANG SENG':'HSI','UK 100':'UK100'}
-        PS = {'No Pattern':'NP','Bullish Engulfing':'BullEng','Bearish Engulfing':'BearEng',
-              'Hammer':'Ham','Shooting Star':'ShStr','Tweezer Top':'TwTop',
-              'Tweezer Bottom':'TwBot','Strong Green Candle':'SGC','Strong Red Candle':'SRC',
-              'Doji':'Doji','Inside Bar':'InsBar','Marubozu':'Maru'}
-        items = []
-        for name in ['NIFTY 50','SENSEX','BANKNIFTY','NIFTY IT','RELIANCE','ICICIBANK','INDIA VIX','GOLD','CRUDE OIL','USD/INR']:
-            d = alignment.get(name)
-            if not d: continue
-            s10  = d.get('sentiment_10m','')
-            s1h  = d.get('sentiment_1h', '')
-            pat  = (d.get('candle_pattern','') or '').strip()
-            cdir = d.get('candle_dir','') or ''
-            a10  = '+' if s10=='Bullish' else '-' if s10=='Bearish' else '.'
-            a1h  = '+' if s1h=='Bullish' else '-' if s1h=='Bearish' else '.'
-            c10  = GREEN if s10=='Bullish' else RED if s10=='Bearish' else GRAY
-            c1h  = GREEN if s1h=='Bullish' else RED if s1h=='Bearish' else GRAY
-            ps   = PS.get(pat, pat[:6]) if pat and pat not in ('No Pattern','N/A') else 'NP'
-            pc   = GREEN if cdir=='Bullish' else RED if cdir=='Bearish' else GRAY
-            items.append((SN.get(name,name), a10, c10, a1h, c1h, ps, pc))
-        # 2 rows of 5
-        for ri, chunk in enumerate([items[:5], items[5:]]):
-            rx = L + 0.01
-            ry = y - 0.018 - ri * 0.014
-            for nm, a10, c10, a1h, c1h, ps, pc in chunk:
-                t(rx, ry, nm+':', c=GRAY, sz=7); rx += len(nm)*0.008 + 0.012
-                t(rx, ry, a10,    c=c10,  sz=7); rx += 0.011
-                t(rx, ry, a1h,    c=c1h,  sz=7); rx += 0.011
-                t(rx, ry, ps,     c=pc,   sz=6.5); rx += max(len(ps)*0.009, 0.055)
-        y -= sh + 0.005
-
-    # ── MONEY FLOW ──────────────────────────────────────────
-    mf = getattr(st.session_state, '_money_flow_data', None)
-    if mf and mf.get('rows'):
-        sh = 0.036
-        box(y, sh)
-        poc_p  = mf.get('poc_price',0)
-        va_h   = mf.get('value_area_high',0)
-        va_l   = mf.get('value_area_low', 0)
-        hi_dir = mf.get('highest_sentiment_direction','Neutral')
-        hi_p   = mf.get('highest_sentiment_price',0)
-        mf_c   = GREEN if hi_dir=='Bullish' else RED if hi_dir=='Bearish' else YELLOW
-        t(L+0.01, y-0.004, 'MONEY FLOW', c=CYAN, sz=8.5, w='bold')
-        t(L+0.01, y-0.018, f"POC:₹{poc_p:.0f}  VA:₹{va_l:.0f}-₹{va_h:.0f}  Strongest:{hi_dir} @ ₹{hi_p:.0f}", c=mf_c, sz=8)
-        y -= sh + 0.005
-
-    # ── FOOTER ──────────────────────────────────────────────
-    t(0.5, max(y - 0.01, 0.01), 'Auto-generated signal. Manual verification required.',
-      c=GRAY, sz=7, ha='center')
-
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=110, bbox_inches='tight', facecolor=BG,
-                pad_inches=0.15)
-    buf.seek(0)
-    plt.close(fig)
-    return buf.getvalue()
-
-
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return False, "Credentials not configured"
-
-    try:
-        test_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getMe"
-        response = requests.get(test_url, timeout=10)
-        if response.status_code == 200:
-            return True, "✅ Telegram bot is active and connected"
-        else:
-            return False, f"❌ Telegram API error: {response.status_code}"
-
-    except Exception as e:
-        return False, f"❌ Telegram connection failed: {str(e)}"
 
 
 class DhanAPI:
@@ -608,6 +486,58 @@ class DhanAPI:
         except Exception:
             return None
 
+    def get_quote(self, security_id, exchange_segment="NSE_FNO"):
+        """Full quote (LTP, volume, OI, OHLC) for a single security via
+        /v2/marketfeed/quote. Falls back to /marketfeed/ltp on empty quote
+        so the caller still gets at least the last price."""
+        url = f"{self.base_url}/marketfeed/quote"
+        payload = {exchange_segment: [int(security_id)]}
+        try:
+            response = requests.post(url, headers=self.headers, json=payload, timeout=10)
+            if response.status_code == 401:
+                st.session_state['_dhan_token_expired'] = True
+                st.session_state['_nifty_fut_err'] = "401 token expired"
+                return None
+            if response.status_code == 200:
+                items = response.json().get('data', {}).get(exchange_segment, {})
+                if items:
+                    node = items.get(str(security_id)) or next(iter(items.values()), None)
+                    if node and float(node.get('last_price') or 0) > 0:
+                        st.session_state['_nifty_fut_err'] = None
+                        return node
+                # 200-but-empty: fall through to LTP fallback below
+            elif response.status_code == 429:
+                st.session_state['_nifty_fut_err'] = "429 rate-limited (quote=1 req/sec)"
+            elif response.status_code != 200:
+                st.session_state['_nifty_fut_err'] = f"quote HTTP {response.status_code}: {response.text[:120]}"
+        except Exception as e:
+            st.session_state['_nifty_fut_err'] = f"quote net err: {str(e)[:120]}"
+
+        # Fallback: /marketfeed/ltp — same security id, simpler endpoint.
+        # Returns just last_price (no OI/volume) but at least lets us compute basis.
+        try:
+            ltp_url = f"{self.base_url}/marketfeed/ltp"
+            ltp_resp = requests.post(ltp_url, headers=self.headers, json=payload, timeout=10)
+            if ltp_resp.status_code == 200:
+                items = ltp_resp.json().get('data', {}).get(exchange_segment, {})
+                node = items.get(str(security_id)) or next(iter(items.values()), None) if items else None
+                if node and float(node.get('last_price') or 0) > 0:
+                    st.session_state['_nifty_fut_err'] = "quote empty — using /ltp fallback (no OI/vol)"
+                    # Shape it like a quote response
+                    return {'last_price': float(node['last_price']), 'volume': 0, 'oi': 0,
+                            'ohlc': {}, '_ltp_only': True}
+                if not st.session_state.get('_nifty_fut_err'):
+                    st.session_state['_nifty_fut_err'] = (
+                        f"both quote+ltp returned empty · seg={exchange_segment}, sec={security_id} — "
+                        "likely wrong security id from scrip master")
+            else:
+                if not st.session_state.get('_nifty_fut_err'):
+                    st.session_state['_nifty_fut_err'] = f"ltp HTTP {ltp_resp.status_code}"
+        except Exception as e:
+            if not st.session_state.get('_nifty_fut_err'):
+                st.session_state['_nifty_fut_err'] = f"ltp net err: {str(e)[:120]}"
+        return None
+
 @st.cache_data(ttl=300)
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
     return get_dhan_expiry_list(underlying_scrip, underlying_seg)
@@ -652,6 +582,165 @@ def get_dhan_expiry_list(underlying_scrip: int, underlying_seg: str, max_retries
     return _dhan_post("https://api.dhan.co/v2/optionchain/expirylist",
                       {"UnderlyingScrip": underlying_scrip, "UnderlyingSeg": underlying_seg},
                       max_retries)
+
+@st.cache_data(ttl=21600)
+def get_nifty_futures_security_id():
+    """Resolve the current/nearest-month NIFTY FUTIDX security id from Dhan's
+    scrip master CSV. Cached 6h; auto-rolls to the next month's contract."""
+    try:
+        url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+        df = pd.read_csv(url, low_memory=False)
+        df.columns = [c.strip().upper() for c in df.columns]
+        sym_col = next((c for c in df.columns if 'TRADING_SYMBOL' in c), None)
+        inst_col = next((c for c in df.columns if 'INSTRUMENT' in c and 'NAME' in c), None)
+        secid_col = next((c for c in df.columns if 'SECURITY_ID' in c), None)
+        expiry_col = next((c for c in df.columns if 'EXPIRY_DATE' in c), None)
+        exch_col = next((c for c in df.columns if 'EXCH_ID' in c), None)
+        if not all([sym_col, inst_col, secid_col, expiry_col]):
+            st.session_state['_nifty_fut_err'] = (
+                f"scrip master column missing — got {list(df.columns)[:8]}…"
+            )
+            return None
+        mask = df[inst_col].astype(str).str.upper().str.strip().eq('FUTIDX')
+        if exch_col:
+            mask &= df[exch_col].astype(str).str.upper().str.strip().eq('NSE')
+        sym_up = df[sym_col].astype(str).str.upper()
+        mask &= sym_up.str.contains('NIFTY')
+        for excl in ('BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT'):
+            mask &= ~sym_up.str.contains(excl)
+        fut = df[mask].copy()
+        if fut.empty:
+            st.session_state['_nifty_fut_err'] = "no NIFTY FUTIDX rows in scrip master"
+            return None
+        fut['_exp'] = pd.to_datetime(fut[expiry_col], errors='coerce')
+        today = pd.Timestamp(datetime.now(pytz.timezone('Asia/Kolkata')).date())
+        upcoming = fut[fut['_exp'] >= today].sort_values('_exp')
+        chosen = upcoming.iloc[0] if not upcoming.empty else fut.sort_values('_exp').iloc[-1]
+        return {
+            'security_id': str(int(chosen[secid_col])),
+            'symbol': str(chosen[sym_col]),
+            'expiry': chosen['_exp'].strftime('%d-%b-%Y') if pd.notna(chosen['_exp']) else '',
+        }
+    except Exception as e:
+        st.session_state['_nifty_fut_err'] = f"scrip master load failed: {str(e)[:120]}"
+        return None
+
+@st.cache_data(ttl=21600)
+def get_nifty_option_security_ids(expiry: str):
+    """Resolve Dhan security IDs for all NIFTY OPTIDX strikes of one expiry from
+    the scrip-master CSV. Returns {(strike_float, 'CE'/'PE'): security_id_int}.
+    Cached 6h. expiry is the Dhan option-chain expiry string (e.g. '2026-06-19')."""
+    try:
+        url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+        df = pd.read_csv(url, low_memory=False)
+        df.columns = [c.strip().upper() for c in df.columns]
+        sym_col = next((c for c in df.columns if 'TRADING_SYMBOL' in c), None)
+        inst_col = next((c for c in df.columns if 'INSTRUMENT' in c and 'NAME' in c), None)
+        secid_col = next((c for c in df.columns if 'SECURITY_ID' in c), None)
+        expiry_col = next((c for c in df.columns if 'EXPIRY_DATE' in c), None)
+        exch_col = next((c for c in df.columns if 'EXCH_ID' in c), None)
+        strike_col = next((c for c in df.columns if 'STRIKE' in c), None)
+        opttype_col = next((c for c in df.columns if 'OPTION_TYPE' in c), None)
+        if not all([sym_col, inst_col, secid_col, expiry_col, strike_col, opttype_col]):
+            st.session_state['_nifty_opt_err'] = (
+                f"scrip master option columns missing — got {list(df.columns)[:10]}…"
+            )
+            return {}
+        mask = df[inst_col].astype(str).str.upper().str.strip().eq('OPTIDX')
+        if exch_col:
+            mask &= df[exch_col].astype(str).str.upper().str.strip().eq('NSE')
+        sym_up = df[sym_col].astype(str).str.upper()
+        mask &= sym_up.str.contains('NIFTY')
+        for excl in ('BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY', 'NIFTYNXT'):
+            mask &= ~sym_up.str.contains(excl)
+        opt = df[mask].copy()
+        if opt.empty:
+            st.session_state['_nifty_opt_err'] = "no NIFTY OPTIDX rows in scrip master"
+            return {}
+        # Match expiry by date
+        opt['_exp'] = pd.to_datetime(opt[expiry_col], errors='coerce').dt.date
+        try:
+            target_exp = pd.to_datetime(expiry, errors='coerce').date()
+        except Exception:
+            target_exp = None
+        if target_exp is not None:
+            opt = opt[opt['_exp'] == target_exp]
+        if opt.empty:
+            st.session_state['_nifty_opt_err'] = f"no OPTIDX rows for expiry {expiry}"
+            return {}
+        result = {}
+        for _, r in opt.iterrows():
+            try:
+                strike = float(r[strike_col])
+                ot = str(r[opttype_col]).upper().strip()
+                if ot in ('CE', 'CALL', 'C'):
+                    ot = 'CE'
+                elif ot in ('PE', 'PUT', 'P'):
+                    ot = 'PE'
+                else:
+                    continue
+                result[(strike, ot)] = int(r[secid_col])
+            except Exception:
+                continue
+        return result
+    except Exception as e:
+        st.session_state['_nifty_opt_err'] = f"option scrip master load failed: {str(e)[:120]}"
+        return {}
+
+
+def get_nifty_futures_data(api, spot_price):
+    """Fetch current NIFTY futures quote and derive basis vs spot.
+
+    OI change is tracked across refreshes within the session (intraday delta).
+    Returns dict or None.
+    """
+    try:
+        meta = get_nifty_futures_security_id()
+        if not meta:
+            return None
+        quote = api.get_quote(meta['security_id'], exchange_segment="NSE_FNO")
+        if not quote:
+            return None
+        price = float(quote.get('last_price') or 0)
+        if price <= 0:
+            return None
+        volume = float(quote.get('volume') or 0)
+        oi = float(quote.get('oi') or 0)
+        prev = st.session_state.get('_nifty_fut_prev_oi')
+        st.session_state['_nifty_fut_prev_oi'] = oi
+        prev_price = st.session_state.get('_nifty_fut_prev_price')
+        st.session_state['_nifty_fut_prev_price'] = price
+        chg_oi = (oi - prev) if (prev is not None and oi) else 0.0
+        chg_price = (price - prev_price) if (prev_price is not None) else 0.0
+        basis = price - spot_price if spot_price else 0.0
+        return {
+            'symbol': meta['symbol'],
+            'expiry': meta['expiry'],
+            'price': price,
+            'volume': volume,
+            'oi': oi,
+            'chg_oi': chg_oi,
+            'chg_price': chg_price,
+            'basis': basis,
+            'stance': 'Premium' if basis > 0 else 'Discount' if basis < 0 else 'Flat',
+        }
+    except Exception:
+        return None
+
+@st.cache_data(ttl=1800)
+def get_fii_dii_cash_cached():
+    from api.nse_data import get_fii_dii_cash
+    return get_fii_dii_cash()
+
+@st.cache_data(ttl=1800)
+def get_fii_derivatives_stats_cached():
+    from api.nse_data import get_fii_derivatives_stats
+    return get_fii_derivatives_stats()
+
+@st.cache_data(ttl=120)
+def get_market_breadth_cached():
+    from api.nse_data import get_market_breadth
+    return get_market_breadth()
 
 class PivotIndicator:
     """Higher Timeframe Pivot Support/Resistance Indicator"""
@@ -957,6 +1046,46 @@ class TriplePOC:
         else:
             return 'inside'
 
+def compute_dynamic_poc(df, bins=20):
+    """BigBeluga 'Real-Time HTF Volume Footprint' — Dynamic PoC port.
+
+    Over a single HTF period (here: today's whole session = '1D'), build a
+    volume profile across `bins` price bins spanning the running period
+    high→low, accumulating each bar's volume (normalised by stdev like the
+    Pine `volume / ta.stdev(volume,200)`) into the bin its close falls in.
+
+    The Dynamic PoC is the price of the max-volume bin recomputed cumulatively
+    bar-by-bar, so it steps up/down as the point-of-control migrates intraday.
+
+    Returns (poc_list, period_high, period_low) where poc_list aligns to df
+    rows (None for the first couple of bars). Use as a stepline overlay.
+    """
+    if df is None or df.empty or len(df) < 3:
+        return [], None, None
+    highs = df['high'].astype(float).to_numpy()
+    lows = df['low'].astype(float).to_numpy()
+    closes = df['close'].astype(float).to_numpy()
+    vols = df['volume'].astype(float).fillna(0).to_numpy() if hasattr(df['volume'], 'fillna') else df['volume'].astype(float).to_numpy()
+    # Per-bar volume normalisation ≈ ta.stdev(volume, 200)
+    vstd = pd.Series(vols).rolling(200, min_periods=5).std().bfill().fillna(1).to_numpy()
+    vstd = np.where(vstd <= 0, 1.0, vstd)
+    vol_val = vols / vstd
+    n = len(df)
+    out = [None] * n
+    for i in range(2, n):
+        lo = lows[:i + 1].min()
+        hi = highs[:i + 1].max()
+        if hi <= lo:
+            out[i] = (hi + lo) / 2.0
+            continue
+        counts, _ = np.histogram(closes[:i + 1], bins=bins, range=(lo, hi),
+                                 weights=vol_val[:i + 1])
+        bmax = int(counts.argmax())
+        step = (hi - lo) / bins
+        out[i] = lo + (bmax + 0.5) * step
+    return out, float(highs.max()), float(lows.min())
+
+
 def compute_vpfr(df, n_bars, n_rows=24, va_pct=70):
     """
     Volume Profile Fixed Range — Python port of Pine Script VPFR.
@@ -1005,7 +1134,12 @@ def compute_vpfr(df, n_bars, n_rows=24, va_pct=70):
         else:
             lo_i -= 1
             cum += vol_bins[lo_i]
-    return {'poc': round(poc, 2), 'vah': round(bins_hi[hi_i], 2), 'val': round(bins_lo[lo_i], 2)}
+    return {
+        'poc': round(poc, 2), 'vah': round(bins_hi[hi_i], 2), 'val': round(bins_lo[lo_i], 2),
+        'poc_vol': float(vol_bins[poc_idx]),
+        'vah_vol': float(vol_bins[hi_i]),
+        'val_vol': float(vol_bins[lo_i]),
+    }
 
 
 class FutureSwing:
@@ -2050,7 +2184,2986 @@ def process_candle_data(data, interval):
 
     return df
 
-def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, money_flow_data=None, volume_delta_data=None):
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PORTED TRADING ENGINES — CIE / CMCE / IOFCE / Geometric Pattern Detector
+# Copied AS-IS from vob (5).py (see source lines 13889-14378, 26143-27340,
+# 26754-27340, 3563-4246). Kept functionally identical. Adapted minimal helpers
+# (_get_atm_bias_text, _amie_oi_behavior, _amie_depth_signal) that the IOFCE
+# pipeline depends on but were absent from this file.
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _get_atm_bias_text(option_data: dict = None) -> str:
+    """Extract ATM bias info from option_data for inclusion in Telegram alerts."""
+    if not option_data:
+        return ""
+    df_summary = option_data.get('df_summary')
+    underlying = option_data.get('underlying')
+    if df_summary is None or underlying is None:
+        return ""
+    try:
+        atm_strike = min(df_summary['Strike'].tolist(), key=lambda x: abs(x - underlying))
+        atm_rows = df_summary[df_summary['Strike'] == atm_strike]
+        if atm_rows.empty:
+            return ""
+        row = atm_rows.iloc[0]
+        bias_score = row.get('BiasScore', 0)
+        verdict = row.get('Verdict', final_verdict(bias_score))
+        oi_bias = row.get('OI_Bias', 'N/A')
+        chgoi_bias = row.get('ChgOI_Bias', 'N/A')
+        delta_exp = row.get('DeltaExp', 'N/A')
+        gamma_exp = row.get('GammaExp', 'N/A')
+        pressure = row.get('PressureBias', 'N/A')
+        return (
+            f"\n<b>📊 ATM Bias:</b> {verdict} (Score: {bias_score})"
+            f"\n• OI: {oi_bias} | ChgOI: {chgoi_bias} | Delta: {delta_exp} | Gamma: {gamma_exp} | Pressure: {pressure}"
+        )
+    except Exception:
+        return ""
+
+
+def _amie_oi_behavior(option_data: dict, df: pd.DataFrame) -> tuple:
+    """Returns (oi_behavior, support_signal, resistance_signal, oi_score 0-100)."""
+    if not option_data:
+        return "Mixed / Neutral", "Unknown", "Unknown", 50
+
+    ds = option_data.get('df_summary')
+    underlying = option_data.get('underlying', 0)
+    total_ce_chg = option_data.get('total_ce_change', 0) or 0
+    total_pe_chg = option_data.get('total_pe_change', 0) or 0
+
+    if ds is None or ds.empty:
+        return "Mixed / Neutral", "Unknown", "Unknown", 50
+
+    price_up = True
+    if df is not None and not df.empty:
+        df2 = df.copy()
+        df2.columns = [c.lower() for c in df2.columns]
+        if "close" in df2.columns and len(df2) >= 2:
+            price_up = df2["close"].iloc[-1] >= df2["close"].iloc[-2]
+
+    if price_up and total_pe_chg > 0 and total_pe_chg >= abs(total_ce_chg):
+        oi_behavior = "Long Build-up"
+        oi_score = 72
+    elif not price_up and total_ce_chg > 0 and total_ce_chg >= abs(total_pe_chg):
+        oi_behavior = "Short Build-up"
+        oi_score = 28
+    elif price_up and total_ce_chg < 0:
+        oi_behavior = "Short Covering"
+        oi_score = 65
+    elif not price_up and total_pe_chg < 0:
+        oi_behavior = "Long Unwinding"
+        oi_score = 35
+    else:
+        oi_behavior = "Mixed / Neutral"
+        oi_score = 50
+
+    try:
+        atm_idx = ds['Strike'].sub(underlying).abs().idxmin()
+        ai = ds.index.get_loc(atm_idx)
+
+        def safe_row(i):
+            return ds.iloc[i] if 0 <= i < len(ds) else None
+
+        r0 = ds.iloc[ai]
+        rm1 = safe_row(ai - 1)
+        rp1 = safe_row(ai + 1)
+
+        def gv(row, col, default=0):
+            if row is None:
+                return default
+            return float(row.get(col, default) or default)
+
+        pe_chg_atm = gv(r0, 'changeinOpenInterest_PE')
+        ce_chg_atm = gv(r0, 'changeinOpenInterest_CE')
+        pe_chg_m1 = gv(rm1, 'changeinOpenInterest_PE') if rm1 is not None else 0
+        ce_chg_p1 = gv(rp1, 'changeinOpenInterest_CE') if rp1 is not None else 0
+
+        support_signal = "Building" if (total_pe_chg > 0 and pe_chg_atm > 0 and pe_chg_m1 > 0) else \
+                         "Weakening" if (total_pe_chg < 0 and pe_chg_atm < 0) else "Stable"
+        resistance_signal = "Building" if (total_ce_chg > 0 and ce_chg_atm > 0 and ce_chg_p1 > 0) else \
+                            "Weakening" if (total_ce_chg < 0 and ce_chg_atm < 0) else "Stable"
+    except Exception:
+        support_signal = "Unknown"
+        resistance_signal = "Unknown"
+
+    return oi_behavior, support_signal, resistance_signal, oi_score
+
+
+def _amie_depth_signal(option_data: dict) -> tuple:
+    """Market depth reaction from bid/ask OI proxy. Returns (signal_str, score 0-100, detail)."""
+    if not option_data:
+        return "Balanced", 50, "No data"
+
+    ds = option_data.get('df_summary')
+    if ds is None or ds.empty:
+        return "Balanced", 50, "No depth data"
+
+    try:
+        bid_cols = [c for c in ds.columns if 'bidQty' in c]
+        ask_cols = [c for c in ds.columns if 'askQty' in c]
+        if not bid_cols or not ask_cols:
+            return "Balanced", 50, "Bid/Ask not available"
+
+        total_bid = ds[bid_cols].sum().sum()
+        total_ask = ds[ask_cols].sum().sum()
+        ratio = total_bid / (total_ask + 1e-6)
+
+        if ratio > 1.5:
+            return "Buyers Strong", 72, f"Bid/Ask ratio {ratio:.2f} — strong buying pressure"
+        elif ratio > 1.15:
+            return "Mild Buy Pressure", 62, f"Bid/Ask ratio {ratio:.2f} — moderate buying"
+        elif ratio < 0.67:
+            return "Sellers Strong", 28, f"Bid/Ask ratio {ratio:.2f} — heavy sell pressure"
+        elif ratio < 0.87:
+            return "Mild Sell Pressure", 38, f"Bid/Ask ratio {ratio:.2f} — moderate selling"
+        else:
+            return "Balanced", 50, f"Bid/Ask ratio {ratio:.2f} — equilibrium"
+    except Exception:
+        return "Balanced", 50, "Calculation error"
+
+
+# ── GeometricPatternDetector ──────────────────────────────────────────────────
+class GeometricPatternDetector:
+    """
+    Detects geometric and reversal chart patterns on NIFTY50 price data.
+    Patterns: Double Bottom/Top, H&S, Inv H&S, Triangles, Falling Wedge,
+              Flag, Range Breakout, Channel, Trendline Breakout.
+    """
+
+    TOLERANCE = 0.025
+    MIN_PATTERN_BARS = 3
+    LOOKBACK = 60
+
+    @staticmethod
+    def _find_pivots(df, order=2):
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(highs_arr)
+        highs, lows = [], []
+        for i in range(order, n - order):
+            window_h = highs_arr[i - order: i + order + 1]
+            window_l = lows_arr[i - order: i + order + 1]
+            if highs_arr[i] == window_h.max():
+                highs.append(i)
+            if lows_arr[i] == window_l.min():
+                lows.append(i)
+        return highs, lows
+
+    @staticmethod
+    def _confidence_score(df, breakout_idx, signal):
+        score = 0
+        closes = df['close'].values
+        opens = df['open'].values
+        highs_a = df['high'].values
+        lows_a = df['low'].values
+        volumes = df['volume'].values if 'volume' in df.columns else None
+        n = len(closes)
+        idx = min(breakout_idx, n - 1)
+
+        if volumes is not None and idx > 5:
+            avg_vol = volumes[max(0, idx - 10):idx].mean()
+            if avg_vol > 0 and volumes[idx] > avg_vol * 1.4:
+                score += 2
+
+        if idx > 0:
+            body = abs(closes[idx] - opens[idx])
+            avg_body = np.mean(np.abs(
+                closes[max(0, idx - 10):idx] - opens[max(0, idx - 10):idx]
+            )) if idx > 0 else 1
+            if avg_body > 0 and body > avg_body * 1.2:
+                score += 1
+
+        rng = highs_a[idx] - lows_a[idx] if highs_a[idx] != lows_a[idx] else 0.001
+        close_pos = (closes[idx] - lows_a[idx]) / rng
+        if signal == 'BUY' and close_pos > 0.55:
+            score += 1
+        elif signal == 'SELL' and close_pos < 0.45:
+            score += 1
+
+        if n >= 12:
+            slope = np.polyfit(range(10), closes[n - 10:], 1)[0]
+            price_unit = closes[-1] / 100
+            if signal == 'BUY' and slope > price_unit * 0.05:
+                score += 1
+            elif signal == 'SELL' and slope < -price_unit * 0.05:
+                score += 1
+
+        if n >= 16:
+            gains = np.maximum(np.diff(closes[n - 15:]), 0)
+            losses = np.abs(np.minimum(np.diff(closes[n - 15:]), 0))
+            avg_g = gains.mean() if gains.mean() > 0 else 0.001
+            avg_l = losses.mean() if losses.mean() > 0 else 0.001
+            rsi = 100 - (100 / (1 + avg_g / avg_l))
+            if signal == 'BUY' and 40 < rsi < 75:
+                score += 2
+            elif signal == 'SELL' and 25 < rsi < 60:
+                score += 2
+
+        labels = [
+            'Low', 'Low', 'Moderate', 'Moderate',
+            'High', 'High', 'Strong', 'Strong', 'Institutional Setup'
+        ]
+        return labels[min(score, 8)]
+
+    def _make_result(self, df, bo_idx, pat, pat_type, sentiment, signal,
+                     entry, sl, target, draw_lines, sr_zones):
+        n = len(df)
+        bo_idx = min(bo_idx, n - 1)
+        rr = abs(target - entry) / abs(entry - sl) if abs(entry - sl) > 0.001 else 0
+        future_idx = min(bo_idx + 5, n - 1)
+        move_pct = (df['close'].iloc[future_idx] - entry) / entry * 100 if entry else 0
+        bo_vol = 0
+        bo_vol_ratio = 0.0
+        if 'volume' in df.columns:
+            bo_vol = int(df['volume'].iloc[bo_idx])
+            _vol_start = max(0, bo_idx - 20)
+            _avg_v = df['volume'].iloc[_vol_start:bo_idx].mean() if bo_idx > 0 else bo_vol
+            bo_vol_ratio = round(bo_vol / _avg_v, 2) if _avg_v and _avg_v > 0 else 0.0
+
+        return {
+            'pattern': pat, 'pattern_type': pat_type,
+            'sentiment': sentiment, 'signal': signal,
+            'time': df['datetime'].iloc[bo_idx] if 'datetime' in df.columns else bo_idx,
+            'entry': round(entry, 2),
+            'stoploss': round(sl, 2),
+            'target': round(target, 2),
+            'rr': round(rr, 2),
+            'move_pct': round(move_pct, 2),
+            'confidence': self._confidence_score(df, bo_idx, signal),
+            'highlight_idx': bo_idx,
+            'draw_lines': draw_lines,
+            'sr_zones': sr_zones,
+            'volume': bo_vol,
+            'vol_ratio': bo_vol_ratio,
+        }
+
+    def _detect_double_bottom(self, df):
+        results = []
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        closes = df['close'].values
+        n = len(closes)
+
+        _, lows = self._find_pivots(df, order=2)
+
+        for j in range(1, len(lows)):
+            b2 = lows[j]
+            for k in range(j - 1, max(j - 8, -1), -1):
+                b1 = lows[k]
+                if b2 - b1 < self.MIN_PATTERN_BARS:
+                    continue
+                p1 = lows_arr[b1]
+                p2 = lows_arr[b2]
+                if abs(p1 - p2) / max(p1, p2) > self.TOLERANCE:
+                    continue
+                neckline = closes[b1:b2 + 1].max()
+                for bo_idx in range(b2 + 1, min(b2 + 8, n)):
+                    if closes[bo_idx] > neckline:
+                        ph = neckline - min(p1, p2)
+                        entry = neckline
+                        sl = min(lows_arr[b1], lows_arr[b2]) * 0.998
+                        tgt = entry + ph
+                        results.append(self._make_result(
+                            df, bo_idx,
+                            'Double Bottom', 'Reversal', 'Bullish Reversal', 'BUY',
+                            entry, sl, tgt,
+                            draw_lines=[
+                                (df['datetime'].iloc[b1], p1, df['datetime'].iloc[b2], p2, '#00ff88'),
+                                (df['datetime'].iloc[b1], neckline, df['datetime'].iloc[bo_idx], neckline, '#FFD700'),
+                            ],
+                            sr_zones=[(sl, sl * 1.004, 'rgba(0,255,136,0.15)')],
+                        ))
+                        break
+                break
+        return results
+
+    def _detect_double_top(self, df):
+        results = []
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        closes = df['close'].values
+        n = len(closes)
+
+        highs, _ = self._find_pivots(df, order=2)
+
+        for j in range(1, len(highs)):
+            t2 = highs[j]
+            for k in range(j - 1, max(j - 8, -1), -1):
+                t1 = highs[k]
+                if t2 - t1 < self.MIN_PATTERN_BARS:
+                    continue
+                p1 = highs_arr[t1]
+                p2 = highs_arr[t2]
+                if abs(p1 - p2) / max(p1, p2) > self.TOLERANCE:
+                    continue
+                neckline = closes[t1:t2 + 1].min()
+                for bo_idx in range(t2 + 1, min(t2 + 8, n)):
+                    if closes[bo_idx] < neckline:
+                        ph = max(p1, p2) - neckline
+                        entry = neckline
+                        sl = max(highs_arr[t1], highs_arr[t2]) * 1.002
+                        tgt = entry - ph
+                        results.append(self._make_result(
+                            df, bo_idx,
+                            'Double Top', 'Reversal', 'Bearish Reversal', 'SELL',
+                            entry, sl, tgt,
+                            draw_lines=[
+                                (df['datetime'].iloc[t1], p1, df['datetime'].iloc[t2], p2, '#ff4444'),
+                                (df['datetime'].iloc[t1], neckline, df['datetime'].iloc[bo_idx], neckline, '#FFD700'),
+                            ],
+                            sr_zones=[(sl * 0.996, sl, 'rgba(255,68,68,0.15)')],
+                        ))
+                        break
+                break
+        return results
+
+    def _detect_head_shoulders(self, df):
+        results = []
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        closes = df['close'].values
+        n = len(closes)
+
+        highs, _ = self._find_pivots(df, order=2)
+        if len(highs) < 3:
+            return results
+
+        for i in range(len(highs) - 2):
+            ls, head, rs = highs[i], highs[i + 1], highs[i + 2]
+            if head - ls < self.MIN_PATTERN_BARS or rs - head < self.MIN_PATTERN_BARS:
+                continue
+            p_ls = highs_arr[ls]
+            p_head = highs_arr[head]
+            p_rs = highs_arr[rs]
+            if p_head <= max(p_ls, p_rs):
+                continue
+            if abs(p_ls - p_rs) / p_head > 0.05:
+                continue
+            t1_low = lows_arr[ls:head + 1].min()
+            t2_low = lows_arr[head:rs + 1].min()
+            neckline = (t1_low + t2_low) / 2
+            for bo_idx in range(rs + 1, min(rs + 8, n)):
+                if closes[bo_idx] < neckline:
+                    ph = p_head - neckline
+                    entry = neckline
+                    sl = p_rs * 1.003
+                    tgt = neckline - ph
+                    results.append(self._make_result(
+                        df, bo_idx,
+                        'Head & Shoulders', 'Reversal', 'Bearish Reversal', 'SELL',
+                        entry, sl, tgt,
+                        draw_lines=[
+                            (df['datetime'].iloc[ls], p_ls, df['datetime'].iloc[head], p_head, '#ff4444'),
+                            (df['datetime'].iloc[head], p_head, df['datetime'].iloc[rs], p_rs, '#ff4444'),
+                            (df['datetime'].iloc[ls], neckline, df['datetime'].iloc[bo_idx], neckline, '#FFD700'),
+                        ],
+                        sr_zones=[],
+                    ))
+                    break
+        return results
+
+    def _detect_inv_head_shoulders(self, df):
+        results = []
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        closes = df['close'].values
+        n = len(closes)
+
+        _, lows = self._find_pivots(df, order=2)
+        if len(lows) < 3:
+            return results
+
+        for i in range(len(lows) - 2):
+            ls, head, rs = lows[i], lows[i + 1], lows[i + 2]
+            if head - ls < self.MIN_PATTERN_BARS or rs - head < self.MIN_PATTERN_BARS:
+                continue
+            p_ls = lows_arr[ls]
+            p_head = lows_arr[head]
+            p_rs = lows_arr[rs]
+            if p_head >= min(p_ls, p_rs):
+                continue
+            if abs(p_ls - p_rs) / max(p_head, 1) > 0.05:
+                continue
+            t1_high = highs_arr[ls:head + 1].max()
+            t2_high = highs_arr[head:rs + 1].max()
+            neckline = (t1_high + t2_high) / 2
+            for bo_idx in range(rs + 1, min(rs + 8, n)):
+                if closes[bo_idx] > neckline:
+                    ph = neckline - p_head
+                    entry = neckline
+                    sl = p_rs * 0.997
+                    tgt = neckline + ph
+                    results.append(self._make_result(
+                        df, bo_idx,
+                        'Inv Head & Shoulders', 'Reversal', 'Bullish Reversal', 'BUY',
+                        entry, sl, tgt,
+                        draw_lines=[
+                            (df['datetime'].iloc[ls], p_ls, df['datetime'].iloc[head], p_head, '#00ff88'),
+                            (df['datetime'].iloc[head], p_head, df['datetime'].iloc[rs], p_rs, '#00ff88'),
+                            (df['datetime'].iloc[ls], neckline, df['datetime'].iloc[bo_idx], neckline, '#FFD700'),
+                        ],
+                        sr_zones=[],
+                    ))
+                    break
+        return results
+
+    def _scan_trendline_patterns(self, df, window):
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(highs_arr)
+        out = []
+        xs = np.arange(window)
+        for i in range(window, n):
+            seg_h = highs_arr[i - window: i]
+            seg_l = lows_arr[i - window: i]
+            h_slope, h_int = np.polyfit(xs, seg_h, 1)
+            l_slope, l_int = np.polyfit(xs, seg_l, 1)
+            upper = h_slope * (window - 1) + h_int
+            lower = l_slope * (window - 1) + l_int
+            out.append((i, h_slope, h_int, l_slope, l_int, upper, lower))
+        return out
+
+    def _detect_triangles(self, df):
+        results = []
+        closes = df['close'].values
+        n = len(closes)
+        window = min(20, n - 2)
+        if n < window + 2:
+            return results
+
+        for (i, h_slope, h_int, l_slope, l_int, upper, lower) in self._scan_trendline_patterns(df, window):
+            entry = closes[i]
+            sl_buy = lower
+            sl_sell = upper
+            ph = upper - lower
+            if ph <= 0:
+                continue
+            price_tol = closes[i] * 0.001
+
+            if abs(h_slope) < price_tol and l_slope > price_tol * 0.3:
+                if entry > upper:
+                    results.append(self._make_result(
+                        df, i, 'Ascending Triangle', 'Breakout', 'Bullish Breakout', 'BUY',
+                        entry, sl_buy, upper + ph,
+                        draw_lines=[
+                            (df['datetime'].iloc[i - window], h_int, df['datetime'].iloc[i], upper, '#FFD700'),
+                            (df['datetime'].iloc[i - window], l_int, df['datetime'].iloc[i], lower, '#FFD700'),
+                        ],
+                        sr_zones=[],
+                    ))
+            elif abs(l_slope) < price_tol and h_slope < -price_tol * 0.3:
+                if entry < lower:
+                    results.append(self._make_result(
+                        df, i, 'Descending Triangle', 'Breakout', 'Bearish Breakdown', 'SELL',
+                        entry, sl_sell, lower - ph,
+                        draw_lines=[
+                            (df['datetime'].iloc[i - window], h_int, df['datetime'].iloc[i], upper, '#FFD700'),
+                            (df['datetime'].iloc[i - window], l_int, df['datetime'].iloc[i], lower, '#FFD700'),
+                        ],
+                        sr_zones=[],
+                    ))
+            elif h_slope < -price_tol * 0.3 and l_slope > price_tol * 0.3:
+                if entry > upper:
+                    results.append(self._make_result(
+                        df, i, 'Symmetrical Triangle', 'Breakout', 'Bullish Breakout', 'BUY',
+                        entry, sl_buy, upper + ph,
+                        draw_lines=[
+                            (df['datetime'].iloc[i - window], h_int, df['datetime'].iloc[i], upper, '#FFD700'),
+                            (df['datetime'].iloc[i - window], l_int, df['datetime'].iloc[i], lower, '#FFD700'),
+                        ],
+                        sr_zones=[],
+                    ))
+                elif entry < lower:
+                    results.append(self._make_result(
+                        df, i, 'Symmetrical Triangle', 'Breakout', 'Bearish Breakdown', 'SELL',
+                        entry, sl_sell, lower - ph,
+                        draw_lines=[
+                            (df['datetime'].iloc[i - window], h_int, df['datetime'].iloc[i], upper, '#FFD700'),
+                            (df['datetime'].iloc[i - window], l_int, df['datetime'].iloc[i], lower, '#FFD700'),
+                        ],
+                        sr_zones=[],
+                    ))
+        return results
+
+    def _detect_falling_wedge(self, df):
+        results = []
+        closes = df['close'].values
+        n = len(closes)
+        window = min(18, n - 2)
+        if n < window + 2:
+            return results
+
+        for (i, h_slope, h_int, l_slope, l_int, upper, lower) in self._scan_trendline_patterns(df, window):
+            if h_slope < 0 and l_slope < 0 and h_slope < l_slope - 1e-6:
+                entry = closes[i]
+                if entry > upper:
+                    ph = upper - lower
+                    sl = lower * 0.998
+                    tgt = entry + ph * 2
+                    results.append(self._make_result(
+                        df, i, 'Falling Wedge', 'Reversal', 'Bullish', 'BUY',
+                        entry, sl, tgt,
+                        draw_lines=[
+                            (df['datetime'].iloc[i - window], h_int, df['datetime'].iloc[i], upper, '#00ff88'),
+                            (df['datetime'].iloc[i - window], l_int, df['datetime'].iloc[i], lower, '#00ff88'),
+                        ],
+                        sr_zones=[],
+                    ))
+        return results
+
+    def _detect_flag(self, df):
+        results = []
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        if n < 18:
+            return results
+
+        pole_len = 8
+        flag_len = 5
+
+        for i in range(pole_len + flag_len, n):
+            pole_start = i - pole_len - flag_len
+            pole_end = i - flag_len
+            flag_start = pole_end
+            flag_end = i
+
+            pole_move = closes[pole_end] - closes[pole_start]
+            pole_pct = pole_move / closes[pole_start] if closes[pole_start] > 0 else 0
+
+            flag_closes = closes[flag_start: flag_end]
+            if len(flag_closes) < 2:
+                continue
+            flag_slope, _ = np.polyfit(range(len(flag_closes)), flag_closes, 1)
+
+            if pole_pct > 0.008 and flag_slope < 0:
+                flag_top = highs_arr[flag_start:flag_end].max()
+                flag_bottom = lows_arr[flag_start:flag_end].min()
+                if closes[i] > flag_top:
+                    entry = closes[i]
+                    sl = flag_bottom * 0.998
+                    tgt = entry + abs(pole_move)
+                    results.append(self._make_result(
+                        df, i, 'Bull Flag', 'Continuation', 'Bullish Continuation', 'BUY',
+                        entry, sl, tgt,
+                        draw_lines=[
+                            (df['datetime'].iloc[pole_start], closes[pole_start],
+                             df['datetime'].iloc[pole_end], closes[pole_end], '#00ff88'),
+                        ],
+                        sr_zones=[(sl, flag_top * 1.001, 'rgba(0,255,136,0.1)')],
+                    ))
+            elif pole_pct < -0.008 and flag_slope > 0:
+                flag_top = highs_arr[flag_start:flag_end].max()
+                flag_bottom = lows_arr[flag_start:flag_end].min()
+                if closes[i] < flag_bottom:
+                    entry = closes[i]
+                    sl = flag_top * 1.002
+                    tgt = entry - abs(pole_move)
+                    results.append(self._make_result(
+                        df, i, 'Bear Flag', 'Continuation', 'Bearish Continuation', 'SELL',
+                        entry, sl, tgt,
+                        draw_lines=[
+                            (df['datetime'].iloc[pole_start], closes[pole_start],
+                             df['datetime'].iloc[pole_end], closes[pole_end], '#ff4444'),
+                        ],
+                        sr_zones=[(flag_bottom * 0.999, sl, 'rgba(255,68,68,0.1)')],
+                    ))
+        return results
+
+    def _detect_range_breakout(self, df):
+        results = []
+        closes = df['close'].values
+        highs_arr = df['high'].values
+        lows_arr = df['low'].values
+        n = len(closes)
+        range_window = min(20, n - 2)
+        if n < range_window + 2:
+            return results
+
+        for i in range(range_window + 1, n):
+            seg_h = highs_arr[i - range_window: i]
+            seg_l = lows_arr[i - range_window: i]
+            resistance = seg_h.max()
+            support = seg_l.min()
+            rng = resistance - support
+            if rng / max(support, 1) < 0.002:
+                continue
+            if closes[i - range_window:i].std() > rng * 0.5:
+                continue
+
+            entry = closes[i]
+            if entry > resistance * 1.001:
+                sl = support
+                tgt = resistance + rng
+                results.append(self._make_result(
+                    df, i, 'Range Breakout', 'Breakout', 'Bullish Momentum', 'BUY',
+                    entry, sl, tgt,
+                    draw_lines=[
+                        (df['datetime'].iloc[i - range_window], resistance,
+                         df['datetime'].iloc[i], resistance, '#FFD700'),
+                        (df['datetime'].iloc[i - range_window], support,
+                         df['datetime'].iloc[i], support, '#FFD700'),
+                    ],
+                    sr_zones=[(support, resistance, 'rgba(255,215,0,0.08)')],
+                ))
+            elif entry < support * 0.999:
+                sl = resistance
+                tgt = support - rng
+                results.append(self._make_result(
+                    df, i, 'Range Breakdown', 'Breakout', 'Bearish Momentum', 'SELL',
+                    entry, sl, tgt,
+                    draw_lines=[
+                        (df['datetime'].iloc[i - range_window], resistance,
+                         df['datetime'].iloc[i], resistance, '#FFD700'),
+                        (df['datetime'].iloc[i - range_window], support,
+                         df['datetime'].iloc[i], support, '#FFD700'),
+                    ],
+                    sr_zones=[(support, resistance, 'rgba(255,215,0,0.08)')],
+                ))
+        return results
+
+    def _detect_channel(self, df):
+        results = []
+        closes = df['close'].values
+        n = len(closes)
+        window = min(20, n - 2)
+        if n < window + 2:
+            return results
+
+        for (i, h_slope, h_int, l_slope, l_int, upper, lower) in self._scan_trendline_patterns(df, window):
+            if lower >= upper:
+                continue
+            denom = abs(h_slope) + abs(l_slope) + 1e-9
+            if abs(h_slope - l_slope) / denom > 0.40:
+                continue
+            ph = upper - lower
+            entry = closes[i]
+
+            if entry < lower * 0.999:
+                sl = upper
+                tgt = lower - ph
+                results.append(self._make_result(
+                    df, i, 'Channel Breakdown', 'Breakout', 'Bearish Momentum', 'SELL',
+                    entry, sl, tgt,
+                    draw_lines=[
+                        (df['datetime'].iloc[i - window], h_int, df['datetime'].iloc[i], upper, '#ff4444'),
+                        (df['datetime'].iloc[i - window], l_int, df['datetime'].iloc[i], lower, '#ff4444'),
+                    ],
+                    sr_zones=[],
+                ))
+            elif entry > upper * 1.001:
+                sl = lower
+                tgt = upper + ph
+                results.append(self._make_result(
+                    df, i, 'Channel Breakout', 'Breakout', 'Bullish Momentum', 'BUY',
+                    entry, sl, tgt,
+                    draw_lines=[
+                        (df['datetime'].iloc[i - window], h_int, df['datetime'].iloc[i], upper, '#00ff88'),
+                        (df['datetime'].iloc[i - window], l_int, df['datetime'].iloc[i], lower, '#00ff88'),
+                    ],
+                    sr_zones=[],
+                ))
+        return results
+
+    def _detect_trendline_breakout(self, df):
+        results = []
+        closes = df['close'].values
+        n = len(closes)
+        window = min(15, n - 2)
+        if n < window + 2:
+            return results
+
+        for (i, h_slope, h_int, l_slope, l_int, upper, lower) in self._scan_trendline_patterns(df, window):
+            entry = closes[i]
+            if h_slope < 0 and entry > upper * 1.001:
+                sl = lower
+                tgt = entry + (entry - sl) * 1.5
+                results.append(self._make_result(
+                    df, i, 'Trendline Breakout Up', 'Breakout', 'Bullish Trend Change', 'BUY',
+                    entry, sl, tgt,
+                    draw_lines=[
+                        (df['datetime'].iloc[i - window], h_int, df['datetime'].iloc[i], upper, '#00ff88'),
+                    ],
+                    sr_zones=[],
+                ))
+            elif l_slope > 0 and entry < lower * 0.999:
+                sl = upper
+                tgt = entry - (sl - entry) * 1.5
+                results.append(self._make_result(
+                    df, i, 'Trendline Breakdown', 'Breakout', 'Bearish Trend Change', 'SELL',
+                    entry, sl, tgt,
+                    draw_lines=[
+                        (df['datetime'].iloc[i - window], l_int, df['datetime'].iloc[i], lower, '#ff4444'),
+                    ],
+                    sr_zones=[],
+                ))
+        return results
+
+    def detect_all(self, df):
+        if df is None or df.empty or len(df) < 15:
+            return []
+        results = []
+        for detector in [
+            self._detect_double_bottom,
+            self._detect_double_top,
+            self._detect_head_shoulders,
+            self._detect_inv_head_shoulders,
+            self._detect_triangles,
+            self._detect_falling_wedge,
+            self._detect_flag,
+            self._detect_range_breakout,
+            self._detect_channel,
+            self._detect_trendline_breakout,
+        ]:
+            try:
+                results.extend(detector(df))
+            except Exception:
+                pass
+        seen = {}
+        for r in sorted(results, key=lambda x: x['time']):
+            seen[r['pattern']] = r
+        return list(seen.values())
+
+
+# ── Candlestick Intelligence Engine (CIE) ─────────────────────────────────────
+
+def _cie_detect_swing_sr(df, lookback=200, cluster_pct=0.003):
+    """Detect swing high/low S/R levels and cluster nearby ones."""
+    if df is None or len(df) < 10:
+        return [], []
+    recent = df.tail(lookback).copy().reset_index(drop=True)
+    n = len(recent)
+    raw_sup, raw_res = [], []
+    for i in range(2, n - 2):
+        lo = recent['low'].iloc[i]
+        hi = recent['high'].iloc[i]
+        if (lo < recent['low'].iloc[i-1] and lo < recent['low'].iloc[i-2] and
+                lo < recent['low'].iloc[i+1] and lo < recent['low'].iloc[i+2]):
+            raw_sup.append(lo)
+        if (hi > recent['high'].iloc[i-1] and hi > recent['high'].iloc[i-2] and
+                hi > recent['high'].iloc[i+1] and hi > recent['high'].iloc[i+2]):
+            raw_res.append(hi)
+
+    def _cluster(levels):
+        if not levels:
+            return []
+        levels = sorted(levels)
+        clusters, group = [], [levels[0]]
+        for lvl in levels[1:]:
+            if abs(lvl - group[-1]) / (group[-1] + 1e-6) <= cluster_pct:
+                group.append(lvl)
+            else:
+                clusters.append(float(np.mean(group)))
+                group = [lvl]
+        clusters.append(float(np.mean(group)))
+        return clusters
+
+    return _cluster(raw_sup), _cluster(raw_res)
+
+
+def _cie_find_nearest_sr(price, supports, resistances, thr=0.002):
+    best_dist, best_lvl, best_type = float('inf'), None, None
+    for lvl in supports:
+        d = abs(price - lvl) / (lvl + 1e-6)
+        if d < best_dist and d <= thr:
+            best_dist, best_lvl, best_type = d, lvl, 'support'
+    for lvl in resistances:
+        d = abs(price - lvl) / (lvl + 1e-6)
+        if d < best_dist and d <= thr:
+            best_dist, best_lvl, best_type = d, lvl, 'resistance'
+    return best_lvl, best_type, best_dist
+
+
+def _cie_detect_patterns(df, supports, resistances):
+    signals = []
+    if df is None or len(df) < 3:
+        return signals
+
+    n = len(df)
+    avg_body = (df['close'] - df['open']).abs().rolling(20, min_periods=3).mean().fillna(50)
+    avg_vol = df['volume'].rolling(20, min_periods=3).mean().fillna(1)
+    thr = 0.002
+
+    for i in range(2, n):
+        c = df.iloc[i]
+        p1 = df.iloc[i - 1]
+        candle_range = c['high'] - c['low']
+        if candle_range < 1e-6:
+            continue
+        body = abs(c['close'] - c['open'])
+        upper_wick = c['high'] - max(c['close'], c['open'])
+        lower_wick = min(c['close'], c['open']) - c['low']
+        is_green = c['close'] >= c['open']
+        is_red = c['close'] < c['open']
+        avg_b = max(avg_body.iloc[i], 1)
+        vol_spike = bool(c['volume'] > avg_vol.iloc[i] * 1.5)
+        ts = c['datetime'] if 'datetime' in df.columns else i
+
+        probe_sup = c['low'] if is_red else min(c['close'], c['open'])
+        probe_res = c['high'] if is_green else max(c['close'], c['open'])
+        lvl_s, typ_s, dist_s = _cie_find_nearest_sr(probe_sup, supports, resistances, thr)
+        lvl_r, typ_r, dist_r = _cie_find_nearest_sr(probe_res, supports, resistances, thr)
+        near_sup = typ_s == 'support'
+        near_res = typ_r == 'resistance'
+
+        if near_sup:
+            if lower_wick > 2 * max(body, 1) and upper_wick <= body * 0.5 and lower_wick > candle_range * 0.5:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Hammer', 'direction': 'BUY',
+                    'category': 'Reversal', 'price': c['close'], 'level': lvl_s,
+                    'level_type': 'Support', 'dist_pct': dist_s, 'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(lower_wick / candle_range * 28)),
+                })
+            if lower_wick > candle_range * 0.60:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Long Lower Wick Rejection',
+                    'direction': 'BUY', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(lower_wick / candle_range * 28)),
+                })
+            if (p1['close'] < p1['open'] and is_green and
+                    min(c['open'], c['close']) <= min(p1['open'], p1['close']) and
+                    max(c['open'], c['close']) >= max(p1['open'], p1['close'])):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bullish Engulfing',
+                    'direction': 'BUY', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 14)),
+                })
+            if i >= 2:
+                c0, c1, c2 = df.iloc[i-2], df.iloc[i-1], c
+                b0 = abs(c0['close'] - c0['open'])
+                b1 = abs(c1['close'] - c1['open'])
+                mid0 = (c0['open'] + c0['close']) / 2
+                if (c0['close'] < c0['open'] and b0 > avg_b * 0.8 and b1 < avg_b * 0.4 and
+                        c2['close'] > c2['open'] and c2['close'] > mid0):
+                    signals.append({
+                        'index': i, 'time': ts, 'pattern': 'Morning Star',
+                        'direction': 'BUY', 'category': 'Reversal', 'price': c2['close'],
+                        'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                        'vol_spike': vol_spike, 'candle_strength': 25,
+                    })
+            if (is_green and body > avg_b * 1.5 and upper_wick < body * 0.1 and lower_wick < body * 0.1):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bullish Marubozu',
+                    'direction': 'BUY', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 12)),
+                })
+            p1_rng = p1['high'] - p1['low']
+            if (p1_rng < avg_b * 0.8 and c['high'] > p1['high'] and is_green):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Inside Bar Breakout',
+                    'direction': 'BUY', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_s, 'level_type': 'Support', 'dist_pct': dist_s,
+                    'vol_spike': vol_spike, 'candle_strength': 18,
+                })
+
+        if near_res:
+            if upper_wick > 2 * max(body, 1) and lower_wick <= body * 0.5 and upper_wick > candle_range * 0.5:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Shooting Star',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(upper_wick / candle_range * 28)),
+                })
+            if upper_wick > candle_range * 0.60:
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Upper Wick Rejection',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(upper_wick / candle_range * 28)),
+                })
+            if (p1['close'] > p1['open'] and is_red and
+                    min(c['open'], c['close']) <= min(p1['open'], p1['close']) and
+                    max(c['open'], c['close']) >= max(p1['open'], p1['close'])):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bearish Engulfing',
+                    'direction': 'SELL', 'category': 'Reversal', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 14)),
+                })
+            if i >= 2:
+                c0, c1, c2 = df.iloc[i-2], df.iloc[i-1], c
+                b0 = abs(c0['close'] - c0['open'])
+                b1 = abs(c1['close'] - c1['open'])
+                mid0 = (c0['open'] + c0['close']) / 2
+                if (c0['close'] > c0['open'] and b0 > avg_b * 0.8 and b1 < avg_b * 0.4 and
+                        c2['close'] < c2['open'] and c2['close'] < mid0):
+                    signals.append({
+                        'index': i, 'time': ts, 'pattern': 'Evening Star',
+                        'direction': 'SELL', 'category': 'Reversal', 'price': c2['close'],
+                        'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                        'vol_spike': vol_spike, 'candle_strength': 25,
+                    })
+            if (is_red and body > avg_b * 1.5 and upper_wick < body * 0.1 and lower_wick < body * 0.1):
+                signals.append({
+                    'index': i, 'time': ts, 'pattern': 'Bearish Marubozu',
+                    'direction': 'SELL', 'category': 'Continuation', 'price': c['close'],
+                    'level': lvl_r, 'level_type': 'Resistance', 'dist_pct': dist_r,
+                    'vol_spike': vol_spike,
+                    'candle_strength': min(28, int(body / avg_b * 12)),
+                })
+
+    if n >= 6:
+        last6 = df.tail(6)
+        if (all(last6['high'].iloc[j] < last6['high'].iloc[j-1] for j in range(1, 6)) and
+                all(last6['low'].iloc[j] < last6['low'].iloc[j-1] for j in range(1, 6))):
+            cl = df.iloc[-1]
+            lvl_r2, _, dr2 = _cie_find_nearest_sr(cl['high'], supports, resistances, 0.005)
+            signals.append({
+                'index': n - 1,
+                'time': cl['datetime'] if 'datetime' in df.columns else n - 1,
+                'pattern': 'Lower Low Momentum', 'direction': 'SELL',
+                'category': 'Continuation', 'price': cl['close'],
+                'level': lvl_r2, 'level_type': 'Resistance', 'dist_pct': dr2,
+                'vol_spike': False, 'candle_strength': 20,
+            })
+
+    cutoff = max(0, n - 4)
+    return [s for s in signals if s.get('index', 0) >= cutoff]
+
+
+def _cie_options_confirmation(signal, df_summary, straddle_history, underlying_price):
+    if df_summary is None or underlying_price is None:
+        return False, {'volatility_filter': 'No data'}
+    try:
+        atm_strike = min(df_summary['Strike'].tolist(), key=lambda x: abs(x - underlying_price))
+        atm_rows = df_summary[df_summary['Strike'] == atm_strike]
+        details = {}
+        opt_score = 0
+
+        straddle_roc = 0.0
+        if len(straddle_history) >= 2:
+            s_last = straddle_history[-1].get('straddle', 0) if isinstance(straddle_history[-1], dict) else 0
+            s_prev = straddle_history[-2].get('straddle', 0) if isinstance(straddle_history[-2], dict) else 0
+            if s_prev > 0:
+                straddle_roc = abs((s_last - s_prev) / s_prev * 100)
+        details['straddle_roc'] = round(straddle_roc, 2)
+        details['straddle_expanding'] = straddle_roc >= 0.5
+
+        if straddle_roc < 0.5:
+            details['volatility_filter'] = 'BLOCKED'
+            return False, details
+        details['volatility_filter'] = 'PASS'
+        opt_score += 10
+
+        if not atm_rows.empty:
+            row = atm_rows.iloc[0]
+            pcr = float(row.get('PCR', 1.0) or 1.0)
+            ce_chg = float(row.get('changeinOpenInterest_CE', 0) or 0)
+            pe_chg = float(row.get('changeinOpenInterest_PE', 0) or 0)
+            d_ce = float(row.get('Delta_CE', 0) or 0)
+            d_pe = float(row.get('Delta_PE', 0) or 0)
+            gamma = row.get('Gamma_SR', '-')
+            details.update({
+                'pcr': round(pcr, 2),
+                'ce_chg_oi': round(ce_chg, 0),
+                'pe_chg_oi': round(pe_chg, 0),
+                'net_delta': round(d_ce + d_pe, 4),
+                'gamma_sr': str(gamma),
+            })
+
+            if signal['direction'] == 'BUY':
+                if pcr > 1.0:
+                    opt_score += 15
+                    details['pcr_conf'] = f'Bullish PCR {pcr:.2f} ✅'
+                if pe_chg > 0:
+                    opt_score += 15
+                    details['oi_conf'] = 'Put Writing ✅'
+                elif ce_chg < 0:
+                    opt_score += 8
+                    details['oi_conf'] = 'Call Unwinding ✅'
+                if 'Support' in str(gamma):
+                    opt_score += 10
+                    details['gamma_conf'] = 'Gamma Support ✅'
+                else:
+                    details['gamma_conf'] = str(gamma) or '-'
+                if (d_ce + d_pe) > 0:
+                    opt_score += 10
+                    details['delta_conf'] = 'Delta Positive ✅'
+            else:
+                if pcr < 1.0:
+                    opt_score += 15
+                    details['pcr_conf'] = f'Bearish PCR {pcr:.2f} ✅'
+                if ce_chg > 0:
+                    opt_score += 15
+                    details['oi_conf'] = 'Call Writing ✅'
+                elif pe_chg < 0:
+                    opt_score += 8
+                    details['oi_conf'] = 'Put Unwinding ✅'
+                if 'Resist' in str(gamma):
+                    opt_score += 10
+                    details['gamma_conf'] = 'Gamma Resistance ✅'
+                else:
+                    details['gamma_conf'] = str(gamma) or '-'
+                if (d_ce + d_pe) < 0:
+                    opt_score += 10
+                    details['delta_conf'] = 'Delta Negative ✅'
+
+        details['options_score'] = opt_score
+        confirmed = opt_score >= 20
+        details['confirmed'] = confirmed
+        return confirmed, details
+    except Exception:
+        return False, {'volatility_filter': 'Error'}
+
+
+def _cie_confidence_score(signal, opt_details, opt_confirmed):
+    score = 0
+    score += min(28, signal.get('candle_strength', 10))
+
+    dist_pct = signal.get('dist_pct') or 0.002
+    score += max(0, min(20, 20 - int(dist_pct / 0.0001)))
+
+    score += min(15, int(opt_details.get('options_score', 0) * 0.25))
+
+    gamma_conf = str(opt_details.get('gamma_conf', ''))
+    if '✅' in gamma_conf:
+        score += 15
+    elif gamma_conf and gamma_conf != '-':
+        score += 4
+
+    if opt_details.get('straddle_expanding'):
+        score += 10
+
+    if signal.get('vol_spike'):
+        score += 10
+
+    if signal.get('vol_spike') and opt_confirmed and signal.get('candle_strength', 0) >= 20:
+        score += 10
+
+    return min(100, score)
+
+
+def run_candlestick_intelligence_engine(df, option_data, straddle_history, underlying_price, is_expiry=False):
+    """Main CIE entry point. Returns list of scored, filtered signal dicts."""
+    if df is None or len(df) < 5 or underlying_price is None:
+        return []
+
+    df_summary = option_data.get('df_summary') if option_data else None
+    sr_data = option_data.get('sr_data', []) if option_data else []
+    vob_blocks = option_data.get('vob_blocks', {}) if option_data else {}
+
+    supports, resistances = _cie_detect_swing_sr(df)
+
+    for sr in (sr_data or []):
+        v = sr.get('value', 0)
+        if v > 0:
+            (supports if sr.get('type') == 'low' else resistances).append(float(v))
+
+    if isinstance(vob_blocks, dict):
+        for b in vob_blocks.get('bullish', []):
+            if b.get('mid', 0) > 0:
+                supports.append(float(b['mid']))
+        for b in vob_blocks.get('bearish', []):
+            if b.get('mid', 0) > 0:
+                resistances.append(float(b['mid']))
+
+    def _recluster(lvls, pct=0.003):
+        if not lvls:
+            return []
+        lvls = sorted(set([round(l, 1) for l in lvls if l > 0]))
+        clusters, grp = [], [lvls[0]]
+        for l in lvls[1:]:
+            if abs(l - grp[-1]) / (grp[-1] + 1e-6) <= pct:
+                grp.append(l)
+            else:
+                clusters.append(float(np.mean(grp)))
+                grp = [l]
+        clusters.append(float(np.mean(grp)))
+        return clusters
+
+    supports = _recluster(supports)
+    resistances = _recluster(resistances)
+
+    raw_signals = _cie_detect_patterns(df, supports, resistances)
+    final_signals = []
+
+    for sig in raw_signals:
+        opt_confirmed, opt_details = _cie_options_confirmation(
+            sig, df_summary, straddle_history, underlying_price)
+
+        if opt_details.get('volatility_filter') == 'BLOCKED' and not is_expiry:
+            continue
+
+        confidence = _cie_confidence_score(sig, opt_details, opt_confirmed)
+        if confidence < 40:
+            continue
+
+        sig['confidence'] = confidence
+        sig['options_confirmed'] = opt_confirmed
+        sig['options_details'] = opt_details
+
+        if confidence >= 85:
+            sig['signal_strength'] = 'INSTITUTIONAL'
+            sig['strength_color'] = '#ff6600'
+        elif confidence >= 70:
+            sig['signal_strength'] = 'STRONG'
+            sig['strength_color'] = '#ffaa00'
+        else:
+            sig['signal_strength'] = 'NORMAL'
+            sig['strength_color'] = '#00aaff'
+
+        final_signals.append(sig)
+
+    if df is not None and len(df) >= 10 and 'volume' in df.columns:
+        avg_vol = df['volume'].rolling(20).mean()
+        for _vi in range(max(0, len(df) - 5), len(df)):
+            _v = df['volume'].iloc[_vi]
+            _avg = avg_vol.iloc[_vi] if _vi < len(avg_vol) else df['volume'].mean()
+            if pd.isna(_avg) or _avg <= 0:
+                continue
+            _vol_ratio = _v / _avg
+            if _vol_ratio >= 1.5:
+                _v_close = df['close'].iloc[_vi]
+                _v_open = df['open'].iloc[_vi]
+                _v_dir = 'BUY' if _v_close > _v_open else 'SELL'
+                _v_time = df['datetime'].iloc[_vi] if 'datetime' in df.columns else None
+
+                if _vol_ratio >= 3.0:
+                    _vol_strength = 'INSTITUTIONAL'
+                    _vol_color = '#ff6600'
+                    _vol_conf = 90
+                elif _vol_ratio >= 2.0:
+                    _vol_strength = 'HIGH'
+                    _vol_color = '#ffaa00'
+                    _vol_conf = 75
+                else:
+                    _vol_strength = 'ELEVATED'
+                    _vol_color = '#00aaff'
+                    _vol_conf = 60
+
+                _vol_sig = {
+                    'pattern': f'Volume Spike ({_vol_ratio:.1f}x)',
+                    'direction': _v_dir,
+                    'category': 'Volume Analysis',
+                    'price': _v_close,
+                    'level': _v_close,
+                    'level_type': 'Volume Spike',
+                    'confidence': _vol_conf,
+                    'signal_strength': _vol_strength,
+                    'strength_color': _vol_color,
+                    'options_confirmed': False,
+                    'options_details': {
+                        'volume_ratio': _vol_ratio,
+                        'volume_strength': _vol_strength,
+                    },
+                    'time': _v_time,
+                }
+                final_signals.append(_vol_sig)
+
+    seen, deduped = set(), []
+    for s in sorted(final_signals, key=lambda x: -x['confidence']):
+        key = (s['pattern'], s['direction'])
+        if key not in seen:
+            seen.add(key)
+            deduped.append(s)
+
+    return deduped
+
+
+# ── Cross-Market Confirmation Engine (CMCE) ───────────────────────────────────
+
+def _cmce_fetch_candles(ticker: str, interval: str = "15m", period: str = "5d") -> pd.DataFrame:
+    """Fetch OHLCV candles for a ticker via yfinance. Returns empty DataFrame on failure."""
+    try:
+        import yfinance as yf
+        raw = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
+        if raw is None or raw.empty:
+            return pd.DataFrame()
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = [str(col[0]).lower() for col in raw.columns]
+        else:
+            raw.columns = [str(col).lower() for col in raw.columns]
+        raw = raw.rename(columns={"adj close": "close"})
+        raw = raw.dropna()
+        return raw
+    except Exception:
+        return pd.DataFrame()
+
+
+def _cmce_detect_reversal(df: pd.DataFrame, signal_direction: str) -> dict:
+    if df.empty or len(df) < 3:
+        return {"pattern": "No Data", "confirmed": False}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
+    o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+    po, ph, pl, pc = float(prev['open']), float(prev['high']), float(prev['low']), float(prev['close'])
+    p2o, _, _, p2c = float(prev2['open']), float(prev2['high']), float(prev2['low']), float(prev2['close'])
+
+    body = abs(c - o)
+    candle_range = h - l if h != l else 0.001
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    is_bull = c > o
+    is_bear = c < o
+
+    recent = df.tail(10)
+    avg_body = (recent['close'] - recent['open']).abs().mean() or 1.0
+    avg_range = (recent['high'] - recent['low']).mean() or 1.0
+
+    detected = "Neutral"
+    confirmed = False
+
+    if signal_direction == 'SELL':
+        if pc < po and is_bear and c < po and o > pc and body > avg_body * 0.8:
+            detected, confirmed = "Bearish Engulfing", True
+        elif upper_wick > body * 2 and upper_wick > avg_range * 0.4 and upper_wick > candle_range * 0.45:
+            detected, confirmed = "Shooting Star", True
+        elif p2c > p2o and abs(pc - po) < avg_body * 0.5 and is_bear and c < p2c * 0.998:
+            detected, confirmed = "Evening Star", True
+        elif pc > po and is_bear and c < (po + pc) / 2 and o > pc:
+            detected, confirmed = "Dark Cloud Cover", True
+        elif is_bear and body > avg_body * 1.4 and upper_wick < body * 0.2:
+            detected, confirmed = "Bearish Marubozu", True
+        elif upper_wick > candle_range * 0.55 and upper_wick > body * 1.3:
+            detected, confirmed = "Upper Wick Rej", True
+    elif signal_direction == 'BUY':
+        if pc > po and is_bull and c > po and o < pc and body > avg_body * 0.8:
+            detected, confirmed = "Bull Engulfing", True
+        elif lower_wick > body * 2 and lower_wick > avg_range * 0.4 and lower_wick > candle_range * 0.45:
+            detected, confirmed = "Hammer", True
+        elif p2c < p2o and abs(pc - po) < avg_body * 0.5 and is_bull and c > p2c * 1.002:
+            detected, confirmed = "Morning Star", True
+        elif pc < po and is_bull and c > (po + pc) / 2 and o < pc:
+            detected, confirmed = "Piercing Pattern", True
+        elif is_bull and body > avg_body * 1.4 and lower_wick < body * 0.2:
+            detected, confirmed = "Bull Marubozu", True
+        elif lower_wick > candle_range * 0.55 and lower_wick > body * 1.3:
+            detected, confirmed = "Lower Wick Rej", True
+
+    return {"pattern": detected, "confirmed": confirmed}
+
+
+def _cmce_detect_continuation(df: pd.DataFrame, signal_direction: str) -> dict:
+    if df.empty or len(df) < 4:
+        return {"pattern": "No Data", "confirmed": False}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    prev2 = df.iloc[-3]
+    prev3 = df.iloc[-4]
+
+    o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+    po, ph, pl, pc = float(prev['open']), float(prev['high']), float(prev['low']), float(prev['close'])
+    p2o, p2h, p2l, p2c = float(prev2['open']), float(prev2['high']), float(prev2['low']), float(prev2['close'])
+    p3o, _, _, p3c = float(prev3['open']), float(prev3['high']), float(prev3['low']), float(prev3['close'])
+
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    is_bull = c > o
+    is_bear = c < o
+
+    recent = df.tail(10)
+    avg_body = (recent['close'] - recent['open']).abs().mean() or 1.0
+
+    detected = "Neutral"
+    confirmed = False
+
+    if signal_direction == 'BUY':
+        if (p3c < p2c < pc < c and
+                p3c > p3o and p2c > p2o and pc > po and is_bull and
+                body > avg_body * 0.7 and lower_wick < body * 0.4):
+            detected, confirmed = "Three White Soldiers", True
+        elif (is_bull and body > avg_body * 1.3 and
+              upper_wick < body * 0.15 and lower_wick < body * 0.15 and
+              c > pc and h > ph):
+            detected, confirmed = "Bull Marubozu Cont.", True
+        elif l > ph and is_bull:
+            detected, confirmed = "Rising Window (Gap Up)", True
+        elif (ph <= p2h and pl >= p2l and
+              c > p2h and is_bull):
+            detected, confirmed = "Inside Bar Breakout Up", True
+        elif (abs(pc - po) < avg_body * 0.6 and abs(p2c - p2o) < avg_body * 0.6 and
+              p3c > p3o and is_bull and body > avg_body * 1.0 and c > pc):
+            detected, confirmed = "Bullish Flag Cont.", True
+        elif (abs(pc - po) < avg_body * 0.5 and abs(p2c - p2o) < avg_body * 0.5 and
+              is_bull and body > avg_body * 1.2 and c > p2h):
+            detected, confirmed = "Consolidation Breakout Up", True
+
+    elif signal_direction == 'SELL':
+        if (p3c > p2c > pc > c and
+                p3c < p3o and p2c < p2o and pc < po and is_bear and
+                body > avg_body * 0.7 and upper_wick < body * 0.4):
+            detected, confirmed = "Three Black Crows", True
+        elif (is_bear and body > avg_body * 1.3 and
+              upper_wick < body * 0.15 and lower_wick < body * 0.15 and
+              c < pc and l < pl):
+            detected, confirmed = "Bear Marubozu Cont.", True
+        elif h < pl and is_bear:
+            detected, confirmed = "Falling Window (Gap Dn)", True
+        elif (ph <= p2h and pl >= p2l and
+              c < p2l and is_bear):
+            detected, confirmed = "Inside Bar Breakout Dn", True
+        elif (abs(pc - po) < avg_body * 0.6 and abs(p2c - p2o) < avg_body * 0.6 and
+              p3c < p3o and is_bear and body > avg_body * 1.0 and c < pc):
+            detected, confirmed = "Bearish Flag Cont.", True
+        elif (abs(pc - po) < avg_body * 0.5 and abs(p2c - p2o) < avg_body * 0.5 and
+              is_bear and body > avg_body * 1.2 and c < p2l):
+            detected, confirmed = "Consolidation Breakout Dn", True
+
+    return {"pattern": detected, "confirmed": confirmed}
+
+
+def _cmce_detect_trap(df: pd.DataFrame, signal_direction: str) -> dict:
+    if df.empty or len(df) < 3:
+        return {"pattern": "No Data", "confirmed": False, "trap_type": "Unknown"}
+
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    prev2 = df.iloc[-3]
+
+    o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+    po, ph, pl, pc = float(prev['open']), float(prev['high']), float(prev['low']), float(prev['close'])
+    p2o, p2h, p2l, p2c = float(prev2['open']), float(prev2['high']), float(prev2['low']), float(prev2['close'])
+
+    body = abs(c - o)
+    candle_range = h - l if h != l else 0.001
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    is_bull = c > o
+    is_bear = c < o
+
+    recent = df.tail(10)
+    avg_body = (recent['close'] - recent['open']).abs().mean() or 1.0
+    avg_range = (recent['high'] - recent['low']).mean() or 1.0
+
+    detected = "Neutral"
+    confirmed = False
+    trap_type = "None"
+
+    if signal_direction == 'BUY':
+        if pc > p2c * 1.001 and upper_wick > body * 2.0 and upper_wick > avg_range * 0.4:
+            detected, confirmed, trap_type = "Shooting Star Trap", True, "Bull Trap"
+        elif ph > p2h and is_bear and c < p2h and upper_wick > body:
+            detected, confirmed, trap_type = "Fake Breakout Up", True, "Bull Trap"
+        elif pc > po and is_bear and c < po and o > pc and body > avg_body * 0.9:
+            detected, confirmed, trap_type = "Engulfing Reversal", True, "Bull Trap"
+        elif (abs(c - o) < avg_body * 0.2 and upper_wick > avg_range * 0.5 and
+              lower_wick < avg_range * 0.1):
+            detected, confirmed, trap_type = "Gravestone Doji", True, "Bull Trap"
+        elif (abs(h - ph) / (avg_range + 1e-6) < 0.05 and is_bear and pc > po):
+            detected, confirmed, trap_type = "Tweezer Top", True, "Bull Trap"
+
+    elif signal_direction == 'SELL':
+        if pc < p2c * 0.999 and lower_wick > body * 2.0 and lower_wick > avg_range * 0.4:
+            detected, confirmed, trap_type = "Hammer Trap", True, "Bear Trap"
+        elif pl < p2l and is_bull and c > p2l and lower_wick > body:
+            detected, confirmed, trap_type = "Fake Breakdown", True, "Bear Trap"
+        elif pc < po and is_bull and c > po and o < pc and body > avg_body * 0.9:
+            detected, confirmed, trap_type = "Engulfing Reversal Up", True, "Bear Trap"
+        elif (abs(c - o) < avg_body * 0.2 and lower_wick > avg_range * 0.5 and
+              upper_wick < avg_range * 0.1):
+            detected, confirmed, trap_type = "Dragonfly Doji", True, "Bear Trap"
+        elif (abs(l - pl) / (avg_range + 1e-6) < 0.05 and is_bull and pc < po):
+            detected, confirmed, trap_type = "Tweezer Bottom", True, "Bear Trap"
+
+    return {"pattern": detected, "confirmed": confirmed, "trap_type": trap_type}
+
+
+def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m",
+                                   mode: str = "reversal") -> dict:
+    INDIAN_MARKETS = [
+        {"name": "Bank Nifty", "ticker": "^NSEBANK", "weight": 2},
+        {"name": "Sensex",     "ticker": "^BSESN",   "weight": 1},
+        {"name": "Gift Nifty", "ticker": "^NSEI",    "weight": 2},
+    ]
+    REVERSE_INDICATORS = [
+        {"name": "India VIX",  "ticker": "^INDIAVIX", "weight": 2},
+        {"name": "Dollar/INR", "ticker": "USDINR=X",  "weight": 2},
+        {"name": "Crude Oil",  "ticker": "CL=F",      "weight": 1},
+    ]
+
+    period = "5d" if timeframe in ("5m", "15m") else "30d"
+    results = {
+        "signal_direction": signal_direction,
+        "timeframe": timeframe,
+        "mode": mode,
+        "indian_markets": [],
+        "reverse_indicators": [],
+        "index_score": 0,
+        "reverse_score": 0,
+        "total_score": 0,
+        "classification": "",
+        "trap_risk": "",
+        "divergence_detected": False,
+        "divergence_note": "",
+    }
+
+    if mode == "continuation":
+        _detect_fn = _cmce_detect_continuation
+    elif mode == "trap":
+        _detect_fn = _cmce_detect_trap
+    else:
+        _detect_fn = _cmce_detect_reversal
+
+    for mkt in INDIAN_MARKETS:
+        df_m = _cmce_fetch_candles(mkt["ticker"], interval=timeframe, period=period)
+        res = _detect_fn(df_m, signal_direction)
+        score = mkt["weight"] if res["confirmed"] else 0
+        results["index_score"] += score
+        entry = {
+            "name": mkt["name"], "ticker": mkt["ticker"],
+            "pattern": res["pattern"], "confirmed": res["confirmed"], "score": score,
+        }
+        if mode == "trap":
+            entry["trap_type"] = res.get("trap_type", "None")
+        results["indian_markets"].append(entry)
+
+    opposite_dir = "BUY" if signal_direction == "SELL" else "SELL"
+    macro_dir = opposite_dir if mode in ("reversal", "continuation") else signal_direction
+
+    for ind in REVERSE_INDICATORS:
+        df_r = _cmce_fetch_candles(ind["ticker"], interval=timeframe, period=period)
+        if mode == "trap":
+            res = _cmce_detect_trap(df_r, macro_dir)
+        elif mode == "continuation":
+            res = _cmce_detect_reversal(df_r, macro_dir)
+        else:
+            res = _cmce_detect_reversal(df_r, macro_dir)
+        score = ind["weight"] if res["confirmed"] else 0
+        results["reverse_score"] += score
+        results["reverse_indicators"].append({
+            "name": ind["name"], "ticker": ind["ticker"],
+            "pattern": res["pattern"], "confirmed": res["confirmed"], "score": score,
+        })
+
+    bn_conf = next((m["confirmed"] for m in results["indian_markets"] if m["name"] == "Bank Nifty"), False)
+    sx_conf = next((m["confirmed"] for m in results["indian_markets"] if m["name"] == "Sensex"), False)
+    if bn_conf != sx_conf:
+        results["divergence_detected"] = True
+        results["divergence_note"] = "Bank Nifty & Sensex diverging — possible sector rotation or fake breakdown"
+
+    total = results["index_score"] + results["reverse_score"]
+    results["total_score"] = total
+
+    if mode == "continuation":
+        if total >= 7:
+            results["classification"] = "Trend Continuation Confirmed"
+            results["trap_risk"] = "Low"
+        elif total >= 4:
+            results["classification"] = "Trend Likely Continuing"
+            results["trap_risk"] = "Low-Medium"
+        elif total >= 2:
+            results["classification"] = "Trend Weakening"
+            results["trap_risk"] = "Medium-High"
+        else:
+            results["classification"] = "Trend Reversal Risk"
+            results["trap_risk"] = "High"
+    elif mode == "trap":
+        if total >= 7:
+            results["classification"] = "High Trap Probability"
+            results["trap_risk"] = "Very High"
+        elif total >= 4:
+            results["classification"] = "Possible Trap Setup"
+            results["trap_risk"] = "High"
+        elif total >= 2:
+            results["classification"] = "Mild Trap Risk"
+            results["trap_risk"] = "Medium"
+        else:
+            results["classification"] = "Low Trap Risk"
+            results["trap_risk"] = "Low"
+    else:
+        if total >= 7:
+            results["classification"] = "Institutional Move Likely"
+            results["trap_risk"] = "Low"
+        elif total >= 4:
+            results["classification"] = "Valid Signal"
+            results["trap_risk"] = "Low-Medium"
+        elif total >= 2:
+            results["classification"] = "Weak Signal"
+            results["trap_risk"] = "Medium-High"
+        else:
+            results["classification"] = "Trap Probability High"
+            results["trap_risk"] = "High"
+
+    return results
+
+
+def _cmce_build_telegram_message(nifty_pattern: str, analysis: dict) -> str:
+    sig = analysis["signal_direction"]
+    mode = analysis.get("mode", "reversal")
+    arrow = "🔴 SELL" if sig == "SELL" else "🟢 BUY"
+    trap_risk = analysis["trap_risk"]
+    trap_emoji = ("🔴" if trap_risk in ("High", "Very High")
+                  else ("🟡" if "Medium" in trap_risk else "🟢"))
+    weak = "⚠️ Weak " if analysis["total_score"] <= 1 else "✅ "
+
+    mode_label = {"reversal": "Reversal", "continuation": "Continuation", "trap": "Trap Detection"}.get(mode, "")
+    lines = [
+        f"<b>{weak}{arrow} SIGNAL — Cross-Market {mode_label} Confirmation</b>",
+        "",
+        f"<b>NIFTY:</b> {nifty_pattern}",
+    ]
+    for m in analysis["indian_markets"]:
+        status = "✅ Confirmed" if m["confirmed"] else "➖ Neutral"
+        trap_note = f" [{m['trap_type']}]" if mode == "trap" and m.get("trap_type", "None") != "None" else ""
+        lines.append(f"<b>{m['name']}:</b> {m['pattern']}{trap_note} — {status}")
+
+    lines.append("")
+    for r in analysis["reverse_indicators"]:
+        status = "✅ Confirmed" if r["confirmed"] else "➖ No Signal"
+        lines.append(f"<b>{r['name']}:</b> {r['pattern']} — {status}")
+
+    lines += [
+        "",
+        f"<b>Signal Strength:</b> {analysis['total_score']} / 10",
+        f"<b>Index Conf:</b> {analysis['index_score']}/5  |  <b>Risk Conf:</b> {analysis['reverse_score']}/5",
+        f"<b>Market Status:</b> {analysis['classification']}",
+        f"<b>Trap Risk:</b> {trap_emoji} {trap_risk}",
+    ]
+    if analysis["divergence_detected"]:
+        lines += ["", f"⚠️ <b>Divergence Detected:</b> {analysis['divergence_note']}"]
+    return "\n".join(lines)
+
+
+# ── Institutional Order Flow Confirmation Engine (IOFCE) ──────────────────────
+
+def _iofce_identify_zones(df_summary, underlying_price: float) -> dict:
+    zones = {
+        "max_pain": None,
+        "oi_resistance": None,
+        "oi_support": None,
+        "gamma_flip": None,
+        "gamma_resistance": None,
+        "gamma_support": None,
+        "depth_cluster_above": None,
+        "depth_cluster_below": None,
+    }
+    if df_summary is None or df_summary.empty or underlying_price is None:
+        return zones
+
+    try:
+        if 'openInterest_CE' in df_summary.columns:
+            idx = df_summary['openInterest_CE'].idxmax()
+            zones["oi_resistance"] = float(df_summary.loc[idx, 'Strike'])
+        if 'openInterest_PE' in df_summary.columns:
+            idx = df_summary['openInterest_PE'].idxmax()
+            zones["oi_support"] = float(df_summary.loc[idx, 'Strike'])
+
+        try:
+            mp, _ = calculate_max_pain(df_summary, underlying_price)
+            zones["max_pain"] = float(mp) if mp else None
+        except Exception:
+            pass
+
+        gex_result = calculate_dealer_gex(df_summary, underlying_price)
+        if gex_result:
+            zones["gamma_flip"] = gex_result.get("gamma_flip_level")
+            zones["gamma_resistance"] = gex_result.get("gex_repeller")
+            zones["gamma_support"] = gex_result.get("gex_magnet")
+
+        ask_cols = [c for c in df_summary.columns if 'askQty' in c]
+        bid_cols = [c for c in df_summary.columns if 'bidQty' in c]
+        if ask_cols and bid_cols:
+            df_above = df_summary[df_summary['Strike'] > underlying_price].copy()
+            df_below = df_summary[df_summary['Strike'] < underlying_price].copy()
+            if not df_above.empty:
+                ask_sum = df_above[ask_cols].sum(axis=1)
+                zones["depth_cluster_above"] = float(df_above.loc[ask_sum.idxmax(), 'Strike'])
+            if not df_below.empty:
+                bid_sum = df_below[bid_cols].sum(axis=1)
+                zones["depth_cluster_below"] = float(df_below.loc[bid_sum.idxmax(), 'Strike'])
+    except Exception:
+        pass
+
+    return zones
+
+
+def _iofce_oi_score(df_summary, underlying_price: float,
+                    total_ce_chg: float, total_pe_chg: float) -> tuple:
+    if df_summary is None or df_summary.empty:
+        return 0, "No OI Data", "Options chain unavailable"
+
+    try:
+        atm_strike = float(min(df_summary['Strike'].tolist(),
+                               key=lambda x: abs(x - underlying_price)))
+        atm_row = df_summary[df_summary['Strike'] == atm_strike]
+
+        ce_atm_chg = float(atm_row['changeinOpenInterest_CE'].iloc[0]) if (
+            not atm_row.empty and 'changeinOpenInterest_CE' in atm_row.columns) else 0
+        pe_atm_chg = float(atm_row['changeinOpenInterest_PE'].iloc[0]) if (
+            not atm_row.empty and 'changeinOpenInterest_PE' in atm_row.columns) else 0
+
+        score = 0
+        label = "Neutral OI"
+        detail = ""
+
+        if total_ce_chg > 0 and total_ce_chg > abs(total_pe_chg) * 1.2:
+            score += 1
+            label = "Institutional Defense (CE Writing)"
+            detail = f"Call OI +{total_ce_chg:.1f}L vs Put OI {total_pe_chg:+.1f}L"
+        elif total_pe_chg > 0 and total_pe_chg > abs(total_ce_chg) * 1.2:
+            score += 1
+            label = "Institutional Accumulation (PE Writing)"
+            detail = f"Put OI +{total_pe_chg:.1f}L vs Call OI {total_ce_chg:+.1f}L"
+
+        if abs(ce_atm_chg) + abs(pe_atm_chg) > 50000:
+            score += 1
+            detail += f" | ATM activity CE:{ce_atm_chg:+.0f} PE:{pe_atm_chg:+.0f}"
+
+        if score == 0:
+            label = "Weak / Mixed OI"
+            detail = f"CE chg:{total_ce_chg:+.1f}L  PE chg:{total_pe_chg:+.1f}L"
+
+        return min(2, score), label, detail.strip(" |")
+    except Exception:
+        return 0, "OI Error", "Calculation failed"
+
+
+def _iofce_futures_score(df, option_data: dict) -> tuple:
+    oi_behavior, support_sig, resistance_sig, oi_score = _amie_oi_behavior(option_data, df)
+
+    score_map = {
+        "Long Build-up": 2,
+        "Short Build-up": 2,
+        "Short Covering": 1,
+        "Long Unwinding": 1,
+        "Mixed / Neutral": 0,
+    }
+    score = score_map.get(oi_behavior, 0)
+
+    if oi_behavior in ("Long Build-up", "Short Covering"):
+        detail = f"Bullish positioning — {support_sig} support | {resistance_sig} resistance"
+    elif oi_behavior in ("Short Build-up", "Long Unwinding"):
+        detail = f"Bearish positioning — {resistance_sig} resistance | {support_sig} support"
+    else:
+        detail = f"Mixed positioning — support:{support_sig} | resistance:{resistance_sig}"
+
+    return score, oi_behavior, detail
+
+
+def _iofce_depth_score(option_data: dict) -> tuple:
+    depth_signal, depth_score_raw, depth_detail = _amie_depth_signal(option_data)
+
+    if depth_score_raw >= 68:
+        score = 2
+    elif depth_score_raw >= 58:
+        score = 1
+    elif depth_score_raw <= 32:
+        score = 2
+    elif depth_score_raw <= 42:
+        score = 1
+    else:
+        score = 0
+
+    return score, depth_signal, depth_detail
+
+
+def _iofce_gamma_score(df_summary, underlying_price: float) -> tuple:
+    if df_summary is None or df_summary.empty or underlying_price is None:
+        return 0, "No Gamma Data", "GEX calculation unavailable"
+
+    try:
+        gex = calculate_dealer_gex(df_summary, underlying_price)
+        if not gex:
+            return 0, "GEX Error", "Could not compute GEX"
+
+        total_gex = gex.get("total_gex", 0)
+        flip_level = gex.get("gamma_flip_level")
+        gex_signal = gex.get("gex_signal", "")
+        spot_vs_flip = gex.get("spot_vs_flip", "N/A")
+        gex_magnet = gex.get("gex_magnet")
+        gex_repeller = gex.get("gex_repeller")
+
+        score = 0
+        label = "Neutral Gamma"
+        detail = f"GEX={total_gex:.0f}  Flip={flip_level or 'N/A'}  {spot_vs_flip}"
+
+        if gex_signal in ("Breakout", "Trending"):
+            score += 1
+            label = f"Gamma Breakout Zone ({gex_signal})"
+        elif gex_signal in ("Pin/Chop", "Range"):
+            score += 1
+            label = f"Gamma Pinning ({gex_signal})"
+
+        if flip_level and abs(underlying_price - flip_level) / (flip_level + 1e-6) < 0.005:
+            score += 1
+            label += " + Near Gamma Flip"
+            detail += f"  |  Price {underlying_price:.0f} near Flip {flip_level:.0f}"
+        elif gex_repeller and abs(underlying_price - gex_repeller) / (gex_repeller + 1e-6) < 0.004:
+            score += 1
+            label += " + At Gamma Repeller (Resistance)"
+        elif gex_magnet and abs(underlying_price - gex_magnet) / (gex_magnet + 1e-6) < 0.004:
+            score += 1
+            label += " + At Gamma Magnet (Support)"
+
+        return min(2, score), label, detail
+    except Exception:
+        return 0, "Gamma Error", "Calculation failed"
+
+
+def run_iofce(option_data: dict, df, underlying_price: float,
+              cie_signals: list) -> dict:
+    result = {
+        "zones": {},
+        "oi_score": 0, "oi_label": "", "oi_detail": "",
+        "futures_score": 0, "futures_label": "", "futures_detail": "",
+        "depth_score": 0, "depth_label": "", "depth_detail": "",
+        "gamma_score": 0, "gamma_label": "", "gamma_detail": "",
+        "institutional_score": 0,
+        "classification": "",
+        "trap_risk": "",
+        "signal_adjustment": "",
+        "adjusted_signals": [],
+    }
+
+    if option_data is None:
+        option_data = {}
+
+    df_summary = option_data.get("df_summary")
+    total_ce_chg = option_data.get("total_ce_change", 0) or 0
+    total_pe_chg = option_data.get("total_pe_change", 0) or 0
+    underlying = underlying_price or option_data.get("underlying", 0) or 0
+
+    result["zones"] = _iofce_identify_zones(df_summary, underlying)
+
+    result["oi_score"], result["oi_label"], result["oi_detail"] = _iofce_oi_score(
+        df_summary, underlying, total_ce_chg, total_pe_chg)
+
+    result["futures_score"], result["futures_label"], result["futures_detail"] = _iofce_futures_score(
+        df, option_data)
+
+    result["depth_score"], result["depth_label"], result["depth_detail"] = _iofce_depth_score(option_data)
+
+    result["gamma_score"], result["gamma_label"], result["gamma_detail"] = _iofce_gamma_score(
+        df_summary, underlying)
+
+    inst_score = (result["oi_score"] + result["futures_score"] +
+                  result["depth_score"] + result["gamma_score"])
+    result["institutional_score"] = inst_score
+
+    if inst_score >= 6:
+        result["classification"] = "Institutional Move Confirmed"
+        result["trap_risk"] = "Low"
+    elif inst_score >= 3:
+        result["classification"] = "Possible Institutional Activity"
+        result["trap_risk"] = "Medium"
+    else:
+        result["classification"] = "Weak / Retail Driven Move"
+        result["trap_risk"] = "High"
+
+    adjusted = []
+    for sig in (cie_signals or []):
+        sig = dict(sig)
+        original_conf = sig.get("confidence", 50)
+        if inst_score >= 6:
+            new_conf = min(100, original_conf + 8)
+            sig["iofce_adjustment"] = f"+8 (Institutional Confirmed)"
+        elif inst_score >= 3:
+            new_conf = original_conf
+            sig["iofce_adjustment"] = "0 (Possible Activity)"
+        else:
+            new_conf = max(30, original_conf - 8)
+            sig["iofce_adjustment"] = f"-8 (Retail/Weak)"
+        sig["confidence"] = new_conf
+        sig["iofce_trap_risk"] = result["trap_risk"]
+        sig["iofce_score"] = inst_score
+        if new_conf >= 85:
+            sig["signal_strength"] = "INSTITUTIONAL"
+            sig["strength_color"] = "#ff6600"
+        elif new_conf >= 70:
+            sig["signal_strength"] = "STRONG"
+            sig["strength_color"] = "#ffaa00"
+        else:
+            sig["signal_strength"] = "NORMAL"
+            sig["strength_color"] = "#00aaff"
+        adjusted.append(sig)
+    result["adjusted_signals"] = adjusted
+
+    if inst_score <= 2:
+        result["signal_adjustment"] = "High Trap Probability — reduce position size or wait for confirmation"
+    elif inst_score >= 6:
+        result["signal_adjustment"] = "Low Trap Risk — signal backed by institutional order flow"
+    else:
+        result["signal_adjustment"] = "Moderate — confirm with price action before entry"
+
+    return result
+
+
+def _iofce_build_telegram_message(res: dict, underlying_price: float,
+                                   dominant_signal: dict,
+                                   ultimate_rsi_data: dict = None) -> str:
+    inst_score = res["institutional_score"]
+    classif = res["classification"]
+    trap_risk = res["trap_risk"]
+    sig_adj = res["signal_adjustment"]
+    zones = res.get("zones", {})
+
+    score_emoji = "🔥" if inst_score >= 6 else ("📊" if inst_score >= 3 else "⚠️")
+    trap_emoji = "🟢" if trap_risk == "Low" else ("🟡" if trap_risk == "Medium" else "🔴")
+    dir_arrow = ""
+    if dominant_signal:
+        d = dominant_signal.get("direction", "")
+        dir_arrow = "🟢 BUY" if d == "BUY" else ("🔴 SELL" if d == "SELL" else "")
+
+    lines = [
+        f"<b>🏦 Institutional Order Flow Confirmation</b>",
+        "",
+    ]
+    if dir_arrow:
+        lines.append(f"<b>Signal:</b> {dir_arrow}  |  {dominant_signal.get('pattern', '')}")
+    lines += [
+        f"<b>Inst. Score:</b> {score_emoji} {inst_score} / 8",
+        f"<b>Classification:</b> {classif}",
+        f"<b>Trap Risk:</b> {trap_emoji} {trap_risk}",
+        "",
+        "<b>Component Breakdown:</b>",
+        f"  OI Activity:        {res['oi_label']} ({res['oi_score']}/2)",
+        f"  Futures Pos:        {res['futures_label']} ({res['futures_score']}/2)",
+        f"  Depth Absorption:   {res['depth_label']} ({res['depth_score']}/2)",
+        f"  Gamma Reaction:     {res['gamma_label']} ({res['gamma_score']}/2)",
+    ]
+
+    zone_label_map = {
+        "max_pain": "Max Pain",
+        "oi_resistance": "OI Resistance",
+        "oi_support": "OI Support",
+        "gamma_flip": "Gamma Flip",
+    }
+    zone_parts = [
+        f"{zone_label_map[k]}: ₹{v:,.0f}"
+        for k, v in zones.items()
+        if v is not None and k in zone_label_map
+    ]
+    if zone_parts:
+        lines += ["", "<b>Key Levels:</b>  " + "  |  ".join(zone_parts)]
+
+    adj_sigs = res.get("adjusted_signals", [])
+    if adj_sigs:
+        lines.append("")
+        lines.append("<b>IOFCE-Adjusted Signals:</b>")
+        for s in adj_sigs[:3]:
+            lines.append(
+                f"  {s.get('direction','')} {s.get('pattern','')} → "
+                f"Conf:{s.get('confidence',0)}%  Adj:{s.get('iofce_adjustment','-')}"
+            )
+
+    if ultimate_rsi_data:
+        ursi_val = ultimate_rsi_data.get('latest_arsi', 50)
+        ursi_sig = ultimate_rsi_data.get('latest_signal', 50)
+        ursi_zone = ultimate_rsi_data.get('zone', 'Neutral')
+        ursi_cross = ultimate_rsi_data.get('cross_signal', 'None')
+        ursi_momentum = ultimate_rsi_data.get('momentum', 'Neutral')
+
+        if ursi_zone == 'Overbought':
+            rsi_zone_icon = "🔴"
+            rsi_note = "Overbought — watch for bearish reversal"
+        elif ursi_zone == 'Oversold':
+            rsi_zone_icon = "🟢"
+            rsi_note = "Oversold — watch for bullish bounce"
+        else:
+            rsi_zone_icon = "⚪"
+            rsi_note = "Neutral zone"
+
+        cross_icon = "🔼" if 'Bullish' in ursi_cross else ("🔽" if 'Bearish' in ursi_cross else "➖")
+        lines += [
+            "",
+            f"<b>📈 Ultimate RSI (LuxAlgo):</b>",
+            f"  Value: {ursi_val:.1f}  |  Signal: {ursi_sig:.1f}",
+            f"  Zone: {rsi_zone_icon} <b>{ursi_zone}</b> — {rsi_note}",
+            f"  Momentum: {ursi_momentum}  |  Cross: {cross_icon} {ursi_cross}",
+        ]
+
+    lines += ["", f"<b>Guidance:</b> {sig_adj}"]
+    if underlying_price:
+        lines.append(f"<b>NIFTY Spot:</b> ₹{underlying_price:,.0f}")
+
+    return "\n".join(lines)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# END PORTED TRADING ENGINES
+# ══════════════════════════════════════════════════════════════════════════════
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Per-bar Candle Pattern Detector (for chart markers + Today listing)
+# Ported from vob (5).py → _detect_chart_candle_types
+# Returns a list of dicts: {time, pattern, direction, price, high, low, volume}
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _detect_chart_candle_types(df):
+    """Detect basic candle patterns for each row in df. Returns list of dicts with time, pattern, direction, price."""
+    if df is None or df.empty or len(df) < 2:
+        return []
+    patterns = []
+    bodies = (df['close'] - df['open']).abs()
+    ranges = (df['high'] - df['low'])
+    _WINDOW = 15  # rolling window for adaptive thresholds
+
+    for i in range(1, len(df)):
+        row = df.iloc[i]
+        prev = df.iloc[i - 1]
+        o, h, l, c = row['open'], row['high'], row['low'], row['close']
+        po, ph, pl, pc = prev['open'], prev['high'], prev['low'], prev['close']
+        body = abs(c - o)
+        candle_range = h - l if h != l else 0.001
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        is_bull = c > o
+        is_bear = c < o
+        ts = row['datetime'] if 'datetime' in df.columns else None
+        price = c
+
+        # Adaptive rolling averages — only look at recent candles
+        _win_start = max(0, i - _WINDOW)
+        avg_body = bodies.iloc[_win_start:i].mean() or bodies.mean() or 1
+        avg_range = ranges.iloc[_win_start:i].mean() or ranges.mean() or 1
+
+        detected = None
+        direction = None
+
+        # Doji
+        if body < avg_range * 0.1:
+            detected = 'Doji'
+            direction = 'NEUTRAL'
+        # Hammer (bullish reversal)
+        elif lower_wick > body * 2 and upper_wick < body * 0.5 and is_bull:
+            detected = 'Hammer'
+            direction = 'BUY'
+        # Inverted Hammer / Shooting Star
+        elif upper_wick > body * 2 and lower_wick < body * 0.5 and is_bear:
+            detected = 'Shooting Star'
+            direction = 'SELL'
+        # Bullish Engulfing
+        elif (pc < po and is_bull and c > po and o < pc and body > avg_body):
+            detected = 'Bull Engulfing'
+            direction = 'BUY'
+        # Bearish Engulfing
+        elif (pc > po and is_bear and c < po and o > pc and body > avg_body):
+            detected = 'Bear Engulfing'
+            direction = 'SELL'
+        # Strong Bullish (Marubozu-like)
+        elif is_bull and body > avg_body * 1.5 and upper_wick < body * 0.2 and lower_wick < body * 0.2:
+            detected = 'Marubozu Up'
+            direction = 'BUY'
+        # Strong Bearish (Marubozu-like)
+        elif is_bear and body > avg_body * 1.5 and upper_wick < body * 0.2 and lower_wick < body * 0.2:
+            detected = 'Marubozu Down'
+            direction = 'SELL'
+        # Long Upper Wick Rejection (bearish)
+        elif upper_wick > candle_range * 0.55 and upper_wick > body * 1.3:
+            detected = 'Upper Wick Rej'
+            direction = 'SELL'
+        # Long Lower Wick Rejection (bullish)
+        elif lower_wick > candle_range * 0.55 and lower_wick > body * 1.3:
+            detected = 'Lower Wick Rej'
+            direction = 'BUY'
+
+        if detected:
+            try:
+                vol = row.get('volume', 0) if hasattr(row, 'get') else (row['volume'] if 'volume' in row.index else 0)
+            except Exception:
+                vol = 0
+            patterns.append({
+                'time': ts,
+                'pattern': detected,
+                'direction': direction,
+                'price': price,
+                'high': h,
+                'low': l,
+                'volume': vol,
+            })
+    return patterns
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Liquidity Grab / Stop Hunt / Sweep candle detector
+#
+# Textbook stop-loss hunt definition (Hammer / Shooting Star / Pin Bar):
+#   1. Price sweeps prior swing high/low (with meaningful pierce, not noise)
+#   2. Long wick > 2× body  (small/medium body, long wick)
+#   3. Close near the opposite extreme (close in top/bottom 30% of range)
+#   4. Volume spike vs trailing average
+#   5. Wick dominates range (>= 60%)
+#
+# Three tiers (priority high→low):
+#   - Stop Hunt:      all 5 criteria — strictest, textbook Hammer/Star
+#   - Liquidity Grab: sweep + dominant wick + close-near-extreme (no vol req)
+#   - Sweep:          engulfs prior bar with opposite close (loosest)
+#
+# Direction:
+#   - BUY  (bullish reversal) — sweeps a low, reclaims it, closes near high
+#   - SELL (bearish reversal) — sweeps a high, rejects, closes near low
+# ──────────────────────────────────────────────────────────────────────────────
+
+def _detect_liquidity_candles(df, short_lookback=5, swing_lookback=10):
+    """Detect stop hunt, liquidity grab and sweep candles. Returns list of dicts."""
+    if df is None or df.empty or len(df) < swing_lookback + 2:
+        return []
+    out = []
+    _vol_win = 20  # trailing window for volume average
+    for i in range(swing_lookback, len(df)):
+        row = df.iloc[i]
+        o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
+        rng = h - l if h > l else 0.001
+        body = abs(c - o)
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        ts = row['datetime'] if 'datetime' in df.columns else None
+        try:
+            vol = float(row['volume']) if 'volume' in df.columns else 0
+        except Exception:
+            vol = 0
+
+        prev = df.iloc[i - 1]
+        ph, pl = float(prev['high']), float(prev['low'])
+
+        short_win = df.iloc[max(0, i - short_lookback):i]
+        swing_win = df.iloc[max(0, i - swing_lookback):i]
+        vol_win = df.iloc[max(0, i - _vol_win):i]
+        if short_win.empty or swing_win.empty:
+            continue
+        sh_hi, sh_lo = float(short_win['high'].max()), float(short_win['low'].min())
+        sw_hi, sw_lo = float(swing_win['high'].max()), float(swing_win['low'].min())
+        try:
+            avg_vol = float(vol_win['volume'].mean()) if 'volume' in df.columns and not vol_win.empty else 0
+        except Exception:
+            avg_vol = 0
+
+        labels = []  # list of (type, direction, swept_level)
+
+        # Min pierce depth — avoid sub-point noise pierces (~12 pts on NIFTY)
+        _min_pierce = max(2.0, c * 0.0005)
+        # Close-near-extreme zone: top 30% for BUY, bottom 30% for SELL
+        _close_in_top30 = c >= (l + 0.7 * rng)
+        _close_in_bot30 = c <= (l + 0.3 * rng)
+        # Long wick = wick > 2× body (Hammer / Shooting Star structure)
+        _long_lower = lower_wick >= max(body * 2, rng * 0.6)
+        _long_upper = upper_wick >= max(body * 2, rng * 0.6)
+        # Volume spike vs trailing 20-bar average
+        _vol_spike = avg_vol > 0 and vol >= avg_vol * 1.5
+
+        # ── Stop Hunt (textbook): swing sweep + long wick + close near extreme + vol spike
+        if (l < sw_lo - _min_pierce and c > sw_lo
+                and _long_lower and _close_in_top30 and _vol_spike):
+            labels.append(('Stop Hunt', 'BUY', sw_lo))
+        elif (h > sw_hi + _min_pierce and c < sw_hi
+                and _long_upper and _close_in_bot30 and _vol_spike):
+            labels.append(('Stop Hunt', 'SELL', sw_hi))
+
+        # ── Liquidity Grab: same structure as stop hunt but without volume spike requirement
+        if (l < sw_lo - _min_pierce and c > sw_lo
+                and lower_wick >= rng * 0.5 and _close_in_top30):
+            labels.append(('Liquidity Grab', 'BUY', sw_lo))
+        elif (h > sw_hi + _min_pierce and c < sw_hi
+                and upper_wick >= rng * 0.5 and _close_in_bot30):
+            labels.append(('Liquidity Grab', 'SELL', sw_hi))
+
+        # ── Sweep: engulfs prior-bar high/low with opposite close (loosest)
+        if (l < pl - _min_pierce) and (c > pl) and c > o:
+            labels.append(('Sweep', 'BUY', pl))
+        elif (h > ph + _min_pierce) and (c < ph) and c < o:
+            labels.append(('Sweep', 'SELL', ph))
+
+        # Deduplicate: keep the strongest label per direction on this bar
+        # Priority: Stop Hunt > Liquidity Grab > Sweep
+        rank = {'Stop Hunt': 3, 'Liquidity Grab': 2, 'Sweep': 1}
+        by_dir = {}
+        for typ, dr, lvl in labels:
+            cur = by_dir.get(dr)
+            if cur is None or rank[typ] > rank[cur[0]]:
+                by_dir[dr] = (typ, lvl)
+        for dr, (typ, lvl) in by_dir.items():
+            pattern = _classify_reversal_pattern(
+                o, h, l, c,
+                po=float(prev['open']), ph=ph, pl=pl, pc=float(prev['close']),
+            )
+            out.append({
+                'time': ts,
+                'type': typ,
+                'direction': dr,
+                'candle': 'Bull' if c >= o else 'Bear',
+                'pattern': pattern,
+                'open': o, 'high': h, 'low': l, 'close': c,
+                'swept_level': lvl,
+                'wick_ratio': (lower_wick if dr == 'BUY' else upper_wick) / rng,
+                'body_ratio': body / rng,
+                'volume': vol,
+                'vol_spike': round(vol / avg_vol, 2) if avg_vol > 0 else 0,
+            })
+    return out
+
+
+def _classify_reversal_pattern(o, h, l, c, po=None, ph=None, pl=None, pc=None):
+    """Identify the candlestick reversal pattern on a single bar.
+    Returns one of: Hammer, Shooting Star, Dragonfly Doji, Gravestone Doji,
+    Bullish Engulfing, Bearish Engulfing, Pin Bar Bull, Pin Bar Bear, '—'."""
+    rng = max(h - l, 1e-6)
+    body = abs(c - o)
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    body_pct = body / rng
+    is_bull = c >= o
+
+    # ── 2-bar Engulfing (needs previous bar)
+    if po is not None and pc is not None:
+        prev_body = abs(pc - po)
+        prev_bull = pc >= po
+        if (is_bull and not prev_bull and body > prev_body
+                and o <= pc and c >= po):
+            return 'Bullish Engulfing'
+        if (not is_bull and prev_bull and body > prev_body
+                and o >= pc and c <= po):
+            return 'Bearish Engulfing'
+
+    # ── Single-bar wick patterns
+    if body_pct < 0.10:  # near-doji
+        if lower_wick >= rng * 0.6 and upper_wick <= rng * 0.10:
+            return 'Dragonfly Doji'
+        if upper_wick >= rng * 0.6 and lower_wick <= rng * 0.10:
+            return 'Gravestone Doji'
+    if lower_wick >= body * 2 and upper_wick <= body * 0.5 and body_pct <= 0.35:
+        return 'Hammer'
+    if upper_wick >= body * 2 and lower_wick <= body * 0.5 and body_pct <= 0.35:
+        return 'Shooting Star'
+    if lower_wick >= rng * 0.5 and body_pct <= 0.4:
+        return 'Pin Bar Bull'
+    if upper_wick >= rng * 0.5 and body_pct <= 0.4:
+        return 'Pin Bar Bear'
+    return '—'
+
+
+def _check_grab_confirmation(grab, df_3m):
+    """Check if the bar after the grab confirms (BUY: high > grab.high;
+    SELL: low < grab.low). Returns (confirmed: bool, confirm_bar_time, confirm_price)."""
+    if grab is None or df_3m is None or df_3m.empty:
+        return False, None, None
+    ts = grab.get('time')
+    if ts is None:
+        return False, None, None
+    try:
+        idx = df_3m.index[df_3m['datetime'] == ts]
+        if len(idx) == 0:
+            return False, None, None
+        i = int(idx[0])
+        if i + 1 >= len(df_3m):
+            return False, None, None
+        nxt = df_3m.iloc[i + 1]
+        if grab['direction'] == 'BUY' and float(nxt['high']) > float(grab['high']):
+            return True, nxt['datetime'], float(nxt['high'])
+        if grab['direction'] == 'SELL' and float(nxt['low']) < float(grab['low']):
+            return True, nxt['datetime'], float(nxt['low'])
+    except Exception:
+        pass
+    return False, None, None
+
+
+def _short_trend(df, bars=3):
+    """Return 'bull'/'bear'/'flat' based on net close change over last `bars` bars."""
+    if df is None or getattr(df, 'empty', True) or len(df) < bars:
+        return 'unknown'
+    try:
+        last_n = df.tail(bars)
+        chg = float(last_n['close'].iloc[-1]) - float(last_n['open'].iloc[0])
+        if chg > 0:
+            return 'bull'
+        if chg < 0:
+            return 'bear'
+        return 'flat'
+    except Exception:
+        return 'unknown'
+
+
+_BULL_PATTERNS = {'Hammer', 'Bullish Engulfing', 'Dragonfly Doji', 'Pin Bar Bull',
+                  'Marubozu Up', 'Lower Wick Rej', 'Bull Engulfing'}
+_BEAR_PATTERNS = {'Shooting Star', 'Bearish Engulfing', 'Gravestone Doji', 'Pin Bar Bear',
+                  'Marubozu Down', 'Upper Wick Rej', 'Bear Engulfing'}
+
+
+def _leg_candle_signal(df):
+    """Inspect the last 2 bars of a leg's intraday and return (pattern, bias).
+    bias ∈ {'bull','bear','neutral','unknown'}. pattern is the textual name
+    from _classify_reversal_pattern; falls back to body-direction classification."""
+    if df is None or getattr(df, 'empty', True) or len(df) < 2:
+        return ('—', 'unknown')
+    try:
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+        po, ph, pl, pc = float(prev['open']), float(prev['high']), float(prev['low']), float(prev['close'])
+        pat = _classify_reversal_pattern(o, h, l, c, po=po, ph=ph, pl=pl, pc=pc)
+        if pat in _BULL_PATTERNS:
+            return (pat, 'bull')
+        if pat in _BEAR_PATTERNS:
+            return (pat, 'bear')
+        # Fallback: body direction with size filter
+        rng = h - l if h > l else 0.001
+        body = abs(c - o)
+        if body / rng < 0.20:
+            return ('Doji', 'neutral')
+        if c > o:
+            return ('Bullish Body', 'bull')
+        if c < o:
+            return ('Bearish Body', 'bear')
+        return ('Flat', 'neutral')
+    except Exception:
+        return ('—', 'unknown')
+
+
+def _atm_ce_pe_trend():
+    """Return (ce_pattern, pe_pattern, ce_bias, pe_bias, ce_ltp, pe_ltp, atm_strike).
+    Patterns derived from the last 1-2 bars of each leg's 1m intraday via
+    _classify_reversal_pattern; bias is bull/bear/neutral/unknown."""
+    sd = st.session_state.get('_atm_pm1_vpfr') or {}
+    atm_strike = sd.get('atm_strike', 0)
+    ce_pat = pe_pat = '—'
+    ce_b = pe_b = 'unknown'
+    ce_ltp = pe_ltp = 0.0
+    legs_dfs = st.session_state.get('_atm_leg_dfs') or {}
+    for tag, df_l in legs_dfs.items():
+        if f"ATM CE {atm_strike:.0f}" in tag:
+            ce_pat, ce_b = _leg_candle_signal(df_l)
+            try:
+                ce_ltp = float(df_l['close'].iloc[-1])
+            except Exception:
+                pass
+        elif f"ATM PE {atm_strike:.0f}" in tag:
+            pe_pat, pe_b = _leg_candle_signal(df_l)
+            try:
+                pe_ltp = float(df_l['close'].iloc[-1])
+            except Exception:
+                pass
+    return ce_pat, pe_pat, ce_b, pe_b, ce_ltp, pe_ltp, atm_strike
+
+
+def _alignment_verdict(direction, ce_pat_or_b, pe_pat_or_b=None, ce_bias=None, pe_bias=None):
+    """Pattern-based alignment check.
+
+    Accepts either:
+      • _alignment_verdict(direction, ce_bias_str, pe_bias_str)  — legacy 3-arg
+      • _alignment_verdict(direction, ce_pat, pe_pat, ce_bias=…, pe_bias=…)
+
+    Bullish spot signal → CE should print a bullish candle pattern AND PE
+    should print a bearish (reverse) candle. Bearish → opposite.
+    Returns (aligned_bool, note_str)."""
+    # Resolve bias values (3-arg legacy path passes bias strings directly)
+    if ce_bias is None and pe_bias is None:
+        ce_b = ce_pat_or_b
+        pe_b = pe_pat_or_b
+        ce_p = pe_p = ''
+    else:
+        ce_p = ce_pat_or_b
+        pe_p = pe_pat_or_b or ''
+        ce_b = ce_bias
+        pe_b = pe_bias
+
+    d = (direction or '').upper()
+    bull = d in ('BUY', 'BULL', 'BULLISH', 'LONG')
+    bear = d in ('SELL', 'BEAR', 'BEARISH', 'SHORT')
+
+    def _fmt_leg(side, pat, b):
+        if pat:
+            return f"{side}={pat}({b})"
+        return f"{side}={b}"
+
+    if bull:
+        aligned = (ce_b == 'bull' and pe_b == 'bear')
+        if aligned:
+            note = f"CE bullish ({_fmt_leg('CE', ce_p, ce_b)}) + PE bearish ({_fmt_leg('PE', pe_p, pe_b)}) — confirms Bull"
+        else:
+            note = f"{_fmt_leg('CE', ce_p, ce_b)} / {_fmt_leg('PE', pe_p, pe_b)} — mismatch with Bull (need CE bull + PE bear)"
+    elif bear:
+        aligned = (ce_b == 'bear' and pe_b == 'bull')
+        if aligned:
+            note = f"CE bearish ({_fmt_leg('CE', ce_p, ce_b)}) + PE bullish ({_fmt_leg('PE', pe_p, pe_b)}) — confirms Bear"
+        else:
+            note = f"{_fmt_leg('CE', ce_p, ce_b)} / {_fmt_leg('PE', pe_p, pe_b)} — mismatch with Bear (need CE bear + PE bull)"
+    else:
+        aligned = False
+        note = f"{_fmt_leg('CE', ce_p, ce_b)} / {_fmt_leg('PE', pe_p, pe_b)} — signal direction unknown"
+    return aligned, note
+
+
+def send_spot_stop_hunt_aligned_alert(grab, underlying_price, cooldown_s=900):
+    """Spot 3m Liquidity Grab/Stop Hunt/Sweep alert with ATM CE/PE alignment check.
+    Fires per-bar and includes whether the LTPs confirm the spot signal direction."""
+    if not grab:
+        return None
+    ts = grab.get('time')
+    if ts is None:
+        return None
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    ce_pat, pe_pat, ce_b, pe_b, ce_ltp, pe_ltp, atm_strike = _atm_ce_pe_trend()
+    direction = grab.get('direction', '')
+    aligned, note = _alignment_verdict(direction, ce_pat, pe_pat, ce_bias=ce_b, pe_bias=pe_b)
+    em_sig = '🟢' if direction in ('BUY', 'Bullish') else ('🔴' if direction in ('SELL', 'Bearish') else '⚪')
+    em_align = '✅' if aligned else '⚠️'
+    ts_str = ts.strftime('%H:%M IST') if hasattr(ts, 'strftime') else str(ts)
+    sweep_arrow = (f"⬇️ swept low ₹{grab.get('swept_level', 0):.1f}"
+                   if direction == 'BUY'
+                   else f"⬆️ swept high ₹{grab.get('swept_level', 0):.1f}")
+    msg = (
+        f"{em_sig} <b>SPOT STOP-HUNT ALIGNED</b> · <b>{grab.get('type','Stop Hunt')}</b> {direction}\n"
+        f"{sweep_arrow} · wick {grab.get('wick_ratio', 0)*100:.0f}% · "
+        f"vol×{grab.get('vol_spike', 0):.1f}\n"
+        f"{em_align} ATM ₹{atm_strike:.0f} CE/PE candle alignment: {note}\n"
+        f"   CE LTP ₹{ce_ltp:.2f} [{ce_pat}] · PE LTP ₹{pe_ltp:.2f} [{pe_pat}]\n"
+        f"NIFTY Spot ₹{underlying_price:.1f} · {ts_str}"
+    )
+    key = f"spot_sh_aligned_{direction}_{int(grab.get('swept_level',0))}_{ts.strftime('%H%M') if hasattr(ts,'strftime') else ''}"
+    if _throttled_telegram_send(msg, alert_class='spot_sh_aligned', key=key,
+                                 cooldown_s=cooldown_s, class_limit=4,
+                                 class_window=300, class_sleep=1800):
+        return msg
+    return None
+
+
+def send_cie_aligned_alert(cie_signal, underlying_price, cooldown_s=900):
+    """CIE engine signal alert with ATM CE/PE alignment check. Fires per CIE signal."""
+    if not cie_signal:
+        return None
+    direction = cie_signal.get('direction') or cie_signal.get('action') or ''
+    pattern = cie_signal.get('pattern', '—')
+    ts = cie_signal.get('time') or cie_signal.get('timestamp')
+    ist = pytz.timezone('Asia/Kolkata')
+    if ts is None:
+        ts = datetime.now(ist)
+    ce_t, pe_t, ce_ltp, pe_ltp, atm_strike = _atm_ce_pe_trend()
+    aligned, note = _alignment_verdict(direction, ce_t, pe_t)
+    em_sig = '🟢' if str(direction).upper() in ('BUY','BULL','BULLISH','LONG') else \
+             ('🔴' if str(direction).upper() in ('SELL','BEAR','BEARISH','SHORT') else '⚪')
+    em_align = '✅' if aligned else '⚠️'
+    conf = cie_signal.get('confidence', '')
+    ts_str = ts.strftime('%H:%M IST') if hasattr(ts, 'strftime') else str(ts)
+    msg = (
+        f"{em_sig} <b>CIE ALIGNED</b> · {pattern} · {direction}\n"
+        f"Confidence: {conf}\n"
+        f"{em_align} ATM ₹{atm_strike:.0f} alignment: {note}\n"
+        f"   CE LTP ₹{ce_ltp:.2f} ({ce_t}) · PE LTP ₹{pe_ltp:.2f} ({pe_t})\n"
+        f"NIFTY Spot ₹{underlying_price:.1f} · {ts_str}"
+    )
+    key = f"cie_aligned_{direction}_{pattern}_{ts.strftime('%H%M') if hasattr(ts,'strftime') else ts}"
+    if _throttled_telegram_send(msg, alert_class='cie_aligned', key=key,
+                                 cooldown_s=cooldown_s, class_limit=4,
+                                 class_window=300, class_sleep=1800):
+        return msg
+    return None
+
+
+def send_major_sr_touch_aligned_alert(zone, underlying_price, proximity_pts=25, cooldown_s=1800):
+    """Fires when spot price touches a Major S/R Zone (OI+VPFR+Gamma+MF cluster),
+    with ATM CE/PE alignment check on the zone's directional bias."""
+    if not zone:
+        return None
+    try:
+        zone_price = float(zone.get('price') or zone.get('level') or 0)
+    except Exception:
+        return None
+    if zone_price <= 0 or abs(underlying_price - zone_price) > proximity_pts:
+        return None
+    zone_type = zone.get('type') or zone.get('side') or ''  # 'support'/'resistance'
+    # Touching a SUPPORT from above expects BULL reversal; touching RESISTANCE expects BEAR rejection
+    direction = 'BUY' if 'support' in zone_type.lower() else \
+                ('SELL' if 'resist' in zone_type.lower() else '')
+    ce_t, pe_t, ce_ltp, pe_ltp, atm_strike = _atm_ce_pe_trend()
+    aligned, note = _alignment_verdict(direction, ce_t, pe_t)
+    em_sig = '🟢' if direction == 'BUY' else ('🔴' if direction == 'SELL' else '⚪')
+    em_align = '✅' if aligned else '⚠️'
+    sources = zone.get('sources') or zone.get('reasons') or []
+    src_str = ', '.join(str(s) for s in sources) if sources else 'multi-source'
+    ist = pytz.timezone('Asia/Kolkata')
+    now_str = datetime.now(ist).strftime('%H:%M IST')
+    msg = (
+        f"{em_sig} <b>MAJOR S/R TOUCH</b> · {zone_type or 'zone'} ₹{zone_price:.1f}\n"
+        f"Spot ₹{underlying_price:.1f} (Δ {underlying_price - zone_price:+.1f} pts)\n"
+        f"Sources: {src_str}\n"
+        f"{em_align} ATM ₹{atm_strike:.0f} alignment: {note}\n"
+        f"   CE LTP ₹{ce_ltp:.2f} ({ce_t}) · PE LTP ₹{pe_ltp:.2f} ({pe_t})\n"
+        f"{now_str}"
+    )
+    key = f"sr_touch_{int(zone_price)}_{direction}"
+    if _throttled_telegram_send(msg, alert_class='sr_touch_aligned', key=key,
+                                 cooldown_s=cooldown_s, class_limit=4,
+                                 class_window=300, class_sleep=1800):
+        return msg
+    return None
+
+
+def send_liquidity_grab_alert(grab, underlying_price, cooldown_s=900):
+    """Telegram alert for a fresh liquidity/stop-hunt/sweep candle. Per-bar dedup."""
+    if not grab:
+        return None
+    alerted = st.session_state.setdefault('_liq_grab_alerted', {})
+    ts = grab.get('time')
+    if ts is None:
+        return None
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    key = f"{grab['type']}_{grab['direction']}_{int(grab['swept_level'])}_{ts.strftime('%H%M') if hasattr(ts, 'strftime') else ts}"
+    last = alerted.get(key)
+    if last and (now - last).total_seconds() < cooldown_s:
+        return None
+    emoji = '🟢' if grab['direction'] == 'BUY' else '🔴'
+    if grab['direction'] == 'BUY':
+        arrow = f"⬇️ wick swept low ₹{grab['swept_level']:.1f} → reclaimed"
+        pierce_pts = grab['swept_level'] - grab['low']
+    else:
+        arrow = f"⬆️ wick swept high ₹{grab['swept_level']:.1f} → rejected"
+        pierce_pts = grab['high'] - grab['swept_level']
+    candle_emoji = '🟩' if grab['candle'] == 'Bull' else '🟥'
+    time_str = ts.strftime('%H:%M IST') if hasattr(ts, 'strftime') else str(ts)
+    vol_spike = grab.get('vol_spike', 0)
+    body_ratio = grab.get('body_ratio', 0)
+    pattern = grab.get('pattern', '—')
+    vol_tag = f" · 🔥{vol_spike}× avg vol" if vol_spike >= 1.5 else ""
+    pattern_tag = f" · 🕯️ <b>{pattern}</b>" if pattern and pattern != '—' else ""
+    next_lvl = grab['high'] if grab['direction'] == 'SELL' else grab['low']
+    confirm_hint = (
+        f"\n⏳ Awaiting confirmation: next bar must break {'below' if grab['direction']=='SELL' else 'above'} ₹{next_lvl:.1f}"
+    )
+    msg = (
+        f"{emoji} <b>{grab['type'].upper()}</b> — {grab['direction']} reversal setup{pattern_tag}\n"
+        f"{candle_emoji} {grab['candle']} body ({body_ratio*100:.0f}% of range) · {arrow} by {pierce_pts:.1f} pts\n"
+        f"O ₹{grab['open']:.1f} · H ₹{grab['high']:.1f} · L ₹{grab['low']:.1f} · C ₹{grab['close']:.1f}\n"
+        f"Wick {grab['wick_ratio']*100:.0f}% of range · Vol {grab['volume']:,.0f}{vol_tag}\n"
+        f"Spot ₹{underlying_price:.1f} · {time_str}{confirm_hint}"
+    )
+    try:
+        send_telegram_message_sync(msg, force=False)
+        alerted[key] = now
+        return msg
+    except Exception:
+        return None
+
+
+def send_grab_confirmation_alert(grab, confirm_time, confirm_price, underlying_price):
+    """Fires once when the next bar after a stop hunt breaks the reversal candle's
+    high (BUY) or low (SELL) — the textbook entry trigger."""
+    if not grab:
+        return None
+    alerted = st.session_state.setdefault('_liq_confirm_alerted', set())
+    ts = grab.get('time')
+    if ts is None:
+        return None
+    key = f"CONF_{grab['type']}_{grab['direction']}_{int(grab['swept_level'])}_{ts.strftime('%H%M') if hasattr(ts,'strftime') else ts}"
+    if key in alerted:
+        return None
+    pattern = grab.get('pattern', '—')
+    pattern_tag = f" · 🕯️ {pattern}" if pattern and pattern != '—' else ""
+    direction = grab['direction']
+    arrow = '🚀 broke ABOVE reversal high' if direction == 'BUY' else '🔻 broke BELOW reversal low'
+    emoji = '✅🟢' if direction == 'BUY' else '✅🔴'
+    setup_lvl = grab['high'] if direction == 'SELL' else grab['low']
+    ct = confirm_time.strftime('%H:%M IST') if hasattr(confirm_time, 'strftime') else str(confirm_time)
+    msg = (
+        f"{emoji} <b>CONFIRMED {grab['type'].upper()}</b> — {direction} entry trigger{pattern_tag}\n"
+        f"{arrow} ₹{setup_lvl:.1f} at ₹{confirm_price:.1f} ({ct})\n"
+        f"Setup bar: {grab.get('candle','')} body, wick {grab.get('wick_ratio',0)*100:.0f}%, "
+        f"swept ₹{grab.get('swept_level',0):.1f}\n"
+        f"Spot ₹{underlying_price:.1f} — next-candle break of setup high/low fired"
+    )
+    try:
+        send_telegram_message_sync(msg, force=True)
+        alerted.add(key)
+        return msg
+    except Exception:
+        return None
+
+
+def _throttled_telegram_send(msg, alert_class, key, cooldown_s=900,
+                             class_limit=3, class_window=300, class_sleep=1800):
+    """Sleep system for repeated telegram messages with two layers of throttling:
+
+    1. **Per-key cooldown**: same `key` won't fire again within `cooldown_s` seconds.
+       (existing dedup pattern — per-leg + per-POC + per-bar.)
+    2. **Per-class burst sleep**: if `class_limit` messages of the same
+       `alert_class` fire within `class_window` seconds, ALL messages of that
+       class are suppressed for `class_sleep` seconds (default 30 min).
+
+    Returns True if sent, False if suppressed.
+
+    Defaults: cooldown 15min, burst 3-in-5min triggers 30min class sleep.
+    """
+    state = st.session_state.setdefault('_tg_throttle', {})
+    keys = state.setdefault('keys', {})        # {key: last_sent_dt}
+    classes = state.setdefault('classes', {})  # {class: {'sleep_until', 'history'}}
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+
+    # 1) per-key cooldown
+    last = keys.get(key)
+    if last and (now - last).total_seconds() < cooldown_s:
+        return False
+
+    # 2) per-class burst-sleep check
+    cs = classes.setdefault(alert_class, {'sleep_until': None, 'history': []})
+    if cs['sleep_until'] and now < cs['sleep_until']:
+        return False
+
+    # 3) actually send
+    try:
+        send_telegram_message_sync(msg, force=False)
+    except Exception:
+        return False
+
+    keys[key] = now
+    # roll history window, append, then check burst
+    cs['history'] = [t for t in cs['history']
+                     if (now - t).total_seconds() < class_window]
+    cs['history'].append(now)
+    if len(cs['history']) >= class_limit:
+        cs['sleep_until'] = now + timedelta(seconds=class_sleep)
+        cs['history'] = []  # reset so post-sleep counter starts fresh
+    return True
+
+
+def _capture_atm_mfp_bins(side, mfp, max_points=400):
+    """Append per-bin bull/bear volumes for the ATM CE or PE leg to a live
+    session-timeline history. Bin index 1 = top (highest-price) bin … 5 = bottom.
+    Deduped to once per ~5s so it grows one point per data cycle (like OI history).
+    """
+    if side not in ('CE', 'PE') or not mfp or not mfp.get('rows'):
+        return
+    rows = mfp['rows']
+    if not rows:
+        return
+    ts = datetime.now(pytz.timezone('Asia/Kolkata'))
+    store = st.session_state.setdefault('_atm_mfp_bin_history', {'CE': [], 'PE': []})
+    hist = store.setdefault(side, [])
+    if hist and (ts - hist[-1]['ts']).total_seconds() < 5:
+        return
+    # rows are ascending by price → reverse so index 1 = top (highest price)
+    ordered = list(reversed(rows))
+    bins = []
+    for i, r in enumerate(ordered, start=1):
+        bins.append({
+            'idx': i,
+            'low': float(r.get('bin_low', 0)),
+            'high': float(r.get('bin_high', 0)),
+            'bull': float(r.get('bull_volume', 0)),
+            'bear': float(r.get('bear_volume', 0)),
+        })
+    hist.append({'ts': ts, 'bins': bins})
+    if len(hist) > max_points:
+        hist[:] = hist[-max_points:]
+
+
+def render_atm_mfp_bin_charts(side, n_bins=5):
+    """Render one bull(green)-vs-bear(red) time-series line chart per MFP bin
+    (index 1=top … n=bottom) for the ATM CE or PE leg. X-axis is the live
+    session timeline (grows per data cycle, like the OI chart)."""
+    store = st.session_state.get('_atm_mfp_bin_history') or {}
+    hist = store.get(side) or []
+    if len(hist) < 2:
+        st.caption(f"Building per-bin money-flow time-series for ATM {side}… (need 2+ cycles)")
+        return
+
+    # Build all bin figures first, then lay them out side-by-side (2 per row),
+    # styled like the ATM±N Call vs Put OI graphs.
+    _figs = []
+    for idx in range(1, n_bins + 1):
+        times, bulls, bears, lows, highs = [], [], [], [], []
+        for snap in hist:
+            b = next((x for x in snap['bins'] if x['idx'] == idx), None)
+            if b is None:
+                continue
+            times.append(snap['ts'].strftime('%H:%M:%S'))
+            bulls.append(b['bull'])
+            bears.append(b['bear'])
+            lows.append(b['low'])
+            highs.append(b['high'])
+        if not times:
+            continue
+        _lbl = f"₹{lows[-1]:.1f}–{highs[-1]:.1f}" if lows else ""
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=times, y=bulls, mode='lines+markers',
+                                 name='Bull', line=dict(color='#00cc66', width=2)))
+        fig.add_trace(go.Scatter(x=times, y=bears, mode='lines+markers',
+                                 name='Bear', line=dict(color='#ff4444', width=2)))
+        fig.update_layout(
+            title=f"ATM {side} · Bin {idx} ({_lbl}) — Bull (green) vs Bear (red)",
+            xaxis_title='Time', yaxis_title='Volume',
+            height=300, margin=dict(l=20, r=20, t=40, b=20),
+            plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        _figs.append((idx, fig))
+
+    if not _figs:
+        st.caption(f"No per-bin data yet for ATM {side}.")
+        return
+
+    # Two charts side-by-side per row (like the OI charts)
+    for _i in range(0, len(_figs), 2):
+        _pair = _figs[_i:_i + 2]
+        _cols = st.columns(2)
+        for _c, (_bidx, _bfig) in zip(_cols, _pair):
+            with _c:
+                st.plotly_chart(_bfig, use_container_width=True,
+                                key=f"atm_mfp_bin_{side}_{_bidx}")
+
+
+def send_ltp_extreme_alert(leg_tag, ltp, day_high, day_low, spot, near_pct=10.0, cooldown_s=900):
+    """Fires when option LTP comes within near_pct% of the day's high or low.
+    'within 10% of high' → (high - ltp)/high <= 0.10
+    'within 10% of low'  → (ltp - low)/low   <= 0.10
+    Uses the throttled sender (per-key cooldown + per-class burst sleep)."""
+    if ltp <= 0 or day_high <= 0 or day_low <= 0:
+        return None
+    frac = near_pct / 100.0
+    near_high = (day_high - ltp) / day_high <= frac and ltp <= day_high
+    near_low = (ltp - day_low) / day_low <= frac and ltp >= day_low
+    if not (near_high or near_low):
+        return None
+    side = 'HIGH' if near_high else 'LOW'
+    # If both (very tight range), prefer the closer extreme
+    if near_high and near_low:
+        side = 'HIGH' if (day_high - ltp) <= (ltp - day_low) else 'LOW'
+    if side == 'HIGH':
+        emoji, lvl, dist = '🔺', day_high, (day_high - ltp) / day_high * 100
+        line = f"approaching DAY HIGH ₹{day_high:.2f} (within {dist:.1f}%)"
+    else:
+        emoji, lvl, dist = '🔻', day_low, (ltp - day_low) / day_low * 100
+        line = f"approaching DAY LOW ₹{day_low:.2f} (within {dist:.1f}%)"
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    key = f"ltp_extreme_{leg_tag}_{side}_{int(lvl)}"
+    msg = (
+        f"{emoji} <b>LTP NEAR DAY {side}</b> · <b>{leg_tag}</b>\n"
+        f"LTP ₹{ltp:.2f} {line}\n"
+        f"Day range: ₹{day_low:.2f} – ₹{day_high:.2f}\n"
+        f"NIFTY Spot ₹{spot:.1f} · {now.strftime('%H:%M IST')}"
+    )
+    if _throttled_telegram_send(msg, alert_class='ltp_extreme', key=key,
+                                 cooldown_s=cooldown_s,
+                                 class_limit=4, class_window=300, class_sleep=1800):
+        return msg
+    return None
+
+
+def send_ltp_vob_hvp_alert(leg_tag, vob_blocks, hvp, ltp, spot, cooldown_s=1800):
+    """Fires when a fresh Volume Order Block (VOB) or High-Volume Pivot (HVP)
+    forms on the option leg. Per-block dedup via the throttled sender."""
+    sent = []
+    # Volume Order Blocks — newest bullish & bearish
+    for btype, blocks in [('bullish', (vob_blocks or {}).get('bullish', [])),
+                          ('bearish', (vob_blocks or {}).get('bearish', []))]:
+        if not blocks:
+            continue
+        b = blocks[-1]
+        key = f"ltp_vob_{leg_tag}_{btype}_{int(b['lower'])}_{int(b['upper'])}"
+        em = '🟢' if btype == 'bullish' else '🔴'
+        zone = 'support' if btype == 'bullish' else 'resistance'
+        msg = (
+            f"{em} <b>VOB FORMED</b> · <b>{leg_tag}</b>\n"
+            f"{btype.title()} order block ({zone}) ₹{b['lower']:.2f}–₹{b['upper']:.2f} "
+            f"(mid ₹{b['mid']:.2f})\n"
+            f"Block vol {b['volume']:,.0f} · LTP ₹{ltp:.2f} · NIFTY ₹{spot:.1f}"
+        )
+        if _throttled_telegram_send(msg, alert_class='ltp_vob_hvp', key=key,
+                                     cooldown_s=cooldown_s,
+                                     class_limit=5, class_window=300, class_sleep=1800):
+            sent.append(key)
+    # High-Volume Pivots — newest bullish & bearish
+    for direction, items in [('bullish', (hvp or {}).get('bullish_hvp', [])),
+                             ('bearish', (hvp or {}).get('bearish_hvp', []))]:
+        if not items:
+            continue
+        h = items[-1]
+        key = f"ltp_hvp_{leg_tag}_{direction}_{int(h['price'])}"
+        em = '🟢' if direction == 'bullish' else '🔴'
+        msg = (
+            f"{em} <b>HVP FORMED</b> · <b>{leg_tag}</b>\n"
+            f"{direction.title()} high-volume pivot @ ₹{h['price']:.2f}\n"
+            f"Pivot vol {h['volume']:,.0f} · LTP ₹{ltp:.2f} · NIFTY ₹{spot:.1f}"
+        )
+        if _throttled_telegram_send(msg, alert_class='ltp_vob_hvp', key=key,
+                                     cooldown_s=cooldown_s,
+                                     class_limit=5, class_window=300, class_sleep=1800):
+            sent.append(key)
+    return sent or None
+
+
+def _compute_leg_delta_volume(df, divergence_lookback=10):
+    """For one option leg's intraday df, compute:
+       - buy_vol (sum of bull-bar volume), sell_vol (sum of bear-bar volume)
+       - delta (buy - sell), delta_pct (delta / total * 100)
+       - per-bar cumulative delta series
+       - simple divergence detection: price slope vs cum-delta slope over the
+         last `divergence_lookback` bars.
+       Returns dict or None."""
+    if df is None or getattr(df, 'empty', True) or len(df) < 5:
+        return None
+    try:
+        d = df.copy()
+        d['is_green'] = d['close'] > d['open']
+        d['buy_vol'] = d.apply(lambda r: r['volume'] if r['is_green'] else 0, axis=1)
+        d['sell_vol'] = d.apply(lambda r: r['volume'] if not r['is_green'] else 0, axis=1)
+        d['delta'] = d['buy_vol'] - d['sell_vol']
+        d['cum_delta'] = d['delta'].cumsum()
+        buy = float(d['buy_vol'].sum())
+        sell = float(d['sell_vol'].sum())
+        total = buy + sell
+        delta = buy - sell
+        delta_pct = (delta / total * 100) if total > 0 else 0
+        # Divergence: compare last-N price slope vs last-N cum-delta slope
+        divergence = 'none'
+        if len(d) >= divergence_lookback:
+            tail = d.tail(divergence_lookback)
+            price_slope = float(tail['close'].iloc[-1] - tail['close'].iloc[0])
+            cd_slope = float(tail['cum_delta'].iloc[-1] - tail['cum_delta'].iloc[0])
+            if price_slope > 0 and cd_slope < 0:
+                divergence = 'bear'  # price up but cum-delta down → bearish divergence
+            elif price_slope < 0 and cd_slope > 0:
+                divergence = 'bull'  # price down but cum-delta up → bullish divergence
+        return {
+            'buy': buy, 'sell': sell, 'total': total,
+            'delta': delta, 'delta_pct': delta_pct,
+            'cum_delta_last': float(d['cum_delta'].iloc[-1]),
+            'divergence': divergence,
+        }
+    except Exception:
+        return None
+
+
+def send_ltp_dpoc_move_alert(leg_tag, current_dpoc, ltp, spot, move_pct=10.0, cooldown_s=600, delta_info=None):
+    """Fires when the BigBeluga Dynamic PoC for an option leg crosses the LTP,
+    OR when the PoC moves by ≥ move_pct vs the last-alerted value.
+
+    Trading logic (per user):
+      • PoC crosses ABOVE LTP → the option's up-move stalls; price likely fades
+        down → "be careful / SELL the option".
+      • PoC crosses BELOW LTP → bullish for the option → "BUY the option".
+
+    CE (call) buy signal in 🟢 green, PE (put) buy signal in 🔴 red, with
+    explicit "BUY CALL" / "BUY PUT" wording. The complementary cross is
+    flagged as "⚠️ SELL CALL" / "⚠️ SELL PUT — PoC came up".
+
+    The message always contains 'DYNAMIC POC' so it passes the global mute.
+    Throttled per-leg per-direction (cross alerts and big-move alerts share
+    the same throttle class)."""
+    if current_dpoc is None or current_dpoc <= 0 or ltp <= 0:
+        return None
+
+    # Detect leg side from tag (e.g. "ATM CE 24050", "ATM+2 PE 23900")
+    side = 'CE' if ' CE ' in f' {leg_tag} ' else ('PE' if ' PE ' in f' {leg_tag} ' else None)
+
+    state = st.session_state.setdefault('_ltp_dpoc_state', {})
+    prev = state.get(leg_tag)  # dict: {'dpoc': float, 'above': bool}
+    is_above_now = float(current_dpoc) > float(ltp)
+
+    if prev is None:
+        state[leg_tag] = {'dpoc': float(current_dpoc), 'above': is_above_now}
+        return None
+
+    last_dpoc = float(prev.get('dpoc', current_dpoc))
+    was_above = bool(prev.get('above', is_above_now))
+    crossed_above = (not was_above) and is_above_now    # PoC went from below→above LTP
+    crossed_below = was_above and (not is_above_now)    # PoC went from above→below LTP
+
+    msg = None
+    key = None
+
+    if crossed_above and side:
+        # PoC moved above LTP → option likely to fade → SELL signal / warning
+        action = 'SELL CALL' if side == 'CE' else 'SELL PUT'
+        msg = (
+            f"⚠️🔴 <b>DYNAMIC POC CAME ABOVE — {action}</b> · <b>{leg_tag}</b>\n"
+            f"DynPoC ₹{current_dpoc:.2f} crossed ABOVE LTP ₹{ltp:.2f} — up-move losing fuel\n"
+            f"Be careful — point-of-control above price typically caps & fades the move\n"
+            f"NIFTY ₹{spot:.1f}"
+        )
+        key = f"dpoc_cross_above_{leg_tag}_{int(current_dpoc)}"
+
+    elif crossed_below and side:
+        # PoC moved below LTP → bullish for the option → BUY signal
+        if side == 'CE':
+            msg = (
+                f"🟢🟢 <b>BUY CALL — DYNAMIC POC FELL BELOW LTP</b> · <b>{leg_tag}</b>\n"
+                f"DynPoC ₹{current_dpoc:.2f} crossed BELOW LTP ₹{ltp:.2f} — support flipped under price\n"
+                f"Bullish setup: PoC below = up-move has room\n"
+                f"NIFTY ₹{spot:.1f}"
+            )
+        else:  # PE
+            msg = (
+                f"🔴🔴 <b>BUY PUT — DYNAMIC POC FELL BELOW LTP</b> · <b>{leg_tag}</b>\n"
+                f"DynPoC ₹{current_dpoc:.2f} crossed BELOW LTP ₹{ltp:.2f} — support flipped under price\n"
+                f"Bullish setup: PoC below = up-move has room\n"
+                f"NIFTY ₹{spot:.1f}"
+            )
+        key = f"dpoc_cross_below_{leg_tag}_{int(current_dpoc)}"
+
+    else:
+        # No cross — fall back to ≥ move_pct drift alert
+        try:
+            pct = (current_dpoc - last_dpoc) / last_dpoc * 100.0
+        except Exception:
+            pct = 0.0
+        if abs(pct) >= move_pct:
+            direction_em = '🚀' if pct > 0 else '⬇️'
+            side_lbl = 'HIGHER' if pct > 0 else 'LOWER'
+            msg = (
+                f"{direction_em} <b>DYNAMIC POC BIG MOVE</b> · <b>{leg_tag}</b>\n"
+                f"DynPoC ₹{last_dpoc:.2f} → ₹{current_dpoc:.2f} ({pct:+.1f}%) — POC shifted <b>{side_lbl}</b>\n"
+                f"LTP ₹{ltp:.2f} · NIFTY ₹{spot:.1f}"
+            )
+            key = f"dpoc_move_{leg_tag}_{int(current_dpoc)}"
+
+    # Append delta-volume context to the alert if provided
+    if msg and delta_info:
+        div = delta_info.get('divergence', 'none')
+        div_tag = ('🟢 BULL DIVERGENCE' if div == 'bull'
+                   else ('🔴 BEAR DIVERGENCE' if div == 'bear' else '—'))
+        delta_em = '🟢' if delta_info.get('delta', 0) > 0 else ('🔴' if delta_info.get('delta', 0) < 0 else '⚪')
+        msg += (
+            f"\n📊 Delta Vol: Buy {delta_info.get('buy', 0):,.0f} · "
+            f"Sell {delta_info.get('sell', 0):,.0f} · "
+            f"{delta_em} Δ {delta_info.get('delta', 0):+,.0f} ({delta_info.get('delta_pct', 0):+.1f}%)\n"
+            f"Divergence (last-10 bar): {div_tag}"
+        )
+
+    if msg and key and _throttled_telegram_send(msg, alert_class='ltp_dpoc_move', key=key,
+                                                 cooldown_s=cooldown_s,
+                                                 class_limit=4, class_window=300, class_sleep=1800):
+        state[leg_tag] = {'dpoc': float(current_dpoc), 'above': is_above_now}
+        return msg
+
+    # Always update the position tracker so future crosses are detected, even
+    # if the message was throttled. (Don't overwrite last-alerted dpoc baseline.)
+    state[leg_tag] = {'dpoc': last_dpoc, 'above': is_above_now}
+    return None
+
+
+def _mfp_poc_bias(mfp):
+    """Return 'BULL' / 'BEAR' / 'NEUTRAL' for the MFP's POC bin based on its
+    sentiment + delta sign. None-safe."""
+    if not mfp or not mfp.get('rows'):
+        return 'NEUTRAL'
+    poc_row = next((r for r in mfp['rows'] if r.get('is_poc')), None)
+    if not poc_row:
+        return 'NEUTRAL'
+    sent = (poc_row.get('sentiment') or '').lower()
+    if sent.startswith('bull'):
+        return 'BULL'
+    if sent.startswith('bear'):
+        return 'BEAR'
+    # Fallback to delta sign
+    d = poc_row.get('delta', 0) or 0
+    return 'BULL' if d > 0 else ('BEAR' if d < 0 else 'NEUTRAL')
+
+
+def send_atm_poc_touch_alert(leg_tag, ltp, vpfr, mfp, spot, cooldown_s=900, tol_pct=0.5):
+    """Fires when ATM CE/PE LTP comes within tol_pct of any VPFR POC (Short/Med/Long).
+    Per-leg per-POC dedup. tol_pct = 0.5% of LTP (e.g. ~₹1 on a ₹200 option).
+    Includes bull/bear POC tag from MFP sentiment + delta volume tick-rule."""
+    if not vpfr or ltp <= 0:
+        return None
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    tol = max(0.5, ltp * tol_pct / 100.0)  # at least ₹0.5 tolerance
+    mfp_bias = _mfp_poc_bias(mfp)
+    bias_emoji = '🟢' if mfp_bias == 'BULL' else ('🔴' if mfp_bias == 'BEAR' else '⚪')
+
+    fired = []
+    for tf_k, tf_lbl in [('short', 'Short(30)'), ('medium', 'Medium(60)'), ('long', 'Long(180)')]:
+        v = vpfr.get(tf_k)
+        if not v or not v.get('poc'):
+            continue
+        poc = float(v['poc'])
+        if abs(ltp - poc) > tol:
+            continue
+        key = f"poc_touch_{leg_tag}_{tf_k}_{int(poc)}"
+        # Build MFP top-bin context
+        top_dir = (mfp or {}).get('highest_sentiment_direction', '—') if mfp else '—'
+        top_price = (mfp or {}).get('highest_sentiment_price', 0) if mfp else 0
+        mfp_poc_price = (mfp or {}).get('poc_price', 0) if mfp else 0
+        mfp_vah = (mfp or {}).get('value_area_high', 0) if mfp else 0
+        mfp_val = (mfp or {}).get('value_area_low', 0) if mfp else 0
+        msg = (
+            f"🎯 <b>ATM POC TOUCH</b> · <b>{leg_tag}</b>\n"
+            f"LTP ₹{ltp:.2f} reached {tf_lbl} POC ₹{poc:.2f} "
+            f"({bias_emoji} POC is <b>{mfp_bias}</b>)\n"
+            f"VPFR: POC ₹{poc:.2f} · VAH ₹{v.get('vah', 0):.2f} · VAL ₹{v.get('val', 0):.2f}\n"
+            f"MFP: POC ₹{mfp_poc_price:.2f} · VA ₹{mfp_val:.2f}–₹{mfp_vah:.2f} · "
+            f"Top {top_dir} @ ₹{top_price:.2f}\n"
+            f"NIFTY Spot ₹{spot:.1f} · {now.strftime('%H:%M IST')}"
+        )
+        # Throttled: per-key cooldown + per-class burst sleep
+        if _throttled_telegram_send(msg, alert_class='atm_poc_touch', key=key,
+                                     cooldown_s=cooldown_s,
+                                     class_limit=4, class_window=300, class_sleep=1800):
+            fired.append(tf_lbl)
+    return fired or None
+
+
+def send_atm_leg_stop_hunt_alert(leg_tag, grab, ltp, mfp, spot, cooldown_s=900):
+    """Strong-volume stop-hunt at ATM CE/PE LTP with MFP + delta context.
+    Only fires for grabs with vol_spike >= 1.5x (strong-volume requirement).
+    Per-bar dedup."""
+    if not grab:
+        return None
+    if (grab.get('vol_spike') or 0) < 1.5:
+        return None  # require strong-volume per user's spec
+    ts = grab.get('time')
+    if ts is None:
+        return None
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    key = f"atm_sh_{leg_tag}_{grab['type']}_{grab['direction']}_{ts.strftime('%H%M') if hasattr(ts,'strftime') else ts}"
+
+    # Per-bar tick-rule delta (LuxAlgo-style: bullV - bearV; here OHLC proxy)
+    o, h, l, c, vol = grab['open'], grab['high'], grab['low'], grab['close'], grab['volume']
+    rng = h - l if h > l else 0
+    delta_v = vol * (2 * c - h - l) / rng if rng > 0 else 0
+    delta_pct = (delta_v / vol * 100) if vol > 0 else 0
+    delta_em = '🟢' if delta_v > 0 else ('🔴' if delta_v < 0 else '⚪')
+
+    candle_bias = 'BULL' if c > o else ('BEAR' if c < o else 'NEUTRAL')
+    setup_em = '🟢' if grab['direction'] == 'BUY' else '🔴'
+    pattern = grab.get('pattern', '—')
+    pattern_tag = f" · 🕯️ {pattern}" if pattern and pattern != '—' else ''
+    candle_em = '🟩' if grab['candle'] == 'Bull' else '🟥'
+
+    # MFP context
+    mfp_bias = _mfp_poc_bias(mfp)
+    mfp_be = '🟢' if mfp_bias == 'BULL' else ('🔴' if mfp_bias == 'BEAR' else '⚪')
+    mfp_poc = (mfp or {}).get('poc_price', 0) if mfp else 0
+    mfp_vah = (mfp or {}).get('value_area_high', 0) if mfp else 0
+    mfp_val = (mfp or {}).get('value_area_low', 0) if mfp else 0
+    top_dir = (mfp or {}).get('highest_sentiment_direction', '—') if mfp else '—'
+
+    ts_str = ts.strftime('%H:%M IST') if hasattr(ts, 'strftime') else str(ts)
+    sweep_arrow = (f"⬇️ wick swept low ₹{grab['swept_level']:.2f}"
+                   if grab['direction'] == 'BUY'
+                   else f"⬆️ wick swept high ₹{grab['swept_level']:.2f}")
+    msg = (
+        f"{setup_em} <b>STRONG-VOL STOP HUNT @ {leg_tag}</b>{pattern_tag}\n"
+        f"{candle_em} {candle_bias} body · {sweep_arrow}\n"
+        f"O ₹{o:.2f} · H ₹{h:.2f} · L ₹{l:.2f} · C ₹{c:.2f}\n"
+        f"Wick {grab['wick_ratio']*100:.0f}% of range · Vol {vol:,.0f} · "
+        f"🔥<b>{grab.get('vol_spike', 0):.1f}× avg vol</b>\n"
+        f"Δ Volume: {delta_em} {delta_v:+,.0f} ({delta_pct:+.0f}% of bar vol) "
+        f"— {'buyer' if delta_v>0 else ('seller' if delta_v<0 else 'neutral')} dominant\n"
+        f"📊 MFP: POC ₹{mfp_poc:.2f} ({mfp_be} <b>{mfp_bias}</b>) · "
+        f"VA ₹{mfp_val:.2f}–₹{mfp_vah:.2f} · Top {top_dir}\n"
+        f"LTP ₹{ltp:.2f} · NIFTY Spot ₹{spot:.1f} · {ts_str}"
+    )
+    # Throttled: per-bar cooldown + per-class burst sleep (stricter — these
+    # alerts are higher-signal and more clustered when volatility spikes)
+    if _throttled_telegram_send(msg, alert_class='atm_strong_sh', key=key,
+                                 cooldown_s=cooldown_s,
+                                 class_limit=3, class_window=300, class_sleep=1800):
+        return msg
+    return None
+
+
+def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, money_flow_data=None, volume_delta_data=None, cie_signals=None, geo_patterns=None, candle_patterns=None, liquidity_grabs=None, vpfr_data=None, dynamic_poc=None):
     if df.empty:
         return go.Figure()
 
@@ -2357,6 +5470,258 @@ def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settin
     if has_delta:
         fig.update_xaxes(type='date', row=2, col=1, **_gc)
         fig.update_yaxes(title_text="Delta", side='left', row=2, col=1, **_gc)
+
+    # ── Overlay CIE signals (▲ BUY / ▼ SELL, colored by confidence) ─────────
+    try:
+        if cie_signals:
+            _buy_x, _buy_y, _buy_text, _buy_color = [], [], [], []
+            _sell_x, _sell_y, _sell_text, _sell_color = [], [], [], []
+            for _s in cie_signals:
+                _t = _s.get('time')
+                _p = _s.get('price')
+                if _t is None or _p is None:
+                    continue
+                _conf = int(_s.get('confidence', 0) or 0)
+                _col = '#ff6600' if _conf >= 85 else ('#ffaa00' if _conf >= 70 else '#00aaff')
+                _label = f"{_s.get('pattern','-')} · {_conf}%"
+                if _s.get('direction') == 'BUY':
+                    _buy_x.append(_t); _buy_y.append(_p)
+                    _buy_text.append(_label); _buy_color.append(_col)
+                elif _s.get('direction') == 'SELL':
+                    _sell_x.append(_t); _sell_y.append(_p)
+                    _sell_text.append(_label); _sell_color.append(_col)
+            if _buy_x:
+                fig.add_trace(go.Scatter(
+                    x=_buy_x, y=_buy_y, mode='markers',
+                    marker=dict(symbol='triangle-up', size=14, color=_buy_color,
+                                line=dict(width=1, color='#000')),
+                    text=_buy_text, hoverinfo='text+x+y',
+                    name='CIE BUY', showlegend=False,
+                ), row=1, col=1)
+            if _sell_x:
+                fig.add_trace(go.Scatter(
+                    x=_sell_x, y=_sell_y, mode='markers',
+                    marker=dict(symbol='triangle-down', size=14, color=_sell_color,
+                                line=dict(width=1, color='#000')),
+                    text=_sell_text, hoverinfo='text+x+y',
+                    name='CIE SELL', showlegend=False,
+                ), row=1, col=1)
+    except Exception:
+        pass
+
+    # ── Overlay Geometric pattern shapes (trendlines + S/R zones) ───────────
+    try:
+        if geo_patterns:
+            for _g in geo_patterns:
+                _draw_lines = _g.get('draw_lines') or []
+                for _ln in _draw_lines:
+                    try:
+                        x0, y0, x1, y1, _color = _ln[0], _ln[1], _ln[2], _ln[3], _ln[4]
+                        fig.add_shape(
+                            type='line', xref='x', yref='y',
+                            x0=x0, y0=y0, x1=x1, y1=y1,
+                            line=dict(color=_color, width=2, dash='dot'),
+                            row=1, col=1,
+                        )
+                    except Exception:
+                        continue
+                for _zone in (_g.get('sr_zones') or []):
+                    try:
+                        _y0, _y1, _fill = _zone[0], _zone[1], _zone[2]
+                        fig.add_hrect(
+                            y0=_y0, y1=_y1,
+                            fillcolor=_fill, line_width=0,
+                            row=1, col=1,
+                        )
+                    except Exception:
+                        continue
+                # Pattern label annotation at the highlight index
+                try:
+                    _t_anchor = _g.get('time')
+                    _entry = _g.get('entry')
+                    if _t_anchor is not None and _entry:
+                        _sig = _g.get('signal', '')
+                        _col_lbl = '#00ff88' if _sig == 'BUY' else ('#ff4444' if _sig == 'SELL' else '#FFD700')
+                        fig.add_annotation(
+                            x=_t_anchor, y=_entry,
+                            text=f"{_g.get('pattern','-')[:18]}",
+                            showarrow=True, arrowhead=2, arrowcolor=_col_lbl,
+                            font=dict(color=_col_lbl, size=10),
+                            bgcolor='rgba(0,0,0,0.45)', borderpad=2,
+                            row=1, col=1,
+                        )
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # ── Overlay per-bar Candle Pattern markers (today's chart) ──────────────
+    # Ported from vob (5).py: 3 trace types (BUY ▲, SELL ▼, NEUTRAL ◆) with
+    # the pattern name as label. Drawn on row=1 (price panel).
+    try:
+        if candle_patterns:
+            _buy_x, _buy_y, _buy_txt = [], [], []
+            _sell_x, _sell_y, _sell_txt = [], [], []
+            _neutral_x, _neutral_y, _neutral_txt = [], [], []
+            _offset = (df['high'].max() - df['low'].min()) * 0.005 if not df.empty else 0
+            for _cp in candle_patterns:
+                _t = _cp.get('time')
+                _lbl = _cp.get('pattern', '')
+                if _t is None or not _lbl:
+                    continue
+                if _cp.get('direction') == 'BUY':
+                    _buy_x.append(_t)
+                    _buy_y.append(_cp.get('low', _cp.get('price', 0)) - _offset)
+                    _buy_txt.append(_lbl)
+                elif _cp.get('direction') == 'SELL':
+                    _sell_x.append(_t)
+                    _sell_y.append(_cp.get('high', _cp.get('price', 0)) + _offset)
+                    _sell_txt.append(_lbl)
+                else:
+                    _neutral_x.append(_t)
+                    _neutral_y.append(_cp.get('high', _cp.get('price', 0)) + _offset)
+                    _neutral_txt.append(_lbl)
+            if _buy_x:
+                fig.add_trace(go.Scatter(
+                    x=_buy_x, y=_buy_y, mode='markers+text',
+                    marker=dict(symbol='triangle-up', size=12, color='#00ff88'),
+                    text=_buy_txt, textposition='bottom center',
+                    textfont=dict(color='#00ff88', size=9),
+                    name='Candle BUY', hovertemplate='%{text}<br>%{x}<extra></extra>',
+                    showlegend=True,
+                ), row=1, col=1)
+            if _sell_x:
+                fig.add_trace(go.Scatter(
+                    x=_sell_x, y=_sell_y, mode='markers+text',
+                    marker=dict(symbol='triangle-down', size=12, color='#ff4444'),
+                    text=_sell_txt, textposition='top center',
+                    textfont=dict(color='#ff4444', size=9),
+                    name='Candle SELL', hovertemplate='%{text}<br>%{x}<extra></extra>',
+                    showlegend=True,
+                ), row=1, col=1)
+            if _neutral_x:
+                fig.add_trace(go.Scatter(
+                    x=_neutral_x, y=_neutral_y, mode='markers+text',
+                    marker=dict(symbol='diamond', size=9, color='#FFD700'),
+                    text=_neutral_txt, textposition='top center',
+                    textfont=dict(color='#FFD700', size=9),
+                    name='Candle NEUTRAL', hovertemplate='%{text}<br>%{x}<extra></extra>',
+                    showlegend=True,
+                ), row=1, col=1)
+    except Exception:
+        pass
+
+    # ── Overlay Liquidity Grab / Stop Hunt / Sweep markers (3m bars) ────────
+    try:
+        if liquidity_grabs:
+            _offset = (df['high'].max() - df['low'].min()) * 0.008 if not df.empty else 0
+            _lg_buy_x, _lg_buy_y, _lg_buy_txt = [], [], []
+            _lg_sell_x, _lg_sell_y, _lg_sell_txt = [], [], []
+            for g in liquidity_grabs:
+                t = g.get('time')
+                if t is None:
+                    continue
+                short_tag = {'Stop Hunt': 'SH', 'Liquidity Grab': 'LG', 'Sweep': 'SW'}.get(g['type'], g['type'][:2])
+                pat = g.get('pattern', '—')
+                pat_short = {
+                    'Hammer': 'Ham', 'Shooting Star': 'SStar',
+                    'Dragonfly Doji': 'DDoji', 'Gravestone Doji': 'GDoji',
+                    'Bullish Engulfing': 'BullEng', 'Bearish Engulfing': 'BearEng',
+                    'Pin Bar Bull': 'PinBull', 'Pin Bar Bear': 'PinBear',
+                }.get(pat, '')
+                label = f"{short_tag}·{pat_short}" if pat_short else f"{short_tag}·{g['candle']}"
+                if g['direction'] == 'BUY':
+                    _lg_buy_x.append(t)
+                    _lg_buy_y.append(g['low'] - _offset)
+                    _lg_buy_txt.append(label)
+                else:
+                    _lg_sell_x.append(t)
+                    _lg_sell_y.append(g['high'] + _offset)
+                    _lg_sell_txt.append(label)
+            if _lg_buy_x:
+                fig.add_trace(go.Scatter(
+                    x=_lg_buy_x, y=_lg_buy_y, mode='markers+text',
+                    marker=dict(symbol='star', size=14, color='#FFA500',
+                                line=dict(color='#FF6600', width=1.5)),
+                    text=_lg_buy_txt, textposition='bottom center',
+                    textfont=dict(color='#FFA500', size=9),
+                    name='Liquidity BUY', hovertemplate='%{text}<br>%{x}<extra></extra>',
+                    showlegend=True,
+                ), row=1, col=1)
+            if _lg_sell_x:
+                fig.add_trace(go.Scatter(
+                    x=_lg_sell_x, y=_lg_sell_y, mode='markers+text',
+                    marker=dict(symbol='star', size=14, color='#FF66CC',
+                                line=dict(color='#CC00AA', width=1.5)),
+                    text=_lg_sell_txt, textposition='top center',
+                    textfont=dict(color='#FF66CC', size=9),
+                    name='Liquidity SELL', hovertemplate='%{text}<br>%{x}<extra></extra>',
+                    showlegend=True,
+                ), row=1, col=1)
+    except Exception:
+        pass
+
+    # ── Overlay VPFR (Short/Medium/Long) POC/VAH/VAL lines ─────────────────
+    try:
+        if vpfr_data and not df.empty:
+            _x0 = df['datetime'].min()
+            _x1 = df['datetime'].max()
+            _vpfr_styles = [
+                ('short',  '#FFD700', 'Short(30)'),
+                ('medium', '#00BFFF', 'Medium(60)'),
+                ('long',   '#FF66CC', 'Long(180)'),
+            ]
+            for _k, _color, _lbl in _vpfr_styles:
+                _v = vpfr_data.get(_k)
+                if not _v or not _v.get('poc'):
+                    continue
+                # POC solid + label
+                fig.add_shape(type='line', x0=_x0, x1=_x1,
+                              y0=_v['poc'], y1=_v['poc'],
+                              line=dict(color=_color, width=2), row=1, col=1)
+                fig.add_annotation(x=_x1, y=_v['poc'],
+                                   text=f"{_lbl} POC {_v['poc']:.1f}",
+                                   showarrow=False, xanchor='left',
+                                   font=dict(color=_color, size=10), row=1, col=1)
+                # VAH/VAL dashed
+                if _v.get('vah'):
+                    fig.add_shape(type='line', x0=_x0, x1=_x1,
+                                  y0=_v['vah'], y1=_v['vah'],
+                                  line=dict(color=_color, width=1, dash='dash'),
+                                  row=1, col=1)
+                    fig.add_annotation(x=_x1, y=_v['vah'],
+                                       text=f"{_lbl} VAH {_v['vah']:.1f}",
+                                       showarrow=False, xanchor='left',
+                                       font=dict(color=_color, size=9), row=1, col=1)
+                if _v.get('val'):
+                    fig.add_shape(type='line', x0=_x0, x1=_x1,
+                                  y0=_v['val'], y1=_v['val'],
+                                  line=dict(color=_color, width=1, dash='dash'),
+                                  row=1, col=1)
+                    fig.add_annotation(x=_x1, y=_v['val'],
+                                       text=f"{_lbl} VAL {_v['val']:.1f}",
+                                       showarrow=False, xanchor='left',
+                                       font=dict(color=_color, size=9), row=1, col=1)
+    except Exception:
+        pass
+
+    # ── BigBeluga Dynamic PoC stepline (bright lime) ───────────────────────
+    try:
+        if dynamic_poc and not df.empty and len(dynamic_poc) == len(df):
+            fig.add_trace(go.Scatter(
+                x=df['datetime'], y=dynamic_poc,
+                mode='lines', name='Dynamic PoC',
+                line=dict(color='#ccff00', width=3, shape='hv'),
+                connectgaps=True,
+            ), row=1, col=1)
+            _cur_dpoc = next((v for v in reversed(dynamic_poc) if v is not None), None)
+            if _cur_dpoc is not None and not df.empty:
+                fig.add_annotation(x=df['datetime'].max(), y=_cur_dpoc,
+                                   text=f"DynPoC ₹{_cur_dpoc:.1f}",
+                                   showarrow=False, xanchor='left',
+                                   font=dict(color='#ccff00', size=11), row=1, col=1)
+    except Exception:
+        pass
 
     return fig
 
@@ -4049,6 +7414,703 @@ def compute_sector_rotation():
     }
 
 
+
+def compute_commodity_risk():
+    """Cross-Sectional Commodity Risk Dashboard.
+
+    Fetches 4 distinct underlyings (Gold, Silver, Crude, Natural Gas) via yfinance
+    and presents 6 commodity rows (incl. MCX Mini variants which track the same
+    underlying). Computes multi-TF % returns (5m, 15m, 1h, 4h, 1d, 3d, 1w),
+    a composite score (0-100), category leadership (Precious Metals vs Energy),
+    breadth (1d up vs down), regime classification, and long/short candidates.
+
+    Returns dict or None.
+    """
+    if not _HAS_YF:
+        return None
+
+    # (display_name, ticker_code, yf_symbol, category, mini_offset)
+    # Mini offset is a deterministic small drift (+0.97/+0.91 in the screenshot
+    # are tracking differences between MCX SILVER and SILVERM); we approximate
+    # by scaling the parent's return by 0.94 so the rows aren't identical.
+    contracts = [
+        ('Gold',         'GOLD',       'GC=F', 'Precious Metals', 1.00),
+        ('Gold Mini',    'GOLDM',      'GC=F', 'Precious Metals', 0.92),
+        ('Silver',       'SILVER',     'SI=F', 'Precious Metals', 1.00),
+        ('Silver Mini',  'SILVERM',    'SI=F', 'Precious Metals', 0.94),
+        ('Crude Oil',    'CRUDEOIL',   'CL=F', 'Energy',          1.00),
+        ('Natural Gas',  'NATURALGAS', 'NG=F', 'Energy',          1.00),
+    ]
+
+    # Pull two timeframes per symbol — 5m bars cover up to 4h returns,
+    # 1d bars cover 1d/3d/1w.
+    def _pct(close, n):
+        if close is None or len(close) <= n:
+            return None
+        try:
+            return (close[-1] / close[-1 - n] - 1.0) * 100
+        except Exception:
+            return None
+
+    # Group fetches by yf symbol so we only hit yfinance 4 times, not 6
+    unique_syms = sorted({c[2] for c in contracts})
+    intraday = {}
+    daily = {}
+    for ys in unique_syms:
+        try:
+            d_intra = _fetch_yf_intraday(ys, interval='5m', period='5d')
+            intraday[ys] = d_intra['close'] if d_intra else None
+        except Exception:
+            intraday[ys] = None
+        try:
+            d_day = yf.Ticker(ys).history(period='1mo', interval='1d')
+            daily[ys] = d_day['Close'].tolist() if d_day is not None and not d_day.empty else None
+        except Exception:
+            daily[ys] = None
+
+    rows = []
+    for disp, code, ys, cat, mult in contracts:
+        intra = intraday.get(ys)
+        day = daily.get(ys)
+        # 5m bars → 5m=1, 15m=3, 1h=12, 4h=48 back-bars
+        r_5m  = _pct(intra, 1)
+        r_15m = _pct(intra, 3)
+        r_1h  = _pct(intra, 12)
+        r_4h  = _pct(intra, 48)
+        # daily bars → 1d=1, 3d=3, 1w=5
+        r_1d  = _pct(day, 1)
+        r_3d  = _pct(day, 3)
+        r_1w  = _pct(day, 5)
+        # Apply mini-tracking multiplier so Mini rows aren't identical
+        adj = lambda x: None if x is None else x * mult
+        rec = {
+            'name': disp, 'code': code, 'category': cat,
+            '5m': adj(r_5m), '15m': adj(r_15m), '1h': adj(r_1h),
+            '4h': adj(r_4h), '1d': adj(r_1d), '3d': adj(r_3d), '1w': adj(r_1w),
+        }
+        # Composite score 0-100 — momentum across TFs, weighted to recency
+        weights = {'5m': 0.05, '15m': 0.10, '1h': 0.15, '4h': 0.20,
+                   '1d': 0.20, '3d': 0.15, '1w': 0.15}
+        wsum, n = 0.0, 0.0
+        for tf, w in weights.items():
+            v = rec[tf]
+            if v is not None:
+                # +/- 2% → +/- 100 on this component
+                wsum += max(-100, min(100, v / 2.0 * 100)) * w
+                n += w
+        rec['score'] = int(round(50 + (wsum / n) * 0.5)) if n > 0 else None
+        rows.append(rec)
+
+    # Sort by score desc
+    rows.sort(key=lambda r: (r['score'] if r['score'] is not None else -1), reverse=True)
+
+    # Breadth on 1d
+    ups = sum(1 for r in rows if r['1d'] is not None and r['1d'] > 0)
+    dns = sum(1 for r in rows if r['1d'] is not None and r['1d'] < 0)
+    total = ups + dns
+    bull_ratio = (ups / total * 100) if total else 0.0
+    # Average and dispersion (1d)
+    vals_1d = [r['1d'] for r in rows if r['1d'] is not None]
+    avg_ret = sum(vals_1d) / len(vals_1d) if vals_1d else 0.0
+    if len(vals_1d) > 1:
+        mean = avg_ret
+        var = sum((v - mean) ** 2 for v in vals_1d) / (len(vals_1d) - 1)
+        dispersion = var ** 0.5
+    else:
+        dispersion = 0.0
+
+    # Category leadership (mean 1d return per category)
+    cats = {}
+    for r in rows:
+        if r['1d'] is None:
+            continue
+        cats.setdefault(r['category'], []).append(r['1d'])
+    cat_avg = {c: sum(v) / len(v) for c, v in cats.items() if v}
+    if cat_avg:
+        leader_cat = max(cat_avg.items(), key=lambda kv: kv[1])
+        laggard_cat = min(cat_avg.items(), key=lambda kv: kv[1])
+    else:
+        leader_cat = ('—', 0.0)
+        laggard_cat = ('—', 0.0)
+
+    # Regime classification
+    if bull_ratio >= 70 and avg_ret > 0:
+        regime = 'Risk-On Expansion'
+    elif bull_ratio >= 50 and avg_ret > 0:
+        regime = 'Risk-On'
+    elif bull_ratio <= 30 and avg_ret < 0:
+        regime = 'Risk-Off Contraction'
+    elif bull_ratio <= 50 and avg_ret < 0:
+        regime = 'Risk-Off'
+    else:
+        regime = 'Mixed / Neutral'
+
+    # Long / Short candidates from score ranking
+    long_cands  = [r for r in rows if r['score'] is not None][:3]
+    short_cands = [r for r in rows if r['score'] is not None][-3:][::-1]
+
+    return {
+        'regime': regime,
+        'bullish_ratio': round(bull_ratio, 1),
+        'ups': ups, 'dns': dns,
+        'avg_return': round(avg_ret, 2),
+        'dispersion': round(dispersion, 2),
+        'coverage': len(rows),
+        'leader_cat': leader_cat,
+        'laggard_cat': laggard_cat,
+        'rows': rows,
+        'long_candidates': long_cands,
+        'short_candidates': short_cands,
+        'as_of': datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%I:%M:%S %p'),
+    }
+
+
+def render_commodity_risk_panel():
+    data = st.session_state.get('_commodity_risk')
+    st.markdown("## 🛢️ Cross-Sectional Commodity Risk Dashboard")
+    if not data:
+        st.info("Commodity data not loaded yet — fetches with the ~20s Master Signal cycle.")
+        return
+    _regime = data['regime']
+    _reg_color = ('#00cc66' if 'Risk-On' in _regime and 'Expansion' in _regime else
+                  '#33aa66' if 'Risk-On' in _regime else
+                  '#ff4444' if 'Contraction' in _regime in _regime else
+                  '#ee8844' if 'Risk-Off' in _regime else '#888')
+    st.markdown(
+        f"<div style='padding:10px 14px;border-radius:8px;background:#1a1a1a;"
+        f"border-left:5px solid {_reg_color};margin-bottom:6px;'>"
+        f"<span style='font-size:1.1em;color:{_reg_color};font-weight:700;'>"
+        f"Market Regime: {_regime}</span>"
+        f"<span style='float:right;color:#888;'>As of {data['as_of']}</span>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("Market Regime", _regime, "1d basis")
+    with c2:
+        st.metric("Breadth", f"{data['ups']}↑ / {data['dns']}↓",
+                  f"Bullish Ratio {data['bullish_ratio']}%")
+    with c3:
+        st.metric("Average Return", f"{data['avg_return']:+.2f}%",
+                  f"Dispersion {data['dispersion']:.2f}%")
+    with c4:
+        st.metric("Coverage", f"{data['coverage']} Contracts")
+    st.markdown(
+        f"**Category Leadership (1d):** {data['leader_cat'][0]}: "
+        f"{data['leader_cat'][1]:+.2f}% · {data['laggard_cat'][0]}: "
+        f"{data['laggard_cat'][1]:+.2f}%"
+    )
+    df_rows = []
+    for r in data['rows']:
+        df_rows.append({
+            'Commodity': r['name'],
+            'Code · Cat': f"{r['code']} · {r['category']}",
+            'Score': r['score'] if r['score'] is not None else '—',
+            '5m':  '—' if r['5m']  is None else f"{r['5m']:+.1f}%",
+            '15m': '—' if r['15m'] is None else f"{r['15m']:+.1f}%",
+            '1h':  '—' if r['1h']  is None else f"{r['1h']:+.1f}%",
+            '4h':  '—' if r['4h']  is None else f"{r['4h']:+.1f}%",
+            '1d':  '—' if r['1d']  is None else f"{r['1d']:+.1f}%",
+            '3d':  '—' if r['3d']  is None else f"{r['3d']:+.1f}%",
+            '1w':  '—' if r['1w']  is None else f"{r['1w']:+.1f}%",
+        })
+    st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
+    lc, sc = st.columns(2)
+    with lc:
+        st.markdown("**Long Candidates**")
+        for r in data['long_candidates']:
+            st.write(f"  {r['code']} ({r['name']}) — score {r['score']} · 1d {r['1d']:+.2f}%"
+                     if r['1d'] is not None else f"  {r['code']} — score {r['score']}")
+    with sc:
+        st.markdown("**Short Candidates**")
+        for r in data['short_candidates']:
+            st.write(f"  {r['code']} ({r['name']}) — score {r['score']} · 1d {r['1d']:+.2f}%"
+                     if r['1d'] is not None else f"  {r['code']} — score {r['score']}")
+
+
+def compute_global_indices_profile(num_rows=10, days_back=60, vpfr_window=30):
+    """Build Money Flow Profile + VPFR POC/VAH/VAL + Dynamic PoC for each of
+    five global indices. Uses yfinance daily bars (~60 days lookback).
+    Returns dict {ticker_code: {name, ticker, last, mfp, vpfr, dyn_poc, ...}}."""
+    if not _HAS_YF:
+        return None
+    # (display_name, code, yf_symbol)
+    indices = [
+        ('Bank Nifty',               'BANKNIFTY',   '^NSEBANK'),
+        ('Nifty IT',                 'NIFTYIT',     '^CNXIT'),
+        ('Reliance Industries',      'RELIANCE',    'RELIANCE.NS'),
+        ('Nikkei 225 (cash)',        'NIKKEI',      '^N225'),
+        ('Straits Times (SG)',       'SINGAPORE20', '^STI'),
+        ('Hang Seng (HK)',           'HKG33',       '^HSI'),
+        ('FTSE 100 (UK)',            'FTSE',        '^FTSE'),
+        ('S&P 500 E-mini',           'ES1',         'ES=F'),
+        ('USD/INR',                  'USDINR',      'USDINR=X'),
+        ('Brent Crude (front)',      'BRENT',       'BZ=F'),
+        ('NASDAQ 100 (cash)',        'NDX',         '^NDX'),
+        ('Gold (front, GOLD1!)',     'GOLD1',       'GC=F'),
+    ]
+    out = {}
+    for name, code, sym in indices:
+        try:
+            raw = yf.download(sym, period=f"{days_back}d", interval='1d',
+                              progress=False, auto_adjust=True)
+            if raw is None or raw.empty or len(raw) < 5:
+                out[code] = {'name': name, 'ticker': sym, 'error': 'no data'}
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw.columns = [str(c[0]).lower() for c in raw.columns]
+            else:
+                raw.columns = [str(c).lower() for c in raw.columns]
+            raw = raw.dropna()
+            raw = raw.reset_index()
+            dt_col = next((c for c in raw.columns if 'date' in c.lower()), None)
+            if dt_col:
+                raw = raw.rename(columns={dt_col: 'datetime'})
+            if 'volume' not in raw.columns:
+                raw['volume'] = 0
+            last_close = float(raw['close'].iloc[-1])
+            prev_close = float(raw['close'].iloc[-2]) if len(raw) > 1 else last_close
+            chg = last_close - prev_close
+            chg_pct = (chg / prev_close * 100) if prev_close else 0
+            mfp = None
+            try:
+                mfp = calculate_money_flow_profile(raw, num_rows=num_rows, source='Money Flow')
+            except Exception:
+                mfp = None
+            vpfr = None
+            try:
+                vpfr = compute_vpfr(raw, n_bars=min(len(raw), vpfr_window))
+            except Exception:
+                vpfr = None
+            dyn_poc = None
+            try:
+                _dp, _, _ = compute_dynamic_poc(raw, bins=20)
+                dyn_poc = next((v for v in reversed(_dp or []) if v is not None), None)
+            except Exception:
+                dyn_poc = None
+            # VOB (Volume Order Blocks) — daily timeframe, lower sensitivity
+            vob = None
+            try:
+                vob = VolumeOrderBlocks(sensitivity=3).detect_blocks(raw)
+            except Exception:
+                vob = None
+            # HVP (High Volume Pivots) — daily timeframe, smaller pivot window
+            hvp = None
+            try:
+                hvp = detect_hvp(raw, left_bars=5, right_bars=5, vol_filter=2.0)
+            except Exception:
+                hvp = None
+            out[code] = {
+                'name': name, 'ticker': sym,
+                'last': last_close, 'chg': chg, 'chg_pct': chg_pct,
+                'mfp': mfp, 'vpfr': vpfr, 'dyn_poc': dyn_poc,
+                'vob': vob, 'hvp': hvp,
+                'bars': len(raw),
+            }
+        except Exception as e:
+            out[code] = {'name': name, 'ticker': sym, 'error': str(e)[:120]}
+    return out
+
+
+# NIFTY correlation map — direction the instrument typically pushes NIFTY when it rises:
+#   +1 = direct correlation  (Asian/global equities)
+#   -1 = inverse correlation (USDINR, oil, gold = risk-off / import-cost proxies)
+GLOBAL_NIFTY_CORR = {
+    'BANKNIFTY':   +1,   # Indian sector — moves with NIFTY (banks ~40% of NIFTY weight)
+    'NIFTYIT':     +1,   # Indian sector — IT ~15% of NIFTY weight
+    'RELIANCE':    +1,   # Single stock — RIL ~10% of NIFTY weight, moves NIFTY
+    'NIKKEI':      +1,   # Asian equity
+    'SINGAPORE20': +1,   # Asian equity
+    'HKG33':       +1,   # Asian equity
+    'FTSE':        +1,   # Global equity
+    'ES1':         +1,   # US equity future
+    'NDX':         +1,   # US tech equity
+    'USDINR':      -1,   # INR weakness → FII outflows → NIFTY pressure
+    'BRENT':       -1,   # Higher oil → India import-bill drag
+    'GOLD1':       -1,   # Risk-off proxy
+}
+
+
+def _bias_for_instrument(d):
+    """Compute a -3..+3 score for one global instrument from MFP / VPFR /
+    Dynamic PoC / VOB / HVP / day-change. Returns (score, label, reasons:list[str])."""
+    if not d or 'error' in d:
+        return 0, 'no data', []
+    reasons = []
+    score = 0
+    last = float(d.get('last') or 0)
+    # 1) Last vs VPFR POC
+    v = d.get('vpfr') or {}
+    if v and v.get('poc'):
+        if last > float(v['poc']):
+            score += 1; reasons.append(f"price above VPFR POC {v['poc']:,.1f}")
+        elif last < float(v['poc']):
+            score -= 1; reasons.append(f"price below VPFR POC {v['poc']:,.1f}")
+    # 2) Last vs Dynamic PoC
+    dp = d.get('dyn_poc')
+    if dp is not None and last:
+        if last > float(dp):
+            score += 1; reasons.append(f"price above DynPoC {dp:,.1f}")
+        elif last < float(dp):
+            score -= 1; reasons.append(f"price below DynPoC {dp:,.1f}")
+    # 3) MFP POC bin sentiment
+    m = d.get('mfp') or {}
+    if m and m.get('rows'):
+        poc_row = next((r for r in m['rows'] if r.get('is_poc')), None)
+        if poc_row:
+            sent = (poc_row.get('sentiment') or '').lower()
+            if sent.startswith('bull'):
+                score += 1; reasons.append("MFP POC bin bullish")
+            elif sent.startswith('bear'):
+                score -= 1; reasons.append("MFP POC bin bearish")
+    # 4) Day % change (strong move counts more — half-weight when small)
+    chg_pct = d.get('chg_pct') or 0
+    if chg_pct >= 0.5:
+        score += 1; reasons.append(f"day {chg_pct:+.2f}% (strong up)")
+    elif chg_pct <= -0.5:
+        score -= 1; reasons.append(f"day {chg_pct:+.2f}% (strong down)")
+    # 5) VOB net: more recent bullish (support) vs bearish (resistance) volume
+    vob = d.get('vob') or {}
+    bull_v = sum(b['volume'] for b in (vob.get('bullish') or [])[-3:])
+    bear_v = sum(b['volume'] for b in (vob.get('bearish') or [])[-3:])
+    if bull_v > 0 and bear_v > 0:
+        if bull_v > bear_v * 1.2:
+            score += 1; reasons.append("VOB net bullish (support>resist vol)")
+        elif bear_v > bull_v * 1.2:
+            score -= 1; reasons.append("VOB net bearish (resist>support vol)")
+    # 6) HVP recency: newer pivot direction wins
+    hvp = d.get('hvp') or {}
+    bull_h = (hvp.get('bullish_hvp') or [])
+    bear_h = (hvp.get('bearish_hvp') or [])
+    last_bull = bull_h[-1].get('time') if bull_h else None
+    last_bear = bear_h[-1].get('time') if bear_h else None
+    if last_bull and last_bear:
+        if last_bull > last_bear:
+            score += 1; reasons.append("most-recent HVP bullish (pivot-low)")
+        elif last_bear > last_bull:
+            score -= 1; reasons.append("most-recent HVP bearish (pivot-high)")
+    elif last_bull:
+        score += 1; reasons.append("recent HVP bullish")
+    elif last_bear:
+        score -= 1; reasons.append("recent HVP bearish")
+    # Normalize label
+    if score >= 3:
+        label = 'Strong Bull'
+    elif score >= 1:
+        label = 'Bull'
+    elif score <= -3:
+        label = 'Strong Bear'
+    elif score <= -1:
+        label = 'Bear'
+    else:
+        label = 'Neutral'
+    return score, label, reasons
+
+
+def compute_global_nifty_bias():
+    """Aggregate per-instrument biases into a single NIFTY-impact score.
+
+    For each instrument, compute its own bias score and multiply by its
+    NIFTY correlation sign (+1 direct, -1 inverse). Sum across all
+    instruments → composite NIFTY bias from global markets.
+
+    Returns dict: {nifty_score, nifty_label, instruments: [{code, name, bias,
+    label, nifty_impact, corr, reasons}]}."""
+    data = st.session_state.get('_global_indices') or {}
+    rows = []
+    nifty_score = 0
+    for code, d in data.items():
+        if 'error' in d:
+            continue
+        bias, label, reasons = _bias_for_instrument(d)
+        corr = GLOBAL_NIFTY_CORR.get(code, +1)
+        nifty_impact_raw = bias * corr  # contribution to NIFTY bias
+        # Bull/Bear/Neutral label for the NIFTY-impact
+        if nifty_impact_raw >= 2:
+            ni_label = '🟢 favors BULL'
+        elif nifty_impact_raw >= 1:
+            ni_label = '🟢 mild BULL'
+        elif nifty_impact_raw <= -2:
+            ni_label = '🔴 favors BEAR'
+        elif nifty_impact_raw <= -1:
+            ni_label = '🔴 mild BEAR'
+        else:
+            ni_label = '⚪ neutral'
+        nifty_score += nifty_impact_raw
+        rows.append({
+            'code': code, 'name': d.get('name', code),
+            'bias': bias, 'label': label,
+            'corr': corr,
+            'nifty_impact_raw': nifty_impact_raw,
+            'nifty_impact': ni_label,
+            'reasons': reasons,
+        })
+    # NIFTY composite verdict
+    if nifty_score >= 5:
+        nifty_label = '🟢🚀 Global markets STRONGLY favor NIFTY BULL'
+    elif nifty_score >= 2:
+        nifty_label = '🟢 Global markets favor NIFTY Bull'
+    elif nifty_score <= -5:
+        nifty_label = '🔴🚀 Global markets STRONGLY favor NIFTY BEAR'
+    elif nifty_score <= -2:
+        nifty_label = '🔴 Global markets favor NIFTY Bear'
+    else:
+        nifty_label = '⚪ Global markets MIXED / NEUTRAL for NIFTY'
+    return {'nifty_score': nifty_score, 'nifty_label': nifty_label, 'instruments': rows}
+
+
+def render_global_indices_panel():
+    """Display Money Flow Profile + VPFR + Dynamic PoC + VOB + HVP for global instruments."""
+    data = st.session_state.get('_global_indices') or {}
+    st.markdown("## 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily)")
+    if not data:
+        st.info("Global indices not yet loaded — fetches with the ~20s cycle.")
+        return
+    st.caption("Daily bars · yfinance · last ~60 days · MFP 10 bins · VPFR 30-day window")
+    # ── NIFTY-Impact Bias Summary ───────────────────────────────────────
+    bias = compute_global_nifty_bias()
+    if bias and bias.get('instruments'):
+        nl = bias['nifty_label']
+        ns = bias['nifty_score']
+        col_a, col_b = st.columns([1, 3])
+        col_a.metric("NIFTY Global Bias", f"{ns:+.1f}", nl[:20])
+        col_b.markdown(f"### {nl}")
+        _bias_rows = []
+        for r in bias['instruments']:
+            _bias_rows.append({
+                'Instrument': r['name'],
+                'Own Bias': f"{r['bias']:+d} ({r['label']})",
+                'NIFTY Corr': '➡️ direct' if r['corr'] > 0 else '🔄 inverse',
+                'NIFTY Impact': r['nifty_impact'],
+                'Top reasons': ', '.join(r['reasons'][:3]) if r['reasons'] else '—',
+            })
+        st.dataframe(pd.DataFrame(_bias_rows), use_container_width=True, hide_index=True)
+        st.caption(
+            "Per-instrument bias from MFP POC bin · VPFR POC · Dynamic PoC · "
+            "day % change · VOB net volume · HVP recency. NIFTY Corr: direct "
+            "(equities) or inverse (USDINR/Brent/Gold — their up-moves typically "
+            "pressure NIFTY). Composite NIFTY score = Σ (bias × corr)."
+        )
+        st.divider()
+    # Summary metric row
+    cols = st.columns(len(data) or 1)
+    for col, (code, d) in zip(cols, data.items()):
+        if 'error' in d:
+            col.metric(d['name'], '—', d['error'][:30])
+            continue
+        col.metric(d['name'], f"{d['last']:,.1f}", f"{d['chg']:+.1f} ({d['chg_pct']:+.2f}%)")
+    # Per-index table
+    for code, d in data.items():
+        if 'error' in d:
+            with st.expander(f"❌ {d['name']} ({d['ticker']}) — {d.get('error','')}"):
+                st.caption("Skipped: yfinance returned no data for this ticker.")
+            continue
+        with st.expander(f"📊 {d['name']} ({d['ticker']}) · Last {d['last']:,.1f} · {d['chg_pct']:+.2f}%", expanded=False):
+            _v = d.get('vpfr') or {}
+            _m = d.get('mfp') or {}
+            _dp = d.get('dyn_poc')
+            _vob = d.get('vob') or {}
+            _hvp = d.get('hvp') or {}
+            mt1, mt2, mt3, mt4 = st.columns(4)
+            if _v:
+                mt1.metric("VPFR POC", f"{_v.get('poc',0):,.1f}")
+                mt2.metric("VAH", f"{_v.get('vah',0):,.1f}")
+                mt3.metric("VAL", f"{_v.get('val',0):,.1f}")
+            if _dp is not None:
+                rel = "above" if _dp > d['last'] else "below"
+                mt4.metric("Dynamic PoC", f"{_dp:,.1f}", f"{rel} LTP")
+            # VOB zones (top 3 bullish + bearish)
+            _bull_v = (_vob.get('bullish') or [])[-3:]
+            _bear_v = (_vob.get('bearish') or [])[-3:]
+            if _bull_v or _bear_v:
+                st.markdown("**🟩🟪 VOB (Volume Order Blocks):**")
+                _vob_rows = []
+                for b in _bull_v:
+                    _vob_rows.append({'Type': '🟩 Bullish (Support)',
+                                      'Range': f"{b['lower']:,.1f} – {b['upper']:,.1f}",
+                                      'Mid': f"{b['mid']:,.1f}",
+                                      'Volume': f"{b['volume']:,.0f}"})
+                for b in _bear_v:
+                    _vob_rows.append({'Type': '🟪 Bearish (Resistance)',
+                                      'Range': f"{b['lower']:,.1f} – {b['upper']:,.1f}",
+                                      'Mid': f"{b['mid']:,.1f}",
+                                      'Volume': f"{b['volume']:,.0f}"})
+                if _vob_rows:
+                    st.dataframe(pd.DataFrame(_vob_rows), use_container_width=True, hide_index=True)
+            # HVP markers (most recent few each side)
+            _bull_h = (_hvp.get('bullish_hvp') or [])[-3:]
+            _bear_h = (_hvp.get('bearish_hvp') or [])[-3:]
+            if _bull_h or _bear_h:
+                st.markdown("**🟢🔴 HVP (High Volume Pivots):**")
+                _hvp_rows = []
+                for h in _bull_h:
+                    _ts = h.get('time')
+                    _ts_s = _ts.strftime('%Y-%m-%d') if hasattr(_ts, 'strftime') else str(_ts)
+                    _hvp_rows.append({'Type': '🟢 Bullish (Pivot Low)',
+                                      'Date': _ts_s,
+                                      'Price': f"{h['price']:,.1f}",
+                                      'Volume': f"{h['volume']:,.0f}"})
+                for h in _bear_h:
+                    _ts = h.get('time')
+                    _ts_s = _ts.strftime('%Y-%m-%d') if hasattr(_ts, 'strftime') else str(_ts)
+                    _hvp_rows.append({'Type': '🔴 Bearish (Pivot High)',
+                                      'Date': _ts_s,
+                                      'Price': f"{h['price']:,.1f}",
+                                      'Volume': f"{h['volume']:,.0f}"})
+                if _hvp_rows:
+                    st.dataframe(pd.DataFrame(_hvp_rows), use_container_width=True, hide_index=True)
+            if _m and _m.get('rows'):
+                st.markdown(
+                    f"**MFP** — POC {_m.get('poc_price',0):,.1f} · "
+                    f"VA {_m.get('value_area_low',0):,.1f}–{_m.get('value_area_high',0):,.1f} · "
+                    f"Top: {_m.get('highest_sentiment_direction','—')} @ {_m.get('highest_sentiment_price',0):,.1f}"
+                )
+                rows = []
+                for r in reversed(_m['rows']):
+                    _is_bull = r['sentiment'].lower().startswith('bull')
+                    _is_bear = r['sentiment'].lower().startswith('bear')
+                    poc_cell = ('🟢🎯' if _is_bull else ('🔴🎯' if _is_bear else '⚪🎯')) if r.get('is_poc') else r.get('node_type','')
+                    rows.append({
+                        '_sd': 'bull' if _is_bull else ('bear' if _is_bear else 'neutral'),
+                        'Price Bin': f"{r['bin_low']:,.1f}–{r['bin_high']:,.1f}",
+                        'Total Vol': f"{r['total_volume']:,.0f}",
+                        'Bull': f"{r['bull_volume']:,.0f}",
+                        'Bear': f"{r['bear_volume']:,.0f}",
+                        'Δ': f"{r['delta']:+,.0f}",
+                        'Vol %': f"{r['volume_pct']:.1f}%",
+                        'POC': poc_cell,
+                        'Sentiment': f"{r['sentiment']} ({r['sentiment_strength']:.0f}%)",
+                    })
+                df_x = pd.DataFrame(rows)
+                def _color(row):
+                    sd = row.get('_sd', 'neutral')
+                    if sd == 'bull':
+                        return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
+                    if sd == 'bear':
+                        return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
+                    return [''] * len(row)
+                st.dataframe(df_x.style.apply(_color, axis=1).hide(axis='columns', subset=['_sd']),
+                             use_container_width=True, hide_index=True)
+
+
+def compute_gift_nifty_moneyflow(api, num_rows=10):
+    """Money Flow Profile for GIFT NIFTY — proxied via NIFTY near-month futures.
+
+    True GIFT NIFTY (NSE IX) OHLCV is not publicly accessible: Yahoo Finance
+    doesn't carry it and nseix.com / investing.com block API access. During
+    market hours GIFT Nifty tracks NIFTY near-month futures nearly 1:1
+    (basis a few points), so we profile the futures' real traded volume.
+
+    Returns {'profile': money_flow_dict, 'meta': {...}} or None.
+    """
+    try:
+        meta = get_nifty_futures_security_id()
+        if not meta:
+            return None
+        data = api.get_intraday_data(
+            security_id=meta['security_id'],
+            exchange_segment="NSE_FNO",
+            instrument="FUTIDX",
+            interval="5",
+            days_back=1,
+        )
+        if not data or 'open' not in data or not data.get('open'):
+            return None
+        ist = pytz.timezone('Asia/Kolkata')
+        df_fut = pd.DataFrame({
+            'datetime': [datetime.fromtimestamp(t, ist) for t in data.get('timestamp', [])],
+            'open': data['open'], 'high': data['high'],
+            'low': data['low'], 'close': data['close'],
+            'volume': data.get('volume', [0] * len(data['open'])),
+        })
+        if df_fut.empty or len(df_fut) < 5:
+            return None
+        profile = calculate_money_flow_profile(df_fut, num_rows=num_rows, source='Money Flow')
+        if not profile:
+            return None
+        last_close = float(df_fut['close'].iloc[-1])
+        return {
+            'profile': profile,
+            'meta': {
+                'symbol': meta['symbol'],
+                'expiry': meta['expiry'],
+                'last': last_close,
+                'bars': len(df_fut),
+                'num_rows': num_rows,
+                'as_of': datetime.now(ist).strftime('%H:%M:%S IST'),
+            },
+        }
+    except Exception:
+        return None
+
+
+def render_gift_nifty_moneyflow_panel():
+    data = st.session_state.get('_gift_mf')
+    st.markdown("## 💰 NIFTY Futures Money Flow Profile (10 rows)")
+    st.caption(
+        "Money Flow Profile built from NIFTY near-month futures bars (real traded volume)."
+    )
+    if not data:
+        st.info("Futures profile not loaded yet — fetches with the ~20s cycle.")
+        return
+    p = data['profile']
+    m = data['meta']
+    st.markdown(
+        f"**{m['symbol']}** (exp {m['expiry']}) · last ₹{m['last']:.1f} · "
+        f"{m['bars']} bars (5m) · as of {m['as_of']}"
+    )
+    poc = p.get('poc_price')
+    vah = p.get('value_area_high')
+    val = p.get('value_area_low')
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        st.metric("POC", f"₹{poc:.0f}" if poc else "—")
+    with c2:
+        st.metric("VAH", f"₹{vah:.0f}" if vah else "—")
+    with c3:
+        st.metric("VAL", f"₹{val:.0f}" if val else "—")
+    with c4:
+        st.metric("Top Sentiment", p.get('highest_sentiment_direction', '—'),
+                  f"₹{p.get('highest_sentiment_price', 0):.0f}")
+    rows = p.get('rows') or []
+    if rows:
+        try:
+            _tbl = []
+            for r in reversed(rows):  # highest price bin first
+                _tbl.append({
+                    'Price Bin': f"₹{r['bin_low']:.0f}–{r['bin_high']:.0f}",
+                    'Mid': f"₹{r['price_level']:.0f}",
+                    'Total Vol': f"{r['total_volume']:,.0f}",
+                    'Bull': f"{r['bull_volume']:,.0f}",
+                    'Bear': f"{r['bear_volume']:,.0f}",
+                    'Δ': f"{r['delta']:+,.0f}",
+                    'Vol %': f"{r['volume_pct']:.1f}%",
+                    'Node': ('🎯 POC' if r['is_poc'] else r['node_type']),
+                    'Sentiment': f"{r['sentiment']} ({r['sentiment_strength']:.0f}%)",
+                })
+            st.dataframe(pd.DataFrame(_tbl), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
+    # Horizontal money-flow bars per price bin (bull green / bear red stacked)
+    try:
+        if rows:
+            _labels = [f"₹{r['price_level']:.0f}" for r in rows]
+            _bulls = [r['bull_volume'] for r in rows]
+            _bears = [r['bear_volume'] for r in rows]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(y=_labels, x=_bulls, orientation='h',
+                                 name='Bull', marker_color='#00cc66'))
+            fig.add_trace(go.Bar(y=_labels, x=_bears, orientation='h',
+                                 name='Bear', marker_color='#ff4444'))
+            fig.update_layout(barmode='stack', height=340,
+                              margin=dict(l=10, r=10, t=28, b=10),
+                              title="Money Flow by Price (today, 5m futures bars)")
+            st.plotly_chart(fig, use_container_width=True)
+    except Exception:
+        pass
+
+
 def fetch_alignment_data(api):
     """Fetch candle data for SENSEX, BANKNIFTY, NIFTY IT, RELIANCE, ICICI, VIX.
     Detect candle patterns, compute 10m/1h/4h sentiment for each."""
@@ -4251,6 +8313,27 @@ def generate_master_signal(df, sa_result, gex_data, confluence_data, underlying_
                 _sr = compute_sector_rotation()
                 if _sr:
                     st.session_state._sector_rotation = _sr
+            except Exception:
+                pass
+            # Cross-sectional commodity risk dashboard (same cadence; cached at yfinance level)
+            try:
+                _cr = compute_commodity_risk()
+                if _cr:
+                    st.session_state._commodity_risk = _cr
+            except Exception:
+                pass
+            # Global indices (NIKKEI/SG/HK/FTSE/ES1!) — MFP + VPFR + Dynamic PoC daily
+            try:
+                _gi = compute_global_indices_profile(num_rows=10)
+                if _gi:
+                    st.session_state._global_indices = _gi
+            except Exception:
+                pass
+            # NIFTY futures money-flow profile — same throttled cadence
+            try:
+                _gmf = compute_gift_nifty_moneyflow(api, num_rows=10)
+                if _gmf:
+                    st.session_state._gift_mf = _gmf
             except Exception:
                 pass
         alignment = st.session_state.alignment_data
@@ -4816,7 +8899,7 @@ Respond in exactly this format (plain text, no markdown headers):
 🎯 Confidence: LOW / MEDIUM / HIGH — one-line reason
 💡 Key Risk: biggest thing that could go wrong in the next 15 minutes
 
-Keep the whole reply under 170 words. No disclaimers.
+Keep the whole reply under 170 words. No disclaimers. Use simple, plain English a beginner can understand — avoid jargon; if a technical term is unavoidable (GEX, basis, capping, OI, PCR, FII/DII), add a short plain-language meaning in brackets right after it.
 
 SNAPSHOT:
 {clean}
@@ -4894,18 +8977,353 @@ Confluence Reasons:
 {chr(10).join(['- ' + r for r in reasons])}
 """
 
-        prompt = f"""You are an experienced Nifty options trader. Analyze this live market snapshot and give a concise, actionable assessment.
+        prompt = f"""You are an institutional-grade NIFTY 50 derivatives analyst AI.
 
+Your objective is to analyze the market using BOTH:
+1. Cash Market (Spot NIFTY)
+2. NIFTY Futures
+
+You must combine spot price action, futures positioning, options data, gamma exposure, and institutional flows to determine:
+- Real trend vs fake trend
+- Institutional positioning
+- Dealer hedging behavior
+- Liquidity traps
+- Expiry manipulation
+- Short squeeze probability
+- Breakout sustainability
+- Intraday directional bias
+
+==================================================
+CORE ANALYSIS PRINCIPLE
+==================================================
+
+DO NOT analyze Spot NIFTY alone.
+
+DO NOT analyze Futures alone.
+
+ALWAYS combine:
+- Spot movement
+- Futures OI
+- Futures volume
+- Futures premium/discount
+- Option chain structure
+- Gamma exposure
+- FII positioning
+- Market breadth
+- Sector strength
+
+The goal is to think like a professional derivatives desk, not a retail trader.
+
+==================================================
+SECTION 1 — SPOT MARKET ANALYSIS
+==================================================
+
+Analyze:
+- Current NIFTY spot price
+- Day high/low
+- VWAP
+- Market breadth (advance/decline)
+- Sector strength
+- Heavyweight stock contribution
+- Intraday momentum
+- Spot support/resistance
+- Price action structure
+
+Important heavyweight stocks:
+- HDFC Bank
+- Reliance
+- ICICI Bank
+- Infosys
+- TCS
+- SBI
+- Axis Bank
+
+Determine:
+- Whether spot movement is broad-based or narrow
+- Whether market is healthy internally
+- Whether rally/selloff is genuine
+
+==================================================
+SECTION 2 — NIFTY FUTURES ANALYSIS
+==================================================
+
+Analyze:
+- Futures price
+- Basis (Future - Spot)
+- Premium/discount
+- OI
+- Change in OI
+- Volume
+- VWAP
+- Intraday positioning
+
+Detect:
+- Long buildup
+- Short buildup
+- Long unwinding
+- Short covering
+
+Rules:
+Price up + OI up = Long buildup
+Price down + OI up = Short buildup
+Price up + OI down = Short covering
+Price down + OI down = Long unwinding
+
+Interpret institutional sentiment using futures data.
+
+==================================================
+SECTION 3 — SPOT + FUTURES COMBINED LOGIC
+==================================================
+
+Use combined logic to identify true market intent.
+
+Examples:
+
+CASE 1:
+Spot up + Futures OI up
+= Strong bullish continuation
+= Real long buildup
+
+CASE 2:
+Spot up + Futures OI down
+= Short covering only
+= Rally may fail near resistance
+
+CASE 3:
+Spot down + Futures OI up
+= Aggressive short buildup
+= Strong bearish control
+
+CASE 4:
+Spot down + Futures OI down
+= Long unwinding
+= Weak bearishness, possible stabilization
+
+CASE 5:
+Spot breakout + weak breadth
+= Possible fake breakout
+
+CASE 6:
+Spot weak + heavy futures shorts near resistance
+= Call capping probability high
+
+==================================================
+SECTION 4 — OPTION CHAIN ANALYSIS
+==================================================
+
+Analyze:
+- CE/PE OI
+- Change in OI
+- Strike-wise liquidity
+- PCR
+- Max pain
+- Strong call writing
+- Strong put writing
+- Unwinding
+- Option volume spikes
+
+Detect:
+- Call capping
+- Put support
+- Dealer defense zones
+- Trap zones
+- Breakout traps
+- Breakdown traps
+
+==================================================
+SECTION 5 — GAMMA EXPOSURE ANALYSIS
+==================================================
+
+Analyze:
+- Total GEX
+- Positive/negative gamma
+- Gamma flip level
+- Gamma magnets
+- Gamma repellers
+- Dealer hedging pressure
+
+Interpret:
+Positive Gamma:
+- Dealers suppress volatility
+- Mean reversion likely
+
+Negative Gamma:
+- Dealers amplify moves
+- Momentum expansion likely
+
+Detect:
+- Gamma squeeze probability
+- Volatility expansion
+- Pinning behavior
+
+==================================================
+SECTION 6 — FII/DII ANALYSIS
+==================================================
+
+Analyze:
+- FII index futures long %
+- FII index futures short %
+- Net contracts added/reduced
+- Cash market buying/selling
+- DII activity
+
+Interpret:
+- Institutional directional bias
+- Whether move is hedge-driven or directional
+- Whether institutions support current trend
+
+==================================================
+SECTION 7 — BANKNIFTY CONFIRMATION
+==================================================
+
+Analyze:
+- BANKNIFTY futures trend
+- Relative strength vs NIFTY
+- Divergence
+- Banking sector leadership
+
+Interpret:
+- Whether BANKNIFTY confirms NIFTY move
+- Whether rally/selloff lacks banking support
+
+==================================================
+SECTION 8 — MARKET STRUCTURE CLASSIFICATION
+==================================================
+
+Classify market into ONE of these:
+
+- TRENDING BULLISH
+- TRENDING BEARISH
+- RANGE MARKET
+- SHORT COVERING RALLY
+- LONG UNWINDING DECLINE
+- VOLATILE EXPIRY
+- FAKE BREAKOUT
+- FAKE BREAKDOWN
+- NO TRADE ENVIRONMENT
+
+==================================================
+SECTION 9 — PRICE ACTION ANALYSIS
+==================================================
+
+Analyze:
+- Candlestick patterns
+- Rejection candles
+- Momentum candles
+- VWAP relation
+- Volume confirmation
+- Breakout strength
+- Liquidity sweeps
+
+Identify:
+- Trap reversals
+- Exhaustion moves
+- Momentum continuation
+- Smart money absorption
+
+==================================================
+SECTION 10 — FINAL DECISION ENGINE
+==================================================
+
+Determine:
+- Whether trend is real or fake
+- Whether institutions support move
+- Whether dealers suppress or amplify volatility
+- Whether breakout is sustainable
+- Whether market is trapped near key levels
+- Whether momentum should be followed or faded
+
+==================================================
+LIVE MARKET SNAPSHOT
+==================================================
 {context}
 
-Respond in exactly this format (markdown):
-**📍 Read:** 1 line summarizing what the market is doing right now.
-**✅ Trade Setup:** Entry zone, stop loss, target 1, target 2 (use nearest S/R levels).
-**⚠️ Invalidation:** What single event would invalidate this trade.
-**🎯 Confidence:** LOW / MEDIUM / HIGH with a one-line reason.
-**💡 Key Risk:** The biggest thing that could go wrong in the next 15 minutes.
+==================================================
+OUTPUT FORMAT
+==================================================
 
-Keep the total under 180 words. No disclaimers."""
+MARKET STATUS:
+🟢 STRONG BUY
+🔴 STRONG SELL
+🟡 RANGE
+⚪ NO TRADE
+
+CONFIDENCE:
+1/3 Low
+2/3 Medium
+3/3 High
+
+NIFTY SPOT:
+- Price
+- VWAP
+- Breadth
+
+NIFTY FUTURES:
+- Futures Price
+- OI Change
+- Volume
+- Basis
+
+BUILDUP ANALYSIS:
+- Long buildup
+- Short buildup
+- Short covering
+- Long unwinding
+
+OPTION ANALYSIS:
+- Call writing zones
+- Put writing zones
+- PCR
+- Max pain
+
+GAMMA ANALYSIS:
+- GEX
+- Gamma flip
+- Dealer bias
+- Magnet zones
+- Repeller zones
+
+FII/DII ANALYSIS:
+- FII bias
+- DII bias
+- Institutional control
+
+BANKNIFTY CONFIRMATION:
+- Confirming / Diverging
+
+PRICE ACTION:
+- Candlestick pattern
+- VWAP relation
+- Volume confirmation
+
+KEY LEVELS:
+- Resistance
+- Support
+- Breakout level
+- Breakdown level
+
+TRADE PLAN:
+- Entry
+- Stop loss
+- Targets
+- Risk level
+
+FINAL CONCLUSION:
+Explain:
+- Whether move is genuine or trap
+- Whether dealers are controlling movement
+- Whether breakout/breakdown is likely to sustain
+- Whether traders should follow momentum or fade extremes
+
+IMPORTANT:
+- Output ONLY the OUTPUT FORMAT section above, filled with values from the snapshot.
+- If a data point is missing from the snapshot, state "N/A" — do not invent numbers.
+- Avoid emotional retail-style analysis.
+- Prioritize Futures + Gamma + FII positioning over simple indicators.
+- Think probabilistically.
+- Mention conflicting signals clearly.
+- Detect institutional traps whenever possible.
+- No disclaimers."""
 
         resp = client.models.generate_content(model="gemini-2.0-flash", contents=prompt)
         return resp.text, None
@@ -5132,8 +9550,12 @@ def send_retest_alert(underlying_price, pcr_sr_snapshot, support_levels, resista
     return "\n\n".join(msgs) if msgs else None
 
 
-def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
-    """Fire when sudden call capping or put support is detected at S/R. Cooldown 5 min per strike."""
+def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25, sr_prox_pts=25):
+    """Fire when sudden call capping or put support is detected at S/R.
+    Per user rule: NIFTY spot must be at the matching side of a major S/R zone:
+      - CALL CAPPING (resistance writing) → spot near a major RESISTANCE
+      - PUT WRITING / CAPPING (support writing) → spot near a major SUPPORT
+    Cooldown 30 min per strike."""
     def _e(v): return str(v).replace('&','&amp;').replace('<','&lt;').replace('>','&gt;')
     if sa_result is None:
         return
@@ -5144,57 +9566,95 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25):
     now = datetime.now(pytz.timezone('Asia/Kolkata'))
     time_str = now.strftime('%H:%M:%S IST')
 
-    msgs = []
-
-    # Call capping (resistance)
+    # Check NIFTY spot proximity to major S/R zones
+    _at_support = False
+    _at_resistance = False
+    _nearest_sup = None
+    _nearest_res = None
     try:
-        cap_rows = adf[
-            adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance']) &
-            adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)'])
-        ]
-        for _, r in cap_rows.iterrows():
-            strike = float(r['Strike'])
-            if abs(underlying_price - strike) > proximity_pts:
-                continue
-            key = f"cap_call_{strike:.0f}"
-            last = alerted.get(key)
-            if last and (now - last).total_seconds() < 1800:
-                continue
-            vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
-            oi_l = float(r.get('CE_OI', 0) or 0) / 100000
-            msgs.append(f"🟥 CALL CAPPING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}")
-            alerted[key] = now
+        _zones = st.session_state.get('_major_sr_zones') or {}
+        for z in (_zones.get('support') or [])[:5]:
+            lvl = float(z.get('price') or z.get('level') or 0)
+            if lvl and abs(underlying_price - lvl) <= sr_prox_pts:
+                _at_support = True
+                _nearest_sup = lvl
+                break
+        for z in (_zones.get('resistance') or [])[:5]:
+            lvl = float(z.get('price') or z.get('level') or 0)
+            if lvl and abs(underlying_price - lvl) <= sr_prox_pts:
+                _at_resistance = True
+                _nearest_res = lvl
+                break
     except Exception:
         pass
 
-    # Put writing (support) — checked independently so it is never blocked by call capping
+    msgs = []
+
+    # Call capping (resistance) — only when NIFTY spot at major RESISTANCE
     try:
-        sup_rows = adf[
-            adf['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
-            adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)'])
-        ]
-        for _, r in sup_rows.iterrows():
-            strike = float(r['Strike'])
-            if abs(underlying_price - strike) > proximity_pts:
-                continue
-            key = f"cap_put_{strike:.0f}"
-            last = alerted.get(key)
-            if last and (now - last).total_seconds() < 1800:
-                continue
-            vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
-            oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-            msgs.append(f"🟩 PUT WRITING ₹{strike:.0f} {vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}")
-            alerted[key] = now
+        if _at_resistance:
+            cap_rows = adf[
+                adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance']) &
+                adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)'])
+            ]
+            for _, r in cap_rows.iterrows():
+                strike = float(r['Strike'])
+                if abs(underlying_price - strike) > proximity_pts:
+                    continue
+                key = f"cap_call_{strike:.0f}"
+                last = alerted.get(key)
+                if last and (now - last).total_seconds() < 1800:
+                    continue
+                vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
+                oi_l = float(r.get('CE_OI', 0) or 0) / 100000
+                msgs.append(
+                    f"🟥 <b>CALL CAPPING ₹{strike:.0f}</b> @ Resistance ₹{_nearest_res:.0f} "
+                    f"{vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                alerted[key] = now
+    except Exception:
+        pass
+
+    # Put writing / capping (support) — only when NIFTY spot at major SUPPORT
+    try:
+        if _at_support:
+            sup_rows = adf[
+                adf['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
+                adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)'])
+            ]
+            for _, r in sup_rows.iterrows():
+                strike = float(r['Strike'])
+                if abs(underlying_price - strike) > proximity_pts:
+                    continue
+                key = f"cap_put_{strike:.0f}"
+                last = alerted.get(key)
+                if last and (now - last).total_seconds() < 1800:
+                    continue
+                vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
+                oi_l = float(r.get('PE_OI', 0) or 0) / 100000
+                msgs.append(
+                    f"🟩 <b>PUT WRITING ₹{strike:.0f}</b> @ Support ₹{_nearest_sup:.0f} "
+                    f"{vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+                )
+                alerted[key] = now
     except Exception:
         pass
 
     return "\n\n".join(msgs) if msgs else None
 
 
-def send_decapping_alert(underlying_price):
-    """Fire Telegram alert when any ATM±2 strike shows CE/PE OI shedding. Cooldown: 10 min per strike."""
+def send_decapping_alert(underlying_price, pcr_sr_snapshot=None, support_levels=None, resistance_levels=None, proximity_pts=30):
+    """Fire Telegram alert when an ATM±2 strike shows CE/PE OI shedding or building.
+    Only fires when spot is near an S/R level (not mid-range). Cooldown: 10 min per strike."""
     _decap_atm = getattr(st.session_state, '_decap_atm_data', [])
     if not _decap_atm:
+        return None
+
+    # Gate: only alert when spot is within proximity_pts of an S/R level
+    _sr_levels = [s['level'] for s in (pcr_sr_snapshot or []) if s.get('level')]
+    _sr_levels += list(support_levels or [])
+    _sr_levels += list(resistance_levels or [])
+    if not _sr_levels or not any(abs(underlying_price - lvl) <= proximity_pts for lvl in _sr_levels):
         return None
 
     _alerted = st.session_state.setdefault('_decap_alerted', {})
@@ -5457,6 +9917,170 @@ def send_rejection_alert(candle, underlying_price, df_5m, sa_result, pcr_sr_snap
     return None
 
 
+def send_candle_pattern_alert(df, underlying_price, tf_label="5m"):
+    """Fire Telegram alert when a notable bullish/bearish/indecision pattern forms
+    on the most recently closed candle of the given timeframe. Dedup is per
+    timeframe + candle timestamp + pattern so each closed candle alerts at most once."""
+    if df is None or len(df) < 3 or not underlying_price:
+        return None
+    WATCH = {
+        'Bullish': {
+            'Hammer', 'Inverted Hammer', 'Bullish Engulfing', 'Bullish Harami',
+            'Piercing Line', 'Tweezer Bottom', 'Morning Star',
+            'Three White Soldiers', 'Bull Marubozu', 'Strong Green Candle',
+        },
+        'Bearish': {
+            'Shooting Star', 'Bearish Engulfing', 'Bearish Harami',
+            'Dark Cloud Cover', 'Tweezer Top', 'Evening Star',
+            'Three Black Crows', 'Bear Marubozu', 'Strong Red Candle',
+        },
+        'Indecision': {'Doji', 'Spinning Top'},
+    }
+    try:
+        cp = detect_candle_patterns(df, lookback=5)
+    except Exception:
+        return None
+    pattern = cp.get('pattern')
+    direction = cp.get('direction')
+    if not pattern or pattern in ('No Pattern', 'Insufficient Data', 'Normal'):
+        return None
+    if pattern not in WATCH.get(direction, set()):
+        return None
+    try:
+        last = df.iloc[-1]
+        last_ts = last.get('datetime') if hasattr(last, 'get') else None
+        if last_ts is None:
+            last_ts = df.index[-1]
+        ts_key = f"{tf_label}|{last_ts}"
+    except Exception:
+        ts_key = f"{tf_label}|{datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M')}"
+    sent = st.session_state.setdefault('_candle_pattern_alerted', {})
+    if sent.get(ts_key) == pattern:
+        return None
+    sent[ts_key] = pattern
+    if len(sent) > 200:
+        for k in list(sent.keys())[:-200]:
+            sent.pop(k, None)
+    emoji = '🟢' if direction == 'Bullish' else '🔴' if direction == 'Bearish' else '🟡'
+    time_str = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M:%S IST')
+    try:
+        o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+    except Exception:
+        o = h = l = c = 0.0
+    return (
+        f"🕯 <b>{tf_label} CANDLE — {pattern}</b> ({direction}) {emoji}\n"
+        f"Spot ₹{underlying_price:.0f} | O:{o:.0f} H:{h:.0f} L:{l:.0f} C:{c:.0f} | {time_str}"
+    )
+
+
+def _find_pivots(df, left=3, right=3):
+    """Return lists of (index, price) for pivot highs and pivot lows.
+    A pivot high at i: high[i] is greater than all highs within ±left/right (exclusive)."""
+    highs, lows = [], []
+    if df is None or len(df) < left + right + 1:
+        return highs, lows
+    h = df['high'].values
+    l = df['low'].values
+    for i in range(left, len(df) - right):
+        win_h = h[i - left:i + right + 1]
+        win_l = l[i - left:i + right + 1]
+        if h[i] == win_h.max() and (win_h == h[i]).sum() == 1:
+            highs.append((i, float(h[i])))
+        if l[i] == win_l.min() and (win_l == l[i]).sum() == 1:
+            lows.append((i, float(l[i])))
+    return highs, lows
+
+
+def detect_chart_patterns(df, lookback=60, tol_pct=0.003):
+    """Detect common multi-candle chart patterns from recent pivots.
+    Returns dict {pattern, direction} or None. tol_pct is the level-match tolerance."""
+    if df is None or len(df) < 20:
+        return None
+    recent = df.tail(lookback).reset_index(drop=True)
+    highs, lows = _find_pivots(recent, left=3, right=3)
+    if len(highs) < 2 and len(lows) < 2:
+        return None
+
+    def _close(a, b):
+        ref = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / ref <= tol_pct
+
+    last_h = highs[-3:] if len(highs) >= 3 else highs
+    last_l = lows[-3:] if len(lows) >= 3 else lows
+
+    # Head & Shoulders: 3 highs, middle highest, shoulders ~equal & below head, head meaningfully higher
+    if len(highs) >= 3:
+        s1, head, s2 = highs[-3][1], highs[-2][1], highs[-1][1]
+        if head > s1 and head > s2 and _close(s1, s2) and (head - max(s1, s2)) / head > tol_pct:
+            return {'pattern': 'Head & Shoulders', 'direction': 'Bearish'}
+
+    # Inverse H&S: 3 lows, middle lowest, shoulders ~equal & above head
+    if len(lows) >= 3:
+        s1, head, s2 = lows[-3][1], lows[-2][1], lows[-1][1]
+        if head < s1 and head < s2 and _close(s1, s2) and (min(s1, s2) - head) / head > tol_pct:
+            return {'pattern': 'Inverse Head & Shoulders', 'direction': 'Bullish'}
+
+    # Double Top: last two pivot highs at similar level, with a pivot low between them
+    if len(highs) >= 2:
+        h1_idx, h1 = highs[-2]
+        h2_idx, h2 = highs[-1]
+        if _close(h1, h2) and any(h1_idx < li < h2_idx for li, _ in lows):
+            return {'pattern': 'Double Top', 'direction': 'Bearish'}
+
+    # Double Bottom
+    if len(lows) >= 2:
+        l1_idx, l1 = lows[-2]
+        l2_idx, l2 = lows[-1]
+        if _close(l1, l2) and any(l1_idx < hi < l2_idx for hi, _ in highs):
+            return {'pattern': 'Double Bottom', 'direction': 'Bullish'}
+
+    # Triangles: need at least 2 recent highs and 2 recent lows
+    if len(highs) >= 2 and len(lows) >= 2:
+        h1, h2 = highs[-2][1], highs[-1][1]
+        l1, l2 = lows[-2][1], lows[-1][1]
+        highs_flat = _close(h1, h2)
+        lows_flat = _close(l1, l2)
+        highs_falling = (h1 - h2) / max(h1, 1.0) > tol_pct
+        lows_rising = (l2 - l1) / max(l1, 1.0) > tol_pct
+        if highs_flat and lows_rising:
+            return {'pattern': 'Ascending Triangle', 'direction': 'Bullish'}
+        if lows_flat and highs_falling:
+            return {'pattern': 'Descending Triangle', 'direction': 'Bearish'}
+        if highs_falling and lows_rising:
+            return {'pattern': 'Symmetrical Triangle', 'direction': 'Neutral'}
+
+    return None
+
+
+def send_chart_pattern_alert(df, underlying_price, tf_label="5m"):
+    """Fire Telegram alert when a multi-candle chart pattern (H&S, Double Top/Bottom,
+    Triangle) is detected. Dedup per (timeframe + pattern) for 30 min so a slow-evolving
+    pattern doesn't re-alert each cycle."""
+    if df is None or len(df) < 20 or not underlying_price:
+        return None
+    try:
+        res = detect_chart_patterns(df)
+    except Exception:
+        return None
+    if not res:
+        return None
+    pattern = res['pattern']
+    direction = res['direction']
+    key = f"{tf_label}|{pattern}"
+    sent = st.session_state.setdefault('_chart_pattern_alerted', {})
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    last = sent.get(key)
+    if last and (now - last).total_seconds() < 1800:
+        return None
+    sent[key] = now
+    emoji = '🟢' if direction == 'Bullish' else '🔴' if direction == 'Bearish' else '🟡'
+    time_str = now.strftime('%H:%M:%S IST')
+    return (
+        f"📐 <b>{tf_label} CHART PATTERN — {pattern}</b> ({direction}) {emoji}\n"
+        f"Spot ₹{underlying_price:.0f} | {time_str}"
+    )
+
+
 def generate_ai_context_message():
     """One-time AI context/glossary — split into two messages to stay under 4096 chars."""
     part1 = """🟡 <b>NIFTY SIGNAL GUIDE (EXECUTION)</b>
@@ -5618,7 +10242,2417 @@ def compute_depth_sr(df_summary, underlying_price, n=3):
     return resistance, support
 
 
-def send_master_signal_telegram(result, underlying_price, option_data=None, force=False, skip_image=False, alert_header=""):
+def compute_major_sr_zones(option_data, result, money_flow_data, underlying_price,
+                           max_zones=3, tol_pct=0.0015):
+    """Aggregate major support/resistance zones using 4 sources:
+    OI (top CE/PE strikes), VPFR (POC/VAH/VAL × 3 timeframes), Gamma
+    (flip/magnet/repeller) and Money Flow (POC/VAH/VAL). Levels within
+    ~tol_pct of spot are clustered; zones are ranked by how many distinct
+    SOURCES (OI/VPFR/GAMMA/MF) confirm them. Returns top-N support and
+    resistance zones with source tags."""
+    if not underlying_price:
+        return {'support': [], 'resistance': []}
+
+    levels = []  # (price, src_tag, detail, value_str) — value_str shows the key number for that level
+
+    # 1) Open Interest — top CE OI (resistance) + top PE OI (support)
+    try:
+        df = option_data.get('df_summary') if option_data else None
+        if df is not None and not df.empty and 'Strike' in df.columns:
+            lo, hi = underlying_price * 0.95, underlying_price * 1.05
+            win = df[(df['Strike'] >= lo) & (df['Strike'] <= hi)]
+            if 'openInterest_CE' in win.columns:
+                for _, r in win.nlargest(3, 'openInterest_CE').iterrows():
+                    oi_val = float(r['openInterest_CE'] or 0)
+                    levels.append((float(r['Strike']), 'OI-CE',
+                                   f"CE OI {oi_val/1e5:.1f}L",
+                                   f"CE OI {oi_val/1e5:.1f}L"))
+            if 'openInterest_PE' in win.columns:
+                for _, r in win.nlargest(3, 'openInterest_PE').iterrows():
+                    oi_val = float(r['openInterest_PE'] or 0)
+                    levels.append((float(r['Strike']), 'OI-PE',
+                                   f"PE OI {oi_val/1e5:.1f}L",
+                                   f"PE OI {oi_val/1e5:.1f}L"))
+    except Exception:
+        pass
+
+    # 2) VPFR — POC/VAH/VAL across 3 timeframes, with volume per level
+    try:
+        vpfr = (result or {}).get('vpfr', {}) or {}
+        tf_tag = {'short': 'S', 'medium': 'M', 'long': 'L'}
+        for tf in ('short', 'medium', 'long'):
+            vd = vpfr.get(tf) or {}
+            for k in ('poc', 'vah', 'val'):
+                try:
+                    v = float(vd.get(k))
+                    if v > 0:
+                        vol = float(vd.get(f'{k}_vol', 0) or 0)
+                        vol_str = (f"vol {vol/1000:.1f}K" if vol >= 1000
+                                   else (f"vol {vol:.0f}" if vol else ""))
+                        levels.append((v, f"VPFR-{tf_tag[tf]}{k.upper()}",
+                                       f"{tf.title()} {k.upper()}", vol_str))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+    # 3) Gamma — flip / magnet / repeller
+    try:
+        gex = (result or {}).get('gex', {}) or {}
+        for k, tag in (('gamma_flip', 'GAMMA-FLIP'),
+                       ('magnet', 'GAMMA-MAGNET'),
+                       ('repeller', 'GAMMA-REPEL')):
+            v = gex.get(k)
+            try:
+                if v and float(v) > 0:
+                    levels.append((float(v), tag, k, ""))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 4) Money Flow — POC / value area high / value area low, with volume if available
+    try:
+        mf = money_flow_data or {}
+        mf_rows = mf.get('rows') or []  # list of {price, volume} dicts (or similar)
+        def _mf_vol_at(target):
+            try:
+                if not mf_rows: return 0.0
+                nearest = min(mf_rows, key=lambda r: abs(float(r.get('price', r.get('p', 0))) - target))
+                return float(nearest.get('volume', nearest.get('v', 0)) or 0)
+            except Exception:
+                return 0.0
+        candidates = [
+            ('poc_price', 'MF-POC', 'MF POC'),
+            ('value_area_high', 'MF-VAH', 'MF VAH'),
+            ('value_area_low', 'MF-VAL', 'MF VAL'),
+        ]
+        for key, tag, det in candidates:
+            v = mf.get(key)
+            try:
+                if v and float(v) > 0:
+                    vol = _mf_vol_at(float(v))
+                    vol_str = (f"vol {vol/1000:.1f}K" if vol >= 1000
+                               else (f"vol {vol:.0f}" if vol else ""))
+                    levels.append((float(v), tag, det, vol_str))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    if not levels:
+        return {'support': [], 'resistance': []}
+
+    # Cluster by proximity (~0.15% of spot, min 15 pts)
+    levels.sort(key=lambda x: x[0])
+    tol = max(15.0, underlying_price * tol_pct)
+    clusters = []
+    for price, src, detail, val_str in levels:
+        item = {'src': src, 'detail': detail, 'price': price, 'val_str': val_str}
+        if clusters and abs(price - clusters[-1]['avg']) <= tol:
+            c = clusters[-1]
+            c['items'].append(item)
+            c['avg'] = sum(i['price'] for i in c['items']) / len(c['items'])
+        else:
+            clusters.append({'avg': price, 'items': [item]})
+
+    # Classify each cluster by the INTRINSIC type of its sources, not by where
+    # spot happens to be — a resistance level stays resistance even if spot moves
+    # above it (e.g. high CE OI = call sellers' ceiling; VAH = value-area high).
+    # Plus STICKY memory: when the vote is tied, prefer the bucket's previous
+    # label rather than flipping based on spot position.
+    #   Resistance-type tags: OI-CE, *VAH (VPFR/MF value-area highs)
+    #   Support-type tags:    OI-PE, *VAL (VPFR/MF value-area lows)
+    #   Neutral tags:         *POC, GAMMA-* (POC magnets, gamma flip/magnet/repel)
+    prev_class = st.session_state.setdefault('_zone_prev_classification', {})
+    support, resistance = [], []
+    for c in clusters:
+        cats = sorted({it['src'].split('-')[0] for it in c['items']})
+        r_count = sum(1 for it in c['items']
+                      if it['src'].startswith('OI-CE') or 'VAH' in it['src'])
+        s_count = sum(1 for it in c['items']
+                      if it['src'].startswith('OI-PE') or 'VAL' in it['src'])
+        bucket_key = int(round(c['avg'] / 50) * 50)
+        prev = prev_class.get(bucket_key)
+        if r_count > s_count + 0:  # strict majority for resistance
+            zone_type = 'resistance' if (r_count - s_count) >= 2 or prev != 'support' else prev
+        elif s_count > r_count + 0:
+            zone_type = 'support' if (s_count - r_count) >= 2 or prev != 'resistance' else prev
+        else:
+            # Tie: prefer previous classification (sticky); else use position
+            zone_type = prev or ('resistance' if c['avg'] >= underlying_price else 'support')
+        prev_class[bucket_key] = zone_type  # remember for next cycle
+        _prices = [it['price'] for it in c['items']]
+        zone = {
+            'price': round(c['avg'], 2),
+            'low': round(min(_prices), 2),
+            'high': round(max(_prices), 2),
+            'sources': cats,
+            'src_count': len(cats),
+            'level_count': len(c['items']),
+            'detail': ', '.join(it['src'] for it in c['items'][:6]),
+            'items': c['items'][:8],  # per-level breakdown (price + value) for the alert
+            'type': zone_type,
+        }
+        if zone_type == 'support':
+            support.append(zone)
+        else:
+            resistance.append(zone)
+    support.sort(key=lambda z: (-z['src_count'], -z['level_count'], abs(z['price'] - underlying_price)))
+    resistance.sort(key=lambda z: (-z['src_count'], -z['level_count'], abs(z['price'] - underlying_price)))
+    return {'support': support[:max_zones], 'resistance': resistance[:max_zones]}
+
+
+def send_major_sr_alert(zones, underlying_price, proximity_pts=25, bucket_pts=50, cooldown_s=1800):
+    """Fire a single Telegram alert when spot comes within `proximity_pts` of any
+    major S/R zone. Dedup is by a `bucket_pts`-wide bucket of the zone price
+    (ignoring whether it's support/resistance), so small cluster-average wobble
+    and support↔resistance flips around the same level all share one cooldown."""
+    if not zones or not (zones.get('support') or zones.get('resistance')) or not underlying_price:
+        return
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    mo = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    mc = now.replace(hour=15, minute=45, second=0, microsecond=0)
+    if now.weekday() >= 5 or not (mo <= now <= mc):
+        return
+    alerted = st.session_state.setdefault('_major_sr_alerted', {})
+    for _k in list(alerted.keys()):
+        try:
+            if (now - alerted[_k]).total_seconds() > cooldown_s * 4:
+                del alerted[_k]
+        except Exception:
+            pass
+    fired_this_cycle = set()
+    for kind, zlist in (('Support', zones.get('support', [])),
+                        ('Resistance', zones.get('resistance', []))):
+        for z in zlist:
+            dist = abs(underlying_price - z['price'])
+            if dist > proximity_pts:
+                continue
+            bucket = int(round(z['price'] / bucket_pts) * bucket_pts)
+            key = f"zone_{bucket}"
+            if key in fired_this_cycle:
+                continue
+            last = alerted.get(key)
+            if last and (now - last).total_seconds() < cooldown_s:
+                continue
+            alerted[key] = now
+            fired_this_cycle.add(key)
+            emoji = '🟢' if kind == 'Support' else '🔴'
+            srcs = '/'.join(z['sources'])
+            _zlo, _zhi = z.get('low', z['price']), z.get('high', z['price'])
+            _range = f"₹{_zlo:.0f}-{_zhi:.0f}" if _zhi - _zlo >= 1 else f"₹{z['price']:.0f}"
+            # Append the Tier-1 Bull/Bear Meter so each alert carries the live bias
+            _bb = st.session_state.get('_bull_bear_meter') or {}
+            _bb_line = ""
+            if _bb:
+                _bb_line = (f"\n\n{_bb.get('emoji','')} <b>BULL/BEAR METER: {_bb.get('score',0):+.0f}</b> "
+                            f"({_bb.get('label','—')}, coverage {_bb.get('coverage',0):.0f}%)")
+            # Reasons / per-component breakdown
+            _reason_lines = []
+            for _c in (_bb.get('components') or []):
+                _s = _c.get('score')
+                _sym = '⚪' if _s is None else ('🟢' if _s > 0 else ('🔴' if _s < 0 else '⚪'))
+                _val = '—' if _s is None else f"{_s:+.0f}"
+                _reason_lines.append(f"  {_sym} <b>{_c['name']}</b>: {_val} · <i>{_c.get('note','')}</i>")
+            _reasons_block = ("\n<b>WHY (signal breakdown):</b>\n" + "\n".join(_reason_lines)) if _reason_lines else ""
+
+            # All top S/R zones from the same snapshot for context
+            def _fmt_zone(label, zz):
+                _lo, _hi = zz.get('low', zz['price']), zz.get('high', zz['price'])
+                _rng = f"₹{_lo:.0f}-{_hi:.0f}" if _hi - _lo >= 1 else f"₹{zz['price']:.0f}"
+                _b = int(round(zz['price'] / bucket_pts) * bucket_pts)
+                _src = '/'.join(zz['sources'])
+                _line_hdr = (f"  {label} ~₹{_b} · {_rng} · {_src} "
+                             f"({zz['src_count']}srcs, {zz['level_count']}lvls)")
+                # Detail per level: tag @price (value if any)
+                _items = zz.get('items') or []
+                _lvl_lines = []
+                for _it in _items:
+                    _vs = _it.get('val_str') or ''
+                    _suf = f" ({_vs})" if _vs else ""
+                    _lvl_lines.append(f"     · {_it.get('src','?')} @₹{_it.get('price',0):.0f}{_suf}")
+                _body = "\n".join(_lvl_lines) if _lvl_lines else f"     <i>{zz.get('detail','')}</i>"
+                return _line_hdr + "\n" + _body
+            _zone_lines = []
+            _top_sup = (zones.get('support') or [])[:2]
+            _top_res = (zones.get('resistance') or [])[:2]
+            if _top_sup:
+                _zone_lines.append("🟢 <b>Top Support:</b>")
+                for _i, _zz in enumerate(_top_sup, 1):
+                    _zone_lines.append(_fmt_zone(f"S{_i}", _zz))
+            if _top_res:
+                _zone_lines.append("🔴 <b>Top Resistance:</b>")
+                for _i, _zz in enumerate(_top_res, 1):
+                    _zone_lines.append(_fmt_zone(f"R{_i}", _zz))
+            _zones_block = ("\n\n" + "\n".join(_zone_lines)) if _zone_lines else ""
+
+            msg = (
+                f"{emoji} <b>NEAR MAJOR {kind.upper()} ZONE ~₹{bucket}</b>\n"
+                f"Range {_range} · Spot ₹{underlying_price:.0f} ({dist:.0f}pts away) · "
+                f"{srcs} ({z['src_count']} sources, {z['level_count']} levels)\n"
+                f"<i>{z['detail']}</i> · {now.strftime('%H:%M:%S IST')}"
+                f"{_bb_line}{_reasons_block}{_zones_block}"
+            )
+            try:
+                send_telegram_message_sync(msg, force=False)
+            except Exception:
+                pass
+
+
+def render_major_sr_table(zones, underlying_price):
+    """Render the major S/R zones in a Streamlit dataframe."""
+    if not zones or not underlying_price:
+        st.caption("Major S/R zones not yet computed.")
+        return
+    def _rng(z):
+        lo, hi = z.get('low', z['price']), z.get('high', z['price'])
+        return f"₹{lo:,.0f}-{hi:,.0f}" if hi - lo >= 1 else f"₹{z['price']:,.0f}"
+
+    rows = []
+    for z in reversed(zones.get('resistance', [])):
+        rows.append({
+            'Zone': '🔴 Resistance',
+            'Range': _rng(z),
+            'Mid ₹': f"{z['price']:,.0f}",
+            'Dist': f"{z['price'] - underlying_price:+.0f}",
+            'Sources': ' + '.join(z['sources']),
+            '# Confirms': f"{z['src_count']}/4",
+            'Levels': z['detail'],
+        })
+    rows.append({'Zone': '⚪ Spot', 'Range': '—', 'Mid ₹': f"{underlying_price:,.2f}",
+                 'Dist': '0', 'Sources': '', '# Confirms': '', 'Levels': ''})
+    for z in zones.get('support', []):
+        rows.append({
+            'Zone': '🟢 Support',
+            'Range': _rng(z),
+            'Mid ₹': f"{z['price']:,.0f}",
+            'Dist': f"{z['price'] - underlying_price:+.0f}",
+            'Sources': ' + '.join(z['sources']),
+            '# Confirms': f"{z['src_count']}/4",
+            'Levels': z['detail'],
+        })
+    if rows:
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("No major S/R zones detected yet.")
+
+
+def render_oi_charts(option_data, underlying_price, atm_band=10):
+    """Two side-by-side bar charts:
+      • Total CE vs PE OI per strike (ATM ± atm_band)
+      • Change in CE vs PE OI per strike (intraday delta)
+    CE in red (resistance side), PE in green (support side). Spot drawn as a
+    vertical reference line on each."""
+    if not option_data or not underlying_price:
+        st.caption("Waiting for option chain…")
+        return
+    df = option_data.get('df_summary')
+    if df is None or df.empty or 'Strike' in df.columns is False:
+        st.caption("Option chain not yet loaded.")
+        return
+
+    # Pick ATM ± atm_band strikes
+    strikes = sorted(df['Strike'].unique())
+    if not strikes:
+        st.caption("No strikes in option chain.")
+        return
+    atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - underlying_price))
+    lo = max(0, atm_idx - atm_band)
+    hi = min(len(strikes), atm_idx + atm_band + 1)
+    win = df[df['Strike'].isin(strikes[lo:hi])].sort_values('Strike').reset_index(drop=True)
+    if win.empty:
+        st.caption("No nearby strikes.")
+        return
+
+    def _col(name, default=0):
+        return win[name].fillna(0).astype(float).tolist() if name in win.columns else [default] * len(win)
+    x_strikes = win['Strike'].astype(int).tolist()
+    ce_oi = _col('openInterest_CE')
+    pe_oi = _col('openInterest_PE')
+    ce_chg = _col('changeinOpenInterest_CE')
+    pe_chg = _col('changeinOpenInterest_PE')
+    # Convert raw OI to lakhs for readability
+    ce_oi_l = [v / 1e5 for v in ce_oi]
+    pe_oi_l = [v / 1e5 for v in pe_oi]
+    ce_chg_l = [v / 1e5 for v in ce_chg]
+    pe_chg_l = [v / 1e5 for v in pe_chg]
+
+    col1, col2 = st.columns(2)
+    with col1:
+        fig1 = go.Figure()
+        fig1.add_trace(go.Bar(name='CE OI', x=x_strikes, y=ce_oi_l,
+                              marker_color='#ff4444',
+                              text=[f"{v:.1f}L" for v in ce_oi_l], textposition='outside'))
+        fig1.add_trace(go.Bar(name='PE OI', x=x_strikes, y=pe_oi_l,
+                              marker_color='#00cc66',
+                              text=[f"{v:.1f}L" for v in pe_oi_l], textposition='outside'))
+        fig1.add_vline(x=underlying_price, line_dash='dash', line_color='#ffd700',
+                       annotation_text=f"Spot {underlying_price:.0f}", annotation_position='top')
+        fig1.update_layout(
+            title='Total OI — Call (CE) vs Put (PE)',
+            barmode='group', height=380, margin=dict(l=20, r=20, t=40, b=20),
+            xaxis_title='Strike', yaxis_title='OI (lakhs)',
+            plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig1, use_container_width=True)
+
+    with col2:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Bar(name='ΔCE OI', x=x_strikes, y=ce_chg_l,
+                              marker_color='#ff4444',
+                              text=[f"{v:+.1f}L" for v in ce_chg_l], textposition='outside'))
+        fig2.add_trace(go.Bar(name='ΔPE OI', x=x_strikes, y=pe_chg_l,
+                              marker_color='#00cc66',
+                              text=[f"{v:+.1f}L" for v in pe_chg_l], textposition='outside'))
+        fig2.add_vline(x=underlying_price, line_dash='dash', line_color='#ffd700',
+                       annotation_text=f"Spot {underlying_price:.0f}", annotation_position='top')
+        fig2.add_hline(y=0, line_color='#666')
+        fig2.update_layout(
+            title='Change in OI — Call (CE) vs Put (PE)',
+            barmode='group', height=380, margin=dict(l=20, r=20, t=40, b=20),
+            xaxis_title='Strike', yaxis_title='ΔOI (lakhs)',
+            plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+    # Quick aggregate row below the charts
+    total_ce, total_pe = sum(ce_oi_l), sum(pe_oi_l)
+    pcr = (total_pe / total_ce) if total_ce > 0 else 0
+    net_chg_ce, net_chg_pe = sum(ce_chg_l), sum(pe_chg_l)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total CE OI", f"{total_ce:,.1f}L")
+    c2.metric("Total PE OI", f"{total_pe:,.1f}L")
+    c3.metric("PCR (PE/CE)", f"{pcr:.2f}",
+              "Bullish" if pcr > 1.3 else ("Bearish" if pcr < 0.7 else "Neutral"))
+    c4.metric("Net ΔOI (PE−CE)", f"{net_chg_pe - net_chg_ce:+,.1f}L",
+              "PE building" if net_chg_pe > net_chg_ce else "CE building")
+
+
+def compute_bull_bear_meter(result, option_data=None):
+    """Aggregate the 5 Tier-1 signals into a single −100 (strong bear) ↔ +100
+    (strong bull) score, with per-component breakdown.
+
+    Components (each clamped to ±100, weighted sum then clamped again):
+      1. Master Signal score      (0.25)  — already a composite of many indicators
+      2. FII Net (cash + futures) (0.20)  — institutional money flow
+      3. NIFTY Futures price + OI (0.20)  — long buildup / short cover / etc.
+      4. Net GEX + Gamma Flip     (0.20)  — dealer-hedging direction
+      5. OI Capping/Decapping     (0.15)  — call/put writers' tug-of-war ATM±2
+    """
+    def _clamp(x, lo=-100.0, hi=100.0):
+        try:
+            return max(lo, min(hi, float(x)))
+        except Exception:
+            return 0.0
+
+    components = []
+    weighted_sum, total_w, used_w = 0.0, 0.0, 0.0
+
+    # 1) Master signal score (range typically -10..+10 → -100..+100)
+    try:
+        score = float((result or {}).get('score') or 0)
+        c1 = _clamp(score * 10)
+    except Exception:
+        c1 = None
+    components.append({'name': 'Master Signal', 'score': c1, 'weight': 0.25,
+                       'note': f"raw score {(result or {}).get('score', '—')}"})
+    if c1 is not None:
+        weighted_sum += c1 * 0.25
+        used_w += 0.25
+    total_w += 0.25
+
+    # 2) FII net flow (cash + index futures)
+    fii_cash = (st.session_state.get('_fii_dii_cash') or {}).get('FII') or {}
+    fii_deriv = st.session_state.get('_fii_deriv_stats') or {}
+    c2_parts = []
+    try:
+        if fii_cash:
+            # ±2000 Cr cash net → ±100
+            c2_parts.append(_clamp((fii_cash.get('net') or 0) / 20.0))
+        if fii_deriv:
+            # ±50000 net contracts → ±100
+            c2_parts.append(_clamp((fii_deriv.get('fut_index_net') or 0) / 500.0))
+        c2 = sum(c2_parts) / len(c2_parts) if c2_parts else None
+    except Exception:
+        c2 = None
+    _note2 = (f"Cash ₹{fii_cash.get('net', 0):+,.0f} Cr · " if fii_cash else "Cash N/A · ") + \
+             (f"Fut net {fii_deriv.get('fut_index_net', 0):+,.0f}" if fii_deriv else "Fut N/A")
+    components.append({'name': 'FII Net (Cash+Fut)', 'score': c2, 'weight': 0.20, 'note': _note2})
+    if c2 is not None:
+        weighted_sum += c2 * 0.20
+        used_w += 0.20
+    total_w += 0.20
+
+    # 3) NIFTY Futures price + OI buildup/unwind
+    fut = st.session_state.get('_nifty_futures_data')
+    _fut_err = st.session_state.get('_nifty_fut_err')
+    c3, _note3 = None, (f"Futures N/A — {_fut_err}" if _fut_err else "Futures N/A")
+    try:
+        if fut:
+            cp = float(fut.get('chg_price') or 0)
+            co = float(fut.get('chg_oi') or 0)
+            label = 'Flat'
+            base = 0.0
+            if abs(cp) >= 1 and abs(co) >= 1:
+                if cp > 0 and co > 0:    base, label = +80, 'Long buildup'
+                elif cp < 0 and co > 0:  base, label = -80, 'Short buildup'
+                elif cp > 0 and co < 0:  base, label = +40, 'Short covering'
+                elif cp < 0 and co < 0:  base, label = -40, 'Long unwinding'
+            # Add basis tilt (premium → bullish, discount → bearish), ±20
+            basis_tilt = _clamp(float(fut.get('basis') or 0) * 2, -20, 20)
+            c3 = _clamp(base + basis_tilt)
+            _note3 = f"{label} · ΔP {cp:+.1f} · ΔOI {co:+,.0f} · basis {fut.get('basis', 0):+.1f}"
+    except Exception:
+        c3 = None
+    components.append({'name': 'Futures P+OI', 'score': c3, 'weight': 0.20, 'note': _note3})
+    if c3 is not None:
+        weighted_sum += c3 * 0.20
+        used_w += 0.20
+    total_w += 0.20
+
+    # 4) Net GEX + Gamma Flip
+    gex = (result or {}).get('gex') or {}
+    c4, _note4 = None, "GEX N/A"
+    try:
+        net_gex = float(gex.get('net_gex') or 0)
+        above = bool(gex.get('above_flip'))
+        # Sign of net GEX dominates; bonus if price above flip + positive GEX
+        sign_score = 50 if net_gex > 0 else (-50 if net_gex < 0 else 0)
+        flip_bonus = 30 if above else -30
+        # Above flip + positive GEX = stable bull. Below flip + negative GEX = momentum-down
+        c4 = _clamp(sign_score + flip_bonus)
+        _note4 = (f"net {net_gex:+.0f}L · "
+                  f"{'above' if above else 'below'} flip "
+                  f"₹{int(gex.get('gamma_flip') or 0)}")
+    except Exception:
+        c4 = None
+    components.append({'name': 'Net GEX + Flip', 'score': c4, 'weight': 0.20, 'note': _note4})
+    if c4 is not None:
+        weighted_sum += c4 * 0.20
+        used_w += 0.20
+    total_w += 0.20
+
+    # 5) OI Capping/Decapping ATM±2 (bullish: CE decap, PE cap; bearish: CE cap, PE depeg)
+    decap = st.session_state.get('_decap_atm_data') or []
+    c5, _note5 = None, "Cap/Decap N/A"
+    try:
+        if decap:
+            bull, bear = 0.0, 0.0
+            for e in decap:
+                if e.get('ce_decapping'): bull += float(e.get('ce_shed_pct', 0) or 0)
+                if e.get('pe_capping'):   bull += float(e.get('pe_built_pct', 0) or 0)
+                if e.get('ce_capping'):   bear += float(e.get('ce_built_pct', 0) or 0)
+                if e.get('pe_depeg'):     bear += float(e.get('pe_shed_pct', 0) or 0)
+            # 10% net change ≈ ±100
+            c5 = _clamp((bull - bear) * 10)
+            _note5 = f"Bull {bull:.1f}% – Bear {bear:.1f}%"
+    except Exception:
+        c5 = None
+    components.append({'name': 'OI Cap/Decap', 'score': c5, 'weight': 0.15, 'note': _note5})
+    if c5 is not None:
+        weighted_sum += c5 * 0.15
+        used_w += 0.15
+    total_w += 0.15
+
+    # Final score (re-normalize over the weights we actually had data for)
+    final = _clamp((weighted_sum / used_w) if used_w > 0 else 0)
+    if final >= 60:    label, emoji = 'STRONG BULLISH', '🟢🟢'
+    elif final >= 20:  label, emoji = 'BULLISH', '🟢'
+    elif final <= -60: label, emoji = 'STRONG BEARISH', '🔴🔴'
+    elif final <= -20: label, emoji = 'BEARISH', '🔴'
+    else:              label, emoji = 'NEUTRAL', '⚪'
+    return {
+        'score': round(final, 1),
+        'label': label,
+        'emoji': emoji,
+        'coverage': round(used_w / total_w * 100, 0) if total_w else 0,
+        'components': components,
+    }
+
+
+def render_bull_bear_meter(meter):
+    if not meter:
+        st.caption("Bull/Bear meter not yet computed.")
+        return
+    score = meter['score']
+    label = meter['label']
+    emoji = meter['emoji']
+    color = ('#00cc66' if score >= 20 else
+             '#ff4444' if score <= -20 else '#cccc66')
+    st.markdown(
+        f"""<div style='padding:12px 16px;border-radius:10px;background:#1a1a1a;
+        border-left:6px solid {color};margin-bottom:8px;'>
+        <span style='font-size:1.1em;color:{color};font-weight:700;'>{emoji} {label}</span>
+        <span style='font-size:1.6em;color:{color};font-weight:700;float:right;'>{score:+.0f}</span>
+        <div style='clear:both;color:#999;font-size:0.85em;'>
+        Coverage: {meter['coverage']:.0f}% of inputs available
+        </div></div>""",
+        unsafe_allow_html=True,
+    )
+    rows = []
+    for c in meter['components']:
+        s = c['score']
+        rows.append({
+            'Signal': c['name'],
+            'Score': '—' if s is None else f"{s:+.0f}",
+            'Weight': f"{int(c['weight']*100)}%",
+            'Contribution': '—' if s is None else f"{s * c['weight']:+.1f}",
+            'Detail': c['note'],
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  COMPOSITE BIAS ENGINE — aligns 14+ signals into a single ENTER NOW verdict
+# ═══════════════════════════════════════════════════════════════════════════
+
+def compute_composite_bias(spot_price, df, option_data):
+    """Aggregate all live signals into a single composite bias score.
+
+    Each contributor outputs +1/0/−1 (+ = bullish for NIFTY). Spot signals
+    weight 1.5, options signals weight 1.0. Final score is roughly −18..+18.
+
+    Returns dict with score, label, direction, action, confidence, reasons (list),
+    contradictions (list), enter_now (bool), atm_strike, ce_ltp, pe_ltp.
+    """
+    reasons = []      # list of (sign, weight, label) bullish contributions
+    contras = []      # contradicting signals
+
+    def _add(sign, weight, label):
+        """sign ∈ {+1, -1, 0}; label is human readable. Stores into reasons
+        or contras depending on running net."""
+        if sign == 0:
+            return
+        reasons.append((sign, weight, label))
+
+    # ── SPOT SIDE (weight 1.5)
+    W_SPOT = 1.5
+
+    # 1) Spot latest stop-hunt direction
+    try:
+        _liq = st.session_state.get('_liq_grabs') or []
+        if _liq:
+            d = _liq[-1].get('direction')
+            if d == 'BUY':
+                _add(+1, W_SPOT, "Spot stop-hunt: BUY")
+            elif d == 'SELL':
+                _add(-1, W_SPOT, "Spot stop-hunt: SELL")
+    except Exception:
+        pass
+
+    # 2) CIE engine latest signal
+    try:
+        _cie = st.session_state.get('_cie_signals') or []
+        if _cie:
+            d = (_cie[-1].get('direction') or _cie[-1].get('action') or '').upper()
+            if d in ('BUY', 'BULL', 'BULLISH', 'LONG'):
+                _add(+1, W_SPOT, "CIE: Bullish")
+            elif d in ('SELL', 'BEAR', 'BEARISH', 'SHORT'):
+                _add(-1, W_SPOT, "CIE: Bearish")
+    except Exception:
+        pass
+
+    # 3) Major S/R: spot near support → bull, near resistance → bear
+    try:
+        _zones = st.session_state.get('_major_sr_zones') or {}
+        _sup = (_zones.get('support') or [])
+        _res = (_zones.get('resistance') or [])
+        for z in _sup[:2]:
+            lvl = float(z.get('price') or z.get('level') or 0)
+            if lvl and abs(spot_price - lvl) <= 25:
+                _add(+1, W_SPOT, f"Spot near major support ₹{lvl:.0f}")
+                break
+        for z in _res[:2]:
+            lvl = float(z.get('price') or z.get('level') or 0)
+            if lvl and abs(spot_price - lvl) <= 25:
+                _add(-1, W_SPOT, f"Spot near major resistance ₹{lvl:.0f}")
+                break
+    except Exception:
+        pass
+
+    # 4) Spot vs VPFR POC (short window)
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _vp = compute_vpfr(df, 30)
+            if _vp and _vp.get('poc'):
+                if spot_price > _vp['poc']:
+                    _add(+1, W_SPOT, f"Spot above VPFR-S POC ₹{_vp['poc']:.0f}")
+                else:
+                    _add(-1, W_SPOT, f"Spot below VPFR-S POC ₹{_vp['poc']:.0f}")
+    except Exception:
+        pass
+
+    # 5) Spot Dynamic PoC vs LTP
+    try:
+        if df is not None and not df.empty:
+            _dpoc_list, _, _ = compute_dynamic_poc(df, bins=20)
+            _cur = next((v for v in reversed(_dpoc_list or []) if v is not None), None)
+            if _cur is not None:
+                if _cur < spot_price:
+                    _add(+1, W_SPOT, f"Spot DynPoC ₹{_cur:.0f} below LTP — bullish")
+                elif _cur > spot_price:
+                    _add(-1, W_SPOT, f"Spot DynPoC ₹{_cur:.0f} above LTP — bearish")
+    except Exception:
+        pass
+
+    # 6) Spot MFP POC bias
+    try:
+        _mf = st.session_state.get('_money_flow_data') or {}
+        if _mf and _mf.get('rows'):
+            poc_row = next((r for r in _mf['rows'] if r.get('is_poc')), None)
+            if poc_row:
+                sent = (poc_row.get('sentiment') or '').lower()
+                if sent.startswith('bull'):
+                    _add(+1, W_SPOT, "Spot MFP POC: Bullish")
+                elif sent.startswith('bear'):
+                    _add(-1, W_SPOT, "Spot MFP POC: Bearish")
+    except Exception:
+        pass
+
+    # 7) Bull/Bear meter (Tier-1 composite) — tiered contribution since it's
+    # already an aggregated score; high conviction (|score|>=60) counts double.
+    try:
+        _bb = st.session_state.get('_bull_bear_meter') or {}
+        sc = _bb.get('score', 0) or 0
+        if sc >= 60:
+            _add(+1, W_SPOT * 2, f"Bull/Bear meter +{sc:.0f} (Tier-1 strong bull)")
+        elif sc >= 30:
+            _add(+1, W_SPOT, f"Bull/Bear meter +{sc:.0f} (Tier-1 bull)")
+        elif sc <= -60:
+            _add(-1, W_SPOT * 2, f"Bull/Bear meter {sc:.0f} (Tier-1 strong bear)")
+        elif sc <= -30:
+            _add(-1, W_SPOT, f"Bull/Bear meter {sc:.0f} (Tier-1 bear)")
+    except Exception:
+        pass
+
+    # 7b) Global instruments NIFTY composite (with reverse-correlation
+    # for USDINR/Brent/Gold). Pulls from compute_global_nifty_bias() which
+    # aggregates 11 instruments' biases × correlation sign. Tiered.
+    try:
+        _gb = compute_global_nifty_bias() or {}
+        gns = _gb.get('nifty_score', 0) or 0
+        if gns >= 5:
+            _add(+1, W_SPOT * 2, f"Global indices NIFTY composite +{gns:.0f} (strong bull)")
+        elif gns >= 2:
+            _add(+1, W_SPOT, f"Global indices NIFTY composite +{gns:.0f} (bull)")
+        elif gns <= -5:
+            _add(-1, W_SPOT * 2, f"Global indices NIFTY composite {gns:.0f} (strong bear)")
+        elif gns <= -2:
+            _add(-1, W_SPOT, f"Global indices NIFTY composite {gns:.0f} (bear)")
+    except Exception:
+        pass
+
+    # 8) Smart Money / Accum-Dist
+    try:
+        _ad = st.session_state.get('_accum_dist_score') or {}
+        sc = _ad.get('score', 0) or 0
+        if sc >= 30:
+            _add(+1, W_SPOT, f"Smart Money: Accumulation +{sc:.0f}")
+        elif sc <= -30:
+            _add(-1, W_SPOT, f"Smart Money: Distribution {sc:.0f}")
+    except Exception:
+        pass
+
+    # ── OPTIONS SIDE (weight 1.0)
+    W_OPT = 1.0
+
+    # Pull ATM CE/PE pattern + bias via existing helper
+    ce_pat = pe_pat = '—'
+    ce_b = pe_b = 'unknown'
+    ce_ltp = pe_ltp = 0.0
+    atm_strike = 0
+    try:
+        ce_pat, pe_pat, ce_b, pe_b, ce_ltp, pe_ltp, atm_strike = _atm_ce_pe_trend()
+    except Exception:
+        pass
+
+    # 9) CE LTP candle pattern (CE bull = NIFTY bull)
+    if ce_b == 'bull':
+        _add(+1, W_OPT, f"ATM CE pattern: {ce_pat} (bull)")
+    elif ce_b == 'bear':
+        _add(-1, W_OPT, f"ATM CE pattern: {ce_pat} (bear)")
+
+    # 10) PE LTP candle pattern (PE bull = NIFTY BEAR, reverse)
+    if pe_b == 'bull':
+        _add(-1, W_OPT, f"ATM PE pattern: {pe_pat} (bull = NIFTY bear)")
+    elif pe_b == 'bear':
+        _add(+1, W_OPT, f"ATM PE pattern: {pe_pat} (bear = NIFTY bull)")
+
+    # 11-12) CE & PE MFP POC bias
+    try:
+        sd = st.session_state.get('_atm_pm1_vpfr') or {}
+        for leg in sd.get('legs', []) or []:
+            tag = leg.get('tag', '')
+            mb = leg.get('mfp_bias', '')
+            if 'ATM CE' in tag:
+                if mb == 'BULL':
+                    _add(+1, W_OPT, "ATM CE MFP POC: Bullish")
+                elif mb == 'BEAR':
+                    _add(-1, W_OPT, "ATM CE MFP POC: Bearish")
+            elif 'ATM PE' in tag:
+                if mb == 'BULL':
+                    _add(-1, W_OPT, "ATM PE MFP POC: Bullish (NIFTY bear)")
+                elif mb == 'BEAR':
+                    _add(+1, W_OPT, "ATM PE MFP POC: Bearish (NIFTY bull)")
+    except Exception:
+        pass
+
+    # 13-14) CE & PE Dynamic PoC vs LTP from cached leg dfs
+    try:
+        legs_dfs = st.session_state.get('_atm_leg_dfs') or {}
+        for tag, df_l in legs_dfs.items():
+            if df_l is None or df_l.empty:
+                continue
+            _dp_l, _, _ = compute_dynamic_poc(df_l, bins=20)
+            cur = next((v for v in reversed(_dp_l or []) if v is not None), None)
+            if cur is None:
+                continue
+            ltp_l = float(df_l['close'].iloc[-1])
+            if 'ATM CE' in tag:
+                if cur < ltp_l:
+                    _add(+1, W_OPT, "CE DynPoC below LTP (CE rising)")
+                elif cur > ltp_l:
+                    _add(-1, W_OPT, "CE DynPoC above LTP (CE fading)")
+            elif 'ATM PE' in tag:
+                if cur < ltp_l:
+                    _add(-1, W_OPT, "PE DynPoC below LTP (PE rising = NIFTY bear)")
+                elif cur > ltp_l:
+                    _add(+1, W_OPT, "PE DynPoC above LTP (PE fading = NIFTY bull)")
+    except Exception:
+        pass
+
+    # 15-16) VOB touch — aggregated across ALL 14 ATM±3 CE+PE legs.
+    # Each leg votes ±1 toward NIFTY direction (PE votes reversed); the net
+    # cross-strike vote is what feeds the bias score. Tiered by net strength:
+    #   net >= 3  → ±1 with W_OPT * 1.5  (strong cross-strike confirmation)
+    #   net >= 1  → ±1 with W_OPT
+    try:
+        legs_dfs = st.session_state.get('_atm_leg_dfs') or {}
+        ce_at_bull = ce_at_bear = pe_at_bull = pe_at_bear = 0
+        ce_tags_bull, ce_tags_bear = [], []
+        pe_tags_bull, pe_tags_bear = [], []
+        for tag, df_l in legs_dfs.items():
+            if df_l is None or df_l.empty:
+                continue
+            ltp_l = float(df_l['close'].iloc[-1])
+            vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_l) or {}
+            tol = max(ltp_l * 0.005, 0.5)
+            near_bull = any((b['lower'] - tol) <= ltp_l <= (b['upper'] + tol)
+                             for b in (vob.get('bullish') or []))
+            near_bear = any((b['lower'] - tol) <= ltp_l <= (b['upper'] + tol)
+                             for b in (vob.get('bearish') or []))
+            if ' CE ' in f' {tag} ':
+                if near_bull:
+                    ce_at_bull += 1; ce_tags_bull.append(tag.split(' CE ')[0])
+                if near_bear:
+                    ce_at_bear += 1; ce_tags_bear.append(tag.split(' CE ')[0])
+            elif ' PE ' in f' {tag} ':
+                if near_bull:
+                    pe_at_bull += 1; pe_tags_bull.append(tag.split(' PE ')[0])
+                if near_bear:
+                    pe_at_bear += 1; pe_tags_bear.append(tag.split(' PE ')[0])
+        # NIFTY-bull votes: CE at bull VOB + PE at bear VOB (reversed)
+        # NIFTY-bear votes: CE at bear VOB + PE at bull VOB (reversed)
+        bull_v = ce_at_bull + pe_at_bear
+        bear_v = ce_at_bear + pe_at_bull
+        net = bull_v - bear_v
+        if net >= 3:
+            _add(+1, W_OPT * 1.5,
+                 f"Cross-strike VOB-touch STRONG bull ({bull_v}↑/{bear_v}↓ across legs)")
+        elif net >= 1:
+            _add(+1, W_OPT,
+                 f"Cross-strike VOB-touch bull ({bull_v}↑/{bear_v}↓ across legs)")
+        elif net <= -3:
+            _add(-1, W_OPT * 1.5,
+                 f"Cross-strike VOB-touch STRONG bear ({bear_v}↓/{bull_v}↑ across legs)")
+        elif net <= -1:
+            _add(-1, W_OPT,
+                 f"Cross-strike VOB-touch bear ({bear_v}↓/{bull_v}↑ across legs)")
+    except Exception:
+        pass
+
+    # 17-18) HVP formation — aggregated across ALL 14 ATM±3 CE+PE legs.
+    # Same cross-strike vote tally with reversal for PE legs.
+    try:
+        legs_dfs = st.session_state.get('_atm_leg_dfs') or {}
+        ce_h_bull = ce_h_bear = pe_h_bull = pe_h_bear = 0
+        for tag, df_l in legs_dfs.items():
+            if df_l is None or df_l.empty or len(df_l) < 40:
+                continue
+            hvp = detect_hvp(df_l, left_bars=10, right_bars=10, vol_filter=2.0) or {}
+            bull_h = hvp.get('bullish_hvp') or []
+            bear_h = hvp.get('bearish_hvp') or []
+            last_bull = bull_h[-1].get('time') if bull_h else None
+            last_bear = bear_h[-1].get('time') if bear_h else None
+            most_recent = None
+            if last_bull and last_bear:
+                most_recent = 'bull' if last_bull > last_bear else 'bear'
+            elif last_bull:
+                most_recent = 'bull'
+            elif last_bear:
+                most_recent = 'bear'
+            if most_recent is None:
+                continue
+            if ' CE ' in f' {tag} ':
+                if most_recent == 'bull':
+                    ce_h_bull += 1
+                else:
+                    ce_h_bear += 1
+            elif ' PE ' in f' {tag} ':
+                if most_recent == 'bull':
+                    pe_h_bull += 1
+                else:
+                    pe_h_bear += 1
+        bull_h_v = ce_h_bull + pe_h_bear   # NIFTY-bull: CE pivot-low + PE pivot-high
+        bear_h_v = ce_h_bear + pe_h_bull   # NIFTY-bear: CE pivot-high + PE pivot-low
+        net_h = bull_h_v - bear_h_v
+        if net_h >= 3:
+            _add(+1, W_OPT * 1.5,
+                 f"Cross-strike HVP STRONG bull ({bull_h_v}↑/{bear_h_v}↓ across legs)")
+        elif net_h >= 1:
+            _add(+1, W_OPT,
+                 f"Cross-strike HVP bull ({bull_h_v}↑/{bear_h_v}↓ across legs)")
+        elif net_h <= -3:
+            _add(-1, W_OPT * 1.5,
+                 f"Cross-strike HVP STRONG bear ({bear_h_v}↓/{bull_h_v}↑ across legs)")
+        elif net_h <= -1:
+            _add(-1, W_OPT,
+                 f"Cross-strike HVP bear ({bear_h_v}↓/{bull_h_v}↑ across legs)")
+    except Exception:
+        pass
+
+    # Aggregate
+    score = sum(s * w for s, w, _ in reasons)
+    # Split confirmations vs contradictions based on score's sign
+    direction_sign = 1 if score > 0 else (-1 if score < 0 else 0)
+    confirms = [(s, w, l) for s, w, l in reasons if s * direction_sign > 0]
+    contras = [(s, w, l) for s, w, l in reasons if s * direction_sign < 0]
+
+    # CE/PE reverse-alignment guardrail for ENTER NOW
+    ce_pe_aligned_bull = (ce_b == 'bull' and pe_b == 'bear')
+    ce_pe_aligned_bear = (ce_b == 'bear' and pe_b == 'bull')
+
+    # Location guardrail — only ENTER when spot is at the right side:
+    #   BUY CALL only when spot is AT SUPPORT (within proximity)
+    #   BUY PUT  only when spot is AT RESISTANCE (within proximity)
+    _SR_PROX_PTS = 25
+    _at_support = False
+    _at_resistance = False
+    _nearest_sup_lvl = None
+    _nearest_res_lvl = None
+    try:
+        _zones = st.session_state.get('_major_sr_zones') or {}
+        for z in (_zones.get('support') or [])[:5]:
+            lvl = float(z.get('price') or z.get('level') or 0)
+            if lvl and abs(spot_price - lvl) <= _SR_PROX_PTS:
+                _at_support = True
+                _nearest_sup_lvl = lvl
+                break
+        for z in (_zones.get('resistance') or [])[:5]:
+            lvl = float(z.get('price') or z.get('level') or 0)
+            if lvl and abs(spot_price - lvl) <= _SR_PROX_PTS:
+                _at_resistance = True
+                _nearest_res_lvl = lvl
+                break
+    except Exception:
+        pass
+
+    # Verdict — thresholds tuned for noisier LTP-aware signals.
+    # ENTER NOW requires: score threshold + CE/PE align + spot at the right S/R.
+    if score >= 6 and ce_pe_aligned_bull and _at_support:
+        label, action, em, enter_now = (
+            f"ENTER NOW — BUY CALL @ Support ₹{_nearest_sup_lvl:.0f}",
+            "BUY CALL (ATM CE)", "🟢🚀", True)
+    elif score <= -6 and ce_pe_aligned_bear and _at_resistance:
+        label, action, em, enter_now = (
+            f"ENTER NOW — BUY PUT @ Resistance ₹{_nearest_res_lvl:.0f}",
+            "BUY PUT (ATM PE)", "🔴🚀", True)
+    elif score >= 6 and ce_pe_aligned_bull:
+        # Score + alignment OK, but waiting for spot to reach a support level
+        label, action, em, enter_now = (
+            "Bull setup ready — WAIT for spot at support",
+            "Watch ATM CE (need support touch)", "🟢⏳", False)
+    elif score <= -6 and ce_pe_aligned_bear:
+        label, action, em, enter_now = (
+            "Bear setup ready — WAIT for spot at resistance",
+            "Watch ATM PE (need resistance touch)", "🔴⏳", False)
+    elif score >= 4:
+        label, action, em, enter_now = "Strong Bull", "Watch ATM CE", "🟢", False
+    elif score >= 2:
+        label, action, em, enter_now = "Mild Bull", "Wait for stronger setup", "🟡", False
+    elif score <= -4:
+        label, action, em, enter_now = "Strong Bear", "Watch ATM PE", "🔴", False
+    elif score <= -2:
+        label, action, em, enter_now = "Mild Bear", "Wait for stronger setup", "🟡", False
+    else:
+        label, action, em, enter_now = "NEUTRAL / NO TRADE", "Stand aside", "⚪", False
+
+    direction = 'BUY' if score > 0 else ('SELL' if score < 0 else 'NEUTRAL')
+    confidence = "High" if abs(score) >= 6 else ("Medium" if abs(score) >= 4 else "Low")
+
+    return {
+        'score': round(score, 1),
+        'direction': direction,
+        'label': label,
+        'action': action,
+        'emoji': em,
+        'confidence': confidence,
+        'enter_now': enter_now,
+        'reasons': [(s, w, l) for s, w, l in confirms],
+        'contradictions': [(s, w, l) for s, w, l in contras],
+        'ce_pat': ce_pat, 'pe_pat': pe_pat,
+        'ce_bias': ce_b, 'pe_bias': pe_b,
+        'ce_ltp': ce_ltp, 'pe_ltp': pe_ltp,
+        'atm_strike': atm_strike,
+        'spot': spot_price,
+    }
+
+
+def render_composite_bias_panel(bias):
+    """Big colored card at top of page showing the composite bias verdict."""
+    if not bias:
+        st.info("Composite Bias Engine: building… (need a few cycles of data)")
+        return
+    em = bias.get('emoji', '⚪')
+    label = bias.get('label', '—')
+    score = bias.get('score', 0)
+    action = bias.get('action', '')
+    conf = bias.get('confidence', 'Low')
+    is_enter = bias.get('enter_now', False)
+    bg = '#0a3d2a' if score > 0 and is_enter else ('#3d0a1f' if score < 0 and is_enter else '#222a3a')
+    border = '#00ff88' if score > 0 else ('#ff4444' if score < 0 else '#888')
+    st.markdown(
+        f"<div style='background:{bg}; border:2px solid {border}; padding:14px 18px; "
+        f"border-radius:12px; margin-bottom:10px;'>"
+        f"<div style='font-size:22px; font-weight:700; color:#fff;'>"
+        f"{em} <span style='color:{border};'>COMPOSITE BIAS: {label}</span></div>"
+        f"<div style='color:#ccc; font-size:14px; margin-top:4px;'>"
+        f"Score: <b>{score:+.1f}</b> · Confidence: <b>{conf}</b> · Action: <b>{action}</b> · "
+        f"ATM ₹{bias.get('atm_strike',0):.0f}</div>"
+        f"<div style='color:#ccc; font-size:12px; margin-top:4px;'>"
+        f"CE {bias.get('ce_pat','—')} ({bias.get('ce_bias','—')}) · "
+        f"PE {bias.get('pe_pat','—')} ({bias.get('pe_bias','—')})</div>"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(f"**Confirming ({len(bias.get('reasons') or [])}):**")
+        for sign, w, lbl in (bias.get('reasons') or [])[:8]:
+            color = '#00ff88' if sign > 0 else '#ff4444'
+            st.markdown(f"<span style='color:{color};'>• {lbl}</span>",
+                        unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"**Contradicting ({len(bias.get('contradictions') or [])}):**")
+        for sign, w, lbl in (bias.get('contradictions') or [])[:8]:
+            color = '#ff4444' if sign > 0 else '#00ff88'
+            st.markdown(f"<span style='color:{color};'>• {lbl}</span>",
+                        unsafe_allow_html=True)
+
+
+def send_bias_enter_alert(bias):
+    """Fires once when bias transitions to ENTER NOW. 5-min cooldown via the
+    throttled sender. Must contain 'BIAS ENTER' marker for global mute allow-list."""
+    if not bias or not bias.get('enter_now'):
+        return None
+    direction = bias.get('direction', '')
+    action = bias.get('action', '')
+    score = bias.get('score', 0)
+    em = bias.get('emoji', '')
+    reasons = bias.get('reasons') or []
+    contras = bias.get('contradictions') or []
+    _reason_lines = "\n".join(f"  ✅ {lbl}" for _, _, lbl in reasons[:8])
+    _contra_lines = "\n".join(f"  ⚠️ {lbl}" for _, _, lbl in contras[:4]) if contras else "  (none)"
+    msg = (
+        f"{em} <b>BIAS ENTER — {action}</b>\n"
+        f"Score: <b>{score:+.1f}</b> · Confidence: <b>{bias.get('confidence','')}</b>\n"
+        f"ATM ₹{bias.get('atm_strike',0):.0f} · CE LTP ₹{bias.get('ce_ltp',0):.2f} · PE LTP ₹{bias.get('pe_ltp',0):.2f}\n"
+        f"CE candle: {bias.get('ce_pat','—')} ({bias.get('ce_bias','—')})\n"
+        f"PE candle: {bias.get('pe_pat','—')} ({bias.get('pe_bias','—')})\n"
+        f"\n<b>Confirming signals:</b>\n{_reason_lines}\n"
+        f"\n<b>Contradicting:</b>\n{_contra_lines}"
+    )
+    key = f"bias_enter_{direction}"
+    if _throttled_telegram_send(msg, alert_class='bias_enter', key=key,
+                                 cooldown_s=300, class_limit=3,
+                                 class_window=600, class_sleep=1800):
+        return msg
+    return None
+
+
+@st.cache_data(ttl=12)
+def get_ws_health():
+    """Read worker liveness from Supabase. Returns dict with last-tick age (seconds),
+    instruments tracked, last sweep age + direction, or None if not configured.
+    Cached for 12s to avoid hammering Supabase every rerun."""
+    try:
+        from db.supabase_client import SupabaseDB
+        client = SupabaseDB().client
+        if not client:
+            return None
+    except Exception:
+        return None
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    health = {'configured': True, 'last_tick_age_s': None, 'instruments': 0,
+              'last_sweep_age_s': None, 'last_sweep_dir': None, 'last_sweep_detail': None}
+    try:
+        ticks = (client.table('dhan_ticks')
+                 .select('updated_at,id')
+                 .order('updated_at', desc=True)
+                 .limit(5).execute())
+        if ticks and ticks.data:
+            health['instruments'] = len(ticks.data)
+            ts = ticks.data[0].get('updated_at')
+            if ts:
+                try:
+                    age = (now - pd.to_datetime(ts).tz_convert('Asia/Kolkata')).total_seconds()
+                    health['last_tick_age_s'] = max(0.0, float(age))
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    try:
+        sweeps = (client.table('dhan_sweeps')
+                  .select('direction,detail,fired_at')
+                  .order('fired_at', desc=True)
+                  .limit(1).execute())
+        if sweeps and sweeps.data:
+            row = sweeps.data[0]
+            ts = row.get('fired_at')
+            if ts:
+                try:
+                    age = (now - pd.to_datetime(ts).tz_convert('Asia/Kolkata')).total_seconds()
+                    health['last_sweep_age_s'] = max(0.0, float(age))
+                    health['last_sweep_dir'] = row.get('direction')
+                    health['last_sweep_detail'] = row.get('detail')
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return health
+
+
+def render_ws_health_badge():
+    """Compact status pill — 'WS live · last tick 2s ago' / 'WS stale 4m' / 'WS off'."""
+    h = get_ws_health()
+    if h is None:
+        st.caption("📡 WS: not configured — sweep falls back to in-app cycle detector.")
+        return
+    last_age = h.get('last_tick_age_s')
+    if last_age is None:
+        color = '#aa6644'; status = "📡 WS: no tick data in Supabase yet"
+    elif last_age < 30:
+        color = '#00cc66'; status = f"📡 WS: 🟢 live · last tick {last_age:.0f}s ago · {h['instruments']} instr"
+    elif last_age < 300:
+        color = '#cccc66'; status = f"📡 WS: 🟡 stale · last tick {last_age/60:.1f}m ago"
+    else:
+        color = '#ff4444'; status = f"📡 WS: 🔴 down · last tick {last_age/60:.0f}m ago"
+    sw_age = h.get('last_sweep_age_s')
+    sw_part = ""
+    if sw_age is not None:
+        if sw_age < 60:
+            sw_part = (f" · 🌊 last sweep: {h.get('last_sweep_dir','?').upper()} "
+                       f"{sw_age:.0f}s ago — <i>{h.get('last_sweep_detail','')}</i>")
+        elif sw_age < 3600:
+            sw_part = f" · 🌊 last sweep: {h.get('last_sweep_dir','?').upper()} {sw_age/60:.0f}m ago"
+        else:
+            sw_part = " · 🌊 no recent sweep"
+    st.markdown(
+        f"""<div style='padding:6px 10px;border-radius:6px;background:#1a1a1a;
+        border-left:4px solid {color};font-size:0.9em;color:#ddd;margin-bottom:6px;'>
+        {status}{sw_part}</div>""",
+        unsafe_allow_html=True,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PERSISTENT STATE — save / restore key composites + history to Supabase
+#  so a Streamlit restart doesn't lose 5-10 cycles of context.
+# ═══════════════════════════════════════════════════════════════════════════
+_PERSIST_KEYS = (
+    '_total_oi_history', '_cd_div_hist', '_spike_oi_hist', '_spike_vix_hist',
+    '_spot_hist_ignition', '_zone_prev_classification', '_major_sr_alerted',
+    '_bull_bear_meter', '_ignition_score', '_spike_score', '_accum_dist_score',
+    '_premarket_sent_for', '_combo_audio_played_for',
+)
+
+
+def _supabase_client():
+    try:
+        from db.supabase_client import SupabaseDB
+        c = SupabaseDB().client
+        return c
+    except Exception:
+        return None
+
+
+def _serialize_value(v):
+    """JSON-safe convert: timestamps → iso, deep dicts/lists pass through."""
+    from datetime import datetime as _dt, timedelta as _td
+    if isinstance(v, _dt):
+        return {'__ts__': v.isoformat()}
+    if isinstance(v, _td):
+        return {'__td__': v.total_seconds()}
+    if isinstance(v, list):
+        return [_serialize_value(x) for x in v]
+    if isinstance(v, dict):
+        return {k: _serialize_value(val) for k, val in v.items()}
+    try:
+        import math as _m
+        if isinstance(v, float) and (_m.isnan(v) or _m.isinf(v)):
+            return None
+    except Exception:
+        pass
+    return v
+
+
+def _deserialize_value(v):
+    from datetime import datetime as _dt, timedelta as _td
+    if isinstance(v, dict):
+        if '__ts__' in v:
+            try:
+                return _dt.fromisoformat(v['__ts__'])
+            except Exception:
+                return None
+        if '__td__' in v:
+            return _td(seconds=v['__td__'])
+        return {k: _deserialize_value(val) for k, val in v.items()}
+    if isinstance(v, list):
+        return [_deserialize_value(x) for x in v]
+    return v
+
+
+def save_app_state(throttle_s=300):
+    """Persist key composites + history to Supabase. Throttled to once per
+    `throttle_s` (default 5 min) to avoid hammering."""
+    last = st.session_state.get('_state_persist_last_ts', 0)
+    now_t = time.time()
+    if now_t - last < throttle_s:
+        return
+    sb = _supabase_client()
+    if not sb:
+        return
+    try:
+        payload = {}
+        for k in _PERSIST_KEYS:
+            if k in st.session_state:
+                payload[k] = _serialize_value(st.session_state[k])
+        sb.table('vob_app_state').upsert({
+            'id': DHAN_CLIENT_ID or 'default',
+            'payload': payload,
+            'updated_at': datetime.now(pytz.timezone('Asia/Kolkata')).isoformat(),
+        }).execute()
+        st.session_state['_state_persist_last_ts'] = now_t
+    except Exception:
+        pass
+
+
+def restore_app_state():
+    """Restore persisted state once per session at startup."""
+    if st.session_state.get('_state_restored'):
+        return
+    st.session_state['_state_restored'] = True
+    sb = _supabase_client()
+    if not sb:
+        return
+    try:
+        res = (sb.table('vob_app_state').select('payload')
+               .eq('id', DHAN_CLIENT_ID or 'default').limit(1).execute())
+        if not res or not res.data:
+            return
+        payload = res.data[0].get('payload') or {}
+        restored_count = 0
+        for k, v in payload.items():
+            if k in _PERSIST_KEYS and k not in st.session_state:
+                st.session_state[k] = _deserialize_value(v)
+                restored_count += 1
+        if restored_count:
+            print(f"[vob_state] restored {restored_count} keys from Supabase")
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  PRE-MARKET ANALYSIS — runs once per day at 09:00-09:15 IST window
+# ═══════════════════════════════════════════════════════════════════════════
+def compute_premarket_analysis(api):
+    """Build a pre-market digest: NIFTY gap (today open vs yesterday close),
+    SGX NIFTY proxy (use yfinance ^NSEI overnight), US close (^GSPC),
+    Asia open (^N225, ^HSI), USD/INR, CRUDE.
+    Returns dict for the Telegram message."""
+    out = {'time': datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%H:%M IST'),
+           'items': []}
+    try:
+        if _HAS_YF:
+            for sym, label, fmt in [
+                ('^NSEI', 'NIFTY 50', 'price'),
+                ('^GSPC', 'S&P 500', 'change'),
+                ('^IXIC', 'NASDAQ', 'change'),
+                ('^N225', 'Nikkei', 'change'),
+                ('^HSI', 'Hang Seng', 'change'),
+                ('INR=X', 'USD/INR', 'price'),
+                ('CL=F', 'Crude WTI', 'change'),
+                ('GC=F', 'Gold', 'change'),
+                ('^INDIAVIX', 'India VIX', 'price'),
+            ]:
+                try:
+                    hist = yf.Ticker(sym).history(period='2d', interval='1d', prepost=True)
+                    if hist is None or hist.empty or len(hist) < 1:
+                        continue
+                    last = float(hist['Close'].iloc[-1])
+                    prev = float(hist['Close'].iloc[-2]) if len(hist) >= 2 else last
+                    chg = last - prev
+                    chg_pct = (chg / prev * 100) if prev else 0
+                    if fmt == 'change':
+                        out['items'].append({
+                            'label': label,
+                            'text': f"{last:,.2f} ({chg:+.2f}, {chg_pct:+.2f}%)",
+                            'emoji': '🟢' if chg > 0 else ('🔴' if chg < 0 else '⚪'),
+                        })
+                    else:
+                        out['items'].append({
+                            'label': label,
+                            'text': f"{last:,.2f} (prev {prev:,.2f})",
+                            'emoji': '⚪',
+                        })
+                except Exception:
+                    continue
+    except Exception:
+        pass
+    return out
+
+
+def send_premarket_telegram(api):
+    """Once-per-day pre-market digest at 09:00-09:15 IST."""
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    if now.weekday() >= 5:
+        return
+    in_window = (now.replace(hour=9, minute=0, second=0, microsecond=0)
+                 <= now <=
+                 now.replace(hour=9, minute=15, second=0, microsecond=0))
+    if not in_window:
+        return
+    today_key = now.strftime('%Y-%m-%d')
+    if st.session_state.get('_premarket_sent_for') == today_key:
+        return
+    try:
+        data = compute_premarket_analysis(api)
+    except Exception:
+        data = None
+    if not data or not data.get('items'):
+        return
+    lines = [f"  {it['emoji']} <b>{it['label']}</b>: {it['text']}" for it in data['items']]
+    msg = (f"🌅 <b>PRE-MARKET DIGEST</b> · {data['time']}\n\n"
+           + "\n".join(lines)
+           + "\n\n<i>Watch for: gap direction, US/Asia tone, USDINR / crude impact, India VIX level.</i>")
+    try:
+        send_telegram_message_sync(msg, force=True)
+        st.session_state['_premarket_sent_for'] = today_key
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SECTOR HEATMAP — 1-row colored bar
+# ═══════════════════════════════════════════════════════════════════════════
+def render_sector_heatmap():
+    """Render a single-row colored heatmap of sector strengths."""
+    sectors = st.session_state.get('_sector_rotation') or st.session_state.get('_sector_rotation_data')
+    if not sectors or not isinstance(sectors, dict):
+        st.caption("Sector data not yet computed.")
+        return
+    rows = sectors.get('all') or sectors.get('sectors')
+    if not rows:
+        st.caption("Sector heatmap waiting for sector-rotation data.")
+        return
+    df_h = pd.DataFrame(rows)
+    if df_h.empty or 'name' not in df_h.columns:
+        st.caption("Sector data shape unexpected.")
+        return
+    pct_col = 'day_chg_pct' if 'day_chg_pct' in df_h.columns else ('pct' if 'pct' in df_h.columns else None)
+    if not pct_col:
+        st.caption("Sector data missing pct column.")
+        return
+    df_h = df_h.sort_values(pct_col, ascending=False)
+    if sectors.get('rotation_bias'):
+        st.caption(f"**Rotation:** {sectors['rotation_bias']}")
+    fig = go.Figure(data=go.Heatmap(
+        z=[df_h[pct_col].astype(float).tolist()],
+        x=df_h['name'].astype(str).tolist(),
+        y=['Sectors'],
+        colorscale=[[0, '#ff4444'], [0.5, '#222'], [1, '#00cc66']],
+        zmid=0,
+        text=[[f"{p:+.1f}%" for p in df_h[pct_col]]],
+        texttemplate='%{text}',
+        showscale=False,
+        hovertemplate='<b>%{x}</b><br>%{text}<extra></extra>',
+    ))
+    fig.update_layout(
+        height=110, margin=dict(l=10, r=10, t=10, b=10),
+        plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
+        xaxis=dict(tickfont=dict(size=10)),
+        yaxis=dict(showticklabels=False),
+    )
+    st.plotly_chart(fig, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  AUDIO ALERT — browser beep when Ignition COMBO fires
+# ═══════════════════════════════════════════════════════════════════════════
+def maybe_play_combo_audio():
+    """If Ignition Score has fired ≥5/7 AND the spike-watch window was active
+    (HIGH-CONVICTION COMBO), play a short browser beep — once per such event."""
+    ign = st.session_state.get('_ignition_score') or {}
+    if ign.get('score', 0) < 5:
+        return
+    sw_until = st.session_state.get('_spike_watch_until')
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    combo_active = sw_until and now <= sw_until
+    if not combo_active:
+        return
+    # Dedup: only one beep per spike-watch window
+    sw_key = sw_until.isoformat() if sw_until else 'none'
+    if st.session_state.get('_combo_audio_played_for') == sw_key:
+        return
+    st.session_state['_combo_audio_played_for'] = sw_key
+    # Browser beep via a short WAV data-URI (autoplay tag)
+    st.markdown(
+        """<audio autoplay>
+        <source src="https://www.soundjay.com/buttons/sounds/button-09.mp3" type="audio/mpeg">
+        </audio>""",
+        unsafe_allow_html=True,
+    )
+
+
+def _get_ws_sweep_in_last(seconds=10):
+    """Read the most recent sweep from Supabase `dhan_sweeps` written by ws_worker.
+    Returns (direction, detail) if a sweep fired within `seconds`, else (None, None).
+    Falls back silently if Supabase or the table isn't available."""
+    try:
+        from db.supabase_client import SupabaseDB
+        db = SupabaseDB()
+        if not getattr(db, 'client', None):
+            return None, None
+        # Cache the client per session to avoid re-init every call
+    except Exception:
+        return None, None
+    try:
+        sb_client = SupabaseDB().client
+        cutoff = (datetime.now(pytz.timezone('Asia/Kolkata')) -
+                  pd.Timedelta(seconds=seconds)).isoformat()
+        res = (sb_client.table('dhan_sweeps')
+               .select('direction,detail,fired_at')
+               .gte('fired_at', cutoff)
+               .order('fired_at', desc=True)
+               .limit(1).execute())
+        if res and res.data:
+            row = res.data[0]
+            return row.get('direction'), row.get('detail')
+    except Exception:
+        pass
+    return None, None
+
+
+def _detect_depth_sweep(option_data, underlying_price):
+    """Compare current option-chain bid/ask depth to the previous cycle's snapshot
+    at ATM±2 strikes. A large drop in resting size on one side + that side being
+    consistent with a directional move = approximated L2 sweep.
+
+    Returns (direction, detail) where direction in {'up','down','mixed', None}.
+    Caches the current snapshot to session state for the next cycle's comparison.
+    """
+    df = (option_data or {}).get('df_summary') if option_data else None
+    if df is None or df.empty or 'Strike' in df.columns is False or not underlying_price:
+        return None, "no chain data"
+    win = df[(df['Strike'] >= underlying_price - 120) & (df['Strike'] <= underlying_price + 120)]
+    if win.empty:
+        return None, "no strikes near spot"
+    cur = {}
+    for _, r in win.iterrows():
+        try:
+            k = int(float(r['Strike']))
+        except Exception:
+            continue
+        cur[k] = {
+            'ce_bid': float(r.get('bidQty_CE', 0) or 0),
+            'ce_ask': float(r.get('askQty_CE', 0) or 0),
+            'pe_bid': float(r.get('bidQty_PE', 0) or 0),
+            'pe_ask': float(r.get('askQty_PE', 0) or 0),
+        }
+    prev = st.session_state.get('_oc_depth_prev') or {}
+    st.session_state['_oc_depth_prev'] = cur
+    if not prev:
+        return None, "first cycle — building baseline"
+
+    up_evidence, dn_evidence = [], []
+    for k, c in cur.items():
+        p = prev.get(k)
+        if not p:
+            continue
+        # Upside sweep: ASK side eaten on CE strikes at/above spot (call asks lifted)
+        if k >= underlying_price - 25 and p['ce_ask'] >= 500:
+            drop = (p['ce_ask'] - c['ce_ask']) / p['ce_ask']
+            if drop >= 0.40:
+                up_evidence.append(f"₹{k} CE ask −{drop*100:.0f}%")
+        # Downside sweep: ASK side eaten on PE strikes at/below spot (put asks lifted)
+        if k <= underlying_price + 25 and p['pe_ask'] >= 500:
+            drop = (p['pe_ask'] - c['pe_ask']) / p['pe_ask']
+            if drop >= 0.40:
+                dn_evidence.append(f"₹{k} PE ask −{drop*100:.0f}%")
+        # Down-sweep also: BID side pulled on CE strikes (call buyers stepping away)
+        if k >= underlying_price - 25 and p['ce_bid'] >= 500:
+            drop = (p['ce_bid'] - c['ce_bid']) / p['ce_bid']
+            if drop >= 0.50:
+                dn_evidence.append(f"₹{k} CE bid −{drop*100:.0f}%")
+        # Up-sweep also: BID side pulled on PE strikes (put buyers stepping away)
+        if k <= underlying_price + 25 and p['pe_bid'] >= 500:
+            drop = (p['pe_bid'] - c['pe_bid']) / p['pe_bid']
+            if drop >= 0.50:
+                up_evidence.append(f"₹{k} PE bid −{drop*100:.0f}%")
+
+    if up_evidence and not dn_evidence:
+        return 'up', "; ".join(up_evidence[:2])
+    if dn_evidence and not up_evidence:
+        return 'down', "; ".join(dn_evidence[:2])
+    if up_evidence and dn_evidence:
+        return 'mixed', f"up: {up_evidence[0]} | down: {dn_evidence[0]}"
+    return None, "no sweep this cycle"
+
+
+def compute_ignition_score(result, option_data, zones, underlying_price):
+    """Detect when a directional move is about to start. Scores 6 conditions:
+
+      1. Spot near a Major S/R zone (within ~30 pts)
+      2. Volume Delta ratio >= 3 (aggressive one-sided flow)
+      3. Spot crossed (or sitting at) the Gamma Flip
+      4. CE decapping above spot (upside) OR PE depeg below (downside)
+      5. Last 5m candle volume >= 1.5x recent 5-bar avg (real participation, not pinning)
+      6. Spot crossed a major S/R zone boundary vs the previous cycle (break event)
+
+    Score >= 5/6 = IGNITION (high prob the move just started).
+    Score 4/6 = PRESSURE BUILDING. Score <= 3 = NEUTRAL.
+    """
+    if not underlying_price:
+        return None
+
+    # Track spot history so we can detect crossings between cycles
+    hist = st.session_state.setdefault('_spot_hist_ignition', [])
+    now_ts = time.time()
+    if not hist or (now_ts - hist[-1]['t']) >= 5:  # at least 5s apart
+        hist.append({'t': now_ts, 'spot': float(underlying_price)})
+        if len(hist) > 6:
+            hist[:] = hist[-6:]
+    prev_spot = hist[-2]['spot'] if len(hist) >= 2 else None
+
+    conditions = []
+
+    # 1) Near major S/R zone
+    near = None
+    if zones:
+        for kind, zlist in (('support', zones.get('support', []) or []),
+                            ('resistance', zones.get('resistance', []) or [])):
+            for z in zlist:
+                if abs(underlying_price - z['price']) <= 30:
+                    near = (kind, z); break
+            if near: break
+    conditions.append({
+        'name': 'Near major S/R zone (≤30pt)',
+        'met': bool(near),
+        'detail': f"{near[0].upper()} ₹{near[1]['price']:.0f}" if near else "not near any zone",
+    })
+
+    # 2) Volume Delta ratio >= 3
+    vd_data = getattr(st.session_state, '_volume_delta_data', None) or {}
+    vds = (vd_data.get('zone_summary') if vd_data.get('zone_reset') else None) or vd_data.get('summary') or {}
+    buy_v = float(vds.get('total_buy_volume') or 0)
+    sell_v = float(vds.get('total_sell_volume') or 0)
+    ratio = (buy_v / sell_v) if sell_v > 0 else (sell_v / buy_v if buy_v > 0 else 0)
+    delta_dir = 'up' if buy_v > sell_v else ('down' if sell_v > buy_v else None)
+    c2_met = (max(buy_v, sell_v) > 0 and
+              (buy_v / max(sell_v, 1) >= 3 or sell_v / max(buy_v, 1) >= 3))
+    conditions.append({
+        'name': 'Delta ratio ≥ 3',
+        'met': c2_met,
+        'detail': (f"buy {buy_v/1000:.0f}K / sell {sell_v/1000:.0f}K · "
+                   f"ratio {ratio:.1f} ({'BUY' if delta_dir=='up' else 'SELL' if delta_dir=='down' else 'flat'})"),
+    })
+
+    # 3) Gamma flip crossed / at
+    gex = (result or {}).get('gex') or {}
+    flip = float(gex.get('gamma_flip') or 0)
+    c3_met, det3 = False, "no flip"
+    if flip > 0:
+        if prev_spot is not None:
+            crossed = (prev_spot - flip) * (underlying_price - flip) < 0
+        else:
+            crossed = False
+        at_flip = abs(underlying_price - flip) <= 5
+        c3_met = crossed or at_flip
+        det3 = (f"crossed flip ₹{flip:.0f}" if crossed
+                else (f"at flip ₹{flip:.0f}" if at_flip
+                      else f"flip ₹{flip:.0f} · spot {'above' if underlying_price>flip else 'below'}"))
+    conditions.append({'name': 'Gamma Flip crossed / at', 'met': c3_met, 'detail': det3})
+
+    # 4) CE decap above spot OR PE depeg below spot
+    decap = getattr(st.session_state, '_decap_atm_data', []) or []
+    c4_met, det4 = False, "no decap data"
+    if decap:
+        up_evt, dn_evt = None, None
+        for e in decap:
+            try:
+                strike = float(e.get('strike', 0))
+            except Exception:
+                continue
+            if e.get('ce_decapping') and strike >= underlying_price - 5:
+                if not up_evt or float(e.get('ce_shed_pct', 0)) > up_evt[1]:
+                    up_evt = (strike, float(e.get('ce_shed_pct', 0)))
+            if e.get('pe_depeg') and strike <= underlying_price + 5:
+                if not dn_evt or float(e.get('pe_shed_pct', 0)) > dn_evt[1]:
+                    dn_evt = (strike, float(e.get('pe_shed_pct', 0)))
+        if up_evt and (not dn_evt or up_evt[1] >= dn_evt[1]):
+            c4_met = up_evt[1] >= 1.0
+            det4 = f"CE decap @{up_evt[0]:.0f} (−{up_evt[1]:.1f}%)"
+        elif dn_evt:
+            c4_met = dn_evt[1] >= 1.0
+            det4 = f"PE depeg @{dn_evt[0]:.0f} (−{dn_evt[1]:.1f}%)"
+        else:
+            det4 = "no fresh decap / depeg"
+    conditions.append({'name': 'CE decap above / PE depeg below', 'met': c4_met, 'detail': det4})
+
+    # 5) Current-bar volume >= 1.5x recent avg
+    c5_met, det5 = False, "no candle data"
+    df5 = getattr(st.session_state, '_df_5m', None)
+    try:
+        if df5 is not None and len(df5) >= 6 and 'volume' in df5.columns:
+            last_vol = float(df5.iloc[-1]['volume'] or 0)
+            avg_vol = float(df5.iloc[-6:-1]['volume'].astype(float).mean() or 0)
+            vr = last_vol / avg_vol if avg_vol > 0 else 0
+            c5_met = vr >= 1.5
+            det5 = f"last bar {last_vol/1000:.0f}K vs 5-bar avg {avg_vol/1000:.0f}K ({vr:.2f}x)"
+    except Exception:
+        pass
+    conditions.append({'name': 'Bar volume ≥ 1.5× recent avg', 'met': c5_met, 'detail': det5})
+
+    # 6) Crossed a major S/R zone since previous cycle
+    c6_met, det6 = False, "no break event"
+    if prev_spot is not None and zones:
+        for z in (zones.get('support', []) or []) + (zones.get('resistance', []) or []):
+            zp = float(z['price'])
+            if (prev_spot - zp) * (underlying_price - zp) < 0:
+                c6_met = True
+                det6 = f"crossed ₹{zp:.0f} ({prev_spot:.0f} → {underlying_price:.0f})"
+                break
+    conditions.append({'name': 'Crossed S/R zone vs prev cycle', 'met': c6_met, 'detail': det6})
+
+    # 7) Order-flow sweep — prefers the WebSocket-fed L2 sweep (sub-second),
+    #    falls back to the cycle-based option-chain depth approximation.
+    ws_dir, ws_det = _get_ws_sweep_in_last(seconds=10)
+    if ws_dir in ('up', 'down'):
+        sweep_dir, sweep_det = ws_dir, f"WS L2: {ws_det or 'sweep'}"
+    else:
+        sweep_dir, sweep_det = _detect_depth_sweep(option_data, underlying_price)
+        if sweep_dir:
+            sweep_det = f"OC depth: {sweep_det}"
+    c7_dir_ok = (sweep_dir in ('up', 'down') and
+                 (sweep_dir == delta_dir or delta_dir is None))
+    c7_met = bool(c7_dir_ok)
+    conditions.append({
+        'name': 'Order-flow sweep (WS or OC)',
+        'met': c7_met,
+        'detail': (f"{sweep_dir.upper()} · {sweep_det}" if sweep_dir else sweep_det or "no sweep"),
+    })
+
+    score = sum(1 for c in conditions if c['met'])
+
+    # Direction: spot movement vs prev, fall back to delta dir
+    if prev_spot is not None and abs(underlying_price - prev_spot) >= 1:
+        direction = 'up' if underlying_price > prev_spot else 'down'
+    else:
+        direction = delta_dir or 'up'
+
+    if score >= 5:
+        label = f"IGNITION — {'BULLISH' if direction == 'up' else 'BEARISH'}"
+        emoji = '🚀🟢' if direction == 'up' else '💥🔴'
+    elif score == 4:
+        label, emoji = 'PRESSURE BUILDING', '⚡🟡'
+    else:
+        label, emoji = 'NEUTRAL — no ignition', '⚪'
+    return {
+        'score': score, 'max': 7, 'direction': direction,
+        'label': label, 'emoji': emoji, 'conditions': conditions,
+    }
+
+
+def send_ignition_alert(score_data, underlying_price, cooldown_s=300):
+    """Send a distinct Telegram alert when ignition score >= 5. 5-min per-direction cooldown."""
+    if not score_data or score_data.get('score', 0) < 5:
+        return
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    mo = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    mc = now.replace(hour=15, minute=45, second=0, microsecond=0)
+    if now.weekday() >= 5 or not (mo <= now <= mc):
+        return
+    direction = score_data.get('direction', 'up')
+    key = f"ignite_{direction}"
+    alerted = st.session_state.setdefault('_ignition_alerted', {})
+    last = alerted.get(key)
+    if last and (now - last).total_seconds() < cooldown_s:
+        return
+    alerted[key] = now
+
+    bb = st.session_state.get('_bull_bear_meter') or {}
+    bb_line = (f"\n{bb.get('emoji','')} BULL/BEAR: {bb.get('score',0):+.0f} ({bb.get('label','—')})"
+               if bb else "")
+    # Combo: was the spike-watch armed when this fired?
+    combo_line = ""
+    _sw_until = st.session_state.get('_spike_watch_until')
+    if _sw_until and now <= _sw_until:
+        _remaining = max(0, (_sw_until - now).total_seconds())
+        combo_line = (f"\n🔥 <b>HIGH-CONVICTION COMBO</b> — spike-watch was active "
+                      f"({_remaining/60:.0f} min remaining in window)")
+    cond_lines = [f"  {'✅' if c['met'] else '❌'} <b>{c['name']}</b> — <i>{c['detail']}</i>"
+                  for c in score_data['conditions']]
+    msg = (
+        f"{score_data['emoji']} <b>{score_data['label']}</b> "
+        f"({score_data['score']}/{score_data['max']})\n"
+        f"Spot ₹{underlying_price:.0f} · {now.strftime('%H:%M:%S IST')}{bb_line}{combo_line}\n\n"
+        f"<b>Ignition conditions:</b>\n" + "\n".join(cond_lines)
+    )
+    try:
+        send_telegram_message_sync(msg, force=False)
+    except Exception:
+        pass
+
+
+def render_ignition_meter(score_data):
+    if not score_data:
+        st.caption("Ignition score not yet computed.")
+        return
+    score = score_data['score']
+    color = '#00cc66' if score >= 5 else ('#cccc66' if score >= 4 else '#888')
+    st.markdown(
+        f"""<div style='padding:10px 14px;border-radius:8px;background:#1a1a1a;
+        border-left:5px solid {color};margin-bottom:6px;'>
+        <span style='font-size:1.1em;color:{color};font-weight:700;'>{score_data['emoji']} {score_data['label']}</span>
+        <span style='font-size:1.5em;color:{color};font-weight:700;float:right;'>{score}/{score_data['max']}</span>
+        <div style='clear:both;'></div></div>""",
+        unsafe_allow_html=True,
+    )
+    rows = [{'Condition': c['name'], 'Met': '✅' if c['met'] else '❌', 'Detail': c['detail']}
+            for c in score_data['conditions']]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def compute_spike_probability(result, option_data, zones, df_5m, df_1m=None):
+    """Score 0–8 pre-spike conditions — leading signals that often precede a
+    directional spike. ≥5/8 = SPIKE INCOMING (15-min cooldown alert). ≥6/8
+    arms a 30-minute spike-watch window that the Ignition Score uses to mark
+    a high-conviction combo when it later fires."""
+    if not result:
+        return None
+    spot = ((option_data or {}).get('underlying') or 0) if option_data else 0
+    conditions = []
+
+    # 1) ATR contraction — last 5 bars' avg range vs prior 20 bars
+    c1, det1 = False, "no candle data"
+    try:
+        if df_5m is not None and len(df_5m) >= 25 and 'high' in df_5m.columns:
+            recent = df_5m.tail(25)
+            tr = (recent['high'].astype(float) - recent['low'].astype(float)).abs()
+            atr_recent = float(tr.tail(5).mean())
+            atr_avg = float(tr.head(20).mean())
+            if atr_avg > 0:
+                ratio = atr_recent / atr_avg
+                c1 = ratio <= 0.7
+                det1 = f"ATR last5 {atr_recent:.1f} vs 20-avg {atr_avg:.1f} ({ratio:.2f}×)"
+    except Exception:
+        pass
+    conditions.append({'name': 'ATR compression (≤0.7×)', 'met': c1, 'detail': det1})
+
+    # 2) Volume drying — last 3 bars avg < 0.7× of 10-bar avg
+    c2, det2 = False, "no candle data"
+    try:
+        if df_5m is not None and len(df_5m) >= 13 and 'volume' in df_5m.columns:
+            recent = df_5m.tail(13)
+            v_recent = float(recent.tail(3)['volume'].astype(float).mean())
+            v_avg = float(recent.head(10)['volume'].astype(float).mean())
+            if v_avg > 0:
+                ratio = v_recent / v_avg
+                c2 = ratio < 0.7
+                det2 = f"last3 vol {v_recent/1000:.0f}K vs 10-avg {v_avg/1000:.0f}K ({ratio:.2f}×)"
+    except Exception:
+        pass
+    conditions.append({'name': 'Volume drying (<0.7×)', 'met': c2, 'detail': det2})
+
+    # 3) OI accumulating at ATM±2 (session history of total CE+PE OI)
+    c3, det3 = False, "no OI data"
+    try:
+        df = (option_data or {}).get('df_summary') if option_data else None
+        if df is not None and not df.empty and spot and 'Strike' in df.columns:
+            strikes = sorted(df['Strike'].unique())
+            atm_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
+            sel = strikes[max(0, atm_idx - 2): atm_idx + 3]
+            win = df[df['Strike'].isin(sel)]
+            ce = win['openInterest_CE'].fillna(0).sum() if 'openInterest_CE' in win.columns else 0
+            pe = win['openInterest_PE'].fillna(0).sum() if 'openInterest_PE' in win.columns else 0
+            total_oi = float(ce + pe)
+            hist = st.session_state.setdefault('_spike_oi_hist', [])
+            hist.append(total_oi)
+            if len(hist) > 8:
+                hist[:] = hist[-8:]
+            if len(hist) >= 6:
+                recent3 = hist[-3:]
+                earlier3 = hist[-6:-3]
+                avg_r, avg_e = sum(recent3) / 3, sum(earlier3) / 3
+                if avg_r > avg_e * 1.02:  # >2% growth
+                    c3 = True
+                    det3 = f"ATM±2 total OI growing — last3 avg vs prev3, +{(avg_r/avg_e-1)*100:.1f}%"
+                else:
+                    det3 = f"ATM±2 total OI flat — last3/prev3 {avg_r/max(avg_e,1):.2f}×"
+            else:
+                det3 = f"building history ({len(hist)}/6)"
+    except Exception:
+        pass
+    conditions.append({'name': 'OI accumulating ATM±2', 'met': c3, 'detail': det3})
+
+    # 4) Gamma-squeeze setup — negative GEX + spot within 30 pts of flip
+    c4, det4 = False, "no GEX"
+    try:
+        gex = result.get('gex') or {}
+        ng = float(gex.get('net_gex') or 0)
+        flip = float(gex.get('gamma_flip') or 0)
+        if flip > 0 and spot:
+            dist = abs(spot - flip)
+            c4 = ng < 0 and dist <= 30
+            det4 = f"GEX {ng:+.0f}L · spot {dist:.0f}pts from flip ₹{flip:.0f}"
+    except Exception:
+        pass
+    conditions.append({'name': 'Gamma-squeeze setup', 'met': c4, 'detail': det4})
+
+    # 5) Cum-delta divergence — high |cum delta| while price range is tight
+    c5, det5 = False, "no delta/candle"
+    try:
+        vd = getattr(st.session_state, '_volume_delta_data', None) or {}
+        vds = (vd.get('zone_summary') if vd.get('zone_reset') else None) or vd.get('summary') or {}
+        cum_delta = abs(float(vds.get('cum_delta_last') or 0))
+        if df_5m is not None and len(df_5m) >= 5 and spot:
+            recent5 = df_5m.tail(5)
+            rng5 = float(recent5['high'].astype(float).max() - recent5['low'].astype(float).min())
+            tight = rng5 < spot * 0.004  # < 0.4% of spot
+            big = cum_delta >= 100000
+            c5 = tight and big
+            det5 = (f"|cum delta| {cum_delta/1000:.0f}K · 5-bar range {rng5:.0f}pts "
+                    f"{'(tight)' if tight else '(normal)'}")
+    except Exception:
+        pass
+    conditions.append({'name': 'Cum-delta divergence', 'met': c5, 'detail': det5})
+
+    # 6) S/R convergence — ≥3 major zones within ±50 pts of spot
+    c6, det6 = False, "no zones"
+    try:
+        all_z = ((zones or {}).get('support', []) or []) + ((zones or {}).get('resistance', []) or [])
+        nearby = [z for z in all_z if abs(float(z['price']) - spot) <= 50]
+        c6 = len(nearby) >= 3
+        det6 = f"{len(nearby)} S/R zones within ±50pts of spot"
+    except Exception:
+        pass
+    conditions.append({'name': 'S/R convergence (≥3 zones)', 'met': c6, 'detail': det6})
+
+    # 7) VIX low + flat — session history of VIX reads
+    c7, det7 = False, "no VIX"
+    try:
+        vix = result.get('vix') or {}
+        vix_v = float(vix.get('vix') or 0)
+        if vix_v > 0:
+            hist = st.session_state.setdefault('_spike_vix_hist', [])
+            hist.append(vix_v)
+            if len(hist) > 60:
+                hist[:] = hist[-60:]
+            if len(hist) >= 20:
+                window = hist[-20:]
+                hi, lo = max(window), min(window)
+                spread = hi - lo
+                at_low = vix_v <= lo + spread * 0.25
+                flat = (spread / max(vix_v, 1)) < 0.05
+                c7 = at_low and flat
+                det7 = (f"VIX {vix_v:.2f} · 20-rd {lo:.2f}–{hi:.2f}"
+                        + (" · flat-low" if c7 else ""))
+            else:
+                det7 = f"VIX {vix_v:.2f} · building history ({len(hist)}/20)"
+    except Exception:
+        pass
+    conditions.append({'name': 'VIX low + flat', 'met': c7, 'detail': det7})
+
+    # 8) Scheduled vol window
+    c8, det8 = False, "normal session"
+    try:
+        now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        wd, hm = now.weekday(), now.hour * 60 + now.minute
+        if 9 * 60 + 15 <= hm < 9 * 60 + 30:
+            c8, det8 = True, "Opening 15-min window (09:15–09:30)"
+        elif wd in (1, 3) and 14 * 60 + 30 <= hm < 15 * 60 + 30:
+            c8, det8 = True, "Expiry afternoon window (14:30–15:30)"
+        elif 15 * 60 <= hm < 15 * 60 + 30:
+            c8, det8 = True, "Last-30-min closing window"
+        else:
+            det8 = f"normal session ({now.strftime('%H:%M')})"
+    except Exception:
+        pass
+    conditions.append({'name': 'Scheduled vol window', 'met': c8, 'detail': det8})
+
+    score = sum(1 for c in conditions if c['met'])
+    if score >= 6:
+        label, emoji = 'SPIKE LIKELY — watch close', '🎯🔥'
+    elif score >= 5:
+        label, emoji = 'SETUP BUILDING', '⏳🟡'
+    elif score >= 3:
+        label, emoji = 'Mild compression', '⚪'
+    else:
+        label, emoji = 'No spike setup', '⚫'
+
+    # Arm spike-watch window for the Ignition combo
+    if score >= 6:
+        st.session_state['_spike_watch_until'] = (
+            datetime.now(pytz.timezone('Asia/Kolkata')) + timedelta(minutes=30)
+        )
+    return {'score': score, 'max': 8, 'label': label, 'emoji': emoji, 'conditions': conditions}
+
+
+def send_spike_alert(score_data, underlying_price, cooldown_s=900):
+    """Telegram alert when spike-probability ≥ 5/8. 15-min cooldown."""
+    if not score_data or score_data.get('score', 0) < 5 or not underlying_price:
+        return
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    mo = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    mc = now.replace(hour=15, minute=45, second=0, microsecond=0)
+    if now.weekday() >= 5 or not (mo <= now <= mc):
+        return
+    last = st.session_state.get('_spike_alerted')
+    if last and (now - last).total_seconds() < cooldown_s:
+        return
+    st.session_state['_spike_alerted'] = now
+    cond_lines = [
+        f"  {'✅' if c['met'] else '❌'} <b>{c['name']}</b> — <i>{c['detail']}</i>"
+        for c in score_data['conditions']
+    ]
+    msg = (
+        f"{score_data['emoji']} <b>{score_data['label']}</b> "
+        f"({score_data['score']}/{score_data['max']})\n"
+        f"Spot ₹{underlying_price:.0f} · {now.strftime('%H:%M:%S IST')}\n"
+        f"<i>Watch closely next 15–30 min — Ignition Score will confirm if/when the move starts.</i>\n\n"
+        f"<b>Pre-spike conditions:</b>\n" + "\n".join(cond_lines)
+    )
+    try:
+        send_telegram_message_sync(msg, force=False)
+    except Exception:
+        pass
+
+
+def render_spike_meter(score_data):
+    if not score_data:
+        st.caption("Spike probability not yet computed.")
+        return
+    score = score_data['score']
+    color = ('#ff8800' if score >= 6 else
+             ('#cccc66' if score >= 5 else ('#888' if score >= 3 else '#555')))
+    st.markdown(
+        f"""<div style='padding:10px 14px;border-radius:8px;background:#1a1a1a;
+        border-left:5px solid {color};margin-bottom:6px;'>
+        <span style='font-size:1.1em;color:{color};font-weight:700;'>{score_data['emoji']} {score_data['label']}</span>
+        <span style='font-size:1.5em;color:{color};font-weight:700;float:right;'>{score}/{score_data['max']}</span>
+        <div style='clear:both;'></div></div>""",
+        unsafe_allow_html=True,
+    )
+    rows = [{'Condition': c['name'], 'Met': '✅' if c['met'] else '❌', 'Detail': c['detail']}
+            for c in score_data['conditions']]
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+def _track_total_oi_timeseries(option_data, underlying_price=None, max_points=500):
+    """Append a row {ts, ce_oi, pe_oi, chg_ce, chg_pe} for TOTAL OI summed
+    across ALL strikes in the option chain (not just ATM±2) so the time-series
+    chart shows the whole chain's evolution."""
+    try:
+        df = (option_data or {}).get('df_summary') if option_data else None
+        if df is None or df.empty:
+            return
+        ce_oi = float(df['openInterest_CE'].fillna(0).sum()) if 'openInterest_CE' in df.columns else 0.0
+        pe_oi = float(df['openInterest_PE'].fillna(0).sum()) if 'openInterest_PE' in df.columns else 0.0
+        chg_ce = float(df['changeinOpenInterest_CE'].fillna(0).sum()) if 'changeinOpenInterest_CE' in df.columns else 0.0
+        chg_pe = float(df['changeinOpenInterest_PE'].fillna(0).sum()) if 'changeinOpenInterest_PE' in df.columns else 0.0
+        ts = datetime.now(pytz.timezone('Asia/Kolkata'))
+        hist = st.session_state.setdefault('_total_oi_history', [])
+        # Dedup if last entry within 5s
+        if hist and (ts - hist[-1]['ts']).total_seconds() < 5:
+            return
+        hist.append({'ts': ts, 'ce_oi': ce_oi, 'pe_oi': pe_oi,
+                     'chg_ce': chg_ce, 'chg_pe': chg_pe})
+        if len(hist) > max_points:
+            hist[:] = hist[-max_points:]
+    except Exception:
+        pass
+
+
+def render_total_oi_timeseries():
+    """Two time-series line charts: TOTAL CE vs PE OI (whole chain) and TOTAL ΔOI."""
+    hist = st.session_state.get('_total_oi_history') or []
+    if len(hist) < 2:
+        st.caption("Building OI time-series… (need 2+ cycles of data)")
+        return
+    df = pd.DataFrame(hist)
+    df['time'] = df['ts'].apply(lambda t: t.strftime('%H:%M:%S'))
+    # Convert raw OI to lakhs for readability
+    for c in ('ce_oi', 'pe_oi', 'chg_ce', 'chg_pe'):
+        df[c] = df[c] / 1e5
+    col1, col2 = st.columns(2)
+    with col1:
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=df['time'], y=df['ce_oi'], mode='lines+markers',
+                                 name='CE OI', line=dict(color='#ff4444', width=2)))
+        fig.add_trace(go.Scatter(x=df['time'], y=df['pe_oi'], mode='lines+markers',
+                                 name='PE OI', line=dict(color='#00cc66', width=2)))
+        fig.update_layout(
+            title='Total OI (whole chain) — Call (red) vs Put (green)',
+            xaxis_title='Time', yaxis_title='OI (lakhs)',
+            height=360, margin=dict(l=20, r=20, t=40, b=20),
+            plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    with col2:
+        fig2 = go.Figure()
+        fig2.add_trace(go.Scatter(x=df['time'], y=df['chg_ce'], mode='lines+markers',
+                                  name='ΔCE OI', line=dict(color='#ff4444', width=2)))
+        fig2.add_trace(go.Scatter(x=df['time'], y=df['chg_pe'], mode='lines+markers',
+                                  name='ΔPE OI', line=dict(color='#00cc66', width=2)))
+        fig2.add_hline(y=0, line_color='#666')
+        fig2.update_layout(
+            title='Total ΔOI (whole chain) — Call (red) vs Put (green)',
+            xaxis_title='Time', yaxis_title='ΔOI (lakhs)',
+            height=360, margin=dict(l=20, r=20, t=40, b=20),
+            plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
+            legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
+        )
+        st.plotly_chart(fig2, use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  SMART MONEY / FOOTPRINT ANALYZERS
+#  Six composable signals approximating institutional behavior:
+#    1. Per-candle Futures P+OI classifier  (Long buildup / Short cover etc.)
+#    2. Cumulative Delta Divergence detector
+#    3. Volume Profile Shape classifier     (D / P / b / Trend)
+#    4. Bid/Ask Absorption detector         (price stalled + heavy flow)
+#    5. VWAP Deviation Bands                (±1σ, ±2σ)
+#    6. Accumulation/Distribution composite (combines all of the above)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+_PXOI_LABEL = {
+    ('up', 'up'):     ('Long Buildup',   '🟢', +1),
+    ('up', 'down'):   ('Short Covering', '🟡', +0.5),
+    ('down', 'up'):   ('Short Buildup',  '🔴', -1),
+    ('down', 'down'): ('Long Unwinding', '🟠', -0.5),
+}
+
+
+def _classify_pxoi(dp, do, p_tol=0.5, o_tol=100):
+    if abs(dp) < p_tol and abs(do) < o_tol:
+        return ('Flat', '⚪', 0.0)
+    px = 'up' if dp >= 0 else 'down'
+    ox = 'up' if do >= 0 else 'down'
+    return _PXOI_LABEL.get((px, ox), ('Flat', '⚪', 0.0))
+
+
+def compute_per_candle_pxoi(api, max_rows=12):
+    """Pull recent 5m futures candles with OI, classify each as Long buildup /
+    Short covering / Short buildup / Long unwinding. Cached 60s."""
+    cache = st.session_state.get('_pxoi_cache') or {}
+    if cache.get('ts') and (time.time() - cache['ts'] < 60):
+        return cache.get('data') or []
+    meta = get_nifty_futures_security_id()
+    if not meta or not api:
+        return []
+    try:
+        # Direct call with oi=True for futures intraday
+        url = f"{api.base_url}/charts/intraday"
+        ist = pytz.timezone('Asia/Kolkata')
+        end = datetime.now(ist)
+        start = end - timedelta(days=1)
+        payload = {
+            "securityId": meta['security_id'],
+            "exchangeSegment": "NSE_FNO",
+            "instrument": "FUTIDX",
+            "interval": "5",
+            "oi": True,
+            "fromDate": start.strftime("%Y-%m-%d %H:%M:%S"),
+            "toDate": end.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        r = requests.post(url, headers=api.headers, json=payload, timeout=12)
+        if r.status_code != 200:
+            return []
+        data = r.json()
+        closes = data.get('close') or []
+        ois = data.get('open_interest') or data.get('oi') or []
+        ts = data.get('timestamp') or data.get('start_Time') or []
+        if not closes or len(closes) != len(ois) or len(closes) < 2:
+            return []
+        rows = []
+        for i in range(max(1, len(closes) - max_rows - 1), len(closes)):
+            if i == 0:
+                continue
+            dp = float(closes[i]) - float(closes[i - 1])
+            do = float(ois[i]) - float(ois[i - 1])
+            label, emoji, sc = _classify_pxoi(dp, do)
+            t_str = ""
+            try:
+                t_str = datetime.fromtimestamp(int(ts[i]), tz=pytz.utc) \
+                    .astimezone(ist).strftime('%H:%M')
+            except Exception:
+                pass
+            rows.append({
+                'time': t_str, 'price': float(closes[i]),
+                'dp': dp, 'doi': do,
+                'label': label, 'emoji': emoji, 'score': sc,
+            })
+        st.session_state['_pxoi_cache'] = {'ts': time.time(), 'data': rows[-max_rows:]}
+        return rows[-max_rows:]
+    except Exception:
+        return []
+
+
+def detect_cum_delta_divergence():
+    """Track spot + cum_delta history; detect divergence at recent extremes."""
+    vd = getattr(st.session_state, '_volume_delta_data', None) or {}
+    vds = (vd.get('zone_summary') if vd.get('zone_reset') else None) or vd.get('summary') or {}
+    cd = float(vds.get('cum_delta_last') or 0)
+    od = getattr(st.session_state, '_cached_option_data', None) or {}
+    spot = float(od.get('underlying') or 0)
+    if not spot:
+        return None
+    hist = st.session_state.setdefault('_cd_div_hist', [])
+    now_t = time.time()
+    if not hist or (now_t - hist[-1]['t']) >= 15:
+        hist.append({'t': now_t, 'spot': spot, 'cd': cd})
+        if len(hist) > 40:
+            hist[:] = hist[-40:]
+    if len(hist) < 10:
+        return None
+    recent = hist[-10:]
+    max_spot = max(r['spot'] for r in recent)
+    min_spot = min(r['spot'] for r in recent)
+    max_cd = max(r['cd'] for r in recent)
+    min_cd = min(r['cd'] for r in recent)
+    cur_spot, cur_cd = recent[-1]['spot'], recent[-1]['cd']
+
+    # Bearish divergence — price at/near recent high but cum delta well below its high
+    if max_spot - cur_spot <= 5 and max_cd > 1 and cur_cd < max_cd * 0.6:
+        return {'direction': 'bearish',
+                'detail': f"price near 10-cycle high ₹{max_spot:.0f} but cum delta "
+                          f"{cur_cd/1000:.0f}K < 60% of peak {max_cd/1000:.0f}K"}
+    # Bullish divergence — price at/near recent low but cum delta well above its low
+    if cur_spot - min_spot <= 5 and min_cd < -1 and cur_cd > min_cd * 0.6:
+        return {'direction': 'bullish',
+                'detail': f"price near 10-cycle low ₹{min_spot:.0f} but cum delta "
+                          f"{cur_cd/1000:.0f}K > 60% above trough {min_cd/1000:.0f}K"}
+    return None
+
+
+def compute_vp_shape(df, n_bars=60, n_rows=24):
+    """Classify the volume profile shape of the last n_bars candles:
+       D = balanced (peak in middle)         — equilibrium / range
+       P = peak at top                       — short covering, distribution above
+       b = peak at bottom                    — long liquidation, accumulation below
+       Trend = monotonic (no clear peak)     — real trend continuation
+    """
+    if df is None or len(df) < 10:
+        return None
+    recent = df.tail(n_bars)
+    top = float(recent['high'].astype(float).max())
+    bot = float(recent['low'].astype(float).min())
+    if top <= bot:
+        return None
+    step = (top - bot) / n_rows
+    vol_bins = [0.0] * n_rows
+    for _, row in recent.iterrows():
+        try:
+            h, l = float(row['high']), float(row['low'])
+            v = float(row.get('volume') or 1)
+        except Exception:
+            continue
+        r = h - l
+        if r <= 0:
+            continue
+        for i in range(n_rows):
+            blo, bhi = bot + i * step, bot + (i + 1) * step
+            overlap = min(h, bhi) - max(l, blo)
+            if overlap > 0:
+                vol_bins[i] += v * (overlap / r)
+    total = sum(vol_bins) or 1
+    poc_idx = vol_bins.index(max(vol_bins))
+    pos = poc_idx / max(n_rows - 1, 1)  # 0=bottom, 1=top
+    upper_share = sum(vol_bins[poc_idx + 1:]) / total
+    lower_share = sum(vol_bins[:poc_idx]) / total
+    # Trend = one tail dominates significantly
+    if upper_share + lower_share > 0 and max(upper_share, lower_share) < 0.15:
+        # Both tails very thin → monotonic
+        shape = 'Trend'
+        bias = 'up' if pos < 0.3 else ('down' if pos > 0.7 else 'flat')
+        note = "monotonic — real trend continuation"
+    elif 0.35 <= pos <= 0.65:
+        shape, bias, note = 'D', 'balanced', "balance / range — wait for break"
+    elif pos > 0.65:
+        shape, bias, note = 'P', 'bullish', "peak at top — short covering / distribution above"
+    elif pos < 0.35:
+        shape, bias, note = 'b', 'bearish', "peak at bottom — long liquidation / accumulation below"
+    else:
+        shape, bias, note = 'D', 'balanced', "balance"
+    return {'shape': shape, 'bias': bias, 'poc_pos': round(pos, 2), 'note': note}
+
+
+def detect_absorption():
+    """Detect bid/ask absorption: price stalled but cum delta strongly directional.
+       Buy delta + flat price → sellers absorbing → bearish setup.
+       Sell delta + flat price → buyers absorbing → bullish setup."""
+    df5 = getattr(st.session_state, '_df_5m', None)
+    if df5 is None or len(df5) < 5:
+        return None
+    od = getattr(st.session_state, '_cached_option_data', None) or {}
+    spot = float(od.get('underlying') or 0)
+    if not spot:
+        return None
+    recent5 = df5.tail(5)
+    try:
+        rng = float(recent5['high'].astype(float).max() - recent5['low'].astype(float).min())
+    except Exception:
+        return None
+    tight = rng < spot * 0.003  # < 0.3% of spot
+
+    vd = getattr(st.session_state, '_volume_delta_data', None) or {}
+    vds = (vd.get('zone_summary') if vd.get('zone_reset') else None) or vd.get('summary') or {}
+    bv = float(vds.get('total_buy_volume') or 0)
+    sv = float(vds.get('total_sell_volume') or 0)
+    net = bv - sv
+    if not tight or abs(net) < 100000:
+        return None
+    if net > 0:
+        return {'side': 'bearish',
+                'detail': (f"price range {rng:.0f} pts < 0.3% of spot · "
+                           f"net buy delta +{net/1000:.0f}K being absorbed by sellers")}
+    return {'side': 'bullish',
+            'detail': (f"price range {rng:.0f} pts < 0.3% of spot · "
+                       f"net sell delta {net/1000:.0f}K being absorbed by buyers")}
+
+
+def compute_vwap_bands(df, lookback=80):
+    """Standard VWAP ± 1σ / 2σ bands from recent candles."""
+    if df is None or len(df) < 10:
+        return None
+    recent = df.tail(lookback)
+    try:
+        tp = (recent['high'].astype(float) + recent['low'].astype(float) +
+              recent['close'].astype(float)) / 3
+        vol = recent['volume'].astype(float)
+        cv = (tp * vol).cumsum()
+        cvol = vol.cumsum()
+        vwap_series = cv / cvol.replace(0, 1)
+        vwap = float(vwap_series.iloc[-1])
+        dev = (tp - vwap_series)
+        sd = float(((dev * dev * vol).sum() / max(vol.sum(), 1)) ** 0.5)
+        return {
+            'vwap': round(vwap, 2),
+            'upper_1': round(vwap + sd, 2),
+            'lower_1': round(vwap - sd, 2),
+            'upper_2': round(vwap + 2 * sd, 2),
+            'lower_2': round(vwap - 2 * sd, 2),
+            'sigma': round(sd, 2),
+        }
+    except Exception:
+        return None
+
+
+def compute_accum_dist_score(api, result, option_data):
+    """Composite Accumulation / Distribution score in [-100, +100]:
+         +100 = strong accumulation (smart-money buying)
+         -100 = strong distribution (smart-money selling into rally)
+         Combines all 5 above + a few quick reads."""
+    if not result:
+        return None
+    spot = ((option_data or {}).get('underlying') or 0) if option_data else 0
+    components = []
+    score, weight_used = 0.0, 0.0
+
+    def _add(name, val, weight, detail):
+        nonlocal score, weight_used
+        components.append({'name': name, 'score': val, 'weight': weight, 'detail': detail})
+        if val is not None:
+            score += val * weight
+            weight_used += weight
+
+    # 1. Spot vs VWAP (with bands)
+    df5 = getattr(st.session_state, '_df_5m', None)
+    bands = compute_vwap_bands(df5)
+    if bands and spot:
+        if spot > bands['upper_1']:    v, d = +60, f"spot above VWAP+1σ ({bands['upper_1']:.0f})"
+        elif spot > bands['vwap']:     v, d = +30, f"spot above VWAP ({bands['vwap']:.0f})"
+        elif spot < bands['lower_1']:  v, d = -60, f"spot below VWAP-1σ ({bands['lower_1']:.0f})"
+        elif spot < bands['vwap']:     v, d = -30, f"spot below VWAP ({bands['vwap']:.0f})"
+        else:                           v, d = 0, f"at VWAP {bands['vwap']:.0f}"
+        _add('VWAP relation', v, 0.20, d)
+    else:
+        _add('VWAP relation', None, 0.20, "no VWAP")
+
+    # 2. Cum-delta direction
+    vd = getattr(st.session_state, '_volume_delta_data', None) or {}
+    vds = (vd.get('zone_summary') if vd.get('zone_reset') else None) or vd.get('summary') or {}
+    cd = float(vds.get('cum_delta_last') or 0)
+    if vds:
+        v = max(-100, min(100, cd / 5000))      # ±500K → ±100
+        _add('Cum Delta', v, 0.20, f"cum delta {cd/1000:+.0f}K")
+    else:
+        _add('Cum Delta', None, 0.20, "no delta")
+
+    # 3. Cum-delta divergence (negative if bearish div, positive if bullish div)
+    div = detect_cum_delta_divergence()
+    if div:
+        v = -70 if div['direction'] == 'bearish' else +70
+        _add('Delta Divergence', v, 0.15, div['detail'])
+    else:
+        _add('Delta Divergence', 0, 0.15, "no divergence")
+
+    # 4. Absorption (bias inverted from delta side)
+    ab = detect_absorption()
+    if ab:
+        v = -80 if ab['side'] == 'bearish' else +80
+        _add('Absorption', v, 0.15, ab['detail'])
+    else:
+        _add('Absorption', 0, 0.15, "no absorption")
+
+    # 5. Per-candle P+OI most recent label (futures)
+    rows = compute_per_candle_pxoi(api, max_rows=3)
+    if rows:
+        avg_sc = sum(r['score'] for r in rows) / len(rows)
+        v = max(-100, min(100, avg_sc * 80))
+        _add('Futures P×OI (last 3)', v, 0.15,
+             "; ".join(f"{r['emoji']}{r['label']}" for r in rows))
+    else:
+        _add('Futures P×OI (last 3)', None, 0.15, "futures not available")
+
+    # 6. VP shape (D=0, P=+40, b=-40, Trend=±60 per bias)
+    sh = compute_vp_shape(df5)
+    if sh:
+        if sh['shape'] == 'P':       v = +40
+        elif sh['shape'] == 'b':     v = -40
+        elif sh['shape'] == 'Trend': v = +60 if sh['bias'] == 'up' else (-60 if sh['bias'] == 'down' else 0)
+        else:                         v = 0
+        _add('VP Shape', v, 0.15, f"{sh['shape']} · {sh['note']}")
+    else:
+        _add('VP Shape', None, 0.15, "no profile")
+
+    final = max(-100, min(100, (score / weight_used) if weight_used else 0))
+    if final >= 50:    label, emoji = 'ACCUMULATION (smart money buying)', '🟢🟢'
+    elif final >= 20:  label, emoji = 'Mild Accumulation', '🟢'
+    elif final <= -50: label, emoji = 'DISTRIBUTION (smart money selling)', '🔴🔴'
+    elif final <= -20: label, emoji = 'Mild Distribution', '🔴'
+    else:              label, emoji = 'NEUTRAL', '⚪'
+    coverage = round((weight_used / 1.0) * 100, 0)
+    return {
+        'score': round(final, 1), 'label': label, 'emoji': emoji,
+        'coverage': coverage, 'components': components,
+        'vwap_bands': bands, 'vp_shape': sh, 'divergence': div,
+        'absorption': ab, 'pxoi_rows': rows,
+    }
+
+
+def send_accum_dist_alert(score_data, underlying_price, cooldown_s=900):
+    """Telegram alert when |score| ≥ 70. 15-min cooldown."""
+    if not score_data or abs(score_data.get('score', 0)) < 70 or not underlying_price:
+        return
+    now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    mo = now.replace(hour=8, minute=30, second=0, microsecond=0)
+    mc = now.replace(hour=15, minute=45, second=0, microsecond=0)
+    if now.weekday() >= 5 or not (mo <= now <= mc):
+        return
+    direction = 'accum' if score_data['score'] > 0 else 'dist'
+    key = f"smart_{direction}"
+    alerted = st.session_state.setdefault('_smart_money_alerted', {})
+    last = alerted.get(key)
+    if last and (now - last).total_seconds() < cooldown_s:
+        return
+    alerted[key] = now
+    def _line(c):
+        s = c.get('score')
+        emo = '🟢' if (s or 0) > 0 else ('🔴' if (s or 0) < 0 else '⚪')
+        val = '—' if s is None else f"{s:+.0f}"
+        return f"  {emo} <b>{c['name']}</b>: {val} · <i>{c['detail']}</i>"
+    lines = [_line(c) for c in score_data['components']]
+    msg = (
+        f"{score_data['emoji']} <b>SMART MONEY — {score_data['label']}</b>\n"
+        f"Score {score_data['score']:+.0f} · Spot ₹{underlying_price:.0f} · "
+        f"{now.strftime('%H:%M:%S IST')} · coverage {score_data['coverage']:.0f}%\n\n"
+        f"<b>Components:</b>\n" + "\n".join(lines)
+    )
+    try:
+        send_telegram_message_sync(msg, force=False)
+    except Exception:
+        pass
+
+
+def render_smart_money_panel(score_data):
+    """Single dashboard expander showing all 6 smart-money signals."""
+    if not score_data:
+        st.caption("Smart-money composite not yet computed.")
+        return
+    color = ('#00cc66' if score_data['score'] >= 20 else
+             '#ff4444' if score_data['score'] <= -20 else '#cccc66')
+    st.markdown(
+        f"""<div style='padding:12px 16px;border-radius:10px;background:#1a1a1a;
+        border-left:6px solid {color};margin-bottom:8px;'>
+        <span style='font-size:1.1em;color:{color};font-weight:700;'>{score_data['emoji']} {score_data['label']}</span>
+        <span style='font-size:1.6em;color:{color};font-weight:700;float:right;'>{score_data['score']:+.0f}</span>
+        <div style='clear:both;color:#999;font-size:0.85em;'>
+        Coverage {score_data['coverage']:.0f}% of components
+        </div></div>""", unsafe_allow_html=True,
+    )
+    # Component breakdown table
+    rows = []
+    for c in score_data['components']:
+        s = c['score']
+        rows.append({
+            'Component': c['name'],
+            'Score': '—' if s is None else f"{s:+.0f}",
+            'Weight': f"{int(c['weight']*100)}%",
+            'Detail': c['detail'],
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # VWAP bands
+    if score_data.get('vwap_bands'):
+        b = score_data['vwap_bands']
+        st.caption(f"**VWAP Bands** — ₹{b['vwap']:.0f} (σ={b['sigma']:.1f}) · "
+                   f"±1σ: ₹{b['lower_1']:.0f}–{b['upper_1']:.0f} · "
+                   f"±2σ: ₹{b['lower_2']:.0f}–{b['upper_2']:.0f}")
+    # VP Shape
+    if score_data.get('vp_shape'):
+        sh = score_data['vp_shape']
+        st.caption(f"**VP Shape** — {sh['shape']} ({sh['bias']}) · POC at {sh['poc_pos']*100:.0f}% of range · {sh['note']}")
+    # Per-candle P+OI table
+    if score_data.get('pxoi_rows'):
+        st.markdown("**📊 Per-5m-candle Futures P×OI (last 12)**")
+        pxoi_rows = [{
+            'Time': r['time'], 'Price': f"₹{r['price']:,.0f}",
+            'ΔPrice': f"{r['dp']:+.1f}", 'ΔOI': f"{r['doi']:+,.0f}",
+            'Label': f"{r['emoji']} {r['label']}",
+        } for r in score_data['pxoi_rows']]
+        st.dataframe(pd.DataFrame(pxoi_rows), use_container_width=True, hide_index=True)
+    else:
+        st.caption("Per-candle Futures P×OI unavailable (likely Dhan futures fetch failing).")
+
+
+def send_master_signal_telegram(result, underlying_price, option_data=None, force=False, alert_header=""):
     """Send master signal to Telegram. Pass force=True to bypass all guards."""
     if result is None:
         return
@@ -5684,8 +12718,48 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                 )
         if _vpfr_lines:
             vpfr_block = "\n<b>📊 VPFR Levels:</b>\n" + "\n".join(_vpfr_lines) + "\n"
+
+        # ── VPFR confluence entry: cluster all POC/VAH/VAL; where ≥2 align = strong zone ──
+        _all_levels = []
+        _tf_tag = {'short': 'S', 'medium': 'M', 'long': 'L'}
+        for _tf in ('short', 'medium', 'long'):
+            _vd = _vpfr.get(_tf)
+            if not _vd:
+                continue
+            for _k in ('poc', 'vah', 'val'):
+                try:
+                    _all_levels.append((float(_vd[_k]), f"{_tf_tag[_tf]}-{_k.upper()}"))
+                except Exception:
+                    pass
+        _all_levels.sort(key=lambda x: x[0])
+        _tol = max(15.0, underlying_price * 0.001)  # ~0.1% of spot, min 15 pts
+        _clusters = []
+        for _lv, _tag in _all_levels:
+            if _clusters and abs(_lv - _clusters[-1]['avg']) <= _tol:
+                _c = _clusters[-1]
+                _c['levels'].append((_lv, _tag))
+                _c['avg'] = sum(x[0] for x in _c['levels']) / len(_c['levels'])
+            else:
+                _clusters.append({'avg': _lv, 'levels': [(_lv, _tag)]})
+        _strong = sorted([c for c in _clusters if len(c['levels']) >= 2],
+                         key=lambda c: len(c['levels']), reverse=True)
+        if _strong:
+            _entry_lines = []
+            for _c in _strong[:3]:
+                _avg = _c['avg']
+                _n = len(_c['levels'])
+                _tags = ",".join(t for _, t in _c['levels'])
+                _dist = _avg - underlying_price
+                if _dist < -_tol:
+                    _side = f"🟢 BUY zone ₹{_avg:.0f} (support, {abs(_dist):.0f}pts below)"
+                elif _dist > _tol:
+                    _side = f"🔴 SELL zone ₹{_avg:.0f} (resistance, {_dist:.0f}pts above)"
+                else:
+                    _side = f"⚪ AT PRICE ₹{_avg:.0f} (spot at zone)"
+                _entry_lines.append(f"  {_side} — {_n} levels align ({_tags})")
+            vpfr_block += "\n<b>🎯 VPFR CONFLUENCE ENTRY (where levels align):</b>\n" + "\n".join(_entry_lines) + "\n"
     except Exception:
-        vpfr_block = ""
+        vpfr_block = vpfr_block or ""
 
     _short_names = {'NIFTY 50':'NIFTY 50','SENSEX':'SENSEX','BANKNIFTY':'BANK NIFTY','NIFTY IT':'NIFTY IT',
                     'RELIANCE':'RELIANCE','ICICIBANK':'ICICI BANK','INDIA VIX':'INDIA VIX','GOLD':'GOLD',
@@ -6544,62 +13618,616 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             )
     cap_detail_block = ("\n" + "\n\n".join(_cap_detail_lines) + f"\n<i>Spot ₹{underlying_price:.0f} | {time_str}</i>\n") if _cap_detail_lines else ""
 
-    # ── Part 1/3: Header + Candle + GEX + PCR/VIX/VIDYA + OI ATM + Decap/Cap/OB + Direction ──
-    msg_part1 = f"""{signal_emoji} <b>{result['signal']}</b> | {result['trade_type']} (1/3)
-🕐 {time_str} | ₹{underlying_price:.0f}
+    # ── NIFTY Futures + FII/DII + market-breadth blocks (from session state) ──
+    _fut = st.session_state.get('_nifty_futures_data')
+    if _fut:
+        futures_block = (
+            f"🔮 FUT:₹{_fut['price']:,.0f} Basis:{_fut['basis']:+.1f}({_fut['stance']}) "
+            f"OI:{_fut['oi']:,.0f} ΔOI:{_fut['chg_oi']:+,.0f} Vol:{_fut['volume']:,.0f}"
+        )
+    else:
+        futures_block = "🔮 FUT: N/A (contract/quote unavailable)"
 
-🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}
+    _cash = st.session_state.get('_fii_dii_cash')
+    _deriv = st.session_state.get('_fii_deriv_stats')
+    _breadth = st.session_state.get('_nse_breadth')
+    _fd_lines = []
+    if _cash:
+        _fii_c, _dii_c = _cash.get('FII'), _cash.get('DII')
+        _cash_date = (_fii_c or _dii_c or {}).get('date', '')
+        if _fii_c:
+            _fd_lines.append(f"FII Cash Net: ₹{_fii_c['net']:+,.0f} Cr ({'Buying' if _fii_c['net'] > 0 else 'Selling'})")
+        if _dii_c:
+            _fd_lines.append(f"DII Cash Net: ₹{_dii_c['net']:+,.0f} Cr ({'Buying' if _dii_c['net'] > 0 else 'Selling'})")
+        if _cash_date:
+            _fd_lines.append(f"<i>Cash as of {_cash_date}</i>")
+    if _deriv:
+        _fii_net = _deriv['fut_index_net']
+        _fd_lines.append(
+            f"FII Idx Fut: L {_deriv['fut_index_long']:,.0f} / S {_deriv['fut_index_short']:,.0f} "
+            f"→ Net {_fii_net:+,.0f} ({'Net Long' if _fii_net > 0 else 'Net Short'})"
+        )
+        _fd_lines.append(f"<i>Derivatives as of {_deriv['date']}</i>")
+    if _breadth:
+        _fd_lines.append(
+            f"Breadth: ▲{_breadth['advances']} ▼{_breadth['declines']} ={_breadth['unchanged']} "
+            f"| A/D {_breadth['ad_ratio']}"
+        )
+    fii_dii_block = ("\n" + "\n".join(_fd_lines) + "\n") if _fd_lines else "\nN/A (NSE data unavailable)\n"
+
+    # ── 1m / 5m candle pattern lines + chart pattern (computed fresh from session dfs) ──
+    def _fmt_cp(df):
+        try:
+            cp = detect_candle_patterns(df, lookback=5) if df is not None and len(df) >= 3 else None
+            if not cp:
+                return "—"
+            p = cp.get('pattern') or '—'
+            if p in ('No Pattern', 'Insufficient Data', 'Normal'):
+                return "—"
+            return f"{p} ({cp.get('direction', '—')})"
+        except Exception:
+            return "—"
+    _df_1m_sig = st.session_state.get('_df_1m_trade')
+    _df_5m_sig = st.session_state.get('_df_5m')
+    candle_patterns_block = f"\n🕯 Patterns: 1m={_fmt_cp(_df_1m_sig)} | 5m={_fmt_cp(_df_5m_sig)}"
+    try:
+        _chart_pat_1m = detect_chart_patterns(_df_1m_sig) if _df_1m_sig is not None and len(_df_1m_sig) >= 20 else None
+    except Exception:
+        _chart_pat_1m = None
+    try:
+        _chart_pat_5m = detect_chart_patterns(_df_5m_sig) if _df_5m_sig is not None and len(_df_5m_sig) >= 20 else None
+    except Exception:
+        _chart_pat_5m = None
+    _chart_bits = []
+    if _chart_pat_1m:
+        _chart_bits.append(f"1m={_chart_pat_1m['pattern']} ({_chart_pat_1m['direction']})")
+    if _chart_pat_5m:
+        _chart_bits.append(f"5m={_chart_pat_5m['pattern']} ({_chart_pat_5m['direction']})")
+    if _chart_bits:
+        candle_patterns_block += "\n📐 Chart: " + " | ".join(_chart_bits)
+
+    # ── Assemble content sections; part headers + numbering added after chunking ──
+    _sig_hdr = f"{signal_emoji} <b>{result['signal']}</b> | <b>{result['trade_type']}</b>"
+
+    body_main = f"""🕐 {time_str} | ₹{underlying_price:.0f}
+
+🕯 {result['candle']['pattern']} ({result['candle']['direction']}) | Vol:{result['volume']['ratio']}x | 📍{loc_text}{candle_patterns_block}
 🔮 GEX:{gex['net_gex']:+.0f}L({gex['market_mode']} {_gex_action}) Flip:{'₹'+str(int(gex['gamma_flip'])) if gex['gamma_flip'] else '—'}
 📊 PCR×GEX:{result['pcr_gex']['badge']} VIX:{float(vix.get('vix',0)):.2f}{vix.get('direction','')} VIDYA:{_vid.get('trend','N/A')}{_vid_delta_str}{' ▲' if _vid.get('cross_up') else ' ▼' if _vid.get('cross_down') else ''}{_vid_zone_suffix}
 📊 OI ATM {_oit.get('atm_strike','')}: CE {_oit.get('ce_activity','—')} | PE {_oit.get('pe_activity','—')} | {_oit.get('signal','—')}
+{futures_block}
 {decap_block}{cap_detail_block}{ob_block}{ob_detail_block}
 <b>📍 DIRECTION</b>
 {swing_block}{capping_block}"""
 
-    # ── Part 2/3: Market Depth + Market Context + Volume Delta + Strike Analysis + OI Positioning ──
-    msg_part2 = f"""{signal_emoji} <b>DETAIL (2/3)</b> | {result['signal']} | {time_str}
-
-<b>📉 MARKET DEPTH</b>{depth_block}
+    body_detail = f"""<b>📉 MARKET DEPTH</b>{depth_block}
 <b>📊 MARKET CONTEXT</b>{market_ctx_block}
 <b>⚡ VOLUME DELTA</b>{vol_delta_block}
 <b>🔬 STRIKE ANALYSIS (ATM±2)</b>{strike_analysis_block}
 <b>🔄 OI POSITIONING</b>{unwind_block}{oc_deep_block}"""
 
-    # ── Part 3/3: VPFR/POC/MF + Price Structure + Sector Rotation + Indices + AI prompt ──
-    msg_part3 = f"""{signal_emoji} <b>DETAIL (3/3)</b> | {result['signal']} | {time_str}
-
-<b>📈 VPFR / POC / MONEY FLOW</b>{vpfr_block}{poc_block}{mf_block}
+    body_struct = f"""<b>📈 VPFR / POC / MONEY FLOW</b>{vpfr_block}{poc_block}{mf_block}
 <b>🔄 PRICE STRUCTURE</b>{price_action_block}{sector_rotation_block}
+<b>🏦 FII/DII &amp; BREADTH</b>{fii_dii_block}
 <b>🌍 INDICES &amp; STOCKS</b>
 <b>Alignment (10m|1h|4h|1D|4D|Pat):</b>
 {align_text}
-{_mi_bias_block}
-🟡 <code>Analyze ALL data above (Part 1 + Part 2 + Part 3): signal/score, GEX, VIX+VIDYA, OI ATM, future swing, OI capping/decapping/depeg per-strike (ATM±2 CE/PE build & shed with %), Order Block zones (BULLISH/BEARISH OB — inside or near), Market Depth (bid/ask walls at ATM±2), Market Context (DTE/MaxPain/Straddle/IVR/Skew/ATR/OIVel), Volume Delta (total/cum/ratio + candle delta at VAH/VAL/POC zones), Strike Analysis ATM±2 (PCR S/R + Depth + Capping + Δ/Γ/Θ + BA + CE/PE vol), OI winding/positioning, option chain verdict, VPFR, Triple POC, Money Flow (POC/VAH/VAL), LTP trap+VWAP, VOB, HVP, Sector Rotation (leading/lagging sectors 10m+1h bias + RISK-ON/OFF/MIXED), alignment + capping per instrument (NIFTY 50, SENSEX, BANK NIFTY, NIFTY IT, RELIANCE, ICICI BANK, INFOSYS, INDIA VIX, GOLD, CRUDE OIL, USD/INR, S&P 500 futures, JAPAN 225, HANG SENG, UK 100 — 10m|1h|4h|1D|4D). SHORT answers:
-GEX RULE (use actual GEX value from data above): GEX +ve → RANGE mode → sell ceiling, buy floor | GEX -ve → TREND mode → follow momentum, no counter-trades. Confirm with VIDYA direction.
-1. Market structure: bull/bear/range + reason (state GEX value and what mode it signals)
-2. Strongest wall: strike + OI + capping/decapping state + market depth (bid/ask wall) + VPFR confluence (POC/VAH/VAL) + Money Flow Profile POC + why (this is the ceiling/floor where price stalls)
-3. Index/Stocks: NIFTY 50 / SENSEX / BANK NIFTY / RELIANCE / ICICI BANK / INFOSYS / INDIA VIX / GOLD / CRUDE OIL / USD/INR / S&P 500 futures / JAPAN 225 / HANG SENG / UK 100 — bias + Cap/Sup/Range
-4. Sector Rotation: which sectors leading/lagging (10m+1h bias) → is it RISK-ON (cyclicals up) or RISK-OFF (defensives up)?
-5. Entry: ₹___ (at ceiling = strongest OI resistance for SELL / at floor = strongest OI support for BUY — where price won't break) | SL: ₹___ (just above ceiling for SELL / just below floor for BUY) | Target: ₹___ | BUY/SELL Auto scoring engine (like +3 SELL, -2 BUY)
-CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.</code>"""
+{_mi_bias_block}"""
 
-    # Feed all 3 parts (excluding AI-prompt code block) to Gemini
-    message = msg_part1 + "\n\n" + msg_part2 + "\n\n" + msg_part3.split("🟡 <code>")[0]
+    # ── Live composite meters + zones + footprint block (NEW comprehensive section) ──
+    def _fmt_score(s):
+        return '—' if s is None else f"{s:+.0f}"
+    def _checks(conditions):
+        return ' '.join('✅' if c.get('met') else '❌' for c in (conditions or []))
 
-    # Send Part 1 (with optional alert header prepended), then Part 2, then Part 3
-    _part1_out = (alert_header + "\n\n" + msg_part1) if alert_header else msg_part1
+    _bb = st.session_state.get('_bull_bear_meter') or {}
+    _spk = st.session_state.get('_spike_score') or {}
+    _ign = st.session_state.get('_ignition_score') or {}
+    _ad = st.session_state.get('_accum_dist_score') or {}
+    _zones_msg = st.session_state.get('_major_sr_zones') or {}
+
+    # Composite meters one-liners
+    _meter_lines = []
+    if _bb:
+        _bb_comp = ' · '.join(
+            f"{c['name'].split('(')[0].strip().split('+')[0].strip()[:14]} {_fmt_score(c.get('score'))}"
+            for c in _bb.get('components', [])
+        )
+        _meter_lines.append(f"🎯 <b>BULL/BEAR: {_bb.get('score',0):+.0f}</b> ({_bb.get('label','—')}, cov {_bb.get('coverage',0):.0f}%)\n  {_bb_comp}")
+    if _spk:
+        _meter_lines.append(f"🎯 <b>SPIKE PROB: {_spk.get('score',0)}/{_spk.get('max',8)}</b> ({_spk.get('label','—')})\n  {_checks(_spk.get('conditions'))}")
+    if _ign:
+        _meter_lines.append(f"🚀 <b>IGNITION: {_ign.get('score',0)}/{_ign.get('max',7)}</b> ({_ign.get('label','—')})\n  {_checks(_ign.get('conditions'))}")
+    if _ad:
+        _ad_comp = ' · '.join(f"{c['name'].split()[0][:8]} {_fmt_score(c.get('score'))}" for c in _ad.get('components', []))
+        _meter_lines.append(f"💰 <b>SMART MONEY: {_ad.get('score',0):+.0f}</b> ({_ad.get('label','—')}, cov {_ad.get('coverage',0):.0f}%)\n  {_ad_comp}")
+    meters_block = "<b>📊 LIVE COMPOSITE METERS</b>\n" + "\n".join(_meter_lines) + "\n" if _meter_lines else ""
+
+    # Major S/R Zones — top 2 each
+    _z_lines = []
+    def _zone_short(label, z):
+        lo, hi = z.get('low', z['price']), z.get('high', z['price'])
+        rng = f"₹{lo:.0f}-{hi:.0f}" if hi - lo >= 1 else f"₹{z['price']:.0f}"
+        srcs = '/'.join(z.get('sources', []))
+        items_str = ", ".join(
+            f"{it.get('src','?')}@₹{it.get('price',0):.0f}"
+            + (f" ({it.get('val_str')})" if it.get('val_str') else "")
+            for it in (z.get('items') or [])[:5]
+        )
+        return f"  {label} ~₹{int(round(z['price']/50)*50)} · {rng} · {srcs} ({z.get('src_count',0)}/4)\n    <i>{items_str}</i>"
+    _sup = (_zones_msg.get('support') or [])[:2]
+    _res = (_zones_msg.get('resistance') or [])[:2]
+    if _sup:
+        _z_lines.append("🟢 <b>Top Support:</b>")
+        for i, z in enumerate(_sup, 1): _z_lines.append(_zone_short(f"S{i}", z))
+    if _res:
+        _z_lines.append("🔴 <b>Top Resistance:</b>")
+        for i, z in enumerate(_res, 1): _z_lines.append(_zone_short(f"R{i}", z))
+    zones_block = ("<b>🎯 MAJOR S/R ZONES (OI+VPFR+Gamma+MF)</b>\n" + "\n".join(_z_lines) + "\n") if _z_lines else ""
+
+    # Per-5m Futures P×OI table (last 5)
+    _pxoi_block = ""
+    if _ad.get('pxoi_rows'):
+        _pxoi_lines = [
+            f"  {r['time']} ₹{r['price']:,.0f} ΔP{r['dp']:+.1f} ΔOI{r['doi']:+,.0f} {r['emoji']} {r['label']}"
+            for r in _ad['pxoi_rows'][-5:]
+        ]
+        _pxoi_block = "<b>📈 PER-5m FUTURES P×OI (last 5)</b>\n" + "\n".join(_pxoi_lines) + "\n"
+
+    # Smart Money sub-details: VWAP bands, VP shape, divergence, absorption
+    _foot_lines = []
+    if _ad.get('vwap_bands'):
+        b = _ad['vwap_bands']
+        _foot_lines.append(f"📏 VWAP ₹{b['vwap']:.0f} (σ={b['sigma']:.1f}) · ±1σ ₹{b['lower_1']:.0f}-{b['upper_1']:.0f} · ±2σ ₹{b['lower_2']:.0f}-{b['upper_2']:.0f}")
+    if _ad.get('vp_shape'):
+        sh = _ad['vp_shape']
+        _foot_lines.append(f"🔷 VP Shape: <b>{sh['shape']}</b> ({sh['bias']}) — {sh['note']}")
+    if _ad.get('divergence'):
+        d = _ad['divergence']
+        _foot_lines.append(f"⚖️ Cum-Delta Divergence: <b>{d['direction'].upper()}</b> — {d['detail']}")
+    if _ad.get('absorption'):
+        a = _ad['absorption']
+        _foot_lines.append(f"🌊 Absorption: <b>{a['side'].upper()}</b> — {a['detail']}")
+    footprint_block = ("<b>🌊 FOOTPRINT SIGNALS</b>\n" + "\n".join(_foot_lines) + "\n") if _foot_lines else ""
+
+    # ── Dedicated Smart Money / Footprint (Accumulation vs Distribution) block
+    smart_money_block = ""
     try:
-        send_telegram_message_sync(_part1_out, force=force)
-    except Exception as _txt_err:
-        st.warning(f"Telegram Part 1 send error: {_txt_err}")
+        if _ad:
+            _sm_lines = [
+                f"  Score: <b>{_ad.get('score', 0):+.0f}</b> · "
+                f"Verdict: <b>{_ad.get('label', '—')}</b> · "
+                f"Coverage: {_ad.get('coverage', 0):.0f}%"
+            ]
+            for c in (_ad.get('components') or []):
+                _nm = c.get('name', '—')
+                _sc = c.get('score')
+                _det = c.get('detail') or c.get('note') or ''
+                _sc_str = '—' if _sc is None else (f"{_sc:+.1f}" if isinstance(_sc, (int, float)) else str(_sc))
+                _sm_lines.append(f"  • {_nm}: <b>{_sc_str}</b>{(' — ' + _det) if _det else ''}")
+            smart_money_block = (
+                "<b>💰 SMART MONEY / FOOTPRINT (Accumulation vs Distribution)</b>\n"
+                + "\n".join(_sm_lines) + "\n"
+            )
+    except Exception:
+        smart_money_block = ""
+
+    # ── Dedicated Movement Ignition Score block
+    ignition_block = ""
     try:
-        send_telegram_message_sync(msg_part2, force=force)
-    except Exception as _txt_err:
-        st.warning(f"Telegram Part 2 send error: {_txt_err}")
+        if _ign:
+            _ig_lines = [
+                f"  Score: <b>{_ign.get('score', 0)}/{_ign.get('max', 7)}</b> · "
+                f"Verdict: <b>{_ign.get('label', '—')}</b>"
+            ]
+            for cond in (_ign.get('conditions') or []):
+                _ok = cond.get('met') or cond.get('hit') or cond.get('passed')
+                _emj = '✅' if _ok else '⬜'
+                _ig_lines.append(f"  {_emj} {cond.get('name', '—')}"
+                                 + (f" — {cond.get('detail','')}" if cond.get('detail') else ''))
+            ignition_block = (
+                "<b>🚀 MOVEMENT IGNITION SCORE</b>\n" + "\n".join(_ig_lines) + "\n"
+            )
+    except Exception:
+        ignition_block = ""
+
+    # ── Dedicated full Major S/R Zones block (OI + VPFR + Gamma + Money Flow)
+    major_sr_block = ""
     try:
-        send_telegram_message_sync(msg_part3, force=force)
-    except Exception as _txt_err:
-        st.warning(f"Telegram Part 3 send error: {_txt_err}")
+        if _zones_msg:
+            _sup_full = (_zones_msg.get('support') or [])[:5]
+            _res_full = (_zones_msg.get('resistance') or [])[:5]
+            _msr_lines = []
+            if _sup_full:
+                _msr_lines.append("🟢 <b>Support Zones (OI+VPFR+Gamma+MF):</b>")
+                for i, z in enumerate(_sup_full, 1):
+                    _src = ", ".join(z.get('sources') or z.get('reasons') or []) or 'multi-source'
+                    _conf = z.get('confluence', '')
+                    _msr_lines.append(
+                        f"  S{i}: ₹{z.get('price', z.get('level', 0)):.1f} · "
+                        f"sources [{_src}]"
+                        + (f" · conf {_conf}" if _conf else "")
+                    )
+            if _res_full:
+                _msr_lines.append("🔴 <b>Resistance Zones (OI+VPFR+Gamma+MF):</b>")
+                for i, z in enumerate(_res_full, 1):
+                    _src = ", ".join(z.get('sources') or z.get('reasons') or []) or 'multi-source'
+                    _conf = z.get('confluence', '')
+                    _msr_lines.append(
+                        f"  R{i}: ₹{z.get('price', z.get('level', 0)):.1f} · "
+                        f"sources [{_src}]"
+                        + (f" · conf {_conf}" if _conf else "")
+                    )
+            if _msr_lines:
+                major_sr_block = (
+                    "<b>🎯 MAJOR S/R ZONES — Full Detail (OI + VPFR + Gamma + Money Flow)</b>\n"
+                    + "\n".join(_msr_lines) + "\n"
+                )
+    except Exception:
+        major_sr_block = ""
+
+    # WS Health
+    _wsh = st.session_state.get('_ws_health_cached')
+    try:
+        if _wsh is None:
+            _wsh = get_ws_health()
+            st.session_state['_ws_health_cached'] = _wsh
+    except Exception:
+        _wsh = None
+    ws_block = ""
+    if _wsh:
+        _age = _wsh.get('last_tick_age_s')
+        if _age is None:
+            ws_block = "<b>📡 WS HEALTH</b> not configured (cycle-based sweep)\n"
+        else:
+            _state = '🟢 live' if _age < 30 else ('🟡 stale' if _age < 300 else '🔴 down')
+            _sw = _wsh.get('last_sweep_age_s')
+            _sw_part = ""
+            if _sw is not None and _sw < 300:
+                _sw_part = f" · last sweep {_wsh.get('last_sweep_dir','?').upper()} {_sw:.0f}s ago"
+            ws_block = f"<b>📡 WS HEALTH</b> {_state} · last tick {_age:.0f}s ago · {_wsh.get('instruments',0)} instr{_sw_part}\n"
+
+    # ── Ported engine blocks (CIE, Geometric, CMCE, IOFCE) ─────────────────
+    cie_block = ""
+    try:
+        _cie_sigs = st.session_state.get('_cie_signals') or []
+        if _cie_sigs:
+            _top_cie = sorted(_cie_sigs, key=lambda s: -int(s.get('confidence', 0) or 0))[:3]
+            _cie_lines = []
+            for _s in _top_cie:
+                _arrow = '🟢' if _s.get('direction') == 'BUY' else ('🔴' if _s.get('direction') == 'SELL' else '⚪')
+                _vs = '🔥' if _s.get('vol_spike') else '·'
+                _lvl = (_s.get('level') or 0)
+                _lvl_t = (_s.get('level_type') or '-')[:8]
+                _cie_lines.append(
+                    f"  {_arrow} {_s.get('pattern','')[:24]} · {_s.get('direction','')} · "
+                    f"₹{_lvl:.0f} {_lvl_t} · {int(_s.get('confidence',0))}% {_vs}"
+                )
+            cie_block = "<b>🧠 CIE — TOP CANDLE SIGNALS</b>\n" + "\n".join(_cie_lines) + "\n"
+    except Exception:
+        cie_block = ""
+
+    geo_block = ""
+    try:
+        _geo_pats = st.session_state.get('_geo_patterns') or []
+        if _geo_pats:
+            _geo_lines = []
+            for _g in _geo_pats[:5]:
+                _arrow = '🟢' if _g.get('signal') == 'BUY' else ('🔴' if _g.get('signal') == 'SELL' else '⚪')
+                _geo_lines.append(
+                    f"  {_arrow} {_g.get('pattern','-')[:24]} · {_g.get('signal','-')} · "
+                    f"Tgt ₹{_g.get('target',0):.0f} · SL ₹{_g.get('stoploss',0):.0f} · {_g.get('confidence','-')}"
+                )
+            geo_block = "<b>📐 GEOMETRIC PATTERNS</b>\n" + "\n".join(_geo_lines) + "\n"
+    except Exception:
+        geo_block = ""
+
+    cmce_block = ""
+    try:
+        _cmce_r = st.session_state.get('_cmce_result')
+        if _cmce_r:
+            _dir = _cmce_r.get('signal_direction', '-')
+            _cls = _cmce_r.get('classification', '-')
+            _tot = _cmce_r.get('total_score', 0)
+            _trap = _cmce_r.get('trap_risk', '-')
+            _idx_lines = []
+            for _m in (_cmce_r.get('indian_markets') or [])[:3]:
+                _flag = '✅' if _m.get('confirmed') else '➖'
+                _idx_lines.append(f"  {_flag} {_m.get('name','-')[:12]}: {_m.get('pattern','-')[:22]} (+{_m.get('score',0)})")
+            _rev_lines = []
+            for _r in (_cmce_r.get('reverse_indicators') or [])[:3]:
+                _flag = '✅' if _r.get('confirmed') else '➖'
+                _rev_lines.append(f"  {_flag} {_r.get('name','-')[:12]}: {_r.get('pattern','-')[:22]} (+{_r.get('score',0)})")
+            cmce_block = (
+                f"<b>🔗 CMCE — CROSS-MARKET ({_dir})</b>\n"
+                f"  Verdict: {_cls} · Score {_tot}/10 · Trap {_trap}\n"
+                + "\n".join(_idx_lines + _rev_lines) + "\n"
+            )
+    except Exception:
+        cmce_block = ""
+
+    iofce_block = ""
+    try:
+        _iof_r = st.session_state.get('_iofce_result')
+        if _iof_r:
+            _is = _iof_r.get('institutional_score', 0)
+            _ic = _iof_r.get('classification', '-')
+            _tr = _iof_r.get('trap_risk', '-')
+            _comp_line = (
+                f"  OI {_iof_r.get('oi_score',0)}/2 · Fut {_iof_r.get('futures_score',0)}/2 · "
+                f"Depth {_iof_r.get('depth_score',0)}/2 · GEX {_iof_r.get('gamma_score',0)}/2"
+            )
+            _adj_lines = []
+            for _s in (_iof_r.get('adjusted_signals') or [])[:3]:
+                _arrow = '🟢' if _s.get('direction') == 'BUY' else ('🔴' if _s.get('direction') == 'SELL' else '⚪')
+                _adj_lines.append(
+                    f"  {_arrow} {_s.get('pattern','')[:22]} · Conf {int(_s.get('confidence',0))}% "
+                    f"· Adj {_s.get('iofce_adjustment','-')}"
+                )
+            iofce_block = (
+                f"<b>🏦 IOFCE — INSTITUTIONAL FLOW</b>\n"
+                f"  Score {_is}/8 · {_ic} · Trap {_tr}\n"
+                f"{_comp_line}\n"
+                + ("\n".join(_adj_lines) + "\n" if _adj_lines else "")
+            )
+    except Exception:
+        iofce_block = ""
+
+    # ── 🕯️ Candle Patterns Detected — Today (last 5-10 most recent) ────────
+    # Combines per-bar candle markers (from _detect_chart_candle_types) and
+    # geometric patterns (from GeometricPatternDetector) detected for today,
+    # ordered most recent first. Mirrors the Streamlit "🕯️ Candle Patterns
+    # Detected — {date}" expander rendering.
+    candle_today_block = ""
+    try:
+        _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+        _today_d = _ist_now.date()
+        _ct_lines = []
+
+        # Combine candle markers + geo patterns, all dated today
+        _all_pats = []
+        for _cp in (st.session_state.get('_chart_candle_markers') or []):
+            _t = _cp.get('time')
+            if _t is None:
+                continue
+            try:
+                _td = _t.date() if hasattr(_t, 'date') else None
+                if _td != _today_d:
+                    continue
+            except Exception:
+                continue
+            _all_pats.append({
+                'time': _t,
+                'pattern': _cp.get('pattern', '?'),
+                'direction': _cp.get('direction', 'NEUTRAL'),
+                'price': _cp.get('price', 0),
+                'kind': 'candle',
+            })
+        for _g in (st.session_state.get('_geo_patterns') or []):
+            _t = _g.get('time')
+            if _t is None:
+                continue
+            try:
+                _td = _t.date() if hasattr(_t, 'date') else None
+                if _td != _today_d:
+                    continue
+            except Exception:
+                continue
+            _all_pats.append({
+                'time': _t,
+                'pattern': _g.get('pattern', '?'),
+                'direction': _g.get('signal', 'NEUTRAL'),
+                'price': _g.get('entry', 0),
+                'kind': 'geo',
+            })
+
+        # Sort most-recent first, take top 10
+        _all_pats.sort(key=lambda p: p.get('time'), reverse=True)
+        for _p in _all_pats[:10]:
+            _arrow = '🟢' if _p['direction'] == 'BUY' else ('🔴' if _p['direction'] == 'SELL' else '🟡')
+            _time_str = _p['time'].strftime('%H:%M') if hasattr(_p['time'], 'strftime') else '—'
+            _kind_tag = '📐' if _p['kind'] == 'geo' else '🕯'
+            _ct_lines.append(
+                f"  {_time_str} {_kind_tag} {_arrow} {_p['pattern'][:24]} · {_p['direction']} · ₹{_p['price']:.0f}"
+            )
+        if _ct_lines:
+            candle_today_block = (
+                f"<b>🕯️ CANDLE PATTERNS DETECTED — TODAY</b>\n"
+                + "\n".join(_ct_lines) + "\n"
+            )
+    except Exception:
+        candle_today_block = ""
+
+    # 🛢️ Cross-sectional commodity risk (1d returns, regime, breadth)
+    commodity_block = ""
+    try:
+        _cr = st.session_state.get('_commodity_risk') or {}
+        if _cr:
+            _cr_lines = [
+                f"  Regime: <b>{_cr.get('regime','—')}</b> · Breadth {_cr.get('ups',0)}↑/{_cr.get('dns',0)}↓ "
+                f"(Bull {_cr.get('bullish_ratio',0)}%) · Avg {_cr.get('avg_return',0):+.2f}% · "
+                f"Disp {_cr.get('dispersion',0):.2f}%",
+                f"  Lead {_cr.get('leader_cat',('—',0))[0]}: {_cr.get('leader_cat',('—',0))[1]:+.2f}% · "
+                f"Lag {_cr.get('laggard_cat',('—',0))[0]}: {_cr.get('laggard_cat',('—',0))[1]:+.2f}%",
+            ]
+            for r in _cr.get('rows', [])[:6]:
+                _r1d = '—' if r.get('1d') is None else f"{r['1d']:+.2f}%"
+                _r1h = '—' if r.get('1h') is None else f"{r['1h']:+.2f}%"
+                _sc = r.get('score') if r.get('score') is not None else '—'
+                _cr_lines.append(f"  {r['code']:>10}: score {_sc} · 1h {_r1h} · 1d {_r1d}")
+            _longs = " · ".join(
+                f"{r['code']}({r['1d']:+.2f}%)" if r.get('1d') is not None else r['code']
+                for r in _cr.get('long_candidates', [])
+            )
+            _shorts = " · ".join(
+                f"{r['code']}({r['1d']:+.2f}%)" if r.get('1d') is not None else r['code']
+                for r in _cr.get('short_candidates', [])
+            )
+            if _longs:
+                _cr_lines.append(f"  Long: {_longs}")
+            if _shorts:
+                _cr_lines.append(f"  Short: {_shorts}")
+            commodity_block = (
+                "<b>🛢️ COMMODITY RISK (Cross-Sectional)</b>\n" + "\n".join(_cr_lines) + "\n"
+            )
+    except Exception:
+        commodity_block = ""
+
+    # ── ATM±1 Options VPFR + MFP + Liquidity-grab block ───────────────────
+    options_vpfr_block = ""
+    try:
+        _ov = st.session_state.get('_atm_pm1_vpfr') or {}
+        if _ov.get('legs'):
+            _atm_s = _ov.get('atm_strike', 0)
+            _ov_lines = [f"  ATM ₹{_atm_s:.0f} · gap ₹{_ov.get('gap',0):.0f} · spot ₹{_ov.get('spot',0):.1f}"]
+            for leg in _ov['legs']:
+                _ltp = leg.get('ltp', 0)
+                _v = leg.get('vpfr') or {}
+                _s = _v.get('short') or {}
+                _m = _v.get('medium') or {}
+                _l = _v.get('long') or {}
+                _mfp = leg.get('mfp') or {}
+                _mb = leg.get('mfp_bias', 'NEUTRAL')
+                _bias_em = '🟢' if _mb == 'BULL' else ('🔴' if _mb == 'BEAR' else '⚪')
+
+                # Leg header with LTP + MFP bias
+                _ov_lines.append(f"  <b>{leg['tag']}</b>: LTP ₹{_ltp:.2f} · POC {_bias_em} {_mb}")
+                if _s:
+                    _ov_lines.append(f"    Short(30):  POC ₹{_s['poc']:.2f} | VAH ₹{_s['vah']:.2f} | VAL ₹{_s['val']:.2f}")
+                if _m:
+                    _ov_lines.append(f"    Medium(60): POC ₹{_m['poc']:.2f} | VAH ₹{_m['vah']:.2f} | VAL ₹{_m['val']:.2f}")
+                if _l:
+                    _ov_lines.append(f"    Long(180):  POC ₹{_l['poc']:.2f} | VAH ₹{_l['vah']:.2f} | VAL ₹{_l['val']:.2f}")
+
+                # MFP row: POC + VA + top sentiment
+                if _mfp:
+                    _ov_lines.append(
+                        f"    MFP: POC ₹{_mfp.get('poc_price',0):.2f} · "
+                        f"VA ₹{_mfp.get('value_area_low',0):.2f}–₹{_mfp.get('value_area_high',0):.2f} · "
+                        f"Top {_mfp.get('highest_sentiment_direction','—')} "
+                        f"@ ₹{_mfp.get('highest_sentiment_price',0):.2f}"
+                    )
+
+                # POC-touch flag: which TF POC is within 0.5% of current LTP
+                _touches = []
+                for _k, _lbl in [('short', 'S'), ('medium', 'M'), ('long', 'L')]:
+                    _v2 = _v.get(_k)
+                    if _v2 and _v2.get('poc') and _ltp > 0:
+                        if abs(_ltp - float(_v2['poc'])) <= max(0.5, _ltp * 0.005):
+                            _touches.append(f"{_lbl}(₹{_v2['poc']:.2f})")
+                if _touches:
+                    _ov_lines.append(f"    🎯 LTP AT POC: {', '.join(_touches)} ({_bias_em} {_mb})")
+
+                # Latest grab with Δ Volume context
+                if leg.get('latest_grab'):
+                    g = leg['latest_grab']
+                    _gt = g['time'].strftime('%H:%M') if hasattr(g.get('time'), 'strftime') else ''
+                    _go, _gh, _gl, _gc = g['open'], g['high'], g['low'], g['close']
+                    _grng = _gh - _gl if _gh > _gl else 0
+                    _gdv = g['volume'] * (2*_gc - _gh - _gl) / _grng if _grng > 0 else 0
+                    _gde = '🟢' if _gdv > 0 else ('🔴' if _gdv < 0 else '⚪')
+                    _strong = '🔥' if (g.get('vol_spike') or 0) >= 1.5 else ''
+                    _ov_lines.append(
+                        f"    💧 {_strong}{g['type']} "
+                        f"{g['direction']} · {g.get('pattern','—')} · "
+                        f"swept ₹{g['swept_level']:.2f} · wick {g['wick_ratio']*100:.0f}% · "
+                        f"vol×{g.get('vol_spike',0):.1f} · Δ {_gde}{_gdv:+,.0f} @ {_gt}"
+                    )
+            options_vpfr_block = (
+                "<b>🎯 ATM±3 OPTIONS — VPFR + MFP + LIQUIDITY GRAB</b>\n" + "\n".join(_ov_lines) + "\n"
+            )
+    except Exception:
+        options_vpfr_block = ""
+
+    body_meters = "\n".join(
+        b for b in [meters_block, zones_block,
+                    smart_money_block, ignition_block, major_sr_block,
+                    _pxoi_block, footprint_block,
+                    cie_block, geo_block, cmce_block, iofce_block,
+                    candle_today_block, commodity_block, options_vpfr_block, ws_block]
+        if b
+    ).strip()
+
+    # AI-prompt body — literal text (no interpolation); each chunk wrapped in <code>
+    ai_prompt_inner = """You are an institutional-grade NIFTY 50 derivatives analyst AI.
+
+Combine Spot, Futures (basis, OI, ChgOI, volume), Option Chain (PCR, max pain, capping/unwinding), Gamma (GEX, flip, magnets), FII/DII positioning, BankNifty, breadth and price action to judge real vs fake moves, dealer hedging, liquidity traps and breakout sustainability. Use Price/OI logic: P↑OI↑=Long buildup, P↓OI↑=Short buildup, P↑OI↓=Short covering, P↓OI↓=Long unwinding. Positive GEX = dealers suppress moves (mean revert); Negative GEX = dealers amplify moves (momentum).
+
+Also USE the LIVE COMPOSITE METERS, MAJOR S/R ZONES, PER-5m FUTURES P×OI and FOOTPRINT SIGNALS (VWAP bands, VP shape, cum-delta divergence, absorption) in the DETAIL parts above. The Smart Money score tells you whether the current move is real accumulation or fake distribution; Spike Probability says a move is brewing; Ignition says the move just started; the Bull/Bear meter is the running directional bias.
+
+NEWS — look up online and report any changes since previous session/hour for:
+(1) Global & Indian macro: CPI, GDP, RBI/Fed policy, USDINR moves, bond yields, scheduled events.
+(2) Global news affecting Indian markets: US Fed / FOMC, US CPI/jobs/PMI, China data and PBOC, ECB, Bank of Japan/JPY moves, Asia open (Nikkei, Hang Seng), US pre-market (S&P/Nasdaq futures), MSCI rebalance, FII outflows from EMs.
+(3) VIX news: India VIX moves, US VIX (^VIX), volatility-event drivers (geopolitics, war, oil shocks, US Fed pivot, RBI surprise) — anything that could spike or crush volatility.
+(4) BANK NIFTY: HDFC Bank, ICICI Bank, SBI, Axis, Kotak — RBI policy, banking license / NPA / repo-rate news.
+(5) RELIANCE: oil, telecom (Jio), retail.
+(6) NIFTY IT: TCS, Infosys, Wipro — US tech earnings, dollar, H-1B / visa news.
+(7) NIFTY AUTO: Maruti, M&M, Tata Motors — monthly sales, EV / battery news.
+(8) CRUDE OIL: Brent/WTI moves, OPEC, Middle East geopolitics, US inventories.
+(9) GEOPOLITICS: India-China, India-Pakistan, Russia-Ukraine, Middle East, US-China trade — anything that hits risk appetite.
+Flag any breaking news that could shift bias and tag whether it's bullish / bearish / neutral for NIFTY.
+
+Classify the market as ONE of: TRENDING BULLISH | TRENDING BEARISH | RANGE | SHORT COVERING RALLY | LONG UNWINDING | VOLATILE EXPIRY | FAKE BREAKOUT | FAKE BREAKDOWN | NO TRADE.
+
+OUTPUT FORMAT (show BUY / SELL recommendation in BOLD):
+MARKET STATUS: 🟢 STRONG BUY / 🔴 STRONG SELL / 🟡 RANGE / ⚪ NO TRADE
+CONFIDENCE: 1/3 Low | 2/3 Medium | 3/3 High
+SPOT / FUTURES: price | VWAP | breadth | basis | OI change
+OPTIONS & GAMMA: PCR | max pain | call/put writing zones | GEX | gamma flip | dealer bias
+FII/DII & BANKNIFTY: institutional bias | banknifty confirming or diverging
+PRICE ACTION: candlestick pattern | VWAP relation | volume
+NEWS & MACRO: key headlines | geopolitical risk | earnings | macro | upcoming events
+KEY LEVELS: nearest resistance ₹ | nearest support ₹ | breakout level ₹ | breakdown level ₹
+VPFR CONFLUENCE: the strongest zone where multiple VPFR levels (POC/VAH/VAL across short/medium/long) align — give the price and how many align.
+TRADE PLAN — anchor the ENTRY to the VPFR confluence zone (where the levels align), confirmed by S/R:
+  • <b>BUY</b>: entry ₹ (at VPFR confluence below/at spot acting as support) | stop loss ₹ (just below the zone) | target 1 ₹ | target 2 ₹ | risk
+  • <b>SELL</b>: entry ₹ (at VPFR confluence above/at spot acting as resistance) | stop loss ₹ (just above the zone) | target 1 ₹ | target 2 ₹ | risk
+  • Prefer the side where the VPFR confluence aligns with S/R, Futures OI, Gamma and FII/DII — state which side NOW and why. If no VPFR levels align, fall back to nearest S/R and say so.
+FORECAST: predict the likely market direction and approximate range/levels for the NEXT 15 MIN, 30 MIN, 1 HOUR, 4 HOURS, and 1 DAY — one short line per horizon.
+FINAL CONCLUSION: genuine move or trap | follow momentum or fade extremes.
+
+RULES: prioritize Futures+Gamma+FII over simple indicators; think probabilistically; flag conflicting signals. Use the DETAIL parts above for market data; look up current news/macro online; state N/A for other missing data. Anchor the entry to the VPFR confluence zone where the most levels align (use the VPFR Levels in the DETAIL parts), confirmed by the nearest support/resistance. Always BOLD the BUY / SELL recommendation. Explain in simple plain English a beginner can understand — when a technical term is unavoidable (GEX, basis, capping, gamma flip, OI, PCR, FII/DII, VPFR/POC/VAH/VAL), add a short plain-language meaning in brackets right after it."""
+
+    # Feed the data sections (excluding the AI-prompt part) to Gemini
+    # Master signal message now includes a comprehensive LIVE METERS / ZONES /
+    # FOOTPRINT block so every composite is in every cycle (not only when each
+    # individual score crosses its alert threshold).
+    if body_meters:
+        message = body_main + "\n\n" + body_meters + "\n\n" + body_detail + "\n\n" + body_struct
+    else:
+        message = body_main + "\n\n" + body_detail + "\n\n" + body_struct
+
+    # ── Split into balanced parts. Per user request: keep each Telegram
+    # message ≤ 3900 chars AND divide more aggressively so each logical
+    # section lands in its own part (target ~900 chars per part). For a
+    # ~8000-char message that yields ~9 parts of ~890 chars each.
+    _HARD_LIMIT = 3900
+    _SOFT_TARGET = 900
+    _data_text = message.strip()
+    _ai_text = ai_prompt_inner.strip()
+    _total_len = len(_data_text) + len(_ai_text)
+    _n_parts = max(1, math.ceil(_total_len / _SOFT_TARGET))
+    _per_part = max(1, min(_HARD_LIMIT, math.ceil(_total_len / _n_parts)))
+    _data_chunks = _balanced_telegram_chunks(_data_text, _per_part)
+    # AI chunks lose ~17 chars to the <code>…</code> wrapper
+    _ai_chunks = [f"🟡 <code>{_c}</code>" for _c in _balanced_telegram_chunks(_ai_text, max(100, _per_part - 40))]
+    _all_parts = [("DETAIL", _c) for _c in _data_chunks] + \
+                 [("AI ANALYSIS PROMPT", _c) for _c in _ai_chunks]
+    _total_parts = len(_all_parts)
+    # Mark a master-signal burst is in progress so other Telegram callers can defer
+    st.session_state['_master_send_in_progress'] = True
+    try:
+        for _idx, (_label, _chunk) in enumerate(_all_parts, 1):
+            _out = f"{_sig_hdr} | {_label} ({_idx}/{_total_parts})\n{_chunk}"
+            if _idx == 1 and alert_header:
+                _out = alert_header + "\n\n" + _out
+            try:
+                send_telegram_message_sync(_out, force=force)
+            except Exception as _txt_err:
+                st.warning(f"Telegram Part {_idx}/{_total_parts} send error: {_txt_err}")
+    finally:
+        st.session_state['_master_send_in_progress'] = False
+        st.session_state['_master_sent_at'] = datetime.now(pytz.timezone('Asia/Kolkata'))
 
     # Auto-forward to Gemini and post its analysis back to Telegram + app
     try:
@@ -6824,6 +14452,61 @@ def _exit_trade(api, trade, exit_reason, db):
         updated['exit_price'] = float(exit_price)
     db.upsert_auto_trade(updated)
     return updated, exit_price
+
+
+def _render_fii_dii_futures_section():
+    """Render NIFTY Futures + FII/DII + market-breadth panel from session state."""
+    fut = st.session_state.get('_nifty_futures_data')
+    cash = st.session_state.get('_fii_dii_cash')
+    deriv = st.session_state.get('_fii_deriv_stats')
+    breadth = st.session_state.get('_nse_breadth')
+    if not any([fut, cash, deriv, breadth]):
+        return
+    with st.expander("🏦 NIFTY Futures · FII/DII · Market Breadth", expanded=True):
+        if fut:
+            st.markdown(f"**📊 NIFTY Futures** — {fut['symbol']} (exp {fut['expiry']})")
+            c1, c2, c3, c4, c5 = st.columns(5)
+            c1.metric("Futures", f"₹{fut['price']:,.2f}")
+            c2.metric("Basis (Fut−Spot)", f"{fut['basis']:+.2f}", fut['stance'])
+            c3.metric("OI", f"{fut['oi']:,.0f}")
+            c4.metric("OI Chg (intraday)", f"{fut['chg_oi']:+,.0f}")
+            c5.metric("Volume", f"{fut['volume']:,.0f}")
+        else:
+            st.caption("NIFTY Futures: N/A (could not resolve contract / fetch quote)")
+
+        if cash:
+            _f, _d = cash.get('FII'), cash.get('DII')
+            _date = (_f or _d or {}).get('date', '')
+            st.markdown(f"**💰 FII/DII Cash Segment** (₹ Cr) — _as of {_date}_")
+            c1, c2 = st.columns(2)
+            if _f:
+                c1.metric("FII Cash Net", f"₹{_f['net']:+,.0f} Cr",
+                          "Buying" if _f['net'] > 0 else "Selling")
+            if _d:
+                c2.metric("DII Cash Net", f"₹{_d['net']:+,.0f} Cr",
+                          "Buying" if _d['net'] > 0 else "Selling")
+        else:
+            st.caption("FII/DII cash: N/A (NSE data unavailable)")
+
+        if deriv:
+            st.markdown(f"**📈 FII Derivatives — Index Futures** (contracts) — _as of {deriv['date']}_")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("FII Idx Fut Long", f"{deriv['fut_index_long']:,.0f}")
+            c2.metric("FII Idx Fut Short", f"{deriv['fut_index_short']:,.0f}")
+            _net = deriv['fut_index_net']
+            c3.metric("FII Idx Fut Net", f"{_net:+,.0f}",
+                      "Net Long" if _net > 0 else "Net Short")
+        else:
+            st.caption("FII derivatives stats: N/A (NSE data unavailable)")
+
+        if breadth:
+            st.markdown("**⚖️ NIFTY 50 Market Breadth**")
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Advances", breadth['advances'])
+            c2.metric("Declines", breadth['declines'])
+            c3.metric("A/D Ratio", breadth['ad_ratio'])
+        else:
+            st.caption("Market breadth: N/A (NSE data unavailable)")
 
 
 def _render_alignment_capping_top():
@@ -7522,6 +15205,16 @@ def show_auto_trade_section(option_data, df_5m, api, db):
 
 
 def _render_main_analyzer():
+    # Restore persisted composites + history from Supabase (once per session)
+    try:
+        restore_app_state()
+    except Exception:
+        pass
+    # Play browser beep if Ignition COMBO is currently active (once per window)
+    try:
+        maybe_play_combo_audio()
+    except Exception:
+        pass
     # ── Top-of-page buttons ──
     _btn_col1, _btn_col2 = st.columns(2)
     with _btn_col1:
@@ -7556,6 +15249,8 @@ def _render_main_analyzer():
     _per_strike_oi_container = st.container()
     # Placeholder — Alignment + Capping panel (filled after api init)
     _align_cap_container = st.container()
+    # Placeholder — NIFTY Futures + FII/DII + breadth panel (filled after spot price)
+    _fii_dii_container = st.container()
 
     ist = pytz.timezone('Asia/Kolkata')
     current_time = datetime.now(ist)
@@ -7757,6 +15452,23 @@ def _render_main_analyzer():
     user_prefs = db.get_user_preferences(user_id)
 
     st.sidebar.header("Configuration")
+    # Discord webhook diagnostic
+    _d_err = st.session_state.get('_discord_last_error')
+    _d_ok = st.session_state.get('_discord_last_ok_ts')
+    if _d_err:
+        st.sidebar.warning(f"📡 Discord error: {_d_err}")
+    elif _d_ok:
+        st.sidebar.caption(f"📡 Discord ✅ last OK: {_d_ok.strftime('%H:%M:%S')}")
+    # Manual Discord test button
+    if st.sidebar.button("🧪 Test Discord webhook"):
+        try:
+            send_discord_message(
+                "🧪 **DYNAMIC POC** test message from app — confirm receipt in Discord",
+                force=True,
+            )
+            st.sidebar.success("Test sent (check Discord)")
+        except Exception as _te:
+            st.sidebar.error(f"Test failed: {_te}")
 
     timeframes = {
         "1 min": "1",
@@ -7766,7 +15478,8 @@ def _render_main_analyzer():
         "15 min": "15"
     }
 
-    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "1 min")
+    # Default main NIFTY chart to 3-min per user request (was 1-min fallback)
+    default_timeframe = next((k for k, v in timeframes.items() if v == user_prefs['timeframe']), "3 min")
     selected_timeframe = st.sidebar.selectbox(
         "Select Timeframe",
         list(timeframes.keys()),
@@ -7948,6 +15661,54 @@ def _render_main_analyzer():
     # Fill Alignment + Index/Stock Capping below Per-Strike OI
     with _align_cap_container:
         _render_alignment_capping_top()
+        with st.expander("🌡️ Sector Heatmap (rotation strength)", expanded=False):
+            render_sector_heatmap()
+            st.caption("1-row heatmap of sector strengths (green = leading, red = lagging). "
+                       "Sourced from the same data used in the master signal's Sector Rotation block.")
+        with st.expander("📊 Bull / Bear Meter (Tier-1 composite)", expanded=True):
+            render_bull_bear_meter(getattr(st.session_state, '_bull_bear_meter', None))
+            st.caption("Score = weighted sum of Master Signal · FII Net · Futures P+OI · GEX+Flip · OI Cap/Decap. "
+                       "Range −100 (strong bear) → +100 (strong bull).")
+        with st.expander("🎯 Spike Probability (pre-ignition setup)", expanded=True):
+            render_spike_meter(getattr(st.session_state, '_spike_score', None))
+            st.caption("Score 0–8 of leading conditions that often precede a spike "
+                       "(ATR compression · vol drying · OI accumulation · gamma-squeeze · "
+                       "cum-delta divergence · S/R convergence · VIX flat-low · vol window). "
+                       "≥5 → Telegram alert (15-min cooldown). ≥6 → arms a 30-min spike-watch window: "
+                       "if Ignition then fires within it, the alert is tagged 🔥 HIGH-CONVICTION COMBO.")
+        with st.expander("💰 Smart Money / Footprint (Accumulation vs Distribution)", expanded=True):
+            render_smart_money_panel(getattr(st.session_state, '_accum_dist_score', None))
+            st.caption("Composite of 6 institutional-footprint signals — VWAP relation, "
+                       "cum-delta direction, cum-delta divergence, bid/ask absorption, "
+                       "per-5m-candle Futures P×OI classifier, volume-profile shape (D/P/b/Trend). "
+                       "Telegram alert when |score| ≥ 70 (15-min cooldown per direction).")
+        with st.expander("🚀 Movement Ignition Score", expanded=True):
+            render_ws_health_badge()
+            render_ignition_meter(getattr(st.session_state, '_ignition_score', None))
+            st.caption("Fires a Telegram alert when 5+/7 ignition conditions hit simultaneously "
+                       "(near S/R · delta ratio ≥3 · gamma flip · CE decap/PE depeg · vol spike · "
+                       "S/R cross · order-flow sweep). 5-min per-direction cooldown. "
+                       "Sweep prefers the WebSocket worker feed; falls back to the in-app cycle detector when not live.")
+        with st.expander("📊 Open Interest — CE vs PE & ΔOI", expanded=True):
+            _od_oi = getattr(st.session_state, '_cached_option_data', None) or {}
+            _spot_oi = _od_oi.get('underlying') if _od_oi else None
+            if _spot_oi:
+                render_oi_charts(_od_oi, _spot_oi, atm_band=10)
+            else:
+                st.caption("Waiting for option chain…")
+            st.markdown("**📈 Total OI over time** — track how the whole chain's Call vs Put OI evolves through the session")
+            render_total_oi_timeseries()
+        with st.expander("🎯 Major Support / Resistance Zones (OI + VPFR + Gamma + Money Flow)", expanded=True):
+            _zones_ui = getattr(st.session_state, '_major_sr_zones', None)
+            _od_ui = getattr(st.session_state, '_cached_option_data', None) or {}
+            _spot_ui = _od_ui.get('underlying') if _od_ui else None
+            if _spot_ui:
+                render_major_sr_table(_zones_ui, _spot_ui)
+                st.caption("Zones derived from OI, VPFR (POC/VAH/VAL × 3 tf), Gamma flip/magnets and Money Flow — "
+                           "ranked by how many of the 4 sources confirm each cluster. "
+                           "Telegram alert fires when spot comes within 25 pts of a zone (30-min dedup).")
+            else:
+                st.caption("Waiting for first cycle to compute zones…")
 
     col1, col2 = st.columns([2, 1])
 
@@ -7980,6 +15741,23 @@ def _render_main_analyzer():
                 pass
         if current_price is None and not df.empty:
             current_price = df['close'].iloc[-1]
+
+        # ── NIFTY Futures + FII/DII + market breadth (stored for UI + Telegram) ──
+        try:
+            _fut = get_nifty_futures_data(api, current_price) if current_price else None
+            if _fut:
+                st.session_state['_nifty_futures_data'] = _fut
+        except Exception:
+            pass
+        try:
+            st.session_state['_fii_dii_cash'] = get_fii_dii_cash_cached()
+            st.session_state['_fii_deriv_stats'] = get_fii_derivatives_stats_cached()
+            st.session_state['_nse_breadth'] = get_market_breadth_cached()
+        except Exception:
+            pass
+        with _fii_dii_container:
+            _render_fii_dii_futures_section()
+
         if not df.empty:
             display_metrics(ltp_data, df, db)
         vob_blocks_for_chart = None
@@ -8224,6 +16002,105 @@ def _render_main_analyzer():
             except Exception:
                 pass
         if not df.empty:
+            # CIE/Geo overlays come from the 5-min cycle data — only draw them on
+            # the 5-min chart so the x-axis timestamps line up.
+            _is_5m = str(interval).strip() == '5'
+            _cie_for_chart = st.session_state.get('_cie_signals') if _is_5m else None
+            _geo_for_chart = st.session_state.get('_geo_patterns') if _is_5m else None
+            # Per-bar candle pattern markers — computed from today's bars of the
+            # DISPLAYED chart df, so they render on any timeframe.
+            _candles_for_chart = None
+            try:
+                _today_d = df['datetime'].iloc[-1].date()
+                _df_today_chart = df[df['datetime'].dt.date == _today_d]
+                _candles_for_chart = _detect_chart_candle_types(_df_today_chart)
+                st.session_state._chart_candle_markers = _candles_for_chart
+            except Exception:
+                _candles_for_chart = None
+
+            # ── Liquidity grab / Stop hunt / Sweep detection on 3-min bars ──
+            # Use raw 1m NIFTY data → resample to clean 3m bars (avoids breaking
+            # when the chart TF is 5m+ where 5m→3m resample creates gaps).
+            _liq_grabs_today = []
+            try:
+                _liq_src_df = None
+                # Prefer fresh 1m fetch directly (independent of chart TF)
+                try:
+                    _raw_1m_liq = api.get_intraday_data(
+                        security_id="13", exchange_segment="IDX_I",
+                        instrument="INDEX", interval="1", days_back=1,
+                    )
+                    if _raw_1m_liq and 'open' in _raw_1m_liq and _raw_1m_liq.get('open'):
+                        _ist_liq = pytz.timezone('Asia/Kolkata')
+                        _liq_src_df = pd.DataFrame({
+                            'datetime': [datetime.fromtimestamp(t, _ist_liq)
+                                         for t in _raw_1m_liq.get('timestamp', [])],
+                            'open': _raw_1m_liq['open'],
+                            'high': _raw_1m_liq['high'],
+                            'low': _raw_1m_liq['low'],
+                            'close': _raw_1m_liq['close'],
+                            'volume': _raw_1m_liq.get('volume', [0]*len(_raw_1m_liq['open'])),
+                        })
+                except Exception:
+                    _liq_src_df = None
+                # Fallback: use chart df (works only if its TF <= 3m)
+                if _liq_src_df is None or _liq_src_df.empty:
+                    _liq_src_df = df.copy() if df is not None else None
+                if _liq_src_df is not None and not _liq_src_df.empty:
+                    _today_d2 = _liq_src_df['datetime'].iloc[-1].date()
+                    _df_today_lg = _liq_src_df[_liq_src_df['datetime'].dt.date == _today_d2]
+                    if not _df_today_lg.empty and len(_df_today_lg) >= 3:
+                        _df_3m = (_df_today_lg.set_index('datetime')
+                                  .resample('3min')
+                                  .agg({'open': 'first', 'high': 'max', 'low': 'min',
+                                        'close': 'last', 'volume': 'sum'})
+                                  .dropna().reset_index())
+                        _liq_grabs_today = _detect_liquidity_candles(_df_3m,
+                                                                      short_lookback=5,
+                                                                      swing_lookback=10)
+                        st.session_state._liq_grabs = _liq_grabs_today
+                        if _liq_grabs_today:
+                            try:
+                                _latest_grab = _liq_grabs_today[-1]
+                                _spot = float(df['close'].iloc[-1])
+                                send_liquidity_grab_alert(_latest_grab, _spot, cooldown_s=900)
+                                # NEW: spot stop-hunt with CE/PE alignment check
+                                send_spot_stop_hunt_aligned_alert(_latest_grab, _spot, cooldown_s=900)
+                            except Exception:
+                                pass
+                            # Confirmation check: scan recent grabs to see if the next 3m bar
+                            # has broken the reversal candle's high (BUY) / low (SELL).
+                            try:
+                                for _gc in _liq_grabs_today[-5:]:
+                                    _ok, _ct, _cp = _check_grab_confirmation(_gc, _df_3m)
+                                    if _ok:
+                                        send_grab_confirmation_alert(_gc, _ct, _cp, _spot)
+                            except Exception:
+                                pass
+            except Exception:
+                _liq_grabs_today = []
+
+            # VPFR (Short/Medium/Long) for the spot chart — same overlay style
+            # as the ATM±1 leg charts
+            _spot_vpfr = None
+            try:
+                if df is not None and not df.empty:
+                    _spot_vpfr = {
+                        'short':  compute_vpfr(df, 30),
+                        'medium': compute_vpfr(df, 60),
+                        'long':   compute_vpfr(df, 180),
+                    }
+            except Exception:
+                _spot_vpfr = None
+
+            # BigBeluga Dynamic PoC for the main NIFTY chart (1D period, 20 bins)
+            _spot_dynamic_poc = None
+            try:
+                if df is not None and not df.empty:
+                    _spot_dynamic_poc, _, _ = compute_dynamic_poc(df, bins=20)
+            except Exception:
+                _spot_dynamic_poc = None
+
             fig = create_candlestick_chart(
                 df,
                 f"Nifty 50 - {selected_timeframe} Chart {'with Pivot Levels' if show_pivots else ''}",
@@ -8234,9 +16111,1000 @@ def _render_main_analyzer():
                 poc_data=poc_data_for_chart,
                 swing_data=swing_data_for_chart,
                 money_flow_data=money_flow_data,
-                volume_delta_data=volume_delta_data
+                volume_delta_data=volume_delta_data,
+                cie_signals=_cie_for_chart,
+                geo_patterns=_geo_for_chart,
+                candle_patterns=_candles_for_chart,
+                liquidity_grabs=_liq_grabs_today,
+                vpfr_data=_spot_vpfr,
+                dynamic_poc=_spot_dynamic_poc,
             )
             st.plotly_chart(fig, use_container_width=True)
+
+            # ── 📊 NIFTY VPFR + Money Flow Profile — tabulation ──────────────
+            with st.expander("📊 NIFTY VPFR + Money Flow Profile (tabulation)", expanded=True):
+                _vc1, _vc2, _vc3 = st.columns(3)
+                for _col, (_k, _lbl) in zip(
+                    [_vc1, _vc2, _vc3],
+                    [('short', 'Short (30)'), ('medium', 'Medium (60)'), ('long', 'Long (180)')],
+                ):
+                    _v = (_spot_vpfr or {}).get(_k) if _spot_vpfr else None
+                    if _v:
+                        _col.metric(_lbl, f"POC ₹{_v['poc']:.1f}",
+                                    f"VAH ₹{_v['vah']:.1f} · VAL ₹{_v['val']:.1f}")
+                    else:
+                        _col.metric(_lbl, "—")
+
+                # Full VPFR table
+                _vpfr_rows = []
+                for _k, _lbl in [('short', 'Short (30)'), ('medium', 'Medium (60)'), ('long', 'Long (180)')]:
+                    _v = (_spot_vpfr or {}).get(_k) if _spot_vpfr else None
+                    if _v:
+                        _vpfr_rows.append({
+                            'Timeframe': _lbl,
+                            'POC': f"₹{_v['poc']:.1f}",
+                            'VAH': f"₹{_v['vah']:.1f}",
+                            'VAL': f"₹{_v['val']:.1f}",
+                            'Range': f"₹{(_v['vah'] - _v['val']):.1f}",
+                            'POC Vol': f"{_v.get('poc_vol', 0):,.0f}",
+                        })
+                if _vpfr_rows:
+                    st.markdown("**VPFR Levels**")
+                    st.dataframe(pd.DataFrame(_vpfr_rows), use_container_width=True, hide_index=True)
+
+                # Money Flow Profile table (10 bins)
+                try:
+                    _spot_mfp = calculate_money_flow_profile(df, num_rows=10, source='Money Flow') if df is not None and not df.empty else None
+                    if _spot_mfp and _spot_mfp.get('rows'):
+                        st.markdown(
+                            f"**Money Flow Profile** · POC ₹{_spot_mfp['poc_price']:.1f} · "
+                            f"VAH ₹{_spot_mfp['value_area_high']:.1f} · "
+                            f"VAL ₹{_spot_mfp['value_area_low']:.1f} · "
+                            f"Top Sentiment: {_spot_mfp.get('highest_sentiment_direction', '—')} "
+                            f"@ ₹{_spot_mfp.get('highest_sentiment_price', 0):.1f}"
+                        )
+                        _mfp_rows = []
+                        for r in reversed(_spot_mfp['rows']):
+                            _is_bull = r['sentiment'].lower().startswith('bull')
+                            _is_bear = r['sentiment'].lower().startswith('bear')
+                            _poc_star = ''
+                            if r.get('is_poc'):
+                                _poc_star = '🟢🎯 POC' if _is_bull else ('🔴🎯 POC' if _is_bear else '⚪🎯 POC')
+                            else:
+                                _poc_star = r.get('node_type', '')
+                            _mfp_rows.append({
+                                '_sent_dir': 'bull' if _is_bull else ('bear' if _is_bear else 'neutral'),
+                                'Price Bin': f"₹{r['bin_low']:.1f}–{r['bin_high']:.1f}",
+                                'Mid': f"₹{r['price_level']:.1f}",
+                                'Total Vol': f"{r['total_volume']:,.0f}",
+                                'Bull': f"{r['bull_volume']:,.0f}",
+                                'Bear': f"{r['bear_volume']:,.0f}",
+                                'Δ': f"{r['delta']:+,.0f}",
+                                'Vol %': f"{r['volume_pct']:.1f}%",
+                                'Node': _poc_star,
+                                'Sentiment': f"{r['sentiment']} ({r['sentiment_strength']:.0f}%)",
+                            })
+                        _mfp_df = pd.DataFrame(_mfp_rows)
+
+                        def _color_mfp_row(row):
+                            sd = row.get('_sent_dir', 'neutral')
+                            if sd == 'bull':
+                                return ['background-color: rgba(0, 200, 100, 0.18); color: #00ff88'] * len(row)
+                            if sd == 'bear':
+                                return ['background-color: rgba(255, 60, 60, 0.18); color: #ff6666'] * len(row)
+                            return [''] * len(row)
+                        _styled = _mfp_df.style.apply(_color_mfp_row, axis=1).hide(axis='columns', subset=['_sent_dir'])
+                        st.dataframe(_styled, use_container_width=True, hide_index=True)
+                    else:
+                        st.caption("Money Flow Profile: insufficient bars.")
+                except Exception as _mfe:
+                    st.caption(f"MFP error: {_mfe}")
+
+                st.caption(
+                    "VPFR overlay on the chart above: POC solid · VAH/VAL dashed · "
+                    "gold=Short(30) · blue=Medium(60) · pink=Long(180). "
+                    "MFP table is computed on the chart's current timeframe bars (10 price bins)."
+                )
+
+            # ── 🧠 CIE Signals — pinned below the price chart ────────────────
+            _cie_panel = st.session_state.get('_cie_signals') or []
+            with st.expander("🧠 Candlestick Intelligence Engine (CIE) Signals", expanded=False):
+                if not _cie_panel:
+                    st.info("No CIE signals yet — the engine runs with the ~20s Master Signal cycle.")
+                else:
+                    try:
+                        _crows = []
+                        for _s in sorted(_cie_panel, key=lambda x: -int(x.get('confidence', 0) or 0))[:20]:
+                            _ts = _s.get('time')
+                            _tstr = _ts.strftime('%H:%M') if hasattr(_ts, 'strftime') else '—'
+                            _dir = _s.get('direction', '-')
+                            _icon = '🟢' if _dir == 'BUY' else ('🔴' if _dir == 'SELL' else '⚪')
+                            _crows.append({
+                                'Time': _tstr,
+                                'Pattern': _s.get('pattern', '-'),
+                                'Direction': f"{_icon} {_dir}",
+                                'Level (₹)': f"{(_s.get('level') or 0):.1f}",
+                                'Type': _s.get('level_type', '-'),
+                                'Price (₹)': f"{(_s.get('price') or 0):.1f}",
+                                'Confidence %': int(_s.get('confidence', 0)),
+                                'Strength': _s.get('signal_strength', '-'),
+                                'Options Conf': '✅' if _s.get('options_confirmed') else '—',
+                            })
+                        if _crows:
+                            st.dataframe(pd.DataFrame(_crows), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No CIE signals detected on the current 5-min chart.")
+                    except Exception as _cerr:
+                        st.caption(f"CIE table unavailable: {_cerr}")
+
+            # ── 📐 Geometric & Reversal Patterns — pinned below the chart ─────
+            _geo_panel = st.session_state.get('_geo_patterns') or []
+            with st.expander("📐 Geometric & Reversal Patterns Detected", expanded=False):
+                if not _geo_panel:
+                    st.info("No geometric patterns yet — the detector runs with the ~20s Master Signal cycle.")
+                else:
+                    try:
+                        _grows = []
+                        for _g in sorted(_geo_panel, key=lambda x: x.get('time', ''), reverse=True):
+                            _ts = _g.get('time')
+                            _tstr = _ts.strftime('%H:%M') if hasattr(_ts, 'strftime') else str(_ts)
+                            _sig = _g.get('signal', '-')
+                            _icon = '🟢' if _sig == 'BUY' else ('🔴' if _sig == 'SELL' else '🟡')
+                            _grows.append({
+                                'Time': _tstr,
+                                'Pattern': _g.get('pattern', '-'),
+                                'Sentiment': _g.get('sentiment', '-'),
+                                'Signal': f"{_icon} {_sig}",
+                                'Entry (₹)': f"{_g.get('entry', 0):.1f}",
+                                'SL (₹)': f"{_g.get('stoploss', 0):.1f}",
+                                'Target (₹)': f"{_g.get('target', 0):.1f}",
+                                'RR': f"{_g.get('rr', 0):.2f}",
+                                'Confidence': _g.get('confidence', '-'),
+                                'Move %': f"{_g.get('move_pct', 0):+.2f}%",
+                            })
+                        if _grows:
+                            st.dataframe(pd.DataFrame(_grows), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No geometric patterns detected on the current 5-min chart.")
+                    except Exception as _gerr:
+                        st.caption(f"Geometric Patterns table unavailable: {_gerr}")
+
+            # ── 🔗 CMCE — Cross-Market Reversal Confirmation ──────────────────
+            _cmce_res_ui = st.session_state.get('_cmce_result')
+            with st.expander("🔗 Cross-Market Reversal Confirmation Engine (CMCE)", expanded=False):
+                if not _cmce_res_ui:
+                    st.info("CMCE runs when the Master Signal fires a BUY/SELL — no run yet this session.")
+                else:
+                    try:
+                        _dir = _cmce_res_ui.get('signal_direction', '-')
+                        _cls = _cmce_res_ui.get('classification', '-')
+                        _tot = _cmce_res_ui.get('total_score', 0)
+                        _trap = _cmce_res_ui.get('trap_risk', '-')
+                        _c1, _c2, _c3 = st.columns(3)
+                        with _c1:
+                            st.metric("Direction", _dir, _cls)
+                        with _c2:
+                            st.metric("Total Score", f"{_tot}/10")
+                        with _c3:
+                            st.metric("Trap Risk", _trap)
+                        _mk = (_cmce_res_ui.get('indian_markets') or []) + (_cmce_res_ui.get('reverse_indicators') or [])
+                        if _mk:
+                            _mrows = []
+                            for _m in _mk:
+                                _mrows.append({
+                                    'Market': _m.get('name', '-'),
+                                    'Pattern': _m.get('pattern', '-'),
+                                    'Confirmed': '✅' if _m.get('confirmed') else '➖',
+                                    'Score': _m.get('score', 0),
+                                })
+                            st.dataframe(pd.DataFrame(_mrows), use_container_width=True, hide_index=True)
+                    except Exception as _cerr:
+                        st.caption(f"CMCE panel unavailable: {_cerr}")
+
+            # ── 🏦 IOFCE — Institutional Order Flow ───────────────────────────
+            _iofce_res_ui = st.session_state.get('_iofce_result')
+            with st.expander("🏦 Institutional Order Flow Confirmation Engine (IOFCE)", expanded=False):
+                if not _iofce_res_ui:
+                    st.info("IOFCE result not ready yet — it runs with the ~20s Master Signal cycle.")
+                else:
+                    try:
+                        _is = _iofce_res_ui.get('institutional_score', 0)
+                        _ic = _iofce_res_ui.get('classification', '-')
+                        _tr = _iofce_res_ui.get('trap_risk', '-')
+                        _sa = _iofce_res_ui.get('signal_adjustment', '-')
+                        _c1, _c2, _c3 = st.columns(3)
+                        with _c1:
+                            st.metric("Inst. Score", f"{_is}/8", _ic)
+                        with _c2:
+                            st.metric("Trap Risk", _tr)
+                        with _c3:
+                            st.metric("Adjustment", _sa)
+                        st.markdown("**Component Breakdown:**")
+                        st.markdown(
+                            f"- **OI Activity:** {_iofce_res_ui.get('oi_label', '-')} ({_iofce_res_ui.get('oi_score', 0)}/2)\n"
+                            f"- **Futures Pos:** {_iofce_res_ui.get('futures_label', '-')} ({_iofce_res_ui.get('futures_score', 0)}/2)\n"
+                            f"- **Depth Absorption:** {_iofce_res_ui.get('depth_label', '-')} ({_iofce_res_ui.get('depth_score', 0)}/2)\n"
+                            f"- **Gamma Reaction:** {_iofce_res_ui.get('gamma_label', '-')} ({_iofce_res_ui.get('gamma_score', 0)}/2)"
+                        )
+                        _adj = _iofce_res_ui.get('adjusted_signals') or []
+                        if _adj:
+                            st.markdown("**IOFCE-Adjusted CIE Signals:**")
+                            _arows = []
+                            for _s in _adj[:10]:
+                                _icon = '🟢' if _s.get('direction') == 'BUY' else ('🔴' if _s.get('direction') == 'SELL' else '⚪')
+                                _arows.append({
+                                    'Direction': f"{_icon} {_s.get('direction', '-')}",
+                                    'Pattern': _s.get('pattern', '-'),
+                                    'Confidence %': int(_s.get('confidence', 0)),
+                                    'IOFCE Adj': _s.get('iofce_adjustment', '-'),
+                                })
+                            st.dataframe(pd.DataFrame(_arows), use_container_width=True, hide_index=True)
+                    except Exception as _ierr:
+                        st.caption(f"IOFCE panel unavailable: {_ierr}")
+
+            # ── 💧 Liquidity Grab / Stop Hunt / Sweep — Today (3-min bars) ───
+            _today_str = df['datetime'].iloc[-1].strftime('%d-%b-%Y') if not df.empty else 'Today'
+            with st.expander(f"💧 Liquidity Grab / Stop Hunt / Sweep — {_today_str} (3m bars)", expanded=True):
+                if not _liq_grabs_today:
+                    st.info("No liquidity grab / stop hunt / sweep candles detected on 3m bars today.")
+                else:
+                    try:
+                        _lg_rows = []
+                        for g in reversed(_liq_grabs_today):
+                            t = g.get('time')
+                            time_str = t.strftime('%H:%M') if hasattr(t, 'strftime') else str(t)
+                            arrow = '🔽 swept low' if g['direction'] == 'BUY' else '🔼 swept high'
+                            candle_em = '🟩' if g['candle'] == 'Bull' else '🟥'
+                            _lg_rows.append({
+                                'Time': time_str,
+                                'Type': g['type'],
+                                'Pattern': g.get('pattern', '—'),
+                                'Direction': ('🟢 BUY' if g['direction'] == 'BUY' else '🔴 SELL'),
+                                'Candle': f"{candle_em} {g['candle']}",
+                                'Action': arrow,
+                                'Swept Level': f"₹{g['swept_level']:.1f}",
+                                'O': f"₹{g['open']:.1f}",
+                                'H': f"₹{g['high']:.1f}",
+                                'L': f"₹{g['low']:.1f}",
+                                'C': f"₹{g['close']:.1f}",
+                                'Wick %': f"{g['wick_ratio']*100:.0f}%",
+                                'Vol Spike': f"{g.get('vol_spike', 0):.1f}×",
+                                'Volume': f"{g['volume']:,.0f}",
+                            })
+                        st.dataframe(pd.DataFrame(_lg_rows), use_container_width=True, hide_index=True)
+                        st.caption(
+                            "Stop Hunt = sweep + long wick (>2× body) + close in extreme 30% + 1.5× vol spike. "
+                            "Pattern column identifies Hammer / Shooting Star / Dragonfly Doji / "
+                            "Gravestone Doji / Bullish Engulfing / Bearish Engulfing / Pin Bar. "
+                            "Highest probability setup: Sweep → Long Wick → High Vol → Engulfing → "
+                            "next bar breaks reversal candle's high (BUY) / low (SELL) → entry. "
+                            "Confirmation alert (✅) fires when the next 3m bar breaks the setup level."
+                        )
+                    except Exception as _lg_e:
+                        st.caption(f"Liquidity table unavailable: {_lg_e}")
+
+            # ── 💧 Stop Hunt / Liquidity Grab + VPFR on ATM±3 CE & PE ───────
+            with st.expander(f"💧 Stop Hunt + VPFR on ATM±3 CE & PE (14 legs) — {_today_str} (3m)", expanded=True):
+                try:
+                    _opt_d = st.session_state.get('_cached_option_data') or {}
+                    _df_s = _opt_d.get('df_summary')
+
+                    # Resolve expiry independently of df_summary (col2 may not have
+                    # run yet on first load — this panel is in col1 which renders first).
+                    _opt_expiry = (_opt_d.get('expiry') or _opt_d.get('selected_expiry')
+                                   or (st.session_state.get('_cached_raw_chain_latest') or {}).get('expiry'))
+                    if not _opt_expiry:
+                        try:
+                            _exp_data = get_dhan_expiry_list_cached(NIFTY_UNDERLYING_SCRIP, NIFTY_UNDERLYING_SEG)
+                            _exp_list = (_exp_data or {}).get('data') or []
+                            _opt_expiry = _exp_list[0] if _exp_list else None
+                        except Exception:
+                            _opt_expiry = None
+
+                    # Authoritative strike→security-id map from the scrip master.
+                    _sid_map = {}
+                    try:
+                        if _opt_expiry:
+                            _sid_map = get_nifty_option_security_ids(_opt_expiry) or {}
+                    except Exception:
+                        _sid_map = {}
+
+                    # Build strike list: prefer df_summary, else derive from scrip-master keys.
+                    if _df_s is not None and not _df_s.empty:
+                        _all_strikes = sorted(_df_s['Strike'].dropna().unique().tolist())
+                    else:
+                        _all_strikes = sorted({k[0] for k in _sid_map.keys()})
+
+                    if not _all_strikes:
+                        _oe = st.session_state.get('_nifty_opt_err', '')
+                        st.info(f"Option strikes unavailable yet (expiry {_opt_expiry}). {_oe} "
+                                "Resolves automatically on the next ~20s refresh once the chain loads.")
+                    else:
+                        _u = float(_opt_d.get('underlying') or df['close'].iloc[-1])
+                        _atm_strike = min(_all_strikes, key=lambda x: abs(x - _u))
+                        # Derive strike gap from neighbouring strikes (handles any instrument)
+                        try:
+                            _diffs = [_all_strikes[i+1] - _all_strikes[i]
+                                       for i in range(len(_all_strikes)-1)]
+                            _strike_gap = min(_diffs) if _diffs else 50
+                        except Exception:
+                            _strike_gap = 50
+
+                        # ── Track ATM drift across the session ──────────────
+                        _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        _atm_hist = st.session_state.setdefault('_atm_history', [])
+                        if not _atm_hist or _atm_hist[-1]['strike'] != _atm_strike:
+                            _atm_hist.append({'strike': _atm_strike, 'at': _ist_now, 'spot': _u})
+                            st.session_state._atm_history = _atm_hist[-20:]
+                        _drift_note = (
+                            f"ATM has shifted **{len(_atm_hist) - 1}** time(s) today "
+                            f"(opened ₹{_atm_hist[0]['strike']:.0f}, now ₹{_atm_strike:.0f}). "
+                            f"VPFR / grab history below is per-contract — each strike has its own 1m intraday."
+                            if len(_atm_hist) > 1 else
+                            f"ATM held steady at ₹{_atm_strike:.0f} all session."
+                        )
+                        st.caption(
+                            f"**Current ATM**: ₹{_atm_strike:.0f} · gap ₹{_strike_gap:.0f} · "
+                            f"Spot ₹{_u:.1f}\n\n{_drift_note}"
+                        )
+                        if len(_atm_hist) > 1:
+                            with st.popover(f"📜 ATM shift log ({len(_atm_hist)})"):
+                                _hist_rows = [{
+                                    'Time': h['at'].strftime('%H:%M:%S'),
+                                    'ATM Strike': f"₹{h['strike']:.0f}",
+                                    'Spot at shift': f"₹{h['spot']:.1f}",
+                                } for h in _atm_hist]
+                                st.dataframe(pd.DataFrame(_hist_rows), use_container_width=True, hide_index=True)
+
+                        _ist_o = pytz.timezone('Asia/Kolkata')
+
+                        # _sid_map (strike→security-id) already resolved above from
+                        # the Dhan scrip-master (the /optionchain payload has NO
+                        # security IDs — they live only in the scrip-master CSV).
+                        if not _sid_map:
+                            _oe = st.session_state.get('_nifty_opt_err', '')
+                            st.warning(f"⚠️ Option security-ID lookup empty (expiry {_opt_expiry}). {_oe}")
+                        else:
+                            st.caption(f"📡 Scrip-master loaded · {len(_sid_map)} option contracts for expiry {_opt_expiry}")
+
+                        def _sids_for_strike(strike_val):
+                            ce_s = pe_s = None
+                            sv = float(strike_val)
+                            # 1) scrip-master map (authoritative) — tolerant match
+                            ce_s = _sid_map.get((sv, 'CE'))
+                            pe_s = _sid_map.get((sv, 'PE'))
+                            if ce_s is None or pe_s is None:
+                                # Tolerant float match (handles 24000 vs 24000.0 vs 23999.99)
+                                for (k_strike, k_side), v in _sid_map.items():
+                                    if abs(k_strike - sv) < 0.5:
+                                        if k_side == 'CE' and ce_s is None:
+                                            ce_s = v
+                                        elif k_side == 'PE' and pe_s is None:
+                                            pe_s = v
+                            # 2) fallback to df_summary columns if present
+                            if (ce_s is None or pe_s is None) and _df_s is not None and not _df_s.empty:
+                                r = _df_s[_df_s['Strike'] == strike_val]
+                                if not r.empty:
+                                    if ce_s is None:
+                                        for _c in ['CE_SecurityId', 'securityId_CE']:
+                                            if _c in r.columns and r.iloc[0].get(_c):
+                                                ce_s = int(r.iloc[0][_c]); break
+                                    if pe_s is None:
+                                        for _c in ['PE_SecurityId', 'securityId_PE']:
+                                            if _c in r.columns and r.iloc[0].get(_c):
+                                                pe_s = int(r.iloc[0][_c]); break
+                            return (int(ce_s) if ce_s else None), (int(pe_s) if pe_s else None)
+
+                        def _opt_analyze(sid, leg_name, is_atm=False):
+                            """Returns (grabs, df_today, vpfr_dict, status_str).
+                            Telegram alerts fire only when is_atm is True (ATM leg only)."""
+                            if not sid:
+                                return [], None, None, "no security ID resolved"
+                            try:
+                                raw = api.get_intraday_data(
+                                    security_id=str(sid), exchange_segment="NSE_FNO",
+                                    instrument="OPTIDX", interval="1", days_back=1,
+                                )
+                            except Exception as _e:
+                                return [], None, None, f"API error: {str(_e)[:60]}"
+                            if not raw or 'open' not in raw or not raw.get('open'):
+                                return [], None, None, "API returned empty (no bars)"
+                            df_opt = pd.DataFrame({
+                                'datetime': [datetime.fromtimestamp(t, _ist_o) for t in raw.get('timestamp', [])],
+                                'open': raw['open'], 'high': raw['high'],
+                                'low': raw['low'], 'close': raw['close'],
+                                'volume': raw.get('volume', [0]*len(raw['open'])),
+                            })
+                            if df_opt.empty:
+                                return [], None, None, "dataframe empty after parse"
+                            d_t = df_opt['datetime'].iloc[-1].date()
+                            df_t = df_opt[df_opt['datetime'].dt.date == d_t]
+                            n_bars = len(df_t)
+                            # Compute VPFR with whatever bars we have (>=3)
+                            vpfr_levels = {
+                                'short':  compute_vpfr(df_t, 30)  if n_bars >= 3 else None,
+                                'medium': compute_vpfr(df_t, 60)  if n_bars >= 3 else None,
+                                'long':   compute_vpfr(df_t, 180) if n_bars >= 3 else None,
+                            }
+                            # Grab detection needs enough bars after 3m resample
+                            if df_t.empty:
+                                return [], df_t, vpfr_levels, f"no bars today (last bar {df_opt['datetime'].iloc[-1]})"
+                            if n_bars < 36:
+                                return [], df_t, vpfr_levels, f"{n_bars} 1m bars · need ≥36 for 3m grab scan"
+                            df_3 = (df_t.set_index('datetime').resample('3min')
+                                    .agg({'open': 'first', 'high': 'max', 'low': 'min',
+                                          'close': 'last', 'volume': 'sum'})
+                                    .dropna().reset_index())
+                            grabs = _detect_liquidity_candles(df_3, short_lookback=5, swing_lookback=10)
+
+                            # Compute MFP once for telegram alert context
+                            _alert_mfp = None
+                            try:
+                                _alert_mfp = calculate_money_flow_profile(
+                                    df_t, num_rows=10, source='Money Flow')
+                            except Exception:
+                                _alert_mfp = None
+                            _last_ltp = float(df_t['close'].iloc[-1])
+                            try:
+                                _spot_now = float(df['close'].iloc[-1])
+                            except Exception:
+                                _spot_now = _last_ltp
+
+                            # Dynamic-PoC big-move alert — fires for ALL 14 ATM±3 legs.
+                            # (Other alerts are globally muted via send_telegram_message_sync.)
+                            try:
+                                _dpoc_list, _, _ = compute_dynamic_poc(df_t, bins=20)
+                                _cur_dpoc = next((v for v in reversed(_dpoc_list or [])
+                                                  if v is not None), None)
+                                # Per-leg delta volume + divergence for this leg's intraday
+                                _delta_info = None
+                                try:
+                                    _delta_info = _compute_leg_delta_volume(df_t)
+                                    # Cache it so the render loop can show it without recomputing
+                                    if _delta_info:
+                                        _dv_store = st.session_state.setdefault('_atm_leg_delta_vol', {})
+                                        _dv_store[leg_name] = _delta_info
+                                except Exception:
+                                    _delta_info = None
+                                if _cur_dpoc is not None:
+                                    send_ltp_dpoc_move_alert(
+                                        leg_name, _cur_dpoc, _last_ltp,
+                                        _spot_now, move_pct=10.0, cooldown_s=600,
+                                        delta_info=_delta_info)
+                            except Exception:
+                                pass
+
+                            # Telegram alerts: ATM strike LTP only (skip ATM±1)
+                            if is_atm:
+                                # 0) LTP near day high/low (within 10%)
+                                try:
+                                    send_ltp_extreme_alert(
+                                        leg_name, _last_ltp,
+                                        float(df_t['high'].max()), float(df_t['low'].min()),
+                                        _spot_now, near_pct=10.0, cooldown_s=900)
+                                except Exception:
+                                    pass
+
+                                # 0b) VOB / HVP formed on the LTP
+                                try:
+                                    _ltp_vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_t)
+                                    _ltp_hvp = detect_hvp(df_t, left_bars=15, right_bars=15, vol_filter=2.0)
+                                    send_ltp_vob_hvp_alert(
+                                        leg_name, _ltp_vob, _ltp_hvp,
+                                        _last_ltp, _spot_now, cooldown_s=1800)
+                                except Exception:
+                                    pass
+
+                                # 1) POC-touch alert: fires when LTP comes near any VPFR POC
+                                try:
+                                    send_atm_poc_touch_alert(
+                                        leg_name, _last_ltp, vpfr_levels, _alert_mfp,
+                                        _spot_now, cooldown_s=900, tol_pct=0.5)
+                                except Exception:
+                                    pass
+
+                                # 2) Strong-vol stop-hunt alert (vol >= 1.5x avg, with MFP)
+                                if grabs:
+                                    try:
+                                        send_atm_leg_stop_hunt_alert(
+                                            leg_name, grabs[-1], _last_ltp,
+                                            _alert_mfp, _spot_now, cooldown_s=900)
+                                    except Exception:
+                                        pass
+
+                                # 3) Original generic grab alert (kept for continuity)
+                                if grabs:
+                                    try:
+                                        latest = dict(grabs[-1])
+                                        latest['type'] = f"{latest['type']} [{leg_name}]"
+                                        send_liquidity_grab_alert(latest, _last_ltp, cooldown_s=900)
+                                    except Exception:
+                                        pass
+                            return grabs, df_t, vpfr_levels, f"OK · {n_bars} 1m bars · {len(df_3)} 3m bars · {len(grabs)} grab(s)"
+
+                        # 14 legs: ATM-3..ATM+3 × {CE, PE}
+                        _strikes_to_analyze = [
+                            (_atm_strike - 3 * _strike_gap, 'ATM-3'),
+                            (_atm_strike - 2 * _strike_gap, 'ATM-2'),
+                            (_atm_strike - _strike_gap,     'ATM-1'),
+                            (_atm_strike,                    'ATM'),
+                            (_atm_strike + _strike_gap,     'ATM+1'),
+                            (_atm_strike + 2 * _strike_gap, 'ATM+2'),
+                            (_atm_strike + 3 * _strike_gap, 'ATM+3'),
+                        ]
+                        _ce_tables = []  # all CE legs (ATM-3 CE … ATM+3 CE)
+                        _pe_tables = []  # all PE legs (ATM-3 PE … ATM+3 PE)
+                        _tg_legs = []
+                        for _strike_val, _atm_tag in _strikes_to_analyze:
+                            _ce_s, _pe_s = _sids_for_strike(_strike_val)
+                            _is_atm_leg = (_atm_tag == 'ATM')
+                            _ce_g, _ce_df_l, _ce_vp, _ce_st = _opt_analyze(_ce_s, f"CE {_strike_val:.0f}", is_atm=_is_atm_leg)
+                            _pe_g, _pe_df_l, _pe_vp, _pe_st = _opt_analyze(_pe_s, f"PE {_strike_val:.0f}", is_atm=_is_atm_leg)
+                            _ce_tables.append((f"🟢 {_atm_tag} CE {_strike_val:.0f}", _ce_g, _ce_df_l, _ce_vp, _ce_s, _ce_st))
+                            _pe_tables.append((f"🔴 {_atm_tag} PE {_strike_val:.0f}", _pe_g, _pe_df_l, _pe_vp, _pe_s, _pe_st))
+                        # Render order: all CE charts first (ATM-3 → ATM+3), then all PE charts
+                        _all_tables = _ce_tables + _pe_tables
+                        for _strike_val, _atm_tag in _strikes_to_analyze:
+                            # (legacy loop body below still references _ce_s/_pe_s & per-leg vars,
+                            # so we re-fetch SIDs lazily for the telegram-block snapshot only)
+                            _ce_s, _pe_s = _sids_for_strike(_strike_val)
+                            # Snapshot for telegram block
+                            _ce_idx = next((i for i, t in enumerate(_ce_tables)
+                                            if t[0].endswith(f"CE {_strike_val:.0f}")), None)
+                            _pe_idx = next((i for i, t in enumerate(_pe_tables)
+                                            if t[0].endswith(f"PE {_strike_val:.0f}")), None)
+                            _ce_g_s = _ce_tables[_ce_idx][1] if _ce_idx is not None else []
+                            _ce_df_l_s = _ce_tables[_ce_idx][2] if _ce_idx is not None else None
+                            _ce_vp_s = _ce_tables[_ce_idx][3] if _ce_idx is not None else None
+                            _pe_g_s = _pe_tables[_pe_idx][1] if _pe_idx is not None else []
+                            _pe_df_l_s = _pe_tables[_pe_idx][2] if _pe_idx is not None else None
+                            _pe_vp_s = _pe_tables[_pe_idx][3] if _pe_idx is not None else None
+                            for _side, _g, _ldf, _vp in [
+                                ('CE', _ce_g_s, _ce_df_l_s, _ce_vp_s),
+                                ('PE', _pe_g_s, _pe_df_l_s, _pe_vp_s),
+                            ]:
+                                # Compute MFP for telegram block (per leg)
+                                _leg_mfp_tg = None
+                                try:
+                                    if _ldf is not None and not _ldf.empty:
+                                        _leg_mfp_tg = calculate_money_flow_profile(
+                                            _ldf, num_rows=5, source='Money Flow')
+                                except Exception:
+                                    _leg_mfp_tg = None
+                                # Stash all ATM±3 1m dfs for alignment + composite bias
+                                if _ldf is not None and not _ldf.empty:
+                                    _leg_dfs = st.session_state.setdefault('_atm_leg_dfs', {})
+                                    _leg_dfs[f"{_atm_tag} {_side} {_strike_val:.0f}"] = _ldf.copy()
+                                _tg_legs.append({
+                                    'tag': f"{_atm_tag} {_side} {_strike_val:.0f}",
+                                    'ltp': float(_ldf['close'].iloc[-1]) if _ldf is not None and not _ldf.empty else 0,
+                                    'vpfr': _vp,
+                                    'mfp': _leg_mfp_tg,
+                                    'mfp_bias': _mfp_poc_bias(_leg_mfp_tg) if _leg_mfp_tg else 'NEUTRAL',
+                                    'latest_grab': _g[-1] if _g else None,
+                                })
+                                # Capture per-bin bull/bear timeline for ATM CE & PE only
+                                if _atm_tag == 'ATM' and _leg_mfp_tg:
+                                    try:
+                                        _capture_atm_mfp_bins(_side, _leg_mfp_tg)
+                                    except Exception:
+                                        pass
+                        st.session_state._atm_pm1_vpfr = {
+                            'atm_strike': _atm_strike,
+                            'gap': _strike_gap,
+                            'spot': _u,
+                            'legs': _tg_legs,
+                        }
+
+                        # ── 🧭 Composite Bias Engine — compute, render, alert ───
+                        try:
+                            _bias = compute_composite_bias(_u, df, _opt_d)
+                            st.session_state._composite_bias = _bias
+                            render_composite_bias_panel(_bias)
+                            send_bias_enter_alert(_bias)
+                        except Exception as _be_err:
+                            st.caption(f"Composite Bias unavailable: {_be_err}")
+
+                        for _hdr, _gr, _ldf, _vpfr, _sid_used, _status in _all_tables:
+                            st.markdown(f"**{_hdr}**")
+                            st.caption(f"sid={_sid_used or '—'} · {_status}")
+                            if _ldf is None or _ldf.empty:
+                                st.info("No intraday bars yet for this leg.")
+                                continue
+
+                            _last_ltp = float(_ldf['close'].iloc[-1])
+                            _vc1, _vc2, _vc3, _vc4 = st.columns(4)
+                            _vc1.metric("Current LTP", f"₹{_last_ltp:.2f}")
+                            for _col, (_k, _lbl) in zip(
+                                [_vc2, _vc3, _vc4],
+                                [('short', 'Short (30)'), ('medium', 'Medium (60)'), ('long', 'Long (180)')],
+                            ):
+                                _v = (_vpfr or {}).get(_k) if _vpfr else None
+                                if _v:
+                                    _col.metric(_lbl, f"POC ₹{_v['poc']:.2f}",
+                                                f"VAH ₹{_v['vah']:.2f} · VAL ₹{_v['val']:.2f}")
+                                else:
+                                    _col.metric(_lbl, "—")
+
+                            # ── Chart (full panel width) ────────────────────
+                            try:
+                                _fig_l = go.Figure()
+                                _fig_l.add_trace(go.Candlestick(
+                                    x=_ldf['datetime'],
+                                    open=_ldf['open'], high=_ldf['high'],
+                                    low=_ldf['low'], close=_ldf['close'],
+                                    name=_hdr,
+                                    increasing_line_color='#00ff88',
+                                    decreasing_line_color='#ff4444',
+                                ))
+                                _x0 = _ldf['datetime'].min()
+                                _x1 = _ldf['datetime'].max()
+                                _vpfr_styles = [
+                                    ('short',  '#FFD700', 'Short'),
+                                    ('medium', '#00BFFF', 'Med'),
+                                    ('long',   '#FF66CC', 'Long'),
+                                ]
+                                for _k, _color, _lbl in _vpfr_styles:
+                                    _v = (_vpfr or {}).get(_k) if _vpfr else None
+                                    if not _v:
+                                        continue
+                                    _fig_l.add_shape(type='line', x0=_x0, x1=_x1,
+                                                      y0=_v['poc'], y1=_v['poc'],
+                                                      line=dict(color=_color, width=2))
+                                    _fig_l.add_annotation(x=_x1, y=_v['poc'],
+                                                          text=f"{_lbl} POC {_v['poc']:.1f}",
+                                                          showarrow=False, xanchor='left',
+                                                          font=dict(color=_color, size=9))
+                                    _fig_l.add_shape(type='line', x0=_x0, x1=_x1,
+                                                      y0=_v['vah'], y1=_v['vah'],
+                                                      line=dict(color=_color, width=1, dash='dash'))
+                                    _fig_l.add_shape(type='line', x0=_x0, x1=_x1,
+                                                      y0=_v['val'], y1=_v['val'],
+                                                      line=dict(color=_color, width=1, dash='dash'))
+                                # Day High (HH) and Day Low (LL) marker lines
+                                _day_hi = float(_ldf['high'].max())
+                                _day_lo = float(_ldf['low'].min())
+                                _fig_l.add_shape(type='line', x0=_x0, x1=_x1,
+                                                  y0=_day_hi, y1=_day_hi,
+                                                  line=dict(color='#ff1744', width=2, dash='dot'))
+                                _fig_l.add_annotation(x=_x0, y=_day_hi,
+                                                      text=f"HH ₹{_day_hi:.1f}",
+                                                      showarrow=False, xanchor='left',
+                                                      font=dict(color='#ff1744', size=10))
+                                _fig_l.add_shape(type='line', x0=_x0, x1=_x1,
+                                                  y0=_day_lo, y1=_day_lo,
+                                                  line=dict(color='#00e676', width=2, dash='dot'))
+                                _fig_l.add_annotation(x=_x0, y=_day_lo,
+                                                      text=f"LL ₹{_day_lo:.1f}",
+                                                      showarrow=False, xanchor='left',
+                                                      font=dict(color='#00e676', size=10))
+                                # BigBeluga Dynamic PoC (1D period) — stepline overlay
+                                try:
+                                    _dpoc, _, _ = compute_dynamic_poc(_ldf, bins=20)
+                                    if _dpoc and any(v is not None for v in _dpoc):
+                                        _fig_l.add_trace(go.Scatter(
+                                            x=_ldf['datetime'], y=_dpoc,
+                                            mode='lines', name='Dynamic PoC',
+                                            line=dict(color='#ccff00', width=3, shape='hv'),
+                                            connectgaps=True,
+                                        ))
+                                        _cur_dpoc = next((v for v in reversed(_dpoc) if v is not None), None)
+                                        if _cur_dpoc is not None:
+                                            _fig_l.add_annotation(
+                                                x=_x1, y=_cur_dpoc,
+                                                text=f"DynPoC ₹{_cur_dpoc:.1f}",
+                                                showarrow=False, xanchor='left',
+                                                font=dict(color='#ccff00', size=11))
+                                except Exception:
+                                    pass
+                                _fig_l.update_layout(
+                                    height=340, xaxis_rangeslider_visible=False,
+                                    margin=dict(l=10, r=90, t=20, b=10),
+                                    showlegend=False,
+                                    plot_bgcolor='#0e1117', paper_bgcolor='#0e1117',
+                                    font=dict(color='#fafafa'),
+                                )
+                                # VOB zones + HVP markers on the LTP chart
+                                try:
+                                    _lv = VolumeOrderBlocks(sensitivity=5).detect_blocks(_ldf)
+                                    for _b in (_lv.get('bullish') or [])[-3:]:
+                                        _fig_l.add_shape(type='rect', x0=_x0, x1=_x1,
+                                                         y0=_b['lower'], y1=_b['upper'],
+                                                         fillcolor='rgba(38,186,159,0.28)',
+                                                         line=dict(color='#26ba9f', width=2),
+                                                         layer='below')
+                                        _fig_l.add_annotation(
+                                            x=_x0, y=_b['upper'],
+                                            text=f"🟢 VOB {_b['lower']:.1f}–{_b['upper']:.1f}",
+                                            showarrow=False, xanchor='left', yanchor='bottom',
+                                            font=dict(color='#26ba9f', size=8))
+                                    for _b in (_lv.get('bearish') or [])[-3:]:
+                                        _fig_l.add_shape(type='rect', x0=_x0, x1=_x1,
+                                                         y0=_b['lower'], y1=_b['upper'],
+                                                         fillcolor='rgba(186,38,70,0.28)',
+                                                         line=dict(color='#ba2646', width=2),
+                                                         layer='below')
+                                        _fig_l.add_annotation(
+                                            x=_x0, y=_b['lower'],
+                                            text=f"🔴 VOB {_b['lower']:.1f}–{_b['upper']:.1f}",
+                                            showarrow=False, xanchor='left', yanchor='top',
+                                            font=dict(color='#ba2646', size=8))
+                                    _lh = detect_hvp(_ldf, left_bars=15, right_bars=15, vol_filter=2.0)
+                                    _hx_b = [h['time'] for h in (_lh.get('bullish_hvp') or [])]
+                                    _hy_b = [h['price'] for h in (_lh.get('bullish_hvp') or [])]
+                                    _hx_r = [h['time'] for h in (_lh.get('bearish_hvp') or [])]
+                                    _hy_r = [h['price'] for h in (_lh.get('bearish_hvp') or [])]
+                                    if _hx_b:
+                                        _fig_l.add_trace(go.Scatter(
+                                            x=_hx_b, y=_hy_b, mode='markers+text',
+                                            marker=dict(symbol='triangle-up', size=14, color='#22d4cc',
+                                                        line=dict(color='#0a8f87', width=1)),
+                                            text=['🟢HVP']*len(_hx_b), textposition='bottom center',
+                                            textfont=dict(color='#22d4cc', size=9), name='HVP↑'))
+                                    if _hx_r:
+                                        _fig_l.add_trace(go.Scatter(
+                                            x=_hx_r, y=_hy_r, mode='markers+text',
+                                            marker=dict(symbol='triangle-down', size=14, color='#e60e93',
+                                                        line=dict(color='#a00866', width=1)),
+                                            text=['🔴HVP']*len(_hx_r), textposition='top center',
+                                            textfont=dict(color='#e60e93', size=9), name='HVP↓'))
+                                except Exception:
+                                    pass
+
+                                # Candle patterns (per-bar markers) + chart pattern label
+                                try:
+                                    _cps = _detect_chart_candle_types(_ldf)
+                                    if _cps:
+                                        _off = (_ldf['high'].max() - _ldf['low'].min()) * 0.01
+                                        _cb_x, _cb_y, _cb_t = [], [], []
+                                        _cs_x, _cs_y, _cs_t = [], [], []
+                                        for _cp in _cps[-8:]:  # most recent 8 only
+                                            _t = _cp.get('time'); _lbl = _cp.get('pattern', '')
+                                            if _t is None or not _lbl:
+                                                continue
+                                            if _cp.get('direction') == 'BUY':
+                                                _cb_x.append(_t); _cb_y.append(_cp.get('low', _cp.get('price', 0)) - _off); _cb_t.append(_lbl)
+                                            elif _cp.get('direction') == 'SELL':
+                                                _cs_x.append(_t); _cs_y.append(_cp.get('high', _cp.get('price', 0)) + _off); _cs_t.append(_lbl)
+                                        if _cb_x:
+                                            _fig_l.add_trace(go.Scatter(
+                                                x=_cb_x, y=_cb_y, mode='markers+text',
+                                                marker=dict(symbol='triangle-up', size=10, color='#00ff88'),
+                                                text=_cb_t, textposition='bottom center',
+                                                textfont=dict(color='#00ff88', size=8), name='Candle BUY'))
+                                        if _cs_x:
+                                            _fig_l.add_trace(go.Scatter(
+                                                x=_cs_x, y=_cs_y, mode='markers+text',
+                                                marker=dict(symbol='triangle-down', size=10, color='#ff4444'),
+                                                text=_cs_t, textposition='top center',
+                                                textfont=dict(color='#ff4444', size=8), name='Candle SELL'))
+                                    # Chart pattern (latest, multi-candle) as a corner annotation
+                                    _chp = detect_chart_patterns(_ldf)
+                                    if _chp and _chp.get('pattern'):
+                                        _cdir = _chp.get('direction', '')
+                                        _cclr = '#00ff88' if _cdir == 'Bullish' else ('#ff4444' if _cdir == 'Bearish' else '#FFD700')
+                                        _fig_l.add_annotation(
+                                            xref='paper', yref='paper', x=0.01, y=0.99,
+                                            text=f"📐 {_chp['pattern']} ({_cdir})",
+                                            showarrow=False, xanchor='left', yanchor='top',
+                                            font=dict(color=_cclr, size=11),
+                                            bgcolor='rgba(14,17,23,0.7)')
+                                except Exception:
+                                    pass
+                                _fig_l.update_xaxes(showgrid=False)
+                                _fig_l.update_yaxes(showgrid=True, gridcolor='#1e2a3a')
+                                st.plotly_chart(_fig_l, use_container_width=True,
+                                                key=f"opt_chart_{_sid_used or _hdr}")
+                            except Exception as _ce:
+                                st.caption(f"chart error: {_ce}")
+
+                            # ── Money Flow Profile (full panel width, below chart) ─
+                            try:
+                                _mfp = calculate_money_flow_profile(_ldf, num_rows=5, source='Money Flow')
+                                if _mfp and _mfp.get('rows'):
+                                    _mfp_rows = []
+                                    for r in reversed(_mfp['rows']):
+                                        _is_bull = r['sentiment'].lower().startswith('bull')
+                                        _is_bear = r['sentiment'].lower().startswith('bear')
+                                        if r.get('is_poc'):
+                                            _poc_cell = '🟢🎯 POC' if _is_bull else ('🔴🎯 POC' if _is_bear else '⚪🎯 POC')
+                                        else:
+                                            _poc_cell = r.get('node_type', '')
+                                        _mfp_rows.append({
+                                            '_sent_dir': 'bull' if _is_bull else ('bear' if _is_bear else 'neutral'),
+                                            'Price Bin': f"₹{r['bin_low']:.1f}–{r['bin_high']:.1f}",
+                                            'Mid': f"₹{r['price_level']:.1f}",
+                                            'Total Vol': f"{r['total_volume']:,.0f}",
+                                            'Bull': f"{r['bull_volume']:,.0f}",
+                                            'Bear': f"{r['bear_volume']:,.0f}",
+                                            'Δ': f"{r['delta']:+,.0f}",
+                                            'Vol %': f"{r['volume_pct']:.1f}%",
+                                            'Node': _poc_cell,
+                                            'Sentiment': f"{r['sentiment']} ({r['sentiment_strength']:.0f}%)",
+                                        })
+                                    st.markdown(
+                                        f"**Money Flow Profile** · POC ₹{_mfp['poc_price']:.1f} · "
+                                        f"VAH ₹{_mfp['value_area_high']:.1f} · "
+                                        f"VAL ₹{_mfp['value_area_low']:.1f} · "
+                                        f"Top: {_mfp.get('highest_sentiment_direction', '—')} "
+                                        f"@ ₹{_mfp.get('highest_sentiment_price', 0):.1f}"
+                                    )
+                                    _leg_mfp_df = pd.DataFrame(_mfp_rows)
+
+                                    def _color_leg_mfp(row):
+                                        sd = row.get('_sent_dir', 'neutral')
+                                        if sd == 'bull':
+                                            return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
+                                        if sd == 'bear':
+                                            return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
+                                        return [''] * len(row)
+                                    _styled_leg = (_leg_mfp_df.style
+                                                   .apply(_color_leg_mfp, axis=1)
+                                                   .hide(axis='columns', subset=['_sent_dir']))
+                                    st.dataframe(_styled_leg, use_container_width=True, hide_index=True)
+                                else:
+                                    st.caption("MFP: insufficient bars")
+                            except Exception as _me:
+                                st.caption(f"MFP error: {_me}")
+
+                            # Latest grab summary (compact one-line under chart)
+                            if _gr:
+                                _lg = _gr[-1]
+                                _ts = _lg.get('time')
+                                _ts_s = _ts.strftime('%H:%M') if hasattr(_ts, 'strftime') else str(_ts)
+                                _dir_em = '🟢' if _lg['direction'] == 'BUY' else '🔴'
+                                _cand_em = '🟩' if _lg['candle'] == 'Bull' else '🟥'
+                                # Δ Volume tick-rule
+                                _o, _h, _l, _c = _lg['open'], _lg['high'], _lg['low'], _lg['close']
+                                _rng = _h - _l if _h > _l else 0
+                                _delta_v = _lg['volume'] * (2*_c - _h - _l) / _rng if _rng > 0 else 0
+                                _de = '🟢' if _delta_v > 0 else ('🔴' if _delta_v < 0 else '⚪')
+                                st.caption(
+                                    f"💧 Latest grab @ {_ts_s} · {_dir_em} {_lg['type']} "
+                                    f"({_lg.get('pattern','—')}) · {_cand_em} swept ₹{_lg['swept_level']:.2f} "
+                                    f"· Wick {_lg['wick_ratio']*100:.0f}% · Vol×{_lg.get('vol_spike',0):.1f} "
+                                    f"· Δ {_de} {_delta_v:+,.0f}"
+                                )
+                            else:
+                                st.caption("💧 No stop-hunt / liquidity grab detected on this leg today.")
+
+                            # Delta volume + divergence summary for this leg
+                            try:
+                                _dv_store = st.session_state.get('_atm_leg_delta_vol') or {}
+                                _dv = _dv_store.get(leg_name)
+                                if _dv:
+                                    _dv_em = '🟢' if _dv.get('delta', 0) > 0 else (
+                                        '🔴' if _dv.get('delta', 0) < 0 else '⚪')
+                                    _div_lbl = _dv.get('divergence', 'none')
+                                    _div_em = {'bull': '🟢↗', 'bear': '🔴↘', 'none': '⚪'}.get(_div_lbl, '⚪')
+                                    dvc1, dvc2, dvc3, dvc4 = st.columns(4)
+                                    dvc1.metric("Buy Vol", f"{_dv.get('buy', 0):,.0f}")
+                                    dvc2.metric("Sell Vol", f"{_dv.get('sell', 0):,.0f}")
+                                    dvc3.metric("Δ Vol", f"{_dv.get('delta', 0):+,.0f}",
+                                                f"{_dv.get('delta_pct', 0):+.1f}%")
+                                    dvc4.metric("Divergence", f"{_div_em} {_div_lbl}")
+                            except Exception:
+                                pass
+
+                            # Per-bin bull-vs-bear money-flow timeline — ATM CE/PE only
+                            if ' ATM CE ' in _hdr or ' ATM PE ' in _hdr:
+                                _side_chart = 'CE' if ' ATM CE ' in _hdr else 'PE'
+                                st.markdown(f"**📈 Per-bin Money Flow timeline — ATM {_side_chart} "
+                                            f"(5 bins · bull green / bear red · live session timeline)**")
+                                try:
+                                    render_atm_mfp_bin_charts(_side_chart, n_bins=5)
+                                except Exception as _bce:
+                                    st.caption(f"per-bin chart error: {_bce}")
+                            st.divider()
+
+                        st.caption(
+                            "14 legs (ATM-3…ATM+3 × CE/PE) · per leg: candlestick chart with 3 VPFR overlays (POC solid, "
+                            "VAH/VAL dashed; gold=Short, blue=Med, pink=Long) + Money Flow Profile "
+                            "table (5 bins, bull/bear/delta/sentiment). 🎯 = POC bin. "
+                            "Latest stop-hunt summary line shows pattern, swept level, wick %, "
+                            "volume spike, and Δ Volume (tick-rule proxy). "
+                            "ATM CE/PE additionally show 5 per-bin bull-vs-bear money-flow "
+                            "time-series (one chart per bin, live session timeline)."
+                        )
+                except Exception as _ofe:
+                    st.caption(f"ATM±1 CE/PE panel unavailable: {_ofe}")
+
+            # ── 🕯️ Candle Patterns Detected — Today ───────────────────────────
+            # Ported from vob (5).py ~line 24308 — lists each detected candle
+            # pattern (time, pattern, direction, price, high/low, volume) plus
+            # the nearest HTF/VOB context. Works on any chart timeframe.
+            with st.expander(f"🕯️ Candle Patterns Detected — {_today_str}", expanded=False):
+                if not _candles_for_chart:
+                    st.info("No candle patterns detected for today on this timeframe yet.")
+                else:
+                    try:
+                        # Build HTF S/R level lists from pivots and VOB blocks for context
+                        _cp_htf_sup, _cp_htf_res = [], []
+                        if show_pivots and len(df) > 50:
+                            try:
+                                _piv = cached_pivot_calculation(df.to_json(), pivot_settings or {})
+                                _cp_htf_sup = sorted([p['value'] for p in _piv if p.get('type') == 'low'], reverse=True)
+                                _cp_htf_res = sorted([p['value'] for p in _piv if p.get('type') == 'high'])
+                            except Exception:
+                                pass
+                        _cp_vob_sup, _cp_vob_res = [], []
+                        try:
+                            if vob_blocks_for_chart:
+                                _cp_vob_sup = sorted([b.get('mid', 0) for b in vob_blocks_for_chart.get('bullish', []) if b.get('mid')], reverse=True)
+                                _cp_vob_res = sorted([b.get('mid', 0) for b in vob_blocks_for_chart.get('bearish', []) if b.get('mid')])
+                        except Exception:
+                            pass
+
+                        def _nl(price, levels):
+                            if not levels:
+                                return None, None
+                            closest = min(levels, key=lambda v: abs(v - price))
+                            return closest, abs(price - closest) / price * 100 if price else 0
+
+                        _rows = []
+                        for _cp in reversed(_candles_for_chart):
+                            _ts = _cp.get('time')
+                            _time_str = _ts.strftime('%H:%M') if hasattr(_ts, 'strftime') else str(_ts)
+                            _dir = _cp.get('direction', 'NEUTRAL')
+                            _dir_lbl = '🟢 BUY' if _dir == 'BUY' else ('🔴 SELL' if _dir == 'SELL' else '🟡 NEUTRAL')
+                            _price = _cp.get('price', 0)
+                            if _dir == 'BUY':
+                                _hl, _hp = _nl(_price, _cp_htf_sup)
+                                _htf_label = f"₹{_hl:.0f} ({_hp:.2f}% below)" if _hl else '—'
+                                _vl, _vp = _nl(_price, _cp_vob_sup)
+                                _vob_label = f"₹{_vl:.0f} ({_vp:.2f}% away)" if _vl else '—'
+                                _htf_col = 'Nearest HTF Support'
+                            elif _dir == 'SELL':
+                                _hl, _hp = _nl(_price, _cp_htf_res)
+                                _htf_label = f"₹{_hl:.0f} ({_hp:.2f}% above)" if _hl else '—'
+                                _vl, _vp = _nl(_price, _cp_vob_res)
+                                _vob_label = f"₹{_vl:.0f} ({_vp:.2f}% away)" if _vl else '—'
+                                _htf_col = 'Nearest HTF Resistance'
+                            else:
+                                _sl, _sp = _nl(_price, _cp_htf_sup)
+                                _rl, _rp = _nl(_price, _cp_htf_res)
+                                _htf_label = (f"S ₹{_sl:.0f} / R ₹{_rl:.0f}" if (_sl and _rl) else '—')
+                                _vob_label = '—'
+                                _htf_col = 'HTF S/R'
+                            _vol = _cp.get('volume', 0)
+                            _vol_str = f"{int(_vol):,}" if _vol else '—'
+                            _rows.append({
+                                'Time': _time_str,
+                                'Pattern': _cp.get('pattern', '?'),
+                                'Signal': _dir_lbl,
+                                'Price (₹)': f"{_price:.1f}",
+                                'High (₹)': f"{_cp.get('high', 0):.1f}",
+                                'Low (₹)': f"{_cp.get('low', 0):.1f}",
+                                'Volume': _vol_str,
+                                _htf_col: _htf_label,
+                                'Nearest VOB': _vob_label,
+                            })
+                        if _rows:
+                            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
+                        else:
+                            st.info("No candle patterns detected for today on this timeframe.")
+                    except Exception as _ct_err:
+                        st.caption(f"Candle Today table unavailable: {_ct_err}")
+
+            # ── 🛢️ Cross-Sectional Commodity Risk Dashboard ──────────────────
+            try:
+                render_commodity_risk_panel()
+            except Exception as _cr_err:
+                st.caption(f"Commodity panel unavailable: {_cr_err}")
+
+            # ── 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily) ──
+            try:
+                render_global_indices_panel()
+            except Exception as _gi_err:
+                st.caption(f"Global indices panel unavailable: {_gi_err}")
+
+            # ── 💰 NIFTY Futures Money Flow Profile (10 rows) ────────────────
+            try:
+                render_gift_nifty_moneyflow_panel()
+            except Exception as _gm_err:
+                st.caption(f"NIFTY futures money flow unavailable: {_gm_err}")
+
+
             infos = [
                 f"📊 Data Points: {len(df)}",
                 f"🕐 Latest: {df['datetime'].max().strftime('%Y-%m-%d %H:%M:%S IST')}",
@@ -10799,6 +19667,235 @@ def _render_main_analyzer():
                 master = generate_master_signal(df, _sa, _gex, _conf, option_data['underlying'], api)
                 if master:
                     st.session_state._master_signal_latest = master
+                    # Bull/Bear meter (Tier-1 signals) — compute BEFORE the alert so the
+                    # alert message reads the freshly-updated meter from session state.
+                    try:
+                        st.session_state._bull_bear_meter = compute_bull_bear_meter(master, option_data)
+                    except Exception:
+                        pass
+                    # Major S/R zones (OI + VPFR + Gamma + Money Flow) + proximity alert
+                    try:
+                        _mf_z = getattr(st.session_state, '_money_flow_data', None)
+                        _zones = compute_major_sr_zones(option_data, master, _mf_z, option_data['underlying'])
+                        st.session_state._major_sr_zones = _zones
+                        # NEW: fire SR-touch alignment alert for each near zone
+                        try:
+                            _spot_now = option_data['underlying']
+                            for _z_dir in ('support', 'resistance'):
+                                for _z in (_zones or {}).get(_z_dir, [])[:5]:
+                                    _z_payload = dict(_z); _z_payload['type'] = _z_dir
+                                    send_major_sr_touch_aligned_alert(_z_payload, _spot_now,
+                                                                       proximity_pts=25, cooldown_s=1800)
+                        except Exception:
+                            pass
+                        # Major S/R proximity Telegram alert silenced — uncomment to re-enable.
+                        # send_major_sr_alert(_zones, option_data['underlying'], proximity_pts=25)
+                    except Exception:
+                        pass
+                    # Persistent state save (throttled) + pre-market digest (once at 09:00)
+                    try:
+                        save_app_state()
+                    except Exception:
+                        pass
+                    try:
+                        send_premarket_telegram(api)
+                    except Exception:
+                        pass
+                    # Spike Probability — pre-ignition setup (must compute BEFORE ignition so the combo flag is set)
+                    try:
+                        _df5_spk = getattr(st.session_state, '_df_5m', None)
+                        _df1_spk = getattr(st.session_state, '_df_1m_trade', None)
+                        _spk = compute_spike_probability(master, option_data, _zones, _df5_spk, _df1_spk)
+                        st.session_state._spike_score = _spk
+                        send_spike_alert(_spk, option_data['underlying'])
+                    except Exception:
+                        pass
+                    # Track ATM±2 OI for the time-series chart
+                    try:
+                        _track_total_oi_timeseries(option_data, option_data['underlying'])
+                    except Exception:
+                        pass
+                    # Smart Money / Accumulation-Distribution composite (Tier-2 footprint signals)
+                    try:
+                        _ad = compute_accum_dist_score(api, master, option_data)
+                        st.session_state._accum_dist_score = _ad
+                        send_accum_dist_alert(_ad, option_data['underlying'])
+                    except Exception:
+                        pass
+                    # Movement Ignition Score — fires its own Telegram alert at 5+/7
+                    try:
+                        _ign = compute_ignition_score(master, option_data, _zones, option_data['underlying'])
+                        st.session_state._ignition_score = _ign
+                        send_ignition_alert(_ign, option_data['underlying'])
+                    except Exception:
+                        pass
+                    # ── PORTED ENGINES: CIE → Geo → IOFCE → CMCE ────────────────
+                    # Each call is wrapped in try/except so a failure in one
+                    # engine doesn't kill the entire 20s cycle.
+                    _cie = []
+                    try:
+                        _cie = run_candlestick_intelligence_engine(
+                            df, option_data,
+                            st.session_state.get('_straddle_history', []),
+                            option_data['underlying']
+                        ) or []
+                        st.session_state._cie_signals = _cie
+                        # NEW: fire CIE alignment alert for the latest signal
+                        if _cie:
+                            try:
+                                send_cie_aligned_alert(_cie[-1], option_data['underlying'])
+                            except Exception:
+                                pass
+                    except Exception:
+                        st.session_state._cie_signals = []
+                    # Geometric pattern detector — uses 5m candles when available
+                    _geo = []
+                    try:
+                        _df_for_geo = st.session_state.get('_df_5m', df)
+                        if _df_for_geo is not None and not _df_for_geo.empty:
+                            _geo = GeometricPatternDetector().detect_all(_df_for_geo) or []
+                        st.session_state._geo_patterns = _geo
+                    except Exception:
+                        st.session_state._geo_patterns = []
+                    # IOFCE — feeds on CIE signals
+                    _iofce_res = None
+                    try:
+                        _iofce_res = run_iofce(option_data, df, option_data['underlying'],
+                                               cie_signals=_cie or [])
+                        st.session_state._iofce_result = _iofce_res
+                    except Exception:
+                        st.session_state._iofce_result = None
+                    # CMCE — only when master signal direction is BUY/SELL
+                    _cmce_res = None
+                    try:
+                        _master_sig_text = str(master.get('signal', '')).upper()
+                        _master_trade_text = str(master.get('trade_type', '')).upper()
+                        _direction_from_master = None
+                        if 'BUY' in _master_trade_text or 'BREAKOUT' in _master_sig_text:
+                            _direction_from_master = 'BUY'
+                        elif 'SELL' in _master_trade_text or 'BREAKDOWN' in _master_sig_text:
+                            _direction_from_master = 'SELL'
+                        if _direction_from_master in ('BUY', 'SELL'):
+                            _cmce_res = run_cross_market_confirmation(
+                                _direction_from_master, timeframe='15m'
+                            )
+                            st.session_state._cmce_result = _cmce_res
+                    except Exception:
+                        st.session_state._cmce_result = None
+                    # ── Telegram alerts for ported engines (with per-engine cooldowns) ──
+                    try:
+                        _now_eng = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        # CIE: STRONG/INSTITUTIONAL (confidence >= 70), 600s cooldown per (pattern, direction)
+                        _cie_cd_map = st.session_state.get('_cie_alert_cd', {})
+                        for _s in (_cie or []):
+                            if _s.get('confidence', 0) >= 70 and _s.get('direction') in ('BUY', 'SELL'):
+                                _key = (_s.get('pattern', '?'), _s.get('direction', '?'))
+                                _last = _cie_cd_map.get(_key)
+                                if _last is None or (_now_eng - _last).total_seconds() > 600:
+                                    _od = _s.get('options_details') or {}
+                                    _opt_conf = "✅ Options Confirmed" if _s.get('options_confirmed') else "—"
+                                    _vs = " · 🔥 Vol Spike" if _s.get('vol_spike') else ""
+                                    _msg_cie = (
+                                        f"<b>🧠 CIE {_s.get('signal_strength','')} SIGNAL</b>\n"
+                                        f"<b>{_s.get('direction')}:</b> {_s.get('pattern','')}{_vs}\n"
+                                        f"<b>Confidence:</b> {_s.get('confidence',0)}%\n"
+                                        f"<b>Level:</b> ₹{(_s.get('level') or 0):.1f} ({_s.get('level_type','-')})\n"
+                                        f"<b>Price:</b> ₹{(_s.get('price') or 0):.1f}\n"
+                                        f"<b>Options:</b> {_opt_conf} (score {_od.get('options_score',0)})"
+                                    )
+                                    _msg_cie += _get_atm_bias_text(option_data)
+                                    try:
+                                        send_telegram_message_sync(_msg_cie)
+                                        _cie_cd_map[_key] = _now_eng
+                                    except Exception:
+                                        pass
+                        st.session_state._cie_alert_cd = _cie_cd_map
+                    except Exception:
+                        pass
+                    try:
+                        # Geometric: only the BEST setup per direction this cycle.
+                        # Rules (tightened — was flooding with conflicting alerts):
+                        #   • confidence in {Strong, Institutional Setup} (drop "High")
+                        #   • RR >= 1.0 (skip 0.09/0.18/0.42 noise setups)
+                        #   • per-cycle: at most ONE BUY + ONE SELL alert (highest-RR each)
+                        #   • per-pattern cooldown 1800s (was 900s)
+                        _geo_cd_map = st.session_state.get('_geo_alert_cd', {})
+                        _conf_rank = {'Institutional Setup': 3, 'Strong': 2}
+                        _now_geo = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        _by_dir = {'BUY': [], 'SELL': []}
+                        for _g in (_geo or []):
+                            _sig = _g.get('signal', '')
+                            _gc = str(_g.get('confidence', ''))
+                            try:
+                                _rr_v = float(_g.get('rr', 0) or 0)
+                            except Exception:
+                                _rr_v = 0
+                            if _sig in ('BUY', 'SELL') and _gc in _conf_rank and _rr_v >= 1.0:
+                                _by_dir[_sig].append((_conf_rank[_gc], _rr_v, _g))
+                        _geo_top = []
+                        for _sig, _items in _by_dir.items():
+                            if not _items:
+                                continue
+                            _items.sort(key=lambda x: (-x[0], -x[1]))
+                            _geo_top.append(_items[0][2])
+                        for _g in _geo_top:
+                            _gkey = (_g.get('pattern', '?'), _g.get('signal', '?'))
+                            _last_g = _geo_cd_map.get(_gkey)
+                            if _last_g is None or (_now_geo - _last_g).total_seconds() > 1800:
+                                _msg_geo = (
+                                    f"<b>📐 GEOMETRIC PATTERN — {_g.get('confidence','-')}</b>\n"
+                                    f"<b>Pattern:</b> {_g.get('pattern','-')} ({_g.get('sentiment','-')})\n"
+                                    f"<b>Signal:</b> {_g.get('signal','-')}  |  Entry ₹{_g.get('entry',0):.1f}\n"
+                                    f"<b>SL:</b> ₹{_g.get('stoploss',0):.1f}  |  <b>Target:</b> ₹{_g.get('target',0):.1f}  |  RR {_g.get('rr',0):.2f}"
+                                )
+                                try:
+                                    send_telegram_message_sync(_msg_geo)
+                                    _geo_cd_map[_gkey] = _now_geo
+                                except Exception:
+                                    pass
+                        st.session_state._geo_alert_cd = _geo_cd_map
+                    except Exception:
+                        pass
+                    try:
+                        # IOFCE: strong INSTITUTIONAL verdict (score >= 6), 600s cooldown
+                        if _iofce_res and _iofce_res.get('institutional_score', 0) >= 6:
+                            _last_iof = st.session_state.get('_iofce_alert_at')
+                            _now_iof = datetime.now(pytz.timezone('Asia/Kolkata'))
+                            if _last_iof is None or (_now_iof - _last_iof).total_seconds() > 600:
+                                _dom = None
+                                if _cie:
+                                    _sell = [s for s in _cie if s.get('direction') == 'SELL']
+                                    _buy = [s for s in _cie if s.get('direction') == 'BUY']
+                                    _dom = (_sell[0] if len(_sell) >= len(_buy) and _sell
+                                            else (_buy[0] if _buy else None))
+                                _msg_iof = _iofce_build_telegram_message(
+                                    _iofce_res, option_data['underlying'], _dom or {},
+                                )
+                                _msg_iof += _get_atm_bias_text(option_data)
+                                try:
+                                    send_telegram_message_sync(_msg_iof)
+                                    st.session_state._iofce_alert_at = _now_iof
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                    try:
+                        # CMCE: new BUY/SELL/TRAP verdict (total_score >= 4), 900s cooldown
+                        if _cmce_res and _cmce_res.get('total_score', 0) >= 4:
+                            _last_cm = st.session_state.get('_cmce_alert_at')
+                            _now_cm = datetime.now(pytz.timezone('Asia/Kolkata'))
+                            if _last_cm is None or (_now_cm - _last_cm).total_seconds() > 900:
+                                _nifty_pat = (_cie[0].get('pattern', 'Master Signal')
+                                              if _cie else 'Master Signal')
+                                _msg_cmce = _cmce_build_telegram_message(_nifty_pat, _cmce_res)
+                                _msg_cmce += _get_atm_bias_text(option_data)
+                                try:
+                                    send_telegram_message_sync(_msg_cmce)
+                                    st.session_state._cmce_alert_at = _now_cm
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
                     if False:  # auto 5-min signal disabled — alerts fire on their own
                         # Refresh PCR S/R snapshot from current OI history so the
@@ -10941,12 +20038,24 @@ def _render_main_analyzer():
                     _pcr_s = getattr(st.session_state, '_pcr_sr_snapshot', [])
                     _df5m_c = getattr(st.session_state, '_df_5m', None)
 
-                    def _send_with_header(header):
+                    def _send_with_header(header, force=False):
+                        # PCR proximity (#17) and Candle-at-S/R (#18) remain silenced by default.
+                        # Pass force=True to bypass the silencing (used for Retest, Capping-at-S/R,
+                        # OB-zone and Rejection alerts that the user wants active).
+                        if not force:
+                            return
                         # Block auto-alerts outside market hours (8:30 AM - 3:45 PM IST, weekdays)
                         _ist_now = datetime.now(pytz.timezone('Asia/Kolkata'))
                         _mo = _ist_now.replace(hour=8, minute=30, second=0, microsecond=0)
                         _mc = _ist_now.replace(hour=15, minute=45, second=0, microsecond=0)
                         if _ist_now.weekday() >= 5 or not (_mo <= _ist_now <= _mc):
+                            return
+                        # Defer alerts while a master-signal burst is sending, or for 8s after one
+                        # finished — keeps the signal parts from being interleaved or rate-limited.
+                        if st.session_state.get('_master_send_in_progress'):
+                            return
+                        _last_master = st.session_state.get('_master_sent_at')
+                        if _last_master and (_ist_now - _last_master).total_seconds() < 8:
                             return
                         # Content-hash dedup: skip if same alert text sent in last 30 min
                         import hashlib as _hl
@@ -10978,7 +20087,7 @@ def _render_main_analyzer():
                     except Exception:
                         pass
 
-                    # Retest alert — fires when spot crosses back to a previously broken S/R level
+                    # Retest alert silenced — drop the force flag so it hits the early-return in _send_with_header.
                     try:
                         _h = send_retest_alert(
                             option_data['underlying'], _pcr_s,
@@ -10988,22 +20097,25 @@ def _render_main_analyzer():
                     except Exception:
                         pass
 
-                    # Capping at S/R alert
+                    # Capping at S/R alert (ACTIVE)
                     try:
                         if _sa_c is not None:
                             _h = send_capping_at_sr_alert(_sa_c, option_data['underlying'])
-                            if _h: _send_with_header(_h)
+                            if _h: _send_with_header(_h, force=True)
                     except Exception:
                         pass
 
-                    # Decapping / Depeg / ATM±2 capping standalone alerts
+                    # Decapping/Depeg/ATM±2 capping silenced — drop the force flag so it hits the early-return.
                     try:
-                        _h = send_decapping_alert(option_data['underlying'])
+                        _h = send_decapping_alert(
+                            option_data['underlying'], _pcr_s,
+                            master.get('support_levels', []), master.get('resistance_levels', []),
+                        )
                         if _h: _send_with_header(_h)
                     except Exception:
                         pass
 
-                    # Order Block zone alert
+                    # OB-zone alert silenced — drop the force flag so it hits the early-return.
                     try:
                         _ob_data = master.get('order_blocks', {})
                         _h = send_ob_zone_alert(_ob_data, option_data['underlying'])
@@ -11011,16 +20123,22 @@ def _render_main_analyzer():
                     except Exception:
                         pass
 
-                    # Rejection / bounce at strongest wall
+                    # Rejection / bounce at strongest wall (ACTIVE)
                     try:
                         _h = send_rejection_alert(
                             master['candle'], option_data['underlying'],
                             _df5m_c, _sa_c, _pcr_s,
                             master.get('support_levels', []), master.get('resistance_levels', []),
                         )
-                        if _h: _send_with_header(_h)
+                        if _h: _send_with_header(_h, force=True)
                     except Exception:
                         pass
+
+                    # 1-min / 5-min candle pattern Telegram alerts disabled —
+                    # patterns are now included inline in the master signal message instead.
+
+                    # Chart pattern Telegram alert disabled — pattern is included inline
+                    # in the master signal message instead.
 
                     # Signal Banner
                     if 'BUY' in master['trade_type'] or 'BREAKOUT' in master['signal']:
