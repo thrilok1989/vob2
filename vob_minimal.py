@@ -3624,6 +3624,60 @@ def _cmce_detect_trap(df: pd.DataFrame, signal_direction: str) -> dict:
     return {"pattern": detected, "confirmed": confirmed, "trap_type": trap_type}
 
 
+def _cmce_option_leg_confirmation(signal_direction: str, mode: str = "reversal") -> dict:
+    """Sync ATM-3..ATM+3 CE/PE 1-min LTP candles with the NIFTY spot signal.
+
+    CE legs are checked against `signal_direction` directly (call premiums move
+    WITH the underlying). PE legs are checked against the OPPOSITE direction —
+    put premiums move INVERSE to the underlying, so a bullish NIFTY signal
+    needs a bearish PE candle (and vice versa) to count as confirmed.
+    Reuses the same reversal/continuation/trap candle detectors as the rest
+    of CMCE so the "sync" logic stays identical across instruments and legs.
+    """
+    legs_dfs = st.session_state.get('_atm_leg_dfs') or {}
+    opposite_dir = "SELL" if signal_direction == "BUY" else "BUY"
+
+    if mode == "continuation":
+        _detect_fn = _cmce_detect_continuation
+    elif mode == "trap":
+        _detect_fn = _cmce_detect_trap
+    else:
+        _detect_fn = _cmce_detect_reversal
+
+    strike_tags = ['ATM-3', 'ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2', 'ATM+3']
+    legs = []
+    confirmed_count = 0
+    total_legs = 0
+    for tag in strike_tags:
+        for side, target_dir in (('CE', signal_direction), ('PE', opposite_dir)):
+            leg_key = next((k for k in legs_dfs if k.startswith(f"{tag} {side} ")), None)
+            df_l = legs_dfs.get(leg_key) if leg_key else None
+            if df_l is None or df_l.empty:
+                continue
+            res = _detect_fn(df_l, target_dir)
+            total_legs += 1
+            if res["confirmed"]:
+                confirmed_count += 1
+            try:
+                ltp = float(df_l['close'].iloc[-1])
+            except Exception:
+                ltp = 0.0
+            strike_val = leg_key.split()[-1] if leg_key else ''
+            legs.append({
+                "tag": tag, "side": side, "strike": strike_val,
+                "target_dir": target_dir, "pattern": res["pattern"],
+                "confirmed": res["confirmed"], "ltp": ltp,
+            })
+
+    option_score = round((confirmed_count / total_legs) * 5, 1) if total_legs else 0.0
+    return {
+        "legs": legs,
+        "confirmed_count": confirmed_count,
+        "total_legs": total_legs,
+        "option_score": option_score,
+    }
+
+
 def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m",
                                    mode: str = "reversal") -> dict:
     INDIAN_MARKETS = [
@@ -3644,8 +3698,12 @@ def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m",
         "mode": mode,
         "indian_markets": [],
         "reverse_indicators": [],
+        "option_legs": [],
         "index_score": 0,
         "reverse_score": 0,
+        "option_leg_score": 0,
+        "option_leg_confirmed": 0,
+        "option_leg_total": 0,
         "total_score": 0,
         "classification": "",
         "trap_risk": "",
@@ -3697,43 +3755,54 @@ def run_cross_market_confirmation(signal_direction: str, timeframe: str = "15m",
         results["divergence_detected"] = True
         results["divergence_note"] = "Bank Nifty & Sensex diverging — possible sector rotation or fake breakdown"
 
-    total = results["index_score"] + results["reverse_score"]
+    # ATM-3..ATM+3 CE/PE 1m LTP candle sync (PE checked in reverse — see
+    # _cmce_option_leg_confirmation docstring). This ties the option leg
+    # premium action back to the same NIFTY spot signal being confirmed.
+    opt_conf = _cmce_option_leg_confirmation(signal_direction, mode=mode)
+    results["option_legs"] = opt_conf["legs"]
+    results["option_leg_score"] = opt_conf["option_score"]
+    results["option_leg_confirmed"] = opt_conf["confirmed_count"]
+    results["option_leg_total"] = opt_conf["total_legs"]
+
+    total = results["index_score"] + results["reverse_score"] + results["option_leg_score"]
     results["total_score"] = total
 
+    # Scale is now 0-15 (5 index + 5 reverse + 5 option-leg); thresholds below
+    # keep the same proportions as the old 0-10 scale (7/4/2 -> 10/6/3).
     if mode == "continuation":
-        if total >= 7:
+        if total >= 10:
             results["classification"] = "Trend Continuation Confirmed"
             results["trap_risk"] = "Low"
-        elif total >= 4:
+        elif total >= 6:
             results["classification"] = "Trend Likely Continuing"
             results["trap_risk"] = "Low-Medium"
-        elif total >= 2:
+        elif total >= 3:
             results["classification"] = "Trend Weakening"
             results["trap_risk"] = "Medium-High"
         else:
             results["classification"] = "Trend Reversal Risk"
             results["trap_risk"] = "High"
     elif mode == "trap":
-        if total >= 7:
+        if total >= 10:
             results["classification"] = "High Trap Probability"
             results["trap_risk"] = "Very High"
-        elif total >= 4:
+        elif total >= 6:
             results["classification"] = "Possible Trap Setup"
             results["trap_risk"] = "High"
-        elif total >= 2:
+        elif total >= 3:
             results["classification"] = "Mild Trap Risk"
             results["trap_risk"] = "Medium"
         else:
             results["classification"] = "Low Trap Risk"
             results["trap_risk"] = "Low"
     else:
-        if total >= 7:
+        if total >= 10:
             results["classification"] = "Institutional Move Likely"
             results["trap_risk"] = "Low"
-        elif total >= 4:
+        elif total >= 6:
             results["classification"] = "Valid Signal"
             results["trap_risk"] = "Low-Medium"
-        elif total >= 2:
+        elif total >= 3:
             results["classification"] = "Weak Signal"
             results["trap_risk"] = "Medium-High"
         else:
@@ -3768,10 +3837,30 @@ def _cmce_build_telegram_message(nifty_pattern: str, analysis: dict) -> str:
         status = "✅ Confirmed" if r["confirmed"] else "➖ No Signal"
         lines.append(f"<b>{r['name']}:</b> {r['pattern']} — {status}")
 
+    opt_legs = analysis.get("option_legs") or []
+    if opt_legs:
+        lines += ["", "<b>ATM±3 Options LTP Sync</b> (PE checked in reverse):"]
+        by_tag = {}
+        for leg in opt_legs:
+            by_tag.setdefault(leg["tag"], {})[leg["side"]] = leg
+        for tag in ['ATM-3', 'ATM-2', 'ATM-1', 'ATM', 'ATM+1', 'ATM+2', 'ATM+3']:
+            sides = by_tag.get(tag)
+            if not sides:
+                continue
+            ce = sides.get('CE')
+            pe = sides.get('PE')
+            ce_txt = f"CE {'✅' if ce['confirmed'] else '➖'}({ce['pattern']})" if ce else "CE —"
+            pe_txt = f"PE(rev) {'✅' if pe['confirmed'] else '➖'}({pe['pattern']})" if pe else "PE(rev) —"
+            lines.append(f"  {tag}: {ce_txt}  |  {pe_txt}")
+        lines.append(
+            f"<b>Legs Confirmed:</b> {analysis.get('option_leg_confirmed', 0)}/{analysis.get('option_leg_total', 0)}"
+        )
+
     lines += [
         "",
-        f"<b>Signal Strength:</b> {analysis['total_score']} / 10",
-        f"<b>Index Conf:</b> {analysis['index_score']}/5  |  <b>Risk Conf:</b> {analysis['reverse_score']}/5",
+        f"<b>Signal Strength:</b> {analysis['total_score']} / 15",
+        f"<b>Index Conf:</b> {analysis['index_score']}/5  |  <b>Risk Conf:</b> {analysis['reverse_score']}/5  |  "
+        f"<b>Options Conf:</b> {analysis.get('option_leg_score', 0)}/5",
         f"<b>Market Status:</b> {analysis['classification']}",
         f"<b>Trap Risk:</b> {trap_emoji} {trap_risk}",
     ]
@@ -17016,10 +17105,14 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
             for _r in (_cmce_r.get('reverse_indicators') or [])[:3]:
                 _flag = '✅' if _r.get('confirmed') else '➖'
                 _rev_lines.append(f"  {_flag} {_r.get('name','-')[:12]}: {_r.get('pattern','-')[:22]} (+{_r.get('score',0)})")
+            _opt_conf_n = _cmce_r.get('option_leg_confirmed', 0)
+            _opt_total_n = _cmce_r.get('option_leg_total', 0)
+            _opt_line = (f"  ATM±3 Options Sync (PE rev): {_opt_conf_n}/{_opt_total_n} legs "
+                         f"(+{_cmce_r.get('option_leg_score', 0)})")
             cmce_block = (
                 f"<b>🔗 CMCE — CROSS-MARKET ({_dir})</b>\n"
-                f"  Verdict: {_cls} · Score {_tot}/10 · Trap {_trap}\n"
-                + "\n".join(_idx_lines + _rev_lines) + "\n"
+                f"  Verdict: {_cls} · Score {_tot}/15 · Trap {_trap}\n"
+                + "\n".join(_idx_lines + _rev_lines + [_opt_line]) + "\n"
             )
     except Exception:
         cmce_block = ""
@@ -19372,7 +19465,7 @@ def _render_main_analyzer():
                         with _c1:
                             st.metric("Direction", _dir, _cls)
                         with _c2:
-                            st.metric("Total Score", f"{_tot}/10")
+                            st.metric("Total Score", f"{_tot}/15")
                         with _c3:
                             st.metric("Trap Risk", _trap)
                         _mk = (_cmce_res_ui.get('indian_markets') or []) + (_cmce_res_ui.get('reverse_indicators') or [])
@@ -19386,6 +19479,24 @@ def _render_main_analyzer():
                                     'Score': _m.get('score', 0),
                                 })
                             st.dataframe(pd.DataFrame(_mrows), use_container_width=True, hide_index=True)
+                        _opt_legs_ui = _cmce_res_ui.get('option_legs') or []
+                        if _opt_legs_ui:
+                            st.caption(
+                                f"ATM±3 Options LTP Sync (PE checked in reverse) — "
+                                f"{_cmce_res_ui.get('option_leg_confirmed', 0)}/"
+                                f"{_cmce_res_ui.get('option_leg_total', 0)} legs confirmed "
+                                f"(score {_cmce_res_ui.get('option_leg_score', 0)}/5)"
+                            )
+                            _lrows = []
+                            for _leg in _opt_legs_ui:
+                                _lrows.append({
+                                    'Strike': f"{_leg.get('tag', '-')} {_leg.get('side', '-')} {_leg.get('strike', '')}",
+                                    'Target Dir': _leg.get('target_dir', '-'),
+                                    'Pattern': _leg.get('pattern', '-'),
+                                    'Confirmed': '✅' if _leg.get('confirmed') else '➖',
+                                    'LTP': _leg.get('ltp', 0),
+                                })
+                            st.dataframe(pd.DataFrame(_lrows), use_container_width=True, hide_index=True)
                     except Exception as _cerr:
                         st.caption(f"CMCE panel unavailable: {_cerr}")
 
@@ -23409,8 +23520,9 @@ def _render_main_analyzer():
                     except Exception:
                         pass
                     try:
-                        # CMCE: new BUY/SELL/TRAP verdict (total_score >= 4), 900s cooldown
-                        if _cmce_res and _cmce_res.get('total_score', 0) >= 4:
+                        # CMCE: new BUY/SELL/TRAP verdict (total_score >= 6 of 15
+                        # now that ATM±3 options-leg sync is folded in), 900s cooldown
+                        if _cmce_res and _cmce_res.get('total_score', 0) >= 6:
                             _last_cm = st.session_state.get('_cmce_alert_at')
                             _now_cm = datetime.now(pytz.timezone('Asia/Kolkata'))
                             if _last_cm is None or (_now_cm - _last_cm).total_seconds() > 900:
