@@ -100,6 +100,22 @@ try:
         or st.secrets.get("gemini", {}).get("GEMINI_API_KEY", "")
         or os.environ.get("GEMINI_API_KEY", "")
     )
+    # Anthropic Claude API key — powers the AI Trade Advisor (auto verdict + chatbox).
+    # Dormant if unset. Get one at console.anthropic.com (pay-as-you-go).
+    ANTHROPIC_API_KEY = (
+        st.secrets.get("ANTHROPIC_API_KEY", "")
+        or st.secrets.get("anthropic", {}).get("api_key", "")
+        or st.secrets.get("anthropic", {}).get("ANTHROPIC_API_KEY", "")
+        or os.environ.get("ANTHROPIC_API_KEY", "")
+    )
+    # Groq API key — FREE backup AI provider (no card). Get one at console.groq.com.
+    # Used automatically if Gemini's key is missing or all Gemini models fail.
+    GROQ_API_KEY = (
+        st.secrets.get("GROQ_API_KEY", "")
+        or st.secrets.get("groq", {}).get("api_key", "")
+        or st.secrets.get("groq", {}).get("GROQ_API_KEY", "")
+        or os.environ.get("GROQ_API_KEY", "")
+    )
     try:
         TELEGRAM_BOT_TOKEN = st.secrets.get("TELEGRAM_BOT_TOKEN", "") or getattr(st.secrets, "TELEGRAM_BOT_TOKEN", "")
         TELEGRAM_CHAT_ID = st.secrets.get("TELEGRAM_CHAT_ID", "") or getattr(st.secrets, "TELEGRAM_CHAT_ID", "")
@@ -118,7 +134,7 @@ try:
     except Exception:
         DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1517484830588141749/I3rR-1g1Z6QDzZztCb43l-rYx3eUhDcy13gx-t2jusdbD6BB5S60wsEQEPcouoA8mtpX"
 except Exception:
-    DHAN_CLIENT_ID = DHAN_ACCESS_TOKEN = supabase_url = supabase_key = TELEGRAM_BOT_TOKEN = TELEGRAM_CHAT_ID = GEMINI_API_KEY = ""
+    DHAN_CLIENT_ID = DHAN_ACCESS_TOKEN = supabase_url = supabase_key = TELEGRAM_BOT_TOKEN = TELEGRAM_CHAT_ID = GEMINI_API_KEY = ANTHROPIC_API_KEY = GROQ_API_KEY = ""
     DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1517484830588141749/I3rR-1g1Z6QDzZztCb43l-rYx3eUhDcy13gx-t2jusdbD6BB5S60wsEQEPcouoA8mtpX"
 
 NIFTY_UNDERLYING_SCRIP = 13
@@ -184,9 +200,12 @@ _ALLOWED_ALERT_MARKERS = (
     'CIE ALIGNED',
     'MAJOR S/R TOUCH',
     'BIAS ENTER',
+    'OVERALL BIAS ENTRY',
     'CALL CAPPING',
     'PUT WRITING',
     'PUT CAPPING',
+    'OB RETEST',
+    'IGNITION',
 )
 
 def _msg_allowed(message):
@@ -369,12 +388,26 @@ class DhanAPI:
         }
 
     def _handle_response(self, response, context=""):
-        """Check response; flag token expiry on 401 and return None."""
+        """Check response; flag token expiry on 401 and return None.
+        On 429 (DH-904 rate limit) trip a global back-off so callers stop
+        hammering Dhan and serve cached data instead — and suppress the
+        repeated error spam."""
         if response.status_code == 200:
             return response.json()
         if response.status_code == 401:
             st.session_state['_dhan_token_expired'] = True
             st.error("🔑 **Dhan token expired.** Open the **Refresh Dhan Token** panel in the sidebar, paste your new access token, and click Apply.")
+        elif response.status_code == 429:
+            _ist = pytz.timezone('Asia/Kolkata')
+            _now = datetime.now(_ist)
+            # Global back-off window — _opt_analyze and other callers check this.
+            st.session_state['_dhan_429_until'] = _now + timedelta(seconds=90)
+            # Notify at most once per 30s instead of spamming on every leg.
+            _last = st.session_state.get('_dhan_429_notified')
+            if not _last or (_now - _last).total_seconds() > 30:
+                st.session_state['_dhan_429_notified'] = _now
+                st.warning("⏸️ Dhan rate-limited (DH-904). Throttling for 90s — "
+                           "showing cached data until it clears.")
         else:
             st.error(f"API Error: {response.status_code} - {response.text}")
         return None
@@ -382,6 +415,23 @@ class DhanAPI:
     def get_intraday_data(self, security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval="1", days_back=1):
         url = f"{self.base_url}/charts/intraday"
         ist = pytz.timezone('Asia/Kolkata')
+        # Respect an active rate-limit back-off: skip the call entirely so we
+        # don't keep tripping DH-904. Callers fall back to cached data.
+        _back = st.session_state.get('_dhan_429_until')
+        if _back and datetime.now(ist) < _back:
+            return None
+        # Throttle: enforce a minimum gap between intraday calls so 14 legs
+        # don't burst past Dhan's per-second limit.
+        try:
+            _last = st.session_state.get('_dhan_last_intraday_ts')
+            _now_t = time.time()
+            if _last is not None:
+                _gap = _now_t - _last
+                if _gap < 0.3:
+                    time.sleep(0.3 - _gap)
+            st.session_state['_dhan_last_intraday_ts'] = time.time()
+        except Exception:
+            pass
         end_date = datetime.now(ist)
         start_date = end_date - timedelta(days=days_back)
         payload = {
@@ -4890,6 +4940,66 @@ def send_ltp_vob_hvp_alert(leg_tag, vob_blocks, hvp, ltp, spot, cooldown_s=1800)
     return sent or None
 
 
+def _ltf_delta_volume(df_1m):
+    """LuxAlgo Volume Delta Candles port (LTF mode).
+
+    For each 1m bar:
+      bull_vol = volume if close > open else 0
+      bear_vol = volume if close < open else 0
+      neutral_vol = volume if close == open else 0
+
+    Then aggregates the FULL 1m series into:
+      buy_total, sell_total, neutral_total, delta, delta_pct
+      max_buy_price  — price of the single 1m bar with the largest bull volume
+      max_sell_price — price of the single 1m bar with the largest bear volume
+      max_print_price — winner between max_buy/sell (the dominant single print)
+
+    Returns dict or None. Operates on the 1m intraday df (the LTF source).
+    """
+    if df_1m is None or getattr(df_1m, 'empty', True) or len(df_1m) < 3:
+        return None
+    try:
+        d = df_1m.copy()
+        d['bull_v'] = d.apply(lambda r: float(r['volume']) if r['close'] > r['open'] else 0.0, axis=1)
+        d['bear_v'] = d.apply(lambda r: float(r['volume']) if r['close'] < r['open'] else 0.0, axis=1)
+        d['neutral_v'] = d.apply(lambda r: float(r['volume']) if r['close'] == r['open'] else 0.0, axis=1)
+        buy_total = float(d['bull_v'].sum())
+        sell_total = float(d['bear_v'].sum())
+        neutral_total = float(d['neutral_v'].sum())
+        total = buy_total + sell_total + neutral_total
+        delta = buy_total - sell_total
+        delta_pct = (delta / total * 100) if total > 0 else 0
+        # Max single-bar prints (LuxAlgo's maxV / maxBl / maxBr concept)
+        max_buy_price = max_sell_price = None
+        if buy_total > 0:
+            idx = d['bull_v'].idxmax()
+            max_buy_price = float(d.loc[idx, 'close'])
+        if sell_total > 0:
+            idx = d['bear_v'].idxmax()
+            max_sell_price = float(d.loc[idx, 'close'])
+        # Dominant max print (the single 1m bar with the biggest one-sided volume)
+        if buy_total >= sell_total:
+            max_print_price = max_buy_price
+            max_print_side = 'buy'
+        else:
+            max_print_price = max_sell_price
+            max_print_side = 'sell'
+        return {
+            'buy_total': buy_total,
+            'sell_total': sell_total,
+            'neutral_total': neutral_total,
+            'total': total,
+            'delta': delta,
+            'delta_pct': delta_pct,
+            'max_buy_price': max_buy_price,
+            'max_sell_price': max_sell_price,
+            'max_print_price': max_print_price,
+            'max_print_side': max_print_side,
+        }
+    except Exception:
+        return None
+
+
 def _compute_leg_delta_volume(df, divergence_lookback=10):
     """For one option leg's intraday df, compute:
        - buy_vol (sum of bull-bar volume), sell_vol (sum of bear-bar volume)
@@ -5015,18 +5125,36 @@ def send_ltp_dpoc_move_alert(leg_tag, current_dpoc, ltp, spot, move_pct=10.0, co
             )
             key = f"dpoc_move_{leg_tag}_{int(current_dpoc)}"
 
-    # Append delta-volume context to the alert if provided
+    # Append delta-volume context — prefer LuxAlgo LTF (more accurate, with
+    # dominant-print price), fall back to legacy bar-level delta + divergence.
     if msg and delta_info:
-        div = delta_info.get('divergence', 'none')
-        div_tag = ('🟢 BULL DIVERGENCE' if div == 'bull'
-                   else ('🔴 BEAR DIVERGENCE' if div == 'bear' else '—'))
-        delta_em = '🟢' if delta_info.get('delta', 0) > 0 else ('🔴' if delta_info.get('delta', 0) < 0 else '⚪')
-        msg += (
-            f"\n📊 Delta Vol: Buy {delta_info.get('buy', 0):,.0f} · "
-            f"Sell {delta_info.get('sell', 0):,.0f} · "
-            f"{delta_em} Δ {delta_info.get('delta', 0):+,.0f} ({delta_info.get('delta_pct', 0):+.1f}%)\n"
-            f"Divergence (last-10 bar): {div_tag}"
-        )
+        # Detect format: LTF has 'buy_total' / 'max_print_price'
+        if 'buy_total' in delta_info:
+            buy_t = delta_info.get('buy_total', 0)
+            sell_t = delta_info.get('sell_total', 0)
+            dpct = delta_info.get('delta_pct', 0)
+            delta_em = '🟢' if dpct > 0 else ('🔴' if dpct < 0 else '⚪')
+            mside = delta_info.get('max_print_side', 'buy')
+            mprice = delta_info.get('max_print_price')
+            print_em = '🟢' if mside == 'buy' else '🔴'
+            msg += (
+                f"\n📊 LTF (LuxAlgo): Buyers {buy_t:,.0f} · Sellers {sell_t:,.0f} · "
+                f"{delta_em} Δ {(buy_t - sell_t):+,.0f} ({dpct:+.1f}%)"
+            )
+            if mprice is not None:
+                msg += f"\n{print_em} Dominant print: <b>{mside.upper()}</b> @ ₹{mprice:.2f}"
+        else:
+            # Legacy bar-level delta with divergence
+            div = delta_info.get('divergence', 'none')
+            div_tag = ('🟢 BULL DIVERGENCE' if div == 'bull'
+                       else ('🔴 BEAR DIVERGENCE' if div == 'bear' else '—'))
+            delta_em = '🟢' if delta_info.get('delta', 0) > 0 else ('🔴' if delta_info.get('delta', 0) < 0 else '⚪')
+            msg += (
+                f"\n📊 Delta Vol: Buy {delta_info.get('buy', 0):,.0f} · "
+                f"Sell {delta_info.get('sell', 0):,.0f} · "
+                f"{delta_em} Δ {delta_info.get('delta', 0):+,.0f} ({delta_info.get('delta_pct', 0):+.1f}%)\n"
+                f"Divergence (last-10 bar): {div_tag}"
+            )
 
     if msg and key and _throttled_telegram_send(msg, alert_class='ltp_dpoc_move', key=key,
                                                  cooldown_s=cooldown_s,
@@ -5117,11 +5245,23 @@ def send_atm_leg_stop_hunt_alert(leg_tag, grab, ltp, mfp, spot, cooldown_s=900):
     now = datetime.now(ist)
     key = f"atm_sh_{leg_tag}_{grab['type']}_{grab['direction']}_{ts.strftime('%H%M') if hasattr(ts,'strftime') else ts}"
 
-    # Per-bar tick-rule delta (LuxAlgo-style: bullV - bearV; here OHLC proxy)
+    # Prefer LuxAlgo LTF leg-level delta (more accurate) over OHLC tick-rule.
     o, h, l, c, vol = grab['open'], grab['high'], grab['low'], grab['close'], grab['volume']
     rng = h - l if h > l else 0
-    delta_v = vol * (2 * c - h - l) / rng if rng > 0 else 0
-    delta_pct = (delta_v / vol * 100) if vol > 0 else 0
+    _ltf = (st.session_state.get('_atm_leg_ltf_delta') or {}).get(leg_tag)
+    if _ltf:
+        buy_t = _ltf.get('buy_total', 0)
+        sell_t = _ltf.get('sell_total', 0)
+        delta_v = buy_t - sell_t
+        delta_pct = _ltf.get('delta_pct', 0)
+        max_print = _ltf.get('max_print_price')
+        max_side = _ltf.get('max_print_side', '')
+    else:
+        # Fallback: OHLC tick-rule proxy on this single grab bar
+        delta_v = vol * (2 * c - h - l) / rng if rng > 0 else 0
+        delta_pct = (delta_v / vol * 100) if vol > 0 else 0
+        max_print = None
+        max_side = ''
     delta_em = '🟢' if delta_v > 0 else ('🔴' if delta_v < 0 else '⚪')
 
     candle_bias = 'BULL' if c > o else ('BEAR' if c < o else 'NEUTRAL')
@@ -5148,8 +5288,10 @@ def send_atm_leg_stop_hunt_alert(leg_tag, grab, ltp, mfp, spot, cooldown_s=900):
         f"O ₹{o:.2f} · H ₹{h:.2f} · L ₹{l:.2f} · C ₹{c:.2f}\n"
         f"Wick {grab['wick_ratio']*100:.0f}% of range · Vol {vol:,.0f} · "
         f"🔥<b>{grab.get('vol_spike', 0):.1f}× avg vol</b>\n"
-        f"Δ Volume: {delta_em} {delta_v:+,.0f} ({delta_pct:+.0f}% of bar vol) "
-        f"— {'buyer' if delta_v>0 else ('seller' if delta_v<0 else 'neutral')} dominant\n"
+        f"📊 LTF Δ: {delta_em} {delta_v:+,.0f} ({delta_pct:+.0f}%) — "
+        f"<b>{'BUYERS' if delta_v>0 else ('SELLERS' if delta_v<0 else 'BALANCED')}</b> dominant"
+        + (f"\n🎯 Dominant print: <b>{max_side.upper()}</b> @ ₹{max_print:.2f}" if max_print else "")
+        + "\n"
         f"📊 MFP: POC ₹{mfp_poc:.2f} ({mfp_be} <b>{mfp_bias}</b>) · "
         f"VA ₹{mfp_val:.2f}–₹{mfp_vah:.2f} · Top {top_dir}\n"
         f"LTP ₹{ltp:.2f} · NIFTY Spot ₹{spot:.1f} · {ts_str}"
@@ -5159,6 +5301,122 @@ def send_atm_leg_stop_hunt_alert(leg_tag, grab, ltp, mfp, spot, cooldown_s=900):
     if _throttled_telegram_send(msg, alert_class='atm_strong_sh', key=key,
                                  cooldown_s=cooldown_s,
                                  class_limit=3, class_window=300, class_sleep=1800):
+        return msg
+    return None
+
+
+def send_vob_retest_alert(leg_tag, ob, side, ltp, spot, cooldown_s=900):
+    """OB Retest alert (BigBeluga Volume-Trend OB engine port).
+
+    Fires when LTP crosses back into an active VOB zone after having left it:
+      side='bull'  → bullish VOB (support) retest from below (LTP re-enters from below
+                      its lower edge) — typically followed by bounce if buyers defend
+      side='bear'  → bearish VOB (resistance) retest from above (LTP re-enters from
+                      above its upper edge) — typically followed by rejection
+
+    `ob` is a dict from analyze_vob_volume() with bull_pct, buy_vol, sell_vol,
+    lower, upper, mid, status, dominant, max_buy_price, max_sell_price.
+    Per-zone-mid dedup; class burst-sleep applies.
+    """
+    if not ob or ltp <= 0:
+        return None
+    try:
+        lo, hi = float(ob.get('lower', 0)), float(ob.get('upper', 0))
+        mid = float(ob.get('mid', (lo + hi) / 2)) if (lo and hi) else 0
+        bull_pct = float(ob.get('bull_pct', 50))
+        bear_pct = 100 - bull_pct
+        buy_v = float(ob.get('buy_vol', 0))
+        sell_v = float(ob.get('sell_vol', 0))
+        status = ob.get('status', 'INTACT')
+        dominant = ob.get('dominant', 'balanced')
+        mb_price = ob.get('max_buy_price')
+        ms_price = ob.get('max_sell_price')
+    except Exception:
+        return None
+    if lo <= 0 or hi <= 0 or hi <= lo:
+        return None
+
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    # Per-zone-mid dedup (zone shifts only when price action changes the OB)
+    key = f"vob_retest_{leg_tag}_{side}_{mid:.2f}"
+
+    if side == 'bull':
+        em = '🟢'
+        zone_type = 'Bull VOB (support)'
+        edge_label = f"top edge ₹{hi:.2f}"
+        thesis = (
+            f"Buyers stacked here (<b>{bull_pct:.0f}% buy vol</b>). "
+            "Retest into demand → watch for bounce."
+        )
+    else:
+        em = '🔴'
+        zone_type = 'Bear VOB (resistance)'
+        edge_label = f"bottom edge ₹{lo:.2f}"
+        thesis = (
+            f"Sellers stacked here (<b>{bear_pct:.0f}% sell vol</b>). "
+            "Retest into supply → watch for rejection."
+        )
+
+    print_lines = []
+    if mb_price:
+        print_lines.append(f"🟢 Max buy print ₹{mb_price:.2f}")
+    if ms_price:
+        print_lines.append(f"🔴 Max sell print ₹{ms_price:.2f}")
+    prints_str = (" · " + " · ".join(print_lines)) if print_lines else ""
+
+    msg = (
+        f"{em} <b>OB RETEST @ {leg_tag}</b>\n"
+        f"📦 {zone_type} ₹{lo:.2f}–₹{hi:.2f} (mid ₹{mid:.2f})\n"
+        f"📍 LTP ₹{ltp:.2f} crossed back over {edge_label}\n"
+        f"🎯 {thesis}\n"
+        f"📊 Buy {buy_v:,.0f} ({bull_pct:.0f}%) · Sell {sell_v:,.0f} ({bear_pct:.0f}%) · "
+        f"Dom <b>{dominant.upper()}</b> · Zone <b>{status}</b>{prints_str}\n"
+        f"NIFTY Spot ₹{spot:.1f} · {now.strftime('%H:%M IST')}"
+    )
+    if _throttled_telegram_send(msg, alert_class='vob_retest', key=key,
+                                 cooldown_s=cooldown_s,
+                                 class_limit=4, class_window=600, class_sleep=1200):
+        return msg
+    return None
+
+
+def send_ignition_alert(tag, ign, ltp, spot, cooldown_s=900):
+    """'Tank full — rally starting' ignition alert. Fires when detect_ignition
+    reports >=1 sub-signal on a leg/spot. Higher conviction when multiple
+    sub-signals agree. `tag` identifies the source (e.g. 'NIFTY Spot',
+    'ATM CE 25000'). Per-(tag, direction, bar) dedup."""
+    if not ign or not ign.get('fired'):
+        return None
+    sigs = ign.get('signals') or []
+    if not sigs:
+        return None
+    direction = ign.get('direction')
+    if direction not in ('bull', 'bear'):
+        return None
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    _t = sigs[0].get('time')
+    _ts = _t.strftime('%H%M') if hasattr(_t, 'strftime') else str(_t)
+    key = f"ignition_{tag}_{direction}_{_ts}"
+
+    n_agree = ign.get('bull_count') if direction == 'bull' else ign.get('bear_count')
+    em = '🟢🚀' if direction == 'bull' else '🔴🚀'
+    head = 'RALLY LOADING' if direction == 'bull' else 'BREAKDOWN LOADING'
+    conviction = 'HIGH' if n_agree >= 2 else 'MEDIUM'
+    lines = [
+        f"{em} <b>IGNITION — {head} @ {tag}</b>",
+        f"🔋 Tank full · {n_agree} signal(s) agree · Conviction <b>{conviction}</b>",
+    ]
+    for s in sigs:
+        if s.get('direction') == direction:
+            _se = '🟢' if direction == 'bull' else '🔴'
+            lines.append(f"{_se} {s.get('name')}: {s.get('detail')}")
+    lines.append(f"LTP ₹{ltp:.2f} · NIFTY Spot ₹{spot:.1f} · {now.strftime('%H:%M IST')}")
+    msg = "\n".join(lines)
+    if _throttled_telegram_send(msg, alert_class='ignition', key=key,
+                                 cooldown_s=cooldown_s,
+                                 class_limit=4, class_window=600, class_sleep=1200):
         return msg
     return None
 
@@ -7288,6 +7546,224 @@ def detect_hvp(df, left_bars=15, right_bars=15, vol_filter=2.0):
         if is_pl:
             bullish_hvp.append({'price': float(lows[i]), 'time': times[i], 'volume': float(vol_sum)})
     return {'bullish_hvp': bullish_hvp[-5:], 'bearish_hvp': bearish_hvp[-5:]}
+
+def detect_divergence(df, pivot_lookback=5, max_bars_back=80):
+    """Detect regular bullish/bearish divergence between price and two
+    momentum indicators (OBV and bar-delta cumulative).
+
+    Pivot rules:
+      - Bullish pivot low = bar whose low is strictly the lowest in a
+        ±pivot_lookback window
+      - Bearish pivot high = strictly highest in a ±pivot_lookback window
+
+    Divergence rules (regular):
+      - Bullish div: price LOWER low while indicator HIGHER low → reversal up
+      - Bearish div: price HIGHER high while indicator LOWER high → reversal down
+
+    Compares only the last 2 confirmed pivots of each type. Returns:
+      {
+        'bull': bool, 'bull_price_low': float, 'bull_pivot_times': [t1, t2],
+        'bear': bool, 'bear_price_high': float, 'bear_pivot_times': [t1, t2],
+        'indicator': 'obv' | 'delta' | 'both' | None,
+      }
+    """
+    out = {'bull': False, 'bear': False, 'indicator': None,
+           'bull_pivot_times': [], 'bear_pivot_times': [],
+           'bull_price_low': 0.0, 'bear_price_high': 0.0}
+    if df is None or getattr(df, 'empty', True) or len(df) < pivot_lookback * 2 + 3:
+        return out
+    try:
+        d = df.tail(max_bars_back).reset_index(drop=True).copy()
+        if 'datetime' not in d.columns or 'volume' not in d.columns:
+            return out
+        n = len(d)
+        # Build OBV
+        sign = np.where(d['close'].diff() > 0, 1,
+                np.where(d['close'].diff() < 0, -1, 0))
+        obv = (sign * d['volume'].values).cumsum()
+        # Bar-delta cumulative (close-anchored tick-rule)
+        rng = (d['high'] - d['low']).replace(0, np.nan)
+        bar_delta = (d['volume'] * (2 * d['close'] - d['high'] - d['low']) / rng).fillna(0).values
+        cum_delta = bar_delta.cumsum()
+        highs = d['high'].values.astype(float)
+        lows = d['low'].values.astype(float)
+        times = d['datetime'].tolist()
+        # Find pivots (skip the unconfirmed tail = last pivot_lookback bars)
+        piv_lows, piv_highs = [], []
+        for i in range(pivot_lookback, n - pivot_lookback):
+            lw = lows[i - pivot_lookback:i + pivot_lookback + 1]
+            hw = highs[i - pivot_lookback:i + pivot_lookback + 1]
+            if lows[i] == lw.min() and (lw == lows[i]).sum() == 1:
+                piv_lows.append(i)
+            if highs[i] == hw.max() and (hw == highs[i]).sum() == 1:
+                piv_highs.append(i)
+        # Bullish div: last 2 pivot lows
+        if len(piv_lows) >= 2:
+            i1, i2 = piv_lows[-2], piv_lows[-1]
+            if lows[i2] < lows[i1]:
+                bull_obv = obv[i2] > obv[i1]
+                bull_delta = cum_delta[i2] > cum_delta[i1]
+                if bull_obv or bull_delta:
+                    out['bull'] = True
+                    out['bull_pivot_times'] = [times[i1], times[i2]]
+                    out['bull_price_low'] = float(lows[i2])
+                    out['indicator'] = ('both' if bull_obv and bull_delta
+                                        else ('obv' if bull_obv else 'delta'))
+        # Bearish div: last 2 pivot highs
+        if len(piv_highs) >= 2:
+            i1, i2 = piv_highs[-2], piv_highs[-1]
+            if highs[i2] > highs[i1]:
+                bear_obv = obv[i2] < obv[i1]
+                bear_delta = cum_delta[i2] < cum_delta[i1]
+                if bear_obv or bear_delta:
+                    out['bear'] = True
+                    out['bear_pivot_times'] = [times[i1], times[i2]]
+                    out['bear_price_high'] = float(highs[i2])
+                    _bear_ind = ('both' if bear_obv and bear_delta
+                                 else ('obv' if bear_obv else 'delta'))
+                    # If both directions found, prefer 'both' tag
+                    if out['indicator'] in (None, _bear_ind):
+                        out['indicator'] = _bear_ind
+                    elif out['indicator'] != 'both':
+                        out['indicator'] = 'both'
+        return out
+    except Exception:
+        return out
+
+
+def detect_ignition(df, bb_len=20, bb_mult=2.0, kc_mult=1.5,
+                    dryup_bars=6, surge_mult=2.0, spring_lookback=20):
+    """'Tank full — rally about to start' detector. The bullish inverse of
+    divergence: instead of trend exhaustion, this finds energy LOADING that
+    precedes a move. Four independent sub-signals, each returns BULL or BEAR
+    (or nothing):
+
+      1. ACCUMULATION BREAKOUT — price coiling (tight range) while OBV breaks
+         its own recent high (smart money loading before the move).
+      2. SQUEEZE RELEASE (TTM) — Bollinger Bands inside Keltner Channels
+         (volatility crushed), then first bar of BB expansion + directional
+         momentum → ignition bar.
+      3. DRY-UP + SURGE — N bars of below-average volume (sellers exhausted),
+         then a single ≥surge_mult× avg-vol bar with a directional close.
+      4. WYCKOFF SPRING — false break below recent low on high volume that
+         immediately snaps back above it (shorts trapped → fuel).
+
+    Returns dict:
+      {
+        'fired': bool,
+        'direction': 'bull' | 'bear' | None,   # net of the sub-signals
+        'signals': [ {name, direction, detail, time} , ... ],
+        'bull_count': int, 'bear_count': int,
+      }
+    All sub-signals evaluate the most-recent (last confirmed) bar context.
+    """
+    out = {'fired': False, 'direction': None, 'signals': [],
+           'bull_count': 0, 'bear_count': 0}
+    need = max(bb_len, spring_lookback, dryup_bars) + 3
+    if df is None or getattr(df, 'empty', True) or len(df) < need:
+        return out
+    try:
+        d = df.tail(max(120, need)).reset_index(drop=True).copy()
+        c = d['close'].astype(float)
+        h = d['high'].astype(float)
+        l = d['low'].astype(float)
+        v = d['volume'].astype(float)
+        t = d['datetime'].tolist()
+        n = len(d)
+        last_t = t[-1]
+        sigs = []
+
+        # ── 1. ACCUMULATION BREAKOUT (price flat + OBV breakout) ──────
+        try:
+            sign = np.where(c.diff() > 0, 1, np.where(c.diff() < 0, -1, 0))
+            obv = pd.Series((sign * v.values).cumsum(), index=d.index)
+            atr_pct = ((h - l) / c.replace(0, np.nan)).rolling(bb_len).mean()
+            # "coiling" = current rolling range tighter than its own median
+            coil = (atr_pct.iloc[-1] < atr_pct.tail(bb_len * 2).median()) if not atr_pct.isna().all() else False
+            obv_prev_hi = obv.iloc[-(bb_len + 1):-1].max()
+            obv_prev_lo = obv.iloc[-(bb_len + 1):-1].min()
+            if coil and obv.iloc[-1] > obv_prev_hi:
+                sigs.append({'name': 'Accumulation Breakout', 'direction': 'bull',
+                             'detail': 'Price coiling + OBV new high (loading)', 'time': last_t})
+            elif coil and obv.iloc[-1] < obv_prev_lo:
+                sigs.append({'name': 'Distribution Breakdown', 'direction': 'bear',
+                             'detail': 'Price coiling + OBV new low (offloading)', 'time': last_t})
+        except Exception:
+            pass
+
+        # ── 2. SQUEEZE RELEASE (TTM: BB inside KC, then expansion) ────
+        try:
+            basis = c.rolling(bb_len).mean()
+            dev = c.rolling(bb_len).std(ddof=0)
+            bb_u, bb_l = basis + bb_mult * dev, basis - bb_mult * dev
+            tr = pd.concat([(h - l), (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
+            atr = tr.rolling(bb_len).mean()
+            kc_u, kc_l = basis + kc_mult * atr, basis - kc_mult * atr
+            squeeze_on = (bb_u < kc_u) & (bb_l > kc_l)
+            # Fired = squeeze was on in the prior few bars, now off (release)
+            was_on = bool(squeeze_on.iloc[-4:-1].any())
+            now_off = bool(squeeze_on.iloc[-1] == False)
+            # momentum = close vs basis (Donchian-ish linreg proxy)
+            mom = float(c.iloc[-1] - basis.iloc[-1])
+            if was_on and now_off and abs(mom) > 0:
+                if mom > 0:
+                    sigs.append({'name': 'Squeeze Release', 'direction': 'bull',
+                                 'detail': 'Volatility squeeze fired UP (ignition)', 'time': last_t})
+                else:
+                    sigs.append({'name': 'Squeeze Release', 'direction': 'bear',
+                                 'detail': 'Volatility squeeze fired DOWN (ignition)', 'time': last_t})
+        except Exception:
+            pass
+
+        # ── 3. DRY-UP + SURGE (low-vol bars then a surge bar) ─────────
+        try:
+            avg_vol = float(v.iloc[-(dryup_bars + 30):-1].mean())
+            dryup = bool((v.iloc[-(dryup_bars + 1):-1] < avg_vol).all()) if avg_vol > 0 else False
+            surge = avg_vol > 0 and v.iloc[-1] >= surge_mult * avg_vol
+            bar_rng = float(h.iloc[-1] - l.iloc[-1])
+            avg_rng = float((h - l).iloc[-(dryup_bars + 30):-1].mean())
+            wide = avg_rng > 0 and bar_rng > avg_rng
+            green = c.iloc[-1] > d['open'].iloc[-1]
+            if dryup and surge and wide:
+                if green:
+                    sigs.append({'name': 'Dry-up + Surge', 'direction': 'bull',
+                                 'detail': f'Vol dry-up then {v.iloc[-1]/avg_vol:.1f}× surge (green)', 'time': last_t})
+                else:
+                    sigs.append({'name': 'Dry-up + Surge', 'direction': 'bear',
+                                 'detail': f'Vol dry-up then {v.iloc[-1]/avg_vol:.1f}× surge (red)', 'time': last_t})
+        except Exception:
+            pass
+
+        # ── 4. WYCKOFF SPRING (false breakdown + snap-back) ───────────
+        try:
+            prior_lo = float(l.iloc[-(spring_lookback + 1):-1].min())
+            prior_hi = float(h.iloc[-(spring_lookback + 1):-1].max())
+            avg_vol2 = float(v.iloc[-(spring_lookback + 1):-1].mean())
+            hi_vol = avg_vol2 > 0 and v.iloc[-1] > 1.3 * avg_vol2
+            # Bull spring: wick breaks below prior low but close snaps back above
+            if l.iloc[-1] < prior_lo and c.iloc[-1] > prior_lo and hi_vol:
+                sigs.append({'name': 'Wyckoff Spring', 'direction': 'bull',
+                             'detail': f'False break ₹{prior_lo:.1f} + snap-back (shorts trapped)', 'time': last_t})
+            # Bear upthrust: wick breaks above prior high but close snaps back below
+            elif h.iloc[-1] > prior_hi and c.iloc[-1] < prior_hi and hi_vol:
+                sigs.append({'name': 'Wyckoff Upthrust', 'direction': 'bear',
+                             'detail': f'False break ₹{prior_hi:.1f} + reject (longs trapped)', 'time': last_t})
+        except Exception:
+            pass
+
+        out['signals'] = sigs
+        out['bull_count'] = sum(1 for s in sigs if s['direction'] == 'bull')
+        out['bear_count'] = sum(1 for s in sigs if s['direction'] == 'bear')
+        if sigs:
+            out['fired'] = True
+            if out['bull_count'] > out['bear_count']:
+                out['direction'] = 'bull'
+            elif out['bear_count'] > out['bull_count']:
+                out['direction'] = 'bear'
+        return out
+    except Exception:
+        return out
+
 
 def detect_ltp_trap(df, delta_length=10, delta_thresh=1.5):
     """Detect LTP Trap signals (VWAP + delta based)."""
@@ -9566,77 +10042,55 @@ def send_capping_at_sr_alert(sa_result, underlying_price, proximity_pts=25, sr_p
     now = datetime.now(pytz.timezone('Asia/Kolkata'))
     time_str = now.strftime('%H:%M:%S IST')
 
-    # Check NIFTY spot proximity to major S/R zones
-    _at_support = False
-    _at_resistance = False
-    _nearest_sup = None
-    _nearest_res = None
-    try:
-        _zones = st.session_state.get('_major_sr_zones') or {}
-        for z in (_zones.get('support') or [])[:5]:
-            lvl = float(z.get('price') or z.get('level') or 0)
-            if lvl and abs(underlying_price - lvl) <= sr_prox_pts:
-                _at_support = True
-                _nearest_sup = lvl
-                break
-        for z in (_zones.get('resistance') or [])[:5]:
-            lvl = float(z.get('price') or z.get('level') or 0)
-            if lvl and abs(underlying_price - lvl) <= sr_prox_pts:
-                _at_resistance = True
-                _nearest_res = lvl
-                break
-    except Exception:
-        pass
-
     msgs = []
 
-    # Call capping (resistance) — only when NIFTY spot at major RESISTANCE
+    # Call capping (resistance writing) — fires on ANY detected event
+    # (S/R-side gating removed per user request).
     try:
-        if _at_resistance:
-            cap_rows = adf[
-                adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance']) &
-                adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)'])
-            ]
-            for _, r in cap_rows.iterrows():
-                strike = float(r['Strike'])
-                if abs(underlying_price - strike) > proximity_pts:
-                    continue
-                key = f"cap_call_{strike:.0f}"
-                last = alerted.get(key)
-                if last and (now - last).total_seconds() < 1800:
-                    continue
-                vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
-                oi_l = float(r.get('CE_OI', 0) or 0) / 100000
-                msgs.append(
-                    f"🟥 <b>CALL CAPPING ₹{strike:.0f}</b> @ Resistance ₹{_nearest_res:.0f} "
-                    f"{vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
-                )
-                alerted[key] = now
+        cap_rows = adf[
+            adf['Call_Class'].isin(['High Conviction Resistance', 'Strong Resistance']) &
+            adf['Call_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Resistance)'])
+        ]
+        for _, r in cap_rows.iterrows():
+            strike = float(r['Strike'])
+            if abs(underlying_price - strike) > proximity_pts:
+                continue
+            key = f"cap_call_{strike:.0f}"
+            last = alerted.get(key)
+            if last and (now - last).total_seconds() < 1800:
+                continue
+            vol_tag = "🔥 Vol Confirmed" if r.get('CE_Vol_High', False) else ""
+            oi_l = float(r.get('CE_OI', 0) or 0) / 100000
+            msgs.append(
+                f"🟥 <b>CALL CAPPING ₹{strike:.0f}</b> "
+                f"{vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            )
+            alerted[key] = now
     except Exception:
         pass
 
-    # Put writing / capping (support) — only when NIFTY spot at major SUPPORT
+    # Put writing / capping (support writing) — fires on ANY detected event
+    # (S/R-side gating removed per user request).
     try:
-        if _at_support:
-            sup_rows = adf[
-                adf['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
-                adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)'])
-            ]
-            for _, r in sup_rows.iterrows():
-                strike = float(r['Strike'])
-                if abs(underlying_price - strike) > proximity_pts:
-                    continue
-                key = f"cap_put_{strike:.0f}"
-                last = alerted.get(key)
-                if last and (now - last).total_seconds() < 1800:
-                    continue
-                vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
-                oi_l = float(r.get('PE_OI', 0) or 0) / 100000
-                msgs.append(
-                    f"🟩 <b>PUT WRITING ₹{strike:.0f}</b> @ Support ₹{_nearest_sup:.0f} "
-                    f"{vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
-                )
-                alerted[key] = now
+        sup_rows = adf[
+            adf['Put_Class'].isin(['High Conviction Support', 'Strong Support']) &
+            adf['Put_Activity'].isin(['Writing (Vol Confirmed)', 'Writing (Support)'])
+        ]
+        for _, r in sup_rows.iterrows():
+            strike = float(r['Strike'])
+            if abs(underlying_price - strike) > proximity_pts:
+                continue
+            key = f"cap_put_{strike:.0f}"
+            last = alerted.get(key)
+            if last and (now - last).total_seconds() < 1800:
+                continue
+            vol_tag = "🔥 Vol Confirmed" if r.get('PE_Vol_High', False) else ""
+            oi_l = float(r.get('PE_OI', 0) or 0) / 100000
+            msgs.append(
+                f"🟩 <b>PUT WRITING ₹{strike:.0f}</b> "
+                f"{vol_tag} | OI {oi_l:.1f}L | Spot ₹{underlying_price:.0f} | {time_str}"
+            )
+            alerted[key] = now
     except Exception:
         pass
 
@@ -10809,6 +11263,260 @@ def render_bull_bear_meter(meter):
 #  COMPOSITE BIAS ENGINE — aligns 14+ signals into a single ENTER NOW verdict
 # ═══════════════════════════════════════════════════════════════════════════
 
+def analyze_vob_volume(df_1m, ltp):
+    """For each VOB zone on the leg's 1m chart, attribute LuxAlgo-style LTF
+    buyer/seller volume to the zone and classify its status.
+
+    For each zone (bullish = support · bearish = resistance):
+      - Find 1m sub-bars whose close fell inside the zone
+      - Sum bull_vol (close>open) and bear_vol (close<open) for those sub-bars
+      - Compute bull%/bear% and identify the max single-bar print inside the zone
+      - Classify status using current LTP position + flow:
+          BUILDING: LTP still in zone, dominant side matches zone type, vol elevated
+          BREAKING: LTP closed outside zone (below bull or above bear) recently
+          INTACT  : LTP near zone, mixed flow
+          FADING  : Dominant side opposite to zone type → zone weakening
+
+    Returns list of dicts (top 3 bull + top 3 bear zones, most recent)."""
+    if df_1m is None or getattr(df_1m, 'empty', True) or len(df_1m) < 20 or ltp <= 0:
+        return []
+    try:
+        vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_1m) or {}
+        results = []
+        avg_vol_1m = float(df_1m['volume'].tail(60).mean()) if 'volume' in df_1m.columns else 0
+        last_close = float(df_1m['close'].iloc[-1])
+        d = df_1m.copy()
+        d['bull_v'] = d.apply(lambda r: float(r['volume']) if r['close'] > r['open'] else 0.0, axis=1)
+        d['bear_v'] = d.apply(lambda r: float(r['volume']) if r['close'] < r['open'] else 0.0, axis=1)
+
+        def _attribute(b, zone_type):
+            zlo, zhi, zmid = float(b['lower']), float(b['upper']), float(b['mid'])
+            in_zone = d[(d['close'] >= zlo) & (d['close'] <= zhi)]
+            if in_zone.empty:
+                return None
+            buy_v = float(in_zone['bull_v'].sum())
+            sell_v = float(in_zone['bear_v'].sum())
+            total_v = buy_v + sell_v
+            bull_pct = (buy_v / total_v * 100) if total_v > 0 else 50
+            # Dominant single-bar print inside the zone
+            mb_price = ms_price = None
+            if buy_v > 0:
+                idx = in_zone['bull_v'].idxmax()
+                mb_price = float(in_zone.loc[idx, 'close'])
+            if sell_v > 0:
+                idx = in_zone['bear_v'].idxmax()
+                ms_price = float(in_zone.loc[idx, 'close'])
+            dominant = 'buyers' if bull_pct > 60 else ('sellers' if bull_pct < 40 else 'balanced')
+            # Status classification
+            if zone_type == 'bullish':
+                # Bull VOB = support
+                if last_close < zlo:
+                    status = 'BREAKING'   # support failed
+                    dominant = 'sellers'
+                elif zlo <= last_close <= zhi and dominant == 'buyers' and (avg_vol_1m > 0 and (total_v / max(len(in_zone), 1)) > avg_vol_1m * 1.2):
+                    status = 'BUILDING'   # buyers defending
+                elif dominant == 'sellers':
+                    status = 'FADING'     # bull zone with seller dominance = weak
+                else:
+                    status = 'INTACT'
+            else:  # bearish VOB = resistance
+                if last_close > zhi:
+                    status = 'BREAKING'   # resistance failed
+                    dominant = 'buyers'
+                elif zlo <= last_close <= zhi and dominant == 'sellers' and (avg_vol_1m > 0 and (total_v / max(len(in_zone), 1)) > avg_vol_1m * 1.2):
+                    status = 'BUILDING'   # sellers stacking
+                elif dominant == 'buyers':
+                    status = 'FADING'     # bear zone with buyer dominance = weak
+                else:
+                    status = 'INTACT'
+            return {
+                'zone_type': zone_type,
+                'role': 'support' if zone_type == 'bullish' else 'resistance',
+                'lower': zlo, 'upper': zhi, 'mid': zmid,
+                'status': status, 'dominant': dominant,
+                'buy_vol': buy_v, 'sell_vol': sell_v, 'total_vol': total_v,
+                'bull_pct': bull_pct,
+                'max_buy_price': mb_price,
+                'max_sell_price': ms_price,
+                'n_bars_in_zone': len(in_zone),
+            }
+
+        for b in (vob.get('bullish') or [])[-3:]:
+            r = _attribute(b, 'bullish')
+            if r:
+                results.append(r)
+        for b in (vob.get('bearish') or [])[-3:]:
+            r = _attribute(b, 'bearish')
+            if r:
+                results.append(r)
+        return results
+    except Exception:
+        return []
+
+
+def classify_leg_sr_behavior(df_l, ltp):
+    """S/R behavior for an option LEG using its own VOB zones as S/R levels.
+
+    Bullish VOB = support · Bearish VOB = resistance for that leg's chart.
+    Returns dict {state, side, level, direction} from the LEG'S OWN perspective
+    (direction = bull/bear for the option itself, NOT NIFTY direction).
+
+    States same as classify_sr_behavior: BREAKING / REJECTING / ACCEPTING /
+    BUILDING / NONE — highest-priority wins."""
+    if df_l is None or getattr(df_l, 'empty', True) or len(df_l) < 5 or ltp <= 0:
+        return None
+    try:
+        vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_l) or {}
+        # Bullish VOBs = support for this leg's LTP; bearish = resistance
+        sup_levels = sorted([b['mid'] for b in (vob.get('bullish') or [])
+                              if b.get('mid') and b['mid'] <= ltp], reverse=True)
+        res_levels = sorted([b['mid'] for b in (vob.get('bearish') or [])
+                              if b.get('mid') and b['mid'] >= ltp])
+        nearest_sup = sup_levels[0] if sup_levels else None
+        nearest_res = res_levels[0] if res_levels else None
+        if nearest_sup is None and nearest_res is None:
+            return {'state': 'NONE', 'side': None, 'level': None, 'direction': 'none'}
+
+        last = df_l.iloc[-1]
+        prev = df_l.iloc[-2]
+        o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+        pc = float(prev['close'])
+        rng = h - l if h > l else 0.001
+        body = abs(c - o)
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        # Vol spike on this leg
+        try:
+            avg_vol = float(df_l['volume'].tail(20).mean())
+            vol_spike = float(last.get('volume', 0)) > avg_vol * 1.5 if avg_vol > 0 else False
+        except Exception:
+            vol_spike = False
+        # Tolerance: 0.5% of LTP or 0.5 points min
+        tol = max(ltp * 0.005, 0.5)
+
+        candidates = []
+        for level, side in [(nearest_res, 'resistance'), (nearest_sup, 'support')]:
+            if level is None:
+                continue
+            dist = ltp - level
+            # BREAKING: crossed level decisively with vol
+            if side == 'resistance' and c > level + tol * 2 and pc <= level and vol_spike:
+                candidates.append((3, 'BREAKING', side, level, 'bull'))
+            elif side == 'support' and c < level - tol * 2 and pc >= level and vol_spike:
+                candidates.append((3, 'BREAKING', side, level, 'bear'))
+            # REJECTING: wick pierced but close back inside
+            if side == 'resistance' and h > level + tol and c < level and upper_wick > body:
+                candidates.append((3, 'REJECTING', side, level, 'bear'))
+            elif side == 'support' and l < level - tol and c > level and lower_wick > body:
+                candidates.append((3, 'REJECTING', side, level, 'bull'))
+            # ACCEPTING: held on right side of broken level for 3+ bars
+            if len(df_l) >= 5:
+                last5 = df_l.tail(5)
+                if side == 'resistance' and last5['close'].iloc[0] < level and (last5['low'] >= level - tol).iloc[-3:].all():
+                    candidates.append((2, 'ACCEPTING', side, level, 'bull'))
+                elif side == 'support' and last5['close'].iloc[0] > level and (last5['high'] <= level + tol).iloc[-3:].all():
+                    candidates.append((2, 'ACCEPTING', side, level, 'bear'))
+            # BUILDING: within tol*3 of level
+            if abs(dist) <= tol * 3:
+                if side == 'support':
+                    candidates.append((1, 'BUILDING', side, level, 'bull'))
+                else:
+                    candidates.append((1, 'BUILDING', side, level, 'bear'))
+        if not candidates:
+            return {'state': 'NONE', 'side': None, 'level': None, 'direction': 'none'}
+        candidates.sort(key=lambda x: -x[0])
+        _, state, side, level, direction = candidates[0]
+        return {'state': state, 'side': side, 'level': float(level), 'direction': direction}
+    except Exception:
+        return None
+
+
+def classify_sr_behavior(df, spot_price):
+    """Classify how price is behaving at the nearest Major S/R level.
+
+    States:
+      BREAKING   — price moved decisively through level with vol confirm
+      REJECTING  — wick pierced level but close back inside (failed move)
+      BUILDING   — price within 25pt, pressure pending (not directional yet)
+      ACCEPTING  — price held above/below broken level (resistance→support flip)
+      NONE       — no nearby S/R or no clear behavior
+
+    Returns dict {state, side, level, direction} where direction is
+    'bull'/'bear'/'none' from a NIFTY-direction perspective."""
+    if df is None or getattr(df, 'empty', True) or len(df) < 5:
+        return None
+    try:
+        # Pull nearest major S/R levels from session-state cluster
+        _zones = st.session_state.get('_major_sr_zones') or {}
+        sup_levels = sorted(
+            [float(z.get('price') or z.get('level') or 0)
+             for z in (_zones.get('support') or [])[:5]
+             if (z.get('price') or z.get('level'))],
+            reverse=True,
+        )
+        res_levels = sorted(
+            [float(z.get('price') or z.get('level') or 0)
+             for z in (_zones.get('resistance') or [])[:5]
+             if (z.get('price') or z.get('level'))],
+        )
+        nearest_sup = next((s for s in sup_levels if s <= spot_price), None)
+        nearest_res = next((r for r in res_levels if r >= spot_price), None)
+        if nearest_sup is None and nearest_res is None:
+            return {'state': 'NONE', 'side': None, 'level': None, 'direction': 'none'}
+
+        last = df.iloc[-1]
+        prev = df.iloc[-2]
+        o, h, l, c = float(last['open']), float(last['high']), float(last['low']), float(last['close'])
+        pc = float(prev['close'])
+        rng = h - l if h > l else 0.001
+        body = abs(c - o)
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        try:
+            avg_vol = float(df['volume'].tail(20).mean())
+            vol_spike = float(last.get('volume', 0)) > avg_vol * 1.5 if avg_vol > 0 else False
+        except Exception:
+            vol_spike = False
+
+        candidates = []  # tuples: (priority, state, side, level, direction)
+        for level, side in [(nearest_res, 'resistance'), (nearest_sup, 'support')]:
+            if level is None:
+                continue
+            dist = spot_price - level
+            # ── BREAKING: crossed level decisively this bar with vol
+            if side == 'resistance' and c > level + max(rng * 0.3, 5) and pc <= level and vol_spike:
+                candidates.append((3, 'BREAKING', side, level, 'bull'))
+            elif side == 'support' and c < level - max(rng * 0.3, 5) and pc >= level and vol_spike:
+                candidates.append((3, 'BREAKING', side, level, 'bear'))
+            # ── REJECTING: wick pierced level but close back inside
+            if side == 'resistance' and h > level + max(rng * 0.2, 3) and c < level and upper_wick > body:
+                candidates.append((3, 'REJECTING', side, level, 'bear'))
+            elif side == 'support' and l < level - max(rng * 0.2, 3) and c > level and lower_wick > body:
+                candidates.append((3, 'REJECTING', side, level, 'bull'))
+            # ── ACCEPTING: held above former-resistance / below former-support for 3+ bars
+            # (resistance → support flip = bull; support → resistance = bear)
+            if len(df) >= 5:
+                last5 = df.tail(5)
+                if side == 'resistance' and last5['close'].iloc[0] < level and (last5['low'] >= level - max(rng * 0.5, 5)).iloc[-3:].all():
+                    candidates.append((2, 'ACCEPTING', side, level, 'bull'))
+                elif side == 'support' and last5['close'].iloc[0] > level and (last5['high'] <= level + max(rng * 0.5, 5)).iloc[-3:].all():
+                    candidates.append((2, 'ACCEPTING', side, level, 'bear'))
+            # ── BUILDING: within 25pt of level (pressure pending — soft tilt)
+            if abs(dist) <= 25:
+                if side == 'support':
+                    candidates.append((1, 'BUILDING', side, level, 'bull'))
+                else:
+                    candidates.append((1, 'BUILDING', side, level, 'bear'))
+        if not candidates:
+            return {'state': 'NONE', 'side': None, 'level': None, 'direction': 'none'}
+        # Highest priority wins (BREAKING/REJECTING > ACCEPTING > BUILDING)
+        candidates.sort(key=lambda x: -x[0])
+        _, state, side, level, direction = candidates[0]
+        return {'state': state, 'side': side, 'level': float(level), 'direction': direction}
+    except Exception:
+        return None
+
+
 def compute_composite_bias(spot_price, df, option_data):
     """Aggregate all live signals into a single composite bias score.
 
@@ -10840,6 +11548,36 @@ def compute_composite_bias(spot_price, df, option_data):
                 _add(+1, W_SPOT, "Spot stop-hunt: BUY")
             elif d == 'SELL':
                 _add(-1, W_SPOT, "Spot stop-hunt: SELL")
+    except Exception:
+        pass
+
+    # 1b) Spot Price–OBV/Δ Divergence (regular div only)
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _sdiv = detect_divergence(df, pivot_lookback=5, max_bars_back=80)
+            if _sdiv.get('bull'):
+                _wm = W_SPOT * (1.5 if _sdiv.get('indicator') == 'both' else 1)
+                _add(+1, _wm,
+                     f"Spot bullish divergence ({(_sdiv.get('indicator') or '').upper()})")
+            if _sdiv.get('bear'):
+                _wm = W_SPOT * (1.5 if _sdiv.get('indicator') == 'both' else 1)
+                _add(-1, _wm,
+                     f"Spot bearish divergence ({(_sdiv.get('indicator') or '').upper()})")
+    except Exception:
+        pass
+
+    # 1c) Spot Ignition (tank-full — rally/breakdown loading)
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _sig = detect_ignition(df)
+            if _sig.get('fired') and _sig.get('direction') in ('bull', 'bear'):
+                _na = _sig.get('bull_count') if _sig['direction'] == 'bull' else _sig.get('bear_count')
+                _wm = W_SPOT * (1.5 if _na >= 2 else 1)
+                _names = ", ".join(s['name'] for s in _sig['signals'] if s['direction'] == _sig['direction'])
+                if _sig['direction'] == 'bull':
+                    _add(+1, _wm, f"Spot ignition BULL ({_names})")
+                else:
+                    _add(-1, _wm, f"Spot ignition BEAR ({_names})")
     except Exception:
         pass
 
@@ -10980,6 +11718,82 @@ def compute_composite_bias(spot_price, df, option_data):
         _add(-1, W_OPT, f"ATM PE pattern: {pe_pat} (bull = NIFTY bear)")
     elif pe_b == 'bear':
         _add(+1, W_OPT, f"ATM PE pattern: {pe_pat} (bear = NIFTY bull)")
+
+    # 10b) Cross-strike ATM CE/PE divergence
+    # CE bull div → CE about to rise → NIFTY bull (same direction)
+    # PE bull div → PE about to rise → NIFTY bear (reversed)
+    try:
+        _leg_dfs = st.session_state.get('_atm_leg_dfs') or {}
+        for _tag, _ldf in _leg_dfs.items():
+            if 'ATM CE' not in _tag and 'ATM PE' not in _tag:
+                continue
+            if _ldf is None or _ldf.empty or len(_ldf) < 30:
+                continue
+            _ld = detect_divergence(_ldf, pivot_lookback=5, max_bars_back=80)
+            _is_ce = 'ATM CE' in _tag
+            if _ld.get('bull'):
+                if _is_ce:
+                    _add(+1, W_OPT, f"{_tag} bull div (CE rising → NIFTY bull)")
+                else:
+                    _add(-1, W_OPT, f"{_tag} bull div (PE rising → NIFTY bear)")
+            if _ld.get('bear'):
+                if _is_ce:
+                    _add(-1, W_OPT, f"{_tag} bear div (CE falling → NIFTY bear)")
+                else:
+                    _add(+1, W_OPT, f"{_tag} bear div (PE falling → NIFTY bull)")
+    except Exception:
+        pass
+
+    # 10c) Cross-strike ATM CE/PE ignition (tank-full)
+    # CE ignition bull → CE loading up → NIFTY bull (same)
+    # PE ignition bull → PE loading up → NIFTY bear (reversed)
+    try:
+        _leg_dfs2 = st.session_state.get('_atm_leg_dfs') or {}
+        for _tag, _ldf in _leg_dfs2.items():
+            if 'ATM CE' not in _tag and 'ATM PE' not in _tag:
+                continue
+            if _ldf is None or _ldf.empty or len(_ldf) < 30:
+                continue
+            _lig = detect_ignition(_ldf)
+            if not _lig.get('fired') or _lig.get('direction') not in ('bull', 'bear'):
+                continue
+            _is_ce = 'ATM CE' in _tag
+            _d = _lig['direction']
+            if _d == 'bull':
+                if _is_ce:
+                    _add(+1, W_OPT, f"{_tag} ignition bull (CE loading → NIFTY bull)")
+                else:
+                    _add(-1, W_OPT, f"{_tag} ignition bull (PE loading → NIFTY bear)")
+            else:
+                if _is_ce:
+                    _add(-1, W_OPT, f"{_tag} ignition bear (CE fading → NIFTY bear)")
+                else:
+                    _add(+1, W_OPT, f"{_tag} ignition bear (PE fading → NIFTY bull)")
+    except Exception:
+        pass
+
+    # 10d) Cross-strike ATM CE/PE VWAP relation
+    # CE above VWAP → CE strong → NIFTY bull (same). PE above VWAP → NIFTY bear (reversed).
+    try:
+        _leg_dfs4 = st.session_state.get('_atm_leg_dfs') or {}
+        for _tag, _ldf in _leg_dfs4.items():
+            if 'ATM CE' not in _tag and 'ATM PE' not in _tag:
+                continue
+            if _ldf is None or _ldf.empty or len(_ldf) < 10:
+                continue
+            _vw = ReversalDetector.calculate_vwap(_ldf)
+            if _vw is None or _vw.empty:
+                continue
+            _above = float(_ldf['close'].iloc[-1]) > float(_vw.iloc[-1])
+            _is_ce = 'ATM CE' in _tag
+            if _is_ce:
+                _add(+1 if _above else -1, W_OPT,
+                     f"{_tag} {'above' if _above else 'below'} VWAP → NIFTY {'bull' if _above else 'bear'}")
+            else:
+                _add(-1 if _above else +1, W_OPT,
+                     f"{_tag} {'above' if _above else 'below'} VWAP → NIFTY {'bear' if _above else 'bull'} (PE reversed)")
+    except Exception:
+        pass
 
     # 11-12) CE & PE MFP POC bias
     try:
@@ -11124,6 +11938,483 @@ def compute_composite_bias(spot_price, df, option_data):
     except Exception:
         pass
 
+    # 19) NIFTY spot Geometric pattern (latest from GeometricPatternDetector)
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _geo_all = GeometricPatternDetector().detect_all(df) or []
+            if _geo_all:
+                _g = _geo_all[-1]
+                sig = (_g.get('signal') or _g.get('sentiment') or '').upper()
+                pat = _g.get('pattern', '—')
+                if 'BUY' in sig or 'BULL' in sig:
+                    _add(+1, W_SPOT * 1.5, f"Spot Geometric pattern: {pat} (BUY)")
+                elif 'SELL' in sig or 'BEAR' in sig:
+                    _add(-1, W_SPOT * 1.5, f"Spot Geometric pattern: {pat} (SELL)")
+    except Exception:
+        pass
+
+    # 20) NIFTY spot Chart pattern (H&S, Double Top/Bottom, Triangles, etc.)
+    try:
+        if df is not None and not df.empty and len(df) >= 20:
+            _chp = detect_chart_patterns(df)
+            if _chp and _chp.get('pattern'):
+                _d = (_chp.get('direction') or '').lower()
+                pat = _chp['pattern']
+                if 'bull' in _d:
+                    _add(+1, W_SPOT, f"Spot Chart pattern: {pat} (Bullish)")
+                elif 'bear' in _d:
+                    _add(-1, W_SPOT, f"Spot Chart pattern: {pat} (Bearish)")
+    except Exception:
+        pass
+
+    # 21) NIFTY spot Candle pattern (last-bar Hammer/Star/Engulfing/etc.)
+    try:
+        if df is not None and not df.empty and len(df) >= 2:
+            last = df.iloc[-1]; prev = df.iloc[-2]
+            _spot_pat = _classify_reversal_pattern(
+                float(last['open']), float(last['high']),
+                float(last['low']),  float(last['close']),
+                po=float(prev['open']), ph=float(prev['high']),
+                pl=float(prev['low']),  pc=float(prev['close']),
+            )
+            if _spot_pat in _BULL_PATTERNS:
+                _add(+1, W_SPOT, f"Spot Candle pattern: {_spot_pat} (Bullish)")
+            elif _spot_pat in _BEAR_PATTERNS:
+                _add(-1, W_SPOT, f"Spot Candle pattern: {_spot_pat} (Bearish)")
+    except Exception:
+        pass
+
+    # 22) VWAP relation — universal intraday compass.
+    # Spot > VWAP = bull bias; below = bear. Cheap to compute.
+    try:
+        if df is not None and not df.empty and len(df) >= 5:
+            tp = (df['high'] + df['low'] + df['close']) / 3
+            cum_tp_vol = (tp * df['volume']).cumsum()
+            cum_vol = df['volume'].cumsum().replace(0, 1)
+            vwap = float((cum_tp_vol / cum_vol).iloc[-1])
+            if vwap > 0:
+                if spot_price > vwap:
+                    _add(+1, W_SPOT, f"Spot ₹{spot_price:.0f} above VWAP ₹{vwap:.0f}")
+                elif spot_price < vwap:
+                    _add(-1, W_SPOT, f"Spot ₹{spot_price:.0f} below VWAP ₹{vwap:.0f}")
+    except Exception:
+        pass
+
+    # 23) NIFTY Futures Basis — premium = bull, discount = bear.
+    # Reads cached _nifty_futures_data populated by the main render cycle.
+    try:
+        _fut = st.session_state.get('_nifty_futures_data') or {}
+        basis = _fut.get('basis')
+        if basis is not None:
+            if basis > 2:
+                _add(+1, W_SPOT * 1.5,
+                     f"Futures premium ₹{basis:+.1f} (institutional long bias)")
+            elif basis < -2:
+                _add(-1, W_SPOT * 1.5,
+                     f"Futures discount ₹{basis:+.1f} (hedging / short bias)")
+    except Exception:
+        pass
+
+    # 24) Price × OI Classifier — institutional sentiment per 5m future bar.
+    # Reads cached _pxoi_cache populated by compute_per_candle_pxoi.
+    # Long Buildup (+1), Short Covering (+0.5), Short Buildup (-1), Long Unwinding (-0.5).
+    try:
+        _px = (st.session_state.get('_pxoi_cache') or {}).get('data') or []
+        if _px:
+            # Average last 3 bars to smooth single-bar noise
+            scores = [row.get('score', 0) for row in _px[-3:] if isinstance(row.get('score'), (int, float))]
+            if scores:
+                avg = sum(scores) / len(scores)
+                if avg >= 0.5:
+                    _add(+1, W_SPOT * 1.5,
+                         f"P×OI 3-bar avg {avg:+.2f} (Long buildup/Short covering)")
+                elif avg <= -0.5:
+                    _add(-1, W_SPOT * 1.5,
+                         f"P×OI 3-bar avg {avg:+.2f} (Short buildup/Long unwinding)")
+    except Exception:
+        pass
+
+    # 25) Reversal Detector — bull score N/6 vs bear score N/6 on spot 5m.
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _df_5m_r = (df.set_index('datetime')
+                          .resample('5min')
+                          .agg({'open': 'first', 'high': 'max', 'low': 'min',
+                                'close': 'last', 'volume': 'sum'})
+                          .dropna().reset_index())
+            if len(_df_5m_r) >= 15:
+                bull_s, _, _ = ReversalDetector.calculate_reversal_score(_df_5m_r)
+                bear_s, _, _ = ReversalDetector.calculate_bearish_reversal_score(_df_5m_r)
+                if bull_s >= 4 and bull_s > bear_s:
+                    _add(+1, W_SPOT, f"Reversal Detector Bull {bull_s}/6 (vs Bear {bear_s}/6)")
+                elif bear_s >= 4 and bear_s > bull_s:
+                    _add(-1, W_SPOT, f"Reversal Detector Bear {bear_s}/6 (vs Bull {bull_s}/6)")
+    except Exception:
+        pass
+
+    # 26) PCR (Put-Call Ratio) at ATM — >1.2 bull (put-writer floor), <0.7 bear.
+    try:
+        _df_s_pcr = (option_data or {}).get('df_summary') if option_data else None
+        if _df_s_pcr is not None and not _df_s_pcr.empty and 'PCR' in _df_s_pcr.columns:
+            _all_s = sorted(_df_s_pcr['Strike'].dropna().unique().tolist())
+            if _all_s:
+                atm_p = min(_all_s, key=lambda x: abs(x - spot_price))
+                _atm_pcr_row = _df_s_pcr[_df_s_pcr['Strike'] == atm_p]
+                if not _atm_pcr_row.empty:
+                    pcr = float(_atm_pcr_row.iloc[0].get('PCR') or 0)
+                    if pcr > 1.2:
+                        _add(+1, W_OPT, f"ATM PCR {pcr:.2f} > 1.2 (bullish, PE writers floor)")
+                    elif 0 < pcr < 0.7:
+                        _add(-1, W_OPT, f"ATM PCR {pcr:.2f} < 0.7 (bearish, CE writers ceiling)")
+    except Exception:
+        pass
+
+    # 27) Market Depth Bias — uses bid/ask quantities from the option chain.
+    # Two signals combined:
+    #   A. ATM CE vs PE bid/ask depth ratio (focused, at-the-money)
+    #   B. Total chain depth tilt across ATM±3 strikes (broader)
+    # Bid stacked on PE/ask stacked on CE = NIFTY bear; reverse = NIFTY bull.
+    # When ATM-only and chain-wide signals AGREE → double weight.
+    try:
+        _df_s = (option_data or {}).get('df_summary') if option_data else None
+        if _df_s is not None and not _df_s.empty:
+            _all_strikes_d = sorted(_df_s['Strike'].dropna().unique().tolist())
+            _atm_d = min(_all_strikes_d, key=lambda x: abs(x - spot_price))
+            try:
+                _diffs = [_all_strikes_d[i+1] - _all_strikes_d[i]
+                          for i in range(len(_all_strikes_d) - 1)]
+                _sg_d = min(_diffs) if _diffs else 50
+            except Exception:
+                _sg_d = 50
+            _has_cols = all(c in _df_s.columns for c in
+                             ('bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE'))
+            if _has_cols:
+                # ── A. ATM-only depth ratio ──────────────────────────────
+                _atm_row = _df_s[_df_s['Strike'] == _atm_d]
+                atm_bias = 0
+                if not _atm_row.empty:
+                    bce = float(_atm_row.iloc[0].get('bidQty_CE') or 0)
+                    bpe = float(_atm_row.iloc[0].get('bidQty_PE') or 0)
+                    ace = float(_atm_row.iloc[0].get('askQty_CE') or 0)
+                    ape = float(_atm_row.iloc[0].get('askQty_PE') or 0)
+                    # NIFTY bull weight = CE bid + PE ask
+                    # NIFTY bear weight = PE bid + CE ask
+                    bull_w_atm = bce + ape
+                    bear_w_atm = bpe + ace
+                    if bull_w_atm > bear_w_atm * 1.3 and bull_w_atm > 0:
+                        atm_bias = +1
+                    elif bear_w_atm > bull_w_atm * 1.3 and bear_w_atm > 0:
+                        atm_bias = -1
+
+                # ── B. Chain-wide tilt across ATM±3 strikes ──────────────
+                _band = _df_s[(_df_s['Strike'] >= _atm_d - 3 * _sg_d) &
+                              (_df_s['Strike'] <= _atm_d + 3 * _sg_d)]
+                chain_bias = 0
+                if not _band.empty:
+                    sbce = float(_band['bidQty_CE'].fillna(0).sum())
+                    sbpe = float(_band['bidQty_PE'].fillna(0).sum())
+                    sace = float(_band['askQty_CE'].fillna(0).sum())
+                    sape = float(_band['askQty_PE'].fillna(0).sum())
+                    bull_w_chain = sbce + sape
+                    bear_w_chain = sbpe + sace
+                    if bull_w_chain > bear_w_chain * 1.2 and bull_w_chain > 0:
+                        chain_bias = +1
+                    elif bear_w_chain > bull_w_chain * 1.2 and bear_w_chain > 0:
+                        chain_bias = -1
+
+                # Combine — both agree → double weight; only one → normal
+                if atm_bias and chain_bias and atm_bias == chain_bias:
+                    if atm_bias > 0:
+                        _add(+1, W_OPT * 2,
+                             f"Market depth STRONG bull (ATM CE-bid + PE-ask heavy, "
+                             f"chain confirms ATM±3)")
+                    else:
+                        _add(-1, W_OPT * 2,
+                             f"Market depth STRONG bear (ATM PE-bid + CE-ask heavy, "
+                             f"chain confirms ATM±3)")
+                elif atm_bias != 0:
+                    if atm_bias > 0:
+                        _add(+1, W_OPT, "Market depth bull at ATM (CE bid > PE bid)")
+                    else:
+                        _add(-1, W_OPT, "Market depth bear at ATM (PE bid > CE bid)")
+                elif chain_bias != 0:
+                    if chain_bias > 0:
+                        _add(+1, W_OPT, "Market depth bull across ATM±3 chain")
+                    else:
+                        _add(-1, W_OPT, "Market depth bear across ATM±3 chain")
+    except Exception:
+        pass
+
+    # 28) Sector Rotation — NSE sector breadth + cyclical vs defensive leadership.
+    # Reads cached st.session_state._sector_rotation (computed alongside
+    # commodity-risk on the ~20s cycle). Tiered:
+    #   • Breadth: count of Bullish vs Bearish sectors at 1h sentiment.
+    #     net >= 4 → strong; net >= 2 → mild.
+    #   • Leadership: cyclical sectors (Auto/Bank/Metal/Realty/Infra/IT/PSU)
+    #     vs defensives (FMCG/Pharma) avg day % change.
+    # Combined: both agree → DOUBLE weight; only one → normal weight.
+    try:
+        _sr_data = st.session_state.get('_sector_rotation')
+        _sectors_list = None
+        if isinstance(_sr_data, list):
+            _sectors_list = _sr_data
+        elif isinstance(_sr_data, dict):
+            _sectors_list = _sr_data.get('rows') or _sr_data.get('sectors')
+        if _sectors_list:
+            # Breadth: Bullish vs Bearish at 1h
+            bull_n = sum(1 for s in _sectors_list if (s.get('s1h') or s.get('sentiment_1h')) == 'Bullish')
+            bear_n = sum(1 for s in _sectors_list if (s.get('s1h') or s.get('sentiment_1h')) == 'Bearish')
+            net_breadth = bull_n - bear_n
+            # Cyclical vs Defensive day % change
+            _CYC = {'AUTO', 'BANK', 'METAL', 'REALTY', 'INFRA', 'IT', 'PSU BANK'}
+            _DEF = {'FMCG', 'PHARMA'}
+            cyc_chgs = [s.get('day_chg_pct', 0) for s in _sectors_list
+                        if (s.get('name') or '').upper() in _CYC and s.get('day_chg_pct') is not None]
+            def_chgs = [s.get('day_chg_pct', 0) for s in _sectors_list
+                        if (s.get('name') or '').upper() in _DEF and s.get('day_chg_pct') is not None]
+            cyc_avg = sum(cyc_chgs) / len(cyc_chgs) if cyc_chgs else 0
+            def_avg = sum(def_chgs) / len(def_chgs) if def_chgs else 0
+            cyc_leads = (cyc_avg - def_avg) > 0.20  # risk-on (cyclicals leading by >0.2%)
+            def_leads = (def_avg - cyc_avg) > 0.20  # risk-off (defensives leading)
+
+            # Decide direction
+            breadth_dir = 0
+            if net_breadth >= 4:
+                breadth_dir = +1   # strong bull breadth
+            elif net_breadth >= 2:
+                breadth_dir = +1   # mild bull
+            elif net_breadth <= -4:
+                breadth_dir = -1   # strong bear
+            elif net_breadth <= -2:
+                breadth_dir = -1   # mild bear
+            leadership_dir = 0
+            if cyc_leads:
+                leadership_dir = +1
+            elif def_leads:
+                leadership_dir = -1
+
+            if breadth_dir and leadership_dir and breadth_dir == leadership_dir:
+                if breadth_dir > 0:
+                    _add(+1, W_SPOT * 1.5,
+                         f"Sector Rotation STRONG bull (breadth {bull_n}↑/{bear_n}↓ + "
+                         f"cyclicals leading {cyc_avg:+.2f}% vs def {def_avg:+.2f}%)")
+                else:
+                    _add(-1, W_SPOT * 1.5,
+                         f"Sector Rotation STRONG bear (breadth {bear_n}↓/{bull_n}↑ + "
+                         f"defensives leading {def_avg:+.2f}% vs cyc {cyc_avg:+.2f}%)")
+            elif breadth_dir != 0:
+                if breadth_dir > 0:
+                    _add(+1, W_SPOT, f"Sector Rotation bull breadth ({bull_n}↑/{bear_n}↓ at 1h)")
+                else:
+                    _add(-1, W_SPOT, f"Sector Rotation bear breadth ({bear_n}↓/{bull_n}↑ at 1h)")
+            elif leadership_dir != 0:
+                if leadership_dir > 0:
+                    _add(+1, W_SPOT, f"Sector Rotation: cyclicals leading {cyc_avg:+.2f}% (risk-on)")
+                else:
+                    _add(-1, W_SPOT, f"Sector Rotation: defensives leading {def_avg:+.2f}% (risk-off)")
+    except Exception:
+        pass
+
+    # 29) Cross-strike VIDYA trend (per-leg) — aggregated across all 14 ATM±3
+    # legs from _atm_leg_vidya cache. CE bullish VIDYA = NIFTY bull; PE bullish
+    # VIDYA REVERSED = NIFTY bear (PE rising = NIFTY falling).
+    try:
+        _vd_store = st.session_state.get('_atm_leg_vidya') or {}
+        ce_bull_v = ce_bear_v = pe_bull_v = pe_bear_v = 0
+        for tag, vd in _vd_store.items():
+            if tag.startswith('sid_'):
+                continue   # skip sid-keyed duplicates
+            trend = (vd or {}).get('trend', '')
+            if ' CE ' in f' {tag} ':
+                if trend == 'Bullish':
+                    ce_bull_v += 1
+                elif trend == 'Bearish':
+                    ce_bear_v += 1
+            elif ' PE ' in f' {tag} ':
+                if trend == 'Bullish':
+                    pe_bull_v += 1
+                elif trend == 'Bearish':
+                    pe_bear_v += 1
+        bull_v = ce_bull_v + pe_bear_v   # CE up + PE down = NIFTY bull
+        bear_v = ce_bear_v + pe_bull_v   # CE down + PE up = NIFTY bear
+        net_v = bull_v - bear_v
+        if net_v >= 4:
+            _add(+1, W_OPT * 1.5,
+                 f"Cross-strike VIDYA STRONG bull ({bull_v}↑/{bear_v}↓ across legs)")
+        elif net_v >= 2:
+            _add(+1, W_OPT,
+                 f"Cross-strike VIDYA bull ({bull_v}↑/{bear_v}↓ across legs)")
+        elif net_v <= -4:
+            _add(-1, W_OPT * 1.5,
+                 f"Cross-strike VIDYA STRONG bear ({bear_v}↓/{bull_v}↑ across legs)")
+        elif net_v <= -2:
+            _add(-1, W_OPT,
+                 f"Cross-strike VIDYA bear ({bear_v}↓/{bull_v}↑ across legs)")
+    except Exception:
+        pass
+
+    # 30) S/R Behavior Classifier — how price is reacting at nearest major S/R.
+    # BREAKING / REJECTING get full weight (definitive moves);
+    # ACCEPTING (resistance→support flip) gets normal weight;
+    # BUILDING is a "pressure pending" tag — half weight.
+    try:
+        _sr_beh = classify_sr_behavior(df, spot_price)
+        if _sr_beh:
+            st.session_state['_sr_behavior_state'] = _sr_beh
+            state = _sr_beh.get('state')
+            direction = _sr_beh.get('direction')
+            side = _sr_beh.get('side', '')
+            level = _sr_beh.get('level') or 0
+            if state in ('BREAKING', 'REJECTING') and direction in ('bull', 'bear'):
+                sign = +1 if direction == 'bull' else -1
+                _add(sign, W_SPOT * 1.5,
+                     f"S/R Behavior: {state} {side} ₹{level:.0f} → {direction.upper()}")
+            elif state == 'ACCEPTING' and direction in ('bull', 'bear'):
+                sign = +1 if direction == 'bull' else -1
+                _add(sign, W_SPOT,
+                     f"S/R Behavior: ACCEPTING {side} ₹{level:.0f} (level flipped → {direction.upper()})")
+            elif state == 'BUILDING' and direction in ('bull', 'bear'):
+                sign = +1 if direction == 'bull' else -1
+                _add(sign, W_SPOT * 0.5,
+                     f"S/R Behavior: BUILDING near {side} ₹{level:.0f} (pressure pending)")
+    except Exception:
+        pass
+
+    # 31) Cross-strike per-leg S/R Behavior — aggregates leg-level VOB S/R
+    # behavior across all 14 ATM±3 legs with PE reversal for NIFTY direction.
+    # BREAKING/REJECTING on CE → bull for NIFTY · same on PE → bear (reversed).
+    try:
+        _sr_store = st.session_state.get('_atm_leg_sr_behavior') or {}
+        bull_v = bear_v = 0
+        strong_legs = []
+        for tag, leg_sr in _sr_store.items():
+            if tag.startswith('sid_'):
+                continue
+            if not leg_sr or leg_sr.get('state') in (None, 'NONE'):
+                continue
+            state = leg_sr.get('state')
+            d = leg_sr.get('direction')   # leg's own direction
+            # Skip BUILDING — too soft for aggregation
+            if state == 'BUILDING':
+                continue
+            # Translate leg direction to NIFTY direction
+            if ' CE ' in f' {tag} ':
+                # CE bull on its own = NIFTY bull (CE rising)
+                nifty_dir = d
+            elif ' PE ' in f' {tag} ':
+                # PE bull on its own = NIFTY bear (PE rising = NIFTY falling)
+                nifty_dir = 'bear' if d == 'bull' else ('bull' if d == 'bear' else 'none')
+            else:
+                continue
+            if nifty_dir == 'bull':
+                bull_v += 1
+                if state in ('BREAKING', 'REJECTING'):
+                    strong_legs.append(tag)
+            elif nifty_dir == 'bear':
+                bear_v += 1
+                if state in ('BREAKING', 'REJECTING'):
+                    strong_legs.append(tag)
+        net = bull_v - bear_v
+        if net >= 3:
+            _add(+1, W_OPT * 1.5,
+                 f"Cross-strike S/R Behavior STRONG bull ({bull_v}↑/{bear_v}↓ across legs)")
+        elif net >= 1:
+            _add(+1, W_OPT,
+                 f"Cross-strike S/R Behavior bull ({bull_v}↑/{bear_v}↓ across legs)")
+        elif net <= -3:
+            _add(-1, W_OPT * 1.5,
+                 f"Cross-strike S/R Behavior STRONG bear ({bear_v}↓/{bull_v}↑ across legs)")
+        elif net <= -1:
+            _add(-1, W_OPT,
+                 f"Cross-strike S/R Behavior bear ({bear_v}↓/{bull_v}↑ across legs)")
+    except Exception:
+        pass
+
+    # 32) Cross-strike VOB BUILDING/BREAKING — LTF buyer/seller per zone.
+    # Bullish VOB BUILDING on CE = CE buyers defending support → NIFTY bull.
+    # Bullish VOB BUILDING on PE = PE buyers defending → NIFTY bear (reversed).
+    # BREAKING flips the sign (zone failed).
+    try:
+        _vv_store = st.session_state.get('_atm_leg_vob_volume') or {}
+        bull_v = bear_v = 0
+        for tag, zones in _vv_store.items():
+            if tag.startswith('sid_') or not zones:
+                continue
+            is_ce = ' CE ' in f' {tag} '
+            is_pe = ' PE ' in f' {tag} '
+            if not (is_ce or is_pe):
+                continue
+            for z in zones:
+                state = z.get('status')
+                ztype = z.get('zone_type')
+                if state == 'BUILDING':
+                    # Bull VOB building = leg about to rise
+                    leg_dir = 'bull' if ztype == 'bullish' else 'bear'
+                elif state == 'BREAKING':
+                    # Bull VOB breaking = leg about to fall; bear VOB breaking = leg about to rise
+                    leg_dir = 'bear' if ztype == 'bullish' else 'bull'
+                else:
+                    continue
+                # Translate to NIFTY direction
+                if is_ce:
+                    nifty_dir = leg_dir
+                else:  # PE — reversed
+                    nifty_dir = 'bear' if leg_dir == 'bull' else 'bull'
+                if nifty_dir == 'bull':
+                    bull_v += 1
+                else:
+                    bear_v += 1
+        net = bull_v - bear_v
+        if net >= 3:
+            _add(+1, W_OPT * 1.5,
+                 f"Cross-strike VOB BUILD/BREAK STRONG bull ({bull_v}↑/{bear_v}↓ legs)")
+        elif net >= 1:
+            _add(+1, W_OPT,
+                 f"Cross-strike VOB BUILD/BREAK bull ({bull_v}↑/{bear_v}↓ legs)")
+        elif net <= -3:
+            _add(-1, W_OPT * 1.5,
+                 f"Cross-strike VOB BUILD/BREAK STRONG bear ({bear_v}↓/{bull_v}↑ legs)")
+        elif net <= -1:
+            _add(-1, W_OPT,
+                 f"Cross-strike VOB BUILD/BREAK bear ({bear_v}↓/{bull_v}↑ legs)")
+    except Exception:
+        pass
+
+    # 33) Multi-Instrument Capping · OI · Volume Monitor —
+    # Aggregates per-instrument market_bias from mi_instrument_data.
+    # SENSEX, BANKNIFTY, RELIANCE, ICICIBANK, INFOSYS all correlate
+    # directly with NIFTY (major index/heavyweights).
+    try:
+        _mi_state = st.session_state.get('mi_instrument_data') or {}
+        bull_v = bear_v = 0
+        bull_tags = []
+        bear_tags = []
+        for ikey, res in _mi_state.items():
+            if not res or 'error' in res:
+                continue
+            _deep = res.get('deep') or {}
+            bias = (_deep.get('market_bias', '') if _deep else res.get('pcr_bias', '')) or ''
+            bias_l = bias.lower()
+            if 'bull' in bias_l:
+                bull_v += 1; bull_tags.append(ikey)
+            elif 'bear' in bias_l:
+                bear_v += 1; bear_tags.append(ikey)
+        net = bull_v - bear_v
+        if net >= 3:
+            _add(+1, W_SPOT * 1.5,
+                 f"Multi-Instrument Monitor STRONG bull ({bull_v}↑/{bear_v}↓: {', '.join(bull_tags[:5])})")
+        elif net >= 1:
+            _add(+1, W_SPOT,
+                 f"Multi-Instrument Monitor bull ({bull_v}↑/{bear_v}↓)")
+        elif net <= -3:
+            _add(-1, W_SPOT * 1.5,
+                 f"Multi-Instrument Monitor STRONG bear ({bear_v}↓/{bull_v}↑: {', '.join(bear_tags[:5])})")
+        elif net <= -1:
+            _add(-1, W_SPOT,
+                 f"Multi-Instrument Monitor bear ({bear_v}↓/{bull_v}↑)")
+    except Exception:
+        pass
+
     # Aggregate
     score = sum(s * w for s, w, _ in reasons)
     # Split confirmations vs contradictions based on score's sign
@@ -11211,6 +12502,820 @@ def compute_composite_bias(spot_price, df, option_data):
     }
 
 
+_BIAS_CATEGORY = {
+    # 🚀 FAST — event-driven / live / low-lag
+    "CIE (latest signal)": 'fast',
+    "Spot Stop-Hunt (latest)": 'fast',
+    "Spot vs Dynamic PoC": 'fast',
+    "ATM CE candle pattern": 'fast',
+    "ATM PE candle pattern (reversed)": 'fast',
+    "Spot Candle Pattern": 'fast',
+    "VWAP relation": 'fast',
+    "NIFTY Futures Basis": 'fast',
+    "Price × OI Classifier": 'fast',
+    "S/R Behavior": 'fast',
+    "Cross-strike leg S/R Behavior": 'fast',
+    "Spot Divergence (OBV/Δ)": 'fast',
+    "Cross-strike leg Divergence": 'fast',
+    "Spot Ignition (tank-full)": 'fast',
+    "Cross-strike leg Ignition": 'fast',
+    "Cross-strike leg VWAP": 'fast',
+    "14-Leg Fast Verdict": 'fast',
+    "Greek Absorption (capping)": 'fast',
+    "Market Depth (ATM)": 'fast',
+    "Cross-strike VOB BUILD/BREAK": 'fast',
+    # 🐢 LAGGING — smoothed composites / slow timeframes
+    "Master Signal (AI)": 'lag',
+    "Bull/Bear Meter (Tier-1)": 'lag',
+    "Smart Money / Accum-Dist": 'lag',
+    "Global NIFTY Bias": 'lag',
+    "Commodity Risk Regime": 'lag',
+    "Sector Rotation": 'lag',
+    "Multi-Instrument Monitor": 'lag',
+    "Reversal Detector": 'lag',
+    "Cross-strike VIDYA": 'lag',
+    "ATM PCR": 'lag',
+    "Spot Geometric Pattern": 'lag',
+    "Spot Chart Pattern": 'lag',
+    "COMPOSITE BIAS Engine": 'lag',
+    "14-Leg Lagging Verdict": 'lag',
+    # 🌫️ MISGUIDING — flips on single bars / accumulated noise
+    "Spot vs VPFR-S POC": 'mis',
+    "Spot MFP POC bin": 'mis',
+    "14-Leg Misguiding Verdict": 'mis',
+}
+
+
+def render_all_bias_dashboard(spot_price, df, option_data):
+    """Bias dashboard split into 3 categories: Fast / Lagging / Misguiding.
+    Each category has its own Overall Verdict + table. Rendered in order:
+    Fast → Lagging → Misguiding."""
+    rows = []
+    cat_scores = {'fast': [0, 0], 'lag': [0, 0], 'mis': [0, 0]}  # [bull, bear]
+
+    def _push(engine, direction, detail, weight=1):
+        """direction ∈ {'bull','bear','neutral','info'}; weight increases vote impact."""
+        em = '🟢' if direction == 'bull' else ('🔴' if direction == 'bear' else '⚪')
+        cat = _BIAS_CATEGORY.get(engine, 'fast')  # unknown engines default to fast
+        rows.append({
+            'Engine': engine,
+            'Bias': f"{em} {direction.upper()}",
+            '_dir': direction,
+            '_cat': cat,
+            'Detail': detail,
+        })
+        if direction == 'bull':
+            cat_scores[cat][0] += weight
+        elif direction == 'bear':
+            cat_scores[cat][1] += weight
+
+    # ── 0b. Greek Absorption / Capping (expected-vs-actual premium) → FAST
+    try:
+        _ga = st.session_state.get('_greek_absorb_last') or {}
+        _gnet = _ga.get('net', 0)
+        if _ga.get('nifty') == 'bull' and _gnet:
+            _push("Greek Absorption (capping)", 'bull',
+                  f"PUT WRITING {_ga.get('pe_writing', 0)} · CALL CAPPING {_ga.get('ce_capping', 0)} (net {_gnet:+d})",
+                  weight=2 if abs(_gnet) >= 2 else 1)
+        elif _ga.get('nifty') == 'bear' and _gnet:
+            _push("Greek Absorption (capping)", 'bear',
+                  f"CALL CAPPING {_ga.get('ce_capping', 0)} · PUT WRITING {_ga.get('pe_writing', 0)} (net {_gnet:+d})",
+                  weight=2 if abs(_gnet) >= 2 else 1)
+    except Exception:
+        pass
+
+    # ── 0. 14-Leg verdict (ATM±3 leg-bias table) SPLIT BY SPEED → each category
+    try:
+        _lt_rows, _lt_overall = build_leg_bias_table(spot_price)
+        st.session_state['_leg_bias_cache'] = (_lt_rows, _lt_overall)
+        if _lt_rows and _lt_overall:
+            _by = _lt_overall.get('by_speed') or {}
+            for _ck, _eng in (('fast', "14-Leg Fast Verdict"),
+                              ('lag', "14-Leg Lagging Verdict"),
+                              ('mis', "14-Leg Misguiding Verdict")):
+                _cv = _by.get(_ck)
+                if not _cv:
+                    continue
+                _cd = ('bull' if _cv['dir'] == 'BULL'
+                       else ('bear' if _cv['dir'] == 'BEAR' else 'neutral'))
+                if _cd == 'neutral':
+                    continue
+                _cw = 2 if abs(_cv.get('net', 0)) >= 3 else 1
+                _push(_eng, _cd,
+                      f"{_cv['label']} · {_cv['bull']}↑/{_cv['bear']}↓ (net {_cv['net']:+d})",
+                      weight=_cw)
+    except Exception:
+        pass
+
+    # ── 1. Master Signal (AI verdict)
+    try:
+        _ms = st.session_state.get('_master_signal_last') or {}
+        verdict = (_ms.get('verdict') or '').upper()
+        if 'BUY' in verdict:
+            _push("Master Signal (AI)", 'bull', verdict, weight=2)
+        elif 'SELL' in verdict:
+            _push("Master Signal (AI)", 'bear', verdict, weight=2)
+        elif verdict:
+            _push("Master Signal (AI)", 'neutral', verdict)
+    except Exception:
+        pass
+
+    # ── 2. Bull/Bear Meter (Tier-1)
+    try:
+        _bb = st.session_state.get('_bull_bear_meter') or {}
+        sc = _bb.get('score', 0) or 0
+        if sc >= 30:
+            _push("Bull/Bear Meter (Tier-1)", 'bull', f"{sc:+.0f} ({_bb.get('label','')})", weight=2)
+        elif sc <= -30:
+            _push("Bull/Bear Meter (Tier-1)", 'bear', f"{sc:+.0f} ({_bb.get('label','')})", weight=2)
+        else:
+            _push("Bull/Bear Meter (Tier-1)", 'neutral', f"{sc:+.0f} ({_bb.get('label','')})")
+    except Exception:
+        pass
+
+    # ── 3. Smart Money / Accumulation-Distribution
+    try:
+        _ad = st.session_state.get('_accum_dist_score') or {}
+        sc = _ad.get('score', 0) or 0
+        if sc >= 30:
+            _push("Smart Money / Accum-Dist", 'bull', f"{sc:+.0f} ({_ad.get('label','')})", weight=2)
+        elif sc <= -30:
+            _push("Smart Money / Accum-Dist", 'bear', f"{sc:+.0f} ({_ad.get('label','')})", weight=2)
+        else:
+            _push("Smart Money / Accum-Dist", 'neutral', f"{sc:+.0f} ({_ad.get('label','')})")
+    except Exception:
+        pass
+
+    # ── 4. Movement Ignition (direction-agnostic — show score only)
+    try:
+        _ig = st.session_state.get('_ignition_score') or {}
+        if _ig.get('score') is not None:
+            sc = _ig.get('score', 0)
+            rows.append({'Engine': "Movement Ignition", 'Bias': f"⚡ {sc}/{_ig.get('max', 7)}",
+                         '_dir': 'info', 'Detail': _ig.get('label', '')})
+    except Exception:
+        pass
+
+    # ── 5. Spike Probability
+    try:
+        _sp = st.session_state.get('_spike_score') or {}
+        if _sp.get('score') is not None:
+            sc = _sp.get('score', 0)
+            rows.append({'Engine': "Spike Probability", 'Bias': f"⚡ {sc}/{_sp.get('max', 8)}",
+                         '_dir': 'info', 'Detail': _sp.get('label', '')})
+    except Exception:
+        pass
+
+    # ── 6. CIE latest signal
+    try:
+        _cie = st.session_state.get('_cie_signals') or []
+        if _cie:
+            last = _cie[-1]
+            d = (last.get('direction') or '').upper()
+            pat = last.get('pattern', '—')
+            if d in ('BUY', 'BULL', 'BULLISH', 'LONG'):
+                _push("CIE (latest signal)", 'bull', pat)
+            elif d in ('SELL', 'BEAR', 'BEARISH', 'SHORT'):
+                _push("CIE (latest signal)", 'bear', pat)
+    except Exception:
+        pass
+
+    # ── 7. Latest Stop Hunt / Liquidity Grab
+    try:
+        _liq = st.session_state.get('_liq_grabs') or []
+        if _liq:
+            last = _liq[-1]
+            d = (last.get('direction') or '').upper()
+            if d == 'BUY':
+                _push("Spot Stop-Hunt (latest)", 'bull', f"{last.get('type','')} · {last.get('pattern','—')}")
+            elif d == 'SELL':
+                _push("Spot Stop-Hunt (latest)", 'bear', f"{last.get('type','')} · {last.get('pattern','—')}")
+    except Exception:
+        pass
+
+    # ── 7b. Spot Price–OBV/Δ Divergence
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _sdiv = detect_divergence(df, pivot_lookback=5, max_bars_back=80)
+            _ind = (_sdiv.get('indicator') or '').upper()
+            _wt = 2 if _sdiv.get('indicator') == 'both' else 1
+            if _sdiv.get('bull'):
+                _push("Spot Divergence (OBV/Δ)", 'bull',
+                      f"Bull div ({_ind}) @ ₹{_sdiv.get('bull_price_low', 0):.0f}", weight=_wt)
+            elif _sdiv.get('bear'):
+                _push("Spot Divergence (OBV/Δ)", 'bear',
+                      f"Bear div ({_ind}) @ ₹{_sdiv.get('bear_price_high', 0):.0f}", weight=_wt)
+    except Exception:
+        pass
+
+    # ── 7c. Cross-strike leg divergence (ATM CE/PE — reversed for PE)
+    try:
+        _leg_dfs = st.session_state.get('_atm_leg_dfs') or {}
+        _div_bull_legs, _div_bear_legs = [], []
+        for _tag, _ldf in _leg_dfs.items():
+            if 'ATM CE' not in _tag and 'ATM PE' not in _tag:
+                continue
+            if _ldf is None or _ldf.empty or len(_ldf) < 30:
+                continue
+            _ld = detect_divergence(_ldf, pivot_lookback=5, max_bars_back=80)
+            _is_ce = 'ATM CE' in _tag
+            if _ld.get('bull'):
+                if _is_ce:
+                    _div_bull_legs.append(f"{_tag} bull")
+                else:
+                    _div_bear_legs.append(f"{_tag} bull→bear")
+            if _ld.get('bear'):
+                if _is_ce:
+                    _div_bear_legs.append(f"{_tag} bear")
+                else:
+                    _div_bull_legs.append(f"{_tag} bear→bull")
+        if _div_bull_legs:
+            _push("Cross-strike leg Divergence", 'bull',
+                  ", ".join(_div_bull_legs[:3]), weight=2 if len(_div_bull_legs) > 1 else 1)
+        if _div_bear_legs:
+            _push("Cross-strike leg Divergence", 'bear',
+                  ", ".join(_div_bear_legs[:3]), weight=2 if len(_div_bear_legs) > 1 else 1)
+    except Exception:
+        pass
+
+    # ── 7d. Spot Ignition (tank-full — rally/breakdown loading)
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _sig = detect_ignition(df)
+            if _sig.get('fired') and _sig.get('direction') in ('bull', 'bear'):
+                _na = _sig.get('bull_count') if _sig['direction'] == 'bull' else _sig.get('bear_count')
+                _names = ", ".join(s['name'] for s in _sig['signals'] if s['direction'] == _sig['direction'])
+                _push("Spot Ignition (tank-full)", _sig['direction'],
+                      f"🔋 {_names}", weight=2 if _na >= 2 else 1)
+    except Exception:
+        pass
+
+    # ── 7e. Cross-strike leg ignition (ATM CE/PE — reversed for PE)
+    try:
+        _leg_dfs3 = st.session_state.get('_atm_leg_dfs') or {}
+        _ign_bull_legs, _ign_bear_legs = [], []
+        for _tag, _ldf in _leg_dfs3.items():
+            if 'ATM CE' not in _tag and 'ATM PE' not in _tag:
+                continue
+            if _ldf is None or _ldf.empty or len(_ldf) < 30:
+                continue
+            _lig = detect_ignition(_ldf)
+            if not _lig.get('fired') or _lig.get('direction') not in ('bull', 'bear'):
+                continue
+            _is_ce = 'ATM CE' in _tag
+            _d = _lig['direction']
+            if _d == 'bull':
+                if _is_ce:
+                    _ign_bull_legs.append(f"{_tag} bull")
+                else:
+                    _ign_bear_legs.append(f"{_tag} bull→bear")
+            else:
+                if _is_ce:
+                    _ign_bear_legs.append(f"{_tag} bear")
+                else:
+                    _ign_bull_legs.append(f"{_tag} bear→bull")
+        if _ign_bull_legs:
+            _push("Cross-strike leg Ignition", 'bull',
+                  "🔋 " + ", ".join(_ign_bull_legs[:3]), weight=2 if len(_ign_bull_legs) > 1 else 1)
+        if _ign_bear_legs:
+            _push("Cross-strike leg Ignition", 'bear',
+                  "🔋 " + ", ".join(_ign_bear_legs[:3]), weight=2 if len(_ign_bear_legs) > 1 else 1)
+    except Exception:
+        pass
+
+    # ── 7f. Cross-strike leg VWAP (ATM CE/PE — reversed for PE)
+    try:
+        _leg_dfs5 = st.session_state.get('_atm_leg_dfs') or {}
+        _vw_bull, _vw_bear = [], []
+        for _tag, _ldf in _leg_dfs5.items():
+            if 'ATM CE' not in _tag and 'ATM PE' not in _tag:
+                continue
+            if _ldf is None or _ldf.empty or len(_ldf) < 10:
+                continue
+            _vw = ReversalDetector.calculate_vwap(_ldf)
+            if _vw is None or _vw.empty:
+                continue
+            _above = float(_ldf['close'].iloc[-1]) > float(_vw.iloc[-1])
+            _is_ce = 'ATM CE' in _tag
+            _nifty_bull = _above if _is_ce else (not _above)
+            (_vw_bull if _nifty_bull else _vw_bear).append(
+                f"{_tag} {'>' if _above else '<'}VWAP")
+        if _vw_bull:
+            _push("Cross-strike leg VWAP", 'bull',
+                  "📈 " + ", ".join(_vw_bull[:3]), weight=2 if len(_vw_bull) > 1 else 1)
+        if _vw_bear:
+            _push("Cross-strike leg VWAP", 'bear',
+                  "📈 " + ", ".join(_vw_bear[:3]), weight=2 if len(_vw_bear) > 1 else 1)
+    except Exception:
+        pass
+
+    # ── 8. Spot vs VPFR-S POC (level-based)
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _vp = compute_vpfr(df, 30)
+            if _vp and _vp.get('poc'):
+                if spot_price > _vp['poc']:
+                    _push("Spot vs VPFR-S POC", 'bull', f"Spot ₹{spot_price:.0f} > POC ₹{_vp['poc']:.0f}")
+                else:
+                    _push("Spot vs VPFR-S POC", 'bear', f"Spot ₹{spot_price:.0f} < POC ₹{_vp['poc']:.0f}")
+    except Exception:
+        pass
+
+    # ── 9. Spot vs Dynamic PoC
+    try:
+        if df is not None and not df.empty:
+            _dp_list, _, _ = compute_dynamic_poc(df, bins=20)
+            _cur = next((v for v in reversed(_dp_list or []) if v is not None), None)
+            if _cur is not None:
+                if _cur < spot_price:
+                    _push("Spot vs Dynamic PoC", 'bull', f"DynPoC ₹{_cur:.0f} below LTP")
+                elif _cur > spot_price:
+                    _push("Spot vs Dynamic PoC", 'bear', f"DynPoC ₹{_cur:.0f} above LTP")
+    except Exception:
+        pass
+
+    # ── 10. Spot MFP POC bin sentiment
+    try:
+        _mf = st.session_state.get('_money_flow_data') or {}
+        if _mf and _mf.get('rows'):
+            poc_row = next((r for r in _mf['rows'] if r.get('is_poc')), None)
+            if poc_row:
+                sent = (poc_row.get('sentiment') or '').lower()
+                if sent.startswith('bull'):
+                    _push("Spot MFP POC bin", 'bull', poc_row.get('sentiment', ''))
+                elif sent.startswith('bear'):
+                    _push("Spot MFP POC bin", 'bear', poc_row.get('sentiment', ''))
+    except Exception:
+        pass
+
+    # ── 11-12. ATM CE / PE candle pattern (PE reversed for NIFTY direction)
+    try:
+        ce_pat, pe_pat, ce_b, pe_b, _, _, atm_strike = _atm_ce_pe_trend()
+        if ce_b in ('bull', 'bear'):
+            _push("ATM CE candle pattern", ce_b, f"{ce_pat} ({ce_b})")
+        if pe_b in ('bull', 'bear'):
+            # PE reversed for NIFTY direction
+            nifty_dir = 'bear' if pe_b == 'bull' else 'bull'
+            _push("ATM PE candle pattern (reversed)", nifty_dir, f"{pe_pat} ({pe_b} on PE = {nifty_dir} NIFTY)")
+    except Exception:
+        pass
+
+    # ── 13. Global NIFTY Bias (12-instrument composite with reverse corr)
+    try:
+        _gb = compute_global_nifty_bias() or {}
+        gns = _gb.get('nifty_score', 0) or 0
+        if gns >= 2:
+            _push("Global NIFTY Bias", 'bull', f"score {gns:+.0f} · {_gb.get('nifty_label','')[:40]}", weight=2)
+        elif gns <= -2:
+            _push("Global NIFTY Bias", 'bear', f"score {gns:+.0f} · {_gb.get('nifty_label','')[:40]}", weight=2)
+        else:
+            _push("Global NIFTY Bias", 'neutral', f"score {gns:+.0f}")
+    except Exception:
+        pass
+
+    # ── Spot pattern engines (geometric / chart / candle)
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _geo_all = GeometricPatternDetector().detect_all(df) or []
+            if _geo_all:
+                _g = _geo_all[-1]
+                sig = (_g.get('signal') or _g.get('sentiment') or '').upper()
+                pat = _g.get('pattern', '—')
+                if 'BUY' in sig or 'BULL' in sig:
+                    _push("Spot Geometric Pattern", 'bull', pat, weight=2)
+                elif 'SELL' in sig or 'BEAR' in sig:
+                    _push("Spot Geometric Pattern", 'bear', pat, weight=2)
+    except Exception:
+        pass
+    try:
+        if df is not None and not df.empty and len(df) >= 20:
+            _chp = detect_chart_patterns(df)
+            if _chp and _chp.get('pattern'):
+                _d = (_chp.get('direction') or '').lower()
+                if 'bull' in _d:
+                    _push("Spot Chart Pattern", 'bull', _chp['pattern'])
+                elif 'bear' in _d:
+                    _push("Spot Chart Pattern", 'bear', _chp['pattern'])
+    except Exception:
+        pass
+    try:
+        if df is not None and not df.empty and len(df) >= 2:
+            last = df.iloc[-1]; prev = df.iloc[-2]
+            _sp = _classify_reversal_pattern(
+                float(last['open']), float(last['high']),
+                float(last['low']),  float(last['close']),
+                po=float(prev['open']), ph=float(prev['high']),
+                pl=float(prev['low']),  pc=float(prev['close']),
+            )
+            if _sp in _BULL_PATTERNS:
+                _push("Spot Candle Pattern", 'bull', _sp)
+            elif _sp in _BEAR_PATTERNS:
+                _push("Spot Candle Pattern", 'bear', _sp)
+    except Exception:
+        pass
+
+    # ── 13b. VWAP relation
+    try:
+        if df is not None and not df.empty and len(df) >= 5:
+            tp = (df['high'] + df['low'] + df['close']) / 3
+            cum_tp_vol = (tp * df['volume']).cumsum()
+            cum_vol = df['volume'].cumsum().replace(0, 1)
+            vwap = float((cum_tp_vol / cum_vol).iloc[-1])
+            if vwap > 0:
+                if spot_price > vwap:
+                    _push("VWAP relation", 'bull', f"Spot ₹{spot_price:.0f} > VWAP ₹{vwap:.0f}")
+                elif spot_price < vwap:
+                    _push("VWAP relation", 'bear', f"Spot ₹{spot_price:.0f} < VWAP ₹{vwap:.0f}")
+    except Exception:
+        pass
+
+    # ── 13c. NIFTY Futures Basis
+    try:
+        _fut = st.session_state.get('_nifty_futures_data') or {}
+        basis = _fut.get('basis')
+        if basis is not None:
+            if basis > 2:
+                _push("NIFTY Futures Basis", 'bull', f"Premium ₹{basis:+.1f} ({_fut.get('stance','')})")
+            elif basis < -2:
+                _push("NIFTY Futures Basis", 'bear', f"Discount ₹{basis:+.1f} ({_fut.get('stance','')})")
+            else:
+                _push("NIFTY Futures Basis", 'neutral', f"Flat ₹{basis:+.1f}")
+    except Exception:
+        pass
+
+    # ── 13d. Price × OI Classifier (3-bar avg)
+    try:
+        _px = (st.session_state.get('_pxoi_cache') or {}).get('data') or []
+        if _px:
+            scores = [row.get('score', 0) for row in _px[-3:] if isinstance(row.get('score'), (int, float))]
+            if scores:
+                avg = sum(scores) / len(scores)
+                last_label = _px[-1].get('label', '')
+                if avg >= 0.5:
+                    _push("Price × OI Classifier", 'bull', f"3-bar avg {avg:+.2f} · last: {last_label}")
+                elif avg <= -0.5:
+                    _push("Price × OI Classifier", 'bear', f"3-bar avg {avg:+.2f} · last: {last_label}")
+    except Exception:
+        pass
+
+    # ── 13e. Reversal Detector (5m)
+    try:
+        if df is not None and not df.empty and len(df) >= 30:
+            _df_5m_r = (df.set_index('datetime')
+                          .resample('5min')
+                          .agg({'open': 'first', 'high': 'max', 'low': 'min',
+                                'close': 'last', 'volume': 'sum'})
+                          .dropna().reset_index())
+            if len(_df_5m_r) >= 15:
+                bs, _, _ = ReversalDetector.calculate_reversal_score(_df_5m_r)
+                rs, _, _ = ReversalDetector.calculate_bearish_reversal_score(_df_5m_r)
+                if bs >= 4 and bs > rs:
+                    _push("Reversal Detector", 'bull', f"Bull {bs}/6 vs Bear {rs}/6")
+                elif rs >= 4 and rs > bs:
+                    _push("Reversal Detector", 'bear', f"Bear {rs}/6 vs Bull {bs}/6")
+    except Exception:
+        pass
+
+    # ── 13f. PCR at ATM
+    try:
+        _df_s_pcr = (option_data or {}).get('df_summary') if option_data else None
+        if _df_s_pcr is not None and not _df_s_pcr.empty and 'PCR' in _df_s_pcr.columns:
+            _all_s = sorted(_df_s_pcr['Strike'].dropna().unique().tolist())
+            if _all_s:
+                atm_p = min(_all_s, key=lambda x: abs(x - spot_price))
+                _atm_pcr_row = _df_s_pcr[_df_s_pcr['Strike'] == atm_p]
+                if not _atm_pcr_row.empty:
+                    pcr = float(_atm_pcr_row.iloc[0].get('PCR') or 0)
+                    if pcr > 1.2:
+                        _push("ATM PCR", 'bull', f"PCR {pcr:.2f} > 1.2 (PE writers = floor)")
+                    elif 0 < pcr < 0.7:
+                        _push("ATM PCR", 'bear', f"PCR {pcr:.2f} < 0.7 (CE writers = ceiling)")
+    except Exception:
+        pass
+
+    # ── 13g. Sector Rotation (breadth + cyclical-vs-defensive leadership)
+    try:
+        _sr_data = st.session_state.get('_sector_rotation')
+        _sectors_list = None
+        if isinstance(_sr_data, list):
+            _sectors_list = _sr_data
+        elif isinstance(_sr_data, dict):
+            _sectors_list = _sr_data.get('rows') or _sr_data.get('sectors')
+        if _sectors_list:
+            bn = sum(1 for s in _sectors_list if (s.get('s1h') or s.get('sentiment_1h')) == 'Bullish')
+            rn = sum(1 for s in _sectors_list if (s.get('s1h') or s.get('sentiment_1h')) == 'Bearish')
+            _CYC = {'AUTO', 'BANK', 'METAL', 'REALTY', 'INFRA', 'IT', 'PSU BANK'}
+            _DEF = {'FMCG', 'PHARMA'}
+            cyc = [s.get('day_chg_pct', 0) for s in _sectors_list
+                   if (s.get('name') or '').upper() in _CYC and s.get('day_chg_pct') is not None]
+            dfn = [s.get('day_chg_pct', 0) for s in _sectors_list
+                   if (s.get('name') or '').upper() in _DEF and s.get('day_chg_pct') is not None]
+            ca = sum(cyc) / len(cyc) if cyc else 0
+            da = sum(dfn) / len(dfn) if dfn else 0
+            net = bn - rn
+            detail = f"{bn}↑ / {rn}↓ @ 1h · cyc {ca:+.2f}% vs def {da:+.2f}%"
+            weight = 2 if (abs(net) >= 4 or abs(ca - da) > 0.20) else 1
+            if net >= 2 or (ca - da) > 0.20:
+                _push("Sector Rotation", 'bull', detail, weight=weight)
+            elif net <= -2 or (da - ca) > 0.20:
+                _push("Sector Rotation", 'bear', detail, weight=weight)
+            else:
+                _push("Sector Rotation", 'neutral', detail)
+    except Exception:
+        pass
+
+    # ── 13g'. Cross-strike VIDYA trend (all 14 ATM±3 legs)
+    try:
+        _vd_store = st.session_state.get('_atm_leg_vidya') or {}
+        ceb = ces = peb = pes = 0
+        for tag, vd in _vd_store.items():
+            if tag.startswith('sid_'):
+                continue
+            tr = (vd or {}).get('trend', '')
+            if ' CE ' in f' {tag} ':
+                if tr == 'Bullish': ceb += 1
+                elif tr == 'Bearish': ces += 1
+            elif ' PE ' in f' {tag} ':
+                if tr == 'Bullish': peb += 1
+                elif tr == 'Bearish': pes += 1
+        bv = ceb + pes
+        brv = ces + peb
+        net = bv - brv
+        detail = f"{bv}↑ / {brv}↓ across legs (CE bull+PE bear vs CE bear+PE bull)"
+        if net >= 4:
+            _push("Cross-strike VIDYA", 'bull', detail, weight=2)
+        elif net >= 2:
+            _push("Cross-strike VIDYA", 'bull', detail)
+        elif net <= -4:
+            _push("Cross-strike VIDYA", 'bear', detail, weight=2)
+        elif net <= -2:
+            _push("Cross-strike VIDYA", 'bear', detail)
+    except Exception:
+        pass
+
+    # ── 13g''. S/R Behavior Classifier
+    try:
+        _srb = st.session_state.get('_sr_behavior_state') or classify_sr_behavior(df, spot_price) or {}
+        state = _srb.get('state')
+        direction = _srb.get('direction')
+        side = _srb.get('side', '')
+        level = _srb.get('level') or 0
+        if state and state != 'NONE' and direction in ('bull', 'bear'):
+            wt = 2 if state in ('BREAKING', 'REJECTING') else 1
+            detail = f"{state} {side} ₹{level:.0f}"
+            _push("S/R Behavior", direction, detail, weight=wt)
+    except Exception:
+        pass
+
+    # ── 13g'''. Cross-strike per-leg S/R Behavior (VOB-based, all 14 legs)
+    try:
+        _sr_store = st.session_state.get('_atm_leg_sr_behavior') or {}
+        bv = brv = 0
+        for tag, leg_sr in _sr_store.items():
+            if tag.startswith('sid_') or not leg_sr:
+                continue
+            state = leg_sr.get('state')
+            if state in (None, 'NONE', 'BUILDING'):
+                continue
+            d = leg_sr.get('direction')
+            if ' CE ' in f' {tag} ':
+                nd = d
+            elif ' PE ' in f' {tag} ':
+                nd = 'bear' if d == 'bull' else ('bull' if d == 'bear' else 'none')
+            else:
+                continue
+            if nd == 'bull': bv += 1
+            elif nd == 'bear': brv += 1
+        net = bv - brv
+        detail = f"{bv}↑ / {brv}↓ across legs (BREAKING/REJECTING/ACCEPTING)"
+        if net >= 3:
+            _push("Cross-strike leg S/R Behavior", 'bull', detail, weight=2)
+        elif net >= 1:
+            _push("Cross-strike leg S/R Behavior", 'bull', detail)
+        elif net <= -3:
+            _push("Cross-strike leg S/R Behavior", 'bear', detail, weight=2)
+        elif net <= -1:
+            _push("Cross-strike leg S/R Behavior", 'bear', detail)
+    except Exception:
+        pass
+
+    # ── 13g''''. Cross-strike VOB BUILDING/BREAKING (LTF buyer/seller per zone)
+    try:
+        _vv_store = st.session_state.get('_atm_leg_vob_volume') or {}
+        bv = brv = 0
+        for tag, zones in _vv_store.items():
+            if tag.startswith('sid_') or not zones:
+                continue
+            is_ce = ' CE ' in f' {tag} '
+            is_pe = ' PE ' in f' {tag} '
+            for z in zones:
+                state = z.get('status')
+                ztype = z.get('zone_type')
+                if state == 'BUILDING':
+                    leg_dir = 'bull' if ztype == 'bullish' else 'bear'
+                elif state == 'BREAKING':
+                    leg_dir = 'bear' if ztype == 'bullish' else 'bull'
+                else:
+                    continue
+                if is_ce:
+                    nd = leg_dir
+                elif is_pe:
+                    nd = 'bear' if leg_dir == 'bull' else 'bull'
+                else:
+                    continue
+                if nd == 'bull': bv += 1
+                elif nd == 'bear': brv += 1
+        net = bv - brv
+        detail = f"{bv}↑ / {brv}↓ across legs (BUILDING + BREAKING zones)"
+        if net >= 3:
+            _push("Cross-strike VOB BUILD/BREAK", 'bull', detail, weight=2)
+        elif net >= 1:
+            _push("Cross-strike VOB BUILD/BREAK", 'bull', detail)
+        elif net <= -3:
+            _push("Cross-strike VOB BUILD/BREAK", 'bear', detail, weight=2)
+        elif net <= -1:
+            _push("Cross-strike VOB BUILD/BREAK", 'bear', detail)
+    except Exception:
+        pass
+
+    # ── 13h. Multi-Instrument Capping · OI · Volume Monitor
+    try:
+        _mi_state = st.session_state.get('mi_instrument_data') or {}
+        bv = brv = 0
+        for ikey, res in _mi_state.items():
+            if not res or 'error' in res:
+                continue
+            _deep = res.get('deep') or {}
+            b = ((_deep.get('market_bias', '') if _deep else res.get('pcr_bias', '')) or '').lower()
+            if 'bull' in b:
+                bv += 1
+            elif 'bear' in b:
+                brv += 1
+        net = bv - brv
+        detail = f"{bv}↑ / {brv}↓ across {bv + brv} instruments"
+        if net >= 3:
+            _push("Multi-Instrument Monitor", 'bull', detail, weight=2)
+        elif net >= 1:
+            _push("Multi-Instrument Monitor", 'bull', detail)
+        elif net <= -3:
+            _push("Multi-Instrument Monitor", 'bear', detail, weight=2)
+        elif net <= -1:
+            _push("Multi-Instrument Monitor", 'bear', detail)
+        elif bv + brv > 0:
+            _push("Multi-Instrument Monitor", 'neutral', detail)
+    except Exception:
+        pass
+
+    # ── 14. Commodity Risk Regime
+    try:
+        _cr = st.session_state.get('_commodity_risk') or {}
+        regime = (_cr.get('regime') or '').lower()
+        if 'risk-on' in regime or 'expansion' in regime:
+            _push("Commodity Risk Regime", 'bull', _cr.get('regime', ''))
+        elif 'risk-off' in regime or 'contraction' in regime:
+            _push("Commodity Risk Regime", 'bear', _cr.get('regime', ''))
+    except Exception:
+        pass
+
+    # ── 15. Market Depth — ATM CE vs PE
+    try:
+        _df_s = (option_data or {}).get('df_summary') if option_data else None
+        if _df_s is not None and not _df_s.empty:
+            _all_s = sorted(_df_s['Strike'].dropna().unique().tolist())
+            atm_d = min(_all_s, key=lambda x: abs(x - spot_price))
+            atm_row = _df_s[_df_s['Strike'] == atm_d]
+            if not atm_row.empty and all(c in _df_s.columns for c in ('bidQty_CE','bidQty_PE','askQty_CE','askQty_PE')):
+                bce = float(atm_row.iloc[0].get('bidQty_CE') or 0)
+                bpe = float(atm_row.iloc[0].get('bidQty_PE') or 0)
+                ace = float(atm_row.iloc[0].get('askQty_CE') or 0)
+                ape = float(atm_row.iloc[0].get('askQty_PE') or 0)
+                bull_w = bce + ape
+                bear_w = bpe + ace
+                if bull_w > bear_w * 1.3 and bull_w > 0:
+                    _push("Market Depth (ATM)", 'bull', f"bidCE+askPE > bidPE+askCE ({bull_w:.0f}>{bear_w:.0f})")
+                elif bear_w > bull_w * 1.3 and bear_w > 0:
+                    _push("Market Depth (ATM)", 'bear', f"bidPE+askCE > bidCE+askPE ({bear_w:.0f}>{bull_w:.0f})")
+    except Exception:
+        pass
+
+    # ── 16. COMPOSITE BIAS Engine (overall)
+    try:
+        _cb = st.session_state.get('_composite_bias') or {}
+        sc = _cb.get('score', 0) or 0
+        if sc >= 2:
+            _push("COMPOSITE BIAS Engine", 'bull', f"score {sc:+.1f} · {_cb.get('label','')}", weight=2)
+        elif sc <= -2:
+            _push("COMPOSITE BIAS Engine", 'bear', f"score {sc:+.1f} · {_cb.get('label','')}", weight=2)
+        else:
+            _push("COMPOSITE BIAS Engine", 'neutral', f"score {sc:+.1f}")
+    except Exception:
+        pass
+
+    # Stash categorized rows so the AI advisor snapshot can read them.
+    try:
+        st.session_state['_all_bias_rows'] = rows
+    except Exception:
+        pass
+
+    # ── Header
+    st.markdown("## 📊 All Bias — Split by Speed: 🚀 Fast / 🐢 Lagging / 🌫️ Misguiding")
+    if not rows:
+        st.info("Bias engines not yet computed (cycle warming up).")
+        return
+
+    # Trigger OVERALL BIAS ENTRY alert from the FAST verdict (most actionable).
+    fast_bull, fast_bear = cat_scores['fast']
+    fast_net = fast_bull - fast_bear
+    if fast_net >= 3:
+        _fast_label = 'STRONG BULL'
+        _fast_em = '🟢🚀'
+    elif fast_net >= 1:
+        _fast_label = 'Bull'
+        _fast_em = '🟢'
+    elif fast_net <= -3:
+        _fast_label = 'STRONG BEAR'
+        _fast_em = '🔴🚀'
+    elif fast_net <= -1:
+        _fast_label = 'Bear'
+        _fast_em = '🔴'
+    else:
+        _fast_label = 'MIXED / NEUTRAL'
+        _fast_em = '⚪'
+    try:
+        send_overall_bias_entry_alert(_fast_label, _fast_em, fast_bull, fast_bear,
+                                       spot_price, option_data)
+    except Exception:
+        pass
+
+    def _verdict(net):
+        if net >= 4:
+            return '🟢🚀', 'STRONG BULL'
+        if net >= 2:
+            return '🟢', 'Bull'
+        if net <= -4:
+            return '🔴🚀', 'STRONG BEAR'
+        if net <= -2:
+            return '🔴', 'Bear'
+        return '⚪', 'MIXED / NEUTRAL'
+
+    def _category_card(cat_key, title, blurb):
+        bull_s, bear_s = cat_scores[cat_key]
+        n = bull_s - bear_s
+        em, label = _verdict(n)
+        bg = '#0a3d2a' if n > 0 else ('#3d0a1f' if n < 0 else '#222a3a')
+        border = '#00ff88' if n > 0 else ('#ff4444' if n < 0 else '#888')
+        st.markdown(
+            f"<div style='background:{bg}; border:2px solid {border}; padding:10px 16px; "
+            f"border-radius:10px; margin-bottom:6px;'>"
+            f"<div style='font-size:18px; font-weight:700; color:#fff;'>"
+            f"{title} · {em} <span style='color:{border};'>{label}</span></div>"
+            f"<div style='color:#ccc; font-size:12px; margin-top:2px;'>"
+            f"Bull: <b style='color:#00ff88;'>{bull_s}</b> · "
+            f"Bear: <b style='color:#ff4444;'>{bear_s}</b> · "
+            f"Net: <b>{n:+d}</b> · {blurb}</div></div>",
+            unsafe_allow_html=True,
+        )
+        # Table of engines in this category
+        seen = set()
+        tr = []
+        for r in rows:
+            if r.get('_cat') != cat_key or r['Engine'] in seen:
+                continue
+            seen.add(r['Engine'])
+            tr.append({'Engine': r['Engine'], 'Bias': r['Bias'], 'Detail': r['Detail']})
+        if tr:
+            st.dataframe(pd.DataFrame(tr), use_container_width=True, hide_index=True)
+        else:
+            st.caption("(no engines in this category reporting yet)")
+
+    # Stash the three speed-verdicts so the consolidated entry alert can show them.
+    try:
+        _dv = {}
+        for _ck in ('fast', 'lag', 'mis'):
+            _bs, _br = cat_scores[_ck]
+            _n = _bs - _br
+            _e, _l = _verdict(_n)
+            _dv[_ck] = {'em': _e, 'label': _l, 'net': _n, 'bull': _bs, 'bear': _br}
+        st.session_state['_dashboard_verdicts'] = _dv
+    except Exception:
+        pass
+
+    # Render in order: FAST first (most actionable) → LAGGING → MISGUIDING
+    _category_card('fast', "🚀 FAST BIAS",
+                    "Event-driven · live · low-lag — what's happening RIGHT NOW.")
+    _category_card('lag', "🐢 LAGGING BIAS",
+                    "Smoothed composites · slow timeframes — confirms the trend, not the turn.")
+    _category_card('mis', "🌫️ MISGUIDING BIAS",
+                    "Flips on single bars / accumulated noise — context only, not for entry timing.")
+
+    st.caption(
+        "🚀 FAST is the one to act on. 🐢 LAGGING confirms regime but enters late. "
+        "🌫️ MISGUIDING is informational — don't trade off these alone. "
+        "OVERALL BIAS ENTRY alert is now triggered by the FAST verdict only "
+        "(strong at net ≥ ±3, mild at ≥ ±1)."
+    )
+
+
 def render_composite_bias_panel(bias):
     """Big colored card at top of page showing the composite bias verdict."""
     if not bias:
@@ -11251,6 +13356,979 @@ def render_composite_bias_panel(bias):
             color = '#ff4444' if sign > 0 else '#00ff88'
             st.markdown(f"<span style='color:{color};'>• {lbl}</span>",
                         unsafe_allow_html=True)
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# AI Trade Advisor — Claude reads ALL signals and recommends an entry.
+# Two surfaces: (1) auto verdict panel, (2) ask-the-market chatbox.
+# Dormant unless ANTHROPIC_API_KEY is set.
+# ─────────────────────────────────────────────────────────────────────────
+AI_ADVISOR_MODEL = "claude-opus-4-8"        # used only if ANTHROPIC_API_KEY is set
+# FREE tier. Tried in order — first that responds wins (model names change
+# across google-genai versions, so we fall through instead of hard-failing).
+AI_ADVISOR_GEMINI_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+    "gemini-flash-latest",
+    "gemini-1.5-flash",
+]
+
+
+def ai_advisor_diagnostics():
+    """Plain-English status of the AI backend so failures are visible, not silent.
+    Returns (ok: bool, lines: list[str])."""
+    lines = []
+    ok = False
+    # Gemini
+    if not _HAS_GEMINI:
+        lines.append("❌ google-genai SDK not installed (pip install google-genai).")
+    elif not GEMINI_API_KEY:
+        lines.append("⚠️ GEMINI_API_KEY not set in secrets/env.")
+    else:
+        masked = GEMINI_API_KEY[:6] + "…" + GEMINI_API_KEY[-4:] if len(GEMINI_API_KEY) > 12 else "set"
+        lines.append(f"✅ Gemini key present ({masked}) · SDK installed.")
+        ok = True
+    # Groq (free backup)
+    if GROQ_API_KEY:
+        gmask = GROQ_API_KEY[:5] + "…" + GROQ_API_KEY[-4:] if len(GROQ_API_KEY) > 12 else "set"
+        lines.append(f"✅ Groq key present ({gmask}) · free backup.")
+        ok = True
+    else:
+        lines.append("ℹ️ No Groq key (optional free backup — console.groq.com).")
+    # Claude (optional paid)
+    if ANTHROPIC_API_KEY:
+        lines.append("✅ Anthropic key present (paid Claude available).")
+        ok = True
+    else:
+        lines.append("ℹ️ No Anthropic key (optional paid fallback).")
+    return ok, lines
+
+
+def ai_test_connection():
+    """Fire one tiny call to confirm the AI actually responds. Tries every
+    available provider in order and returns the first success — or the EXACT
+    errors if all fail (no silent swallow)."""
+    providers = _ai_providers()
+    if not providers:
+        return False, "No AI key set (need GEMINI_API_KEY, GROQ_API_KEY, or ANTHROPIC_API_KEY)."
+    errs = []
+    for prov in providers:
+        try:
+            if prov == 'gemini':
+                client = _get_gemini_client(GEMINI_API_KEY)
+                if client is None:
+                    errs.append("gemini: client init failed"); continue
+                for model in AI_ADVISOR_GEMINI_MODELS:
+                    try:
+                        resp = client.models.generate_content(
+                            model=model, contents="Reply with the word OK.")
+                        txt = (getattr(resp, 'text', '') or '').strip()
+                        if txt:
+                            return True, f"✅ Gemini OK via '{model}': {txt[:40]}"
+                    except Exception as e:
+                        errs.append(f"gemini/{model}: {str(e)[:120]}")
+            elif prov == 'groq':
+                got = "".join(_groq_stream("You are a test.", "Reply with the word OK."))
+                if got.strip():
+                    return True, f"✅ Groq OK: {got.strip()[:40]}"
+                errs.append("groq: empty response")
+            else:
+                client = _anthropic_client()
+                if client is None:
+                    errs.append("claude: client init failed"); continue
+                m = client.messages.create(
+                    model=AI_ADVISOR_MODEL, max_tokens=16,
+                    messages=[{"role": "user", "content": "Reply with the word OK."}])
+                txt = next((b.text for b in m.content if getattr(b, 'type', '') == 'text'), '')
+                return True, f"✅ Claude OK: {txt[:40]}"
+        except Exception as e:
+            errs.append(f"{prov}: {str(e)[:120]}")
+            continue
+    return False, "All providers failed → " + " | ".join(errs)
+
+_AI_ADVISOR_SYSTEM = (
+    "You are an elite intraday NIFTY options trading desk analyst. You receive a "
+    "real-time SNAPSHOT of dozens of computed signals from a live trading terminal "
+    "(composite bias engine, divergence, ignition/accumulation, VOB build/break, "
+    "S/R behavior, money-flow profile, OI, global indices, per-leg option data). "
+    "Your job: synthesize ALL of it and give ONE clear, actionable intraday options "
+    "call.\n\n"
+    "Rules:\n"
+    "- NIFTY direction convention: a rising CALL (CE) = NIFTY bullish; a rising PUT "
+    "(PE) = NIFTY bearish. To trade bullish, BUY CE; to trade bearish, BUY PE.\n"
+    "- Only say ENTER NOW when fast (low-lag) signals agree AND price is at a "
+    "sensible S/R location (buy CE near support, buy PE near resistance). Otherwise "
+    "say WAIT and name the exact trigger you're waiting for.\n"
+    "- Weight FAST signals over LAGGING ones; treat MISGUIDING signals as noise.\n"
+    "- Be decisive and concise. No hedging filler, no disclaimers about being an AI.\n\n"
+    "ALWAYS give EXACT numbers — never vague ranges. Use the live LTP and spot "
+    "values from the snapshot as your anchor:\n"
+    "- ENTRY OPTION LTP: the exact option premium (₹) to buy at, e.g. '₹84.50'. "
+    "If entering now, use the current leg LTP from the snapshot; if waiting, give "
+    "the exact LTP level that triggers entry.\n"
+    "- ENTRY NIFTY SPOT: the exact NIFTY spot level (₹) at which to take the trade, "
+    "e.g. '₹24,180'. Tie this to the nearest support (for CE) or resistance (for PE).\n"
+    "- Also give exact TARGET and STOP-LOSS premiums (₹) for the option.\n\n"
+    "Respond in EXACTLY this format (keep it tight):\n"
+    "VERDICT: <ENTER NOW BUY CE | ENTER NOW BUY PE | WAIT | NO TRADE>\n"
+    "BIAS: <Bullish/Bearish/Neutral> · Conviction <High/Medium/Low>\n"
+    "WHY: <2-4 bullet points citing the specific signals that matter most>\n"
+    "ENTRY OPTION: <ATM±n strike + CE/PE> @ LTP ₹<exact premium>\n"
+    "ENTRY NIFTY SPOT: ₹<exact spot level> (<at support/resistance ₹X>)\n"
+    "TARGET: option ₹<exact premium>  ·  STOP-LOSS: option ₹<exact premium>\n"
+    "INVALIDATION: <the exact spot/LTP level that proves this wrong>\n"
+    "RISK: <1 line on the main risk right now>"
+)
+
+
+def _anthropic_client():
+    """Lazy Anthropic client. Returns None if no key or SDK missing."""
+    if not ANTHROPIC_API_KEY:
+        return None
+    cached = st.session_state.get('_anthropic_client')
+    if cached is not None:
+        return cached
+    try:
+        import anthropic
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        st.session_state['_anthropic_client'] = client
+        return client
+    except Exception as e:
+        st.session_state['_ai_advisor_error'] = f"anthropic SDK not available: {e}"
+        return None
+
+
+def build_ai_market_snapshot(bias, spot_price):
+    """Compact text snapshot of ALL live signals for the AI advisor.
+    Pulls the composite bias (already aggregates 35+ contributors with weighted
+    reasons) plus the categorized All-Bias dashboard, major S/R zones, and
+    per-leg ATM±3 option context from session state."""
+    lines = []
+    ts = datetime.now(pytz.timezone('Asia/Kolkata')).strftime('%Y-%m-%d %H:%M:%S IST')
+    lines.append(f"=== NIFTY INTRADAY SNAPSHOT @ {ts} ===")
+    lines.append(f"NIFTY Spot: ₹{spot_price:.1f}")
+
+    # Composite bias (the core aggregate)
+    if bias:
+        lines.append("")
+        lines.append("--- COMPOSITE BIAS ENGINE ---")
+        lines.append(f"Score {bias.get('score')} · {bias.get('direction')} · "
+                     f"{bias.get('label')} · Conviction {bias.get('confidence')} · "
+                     f"ENTER_NOW={bias.get('enter_now')}")
+        lines.append(f"Suggested action: {bias.get('action')}")
+        lines.append(f"ATM strike {bias.get('atm_strike')} · "
+                     f"CE LTP ₹{bias.get('ce_ltp')} ({bias.get('ce_bias')}/{bias.get('ce_pat')}) · "
+                     f"PE LTP ₹{bias.get('pe_ltp')} ({bias.get('pe_bias')}/{bias.get('pe_pat')})")
+        confs = bias.get('reasons') or []
+        if confs:
+            lines.append(f"Confirming signals ({len(confs)}):")
+            for s, w, l in confs[:18]:
+                lines.append(f"  + [{w:.1f}] {l}")
+        contras = bias.get('contradictions') or []
+        if contras:
+            lines.append(f"Contradicting signals ({len(contras)}):")
+            for s, w, l in contras[:10]:
+                lines.append(f"  - [{w:.1f}] {l}")
+
+    # All-Bias dashboard categories (fast / lag / mis) if computed
+    try:
+        cats = st.session_state.get('_all_bias_rows')
+        if cats:
+            for cat_key, cat_name in [('fast', '🚀 FAST'), ('lag', '🐢 LAGGING'), ('mis', '🌫️ MISGUIDING')]:
+                rows = [r for r in cats if r.get('_cat') == cat_key and r.get('_dir') in ('bull', 'bear')]
+                if rows:
+                    lines.append("")
+                    lines.append(f"--- {cat_name} SIGNALS ---")
+                    for r in rows[:14]:
+                        lines.append(f"  {r.get('Bias')} {r.get('Engine')}: {r.get('Detail')}")
+    except Exception:
+        pass
+
+    # Major S/R zones
+    try:
+        zones = st.session_state.get('_major_sr_zones') or {}
+        sup = [f"₹{float(z.get('price') or z.get('level') or 0):.0f}" for z in (zones.get('support') or [])[:4]]
+        res = [f"₹{float(z.get('price') or z.get('level') or 0):.0f}" for z in (zones.get('resistance') or [])[:4]]
+        if sup or res:
+            lines.append("")
+            lines.append("--- MAJOR S/R ZONES (OI+VPFR+Gamma+MoneyFlow) ---")
+            lines.append(f"Support: {', '.join(sup) or '—'}")
+            lines.append(f"Resistance: {', '.join(res) or '—'}")
+    except Exception:
+        pass
+
+    # Per-leg ATM±3 money-flow bias
+    try:
+        sd = st.session_state.get('_atm_pm1_vpfr') or {}
+        legs = sd.get('legs') or []
+        if legs:
+            lines.append("")
+            lines.append("--- ATM±3 PER-LEG MFP BIAS ---")
+            for leg in legs[:14]:
+                lines.append(f"  {leg.get('tag')}: LTP ₹{leg.get('ltp')} · MFP {leg.get('mfp_bias')}")
+    except Exception:
+        pass
+
+    return "\n".join(lines)
+
+
+def _ai_providers():
+    """Ordered list of available AI backends. All FREE first (Gemini, then
+    Groq), paid Claude last. The advisor tries them in order and falls
+    through automatically if one is missing or fails."""
+    out = []
+    if GEMINI_API_KEY and _HAS_GEMINI:
+        out.append('gemini')
+    if GROQ_API_KEY:
+        out.append('groq')
+    if ANTHROPIC_API_KEY:
+        out.append('claude')
+    return out
+
+
+def _ai_user_content(snapshot_text, user_question=None):
+    if user_question:
+        return (
+            f"{snapshot_text}\n\n=== TRADER QUESTION ===\n{user_question}\n\n"
+            "Answer using the snapshot above. If the question is a yes/no trade "
+            "decision, still give the VERDICT-format answer."
+        )
+    return (
+        f"{snapshot_text}\n\n=== TASK ===\n"
+        "Give your single best intraday options call right now using the format."
+    )
+
+
+def _gemini_stream(prompt):
+    """Yield Gemini text across the model fallback list. Raises if all fail."""
+    client = _get_gemini_client(GEMINI_API_KEY)
+    if client is None:
+        raise RuntimeError("Gemini client init failed (SDK or key).")
+    last_err = None
+    for model in AI_ADVISOR_GEMINI_MODELS:
+        got = False
+        try:
+            stream = client.models.generate_content_stream(model=model, contents=prompt)
+            for chunk in stream:
+                t = getattr(chunk, 'text', None)
+                if t:
+                    got = True
+                    yield t
+            if got:
+                return
+            resp = client.models.generate_content(model=model, contents=prompt)
+            t = getattr(resp, 'text', '') or ''
+            if t:
+                yield t
+                return
+            last_err = f"{model}: empty response"
+        except Exception as e:
+            last_err = f"{model}: {str(e)[:160]}"
+            continue
+    raise RuntimeError(f"all Gemini models failed ({last_err})")
+
+
+# Groq FREE models, tried in order (OpenAI-compatible chat API).
+AI_ADVISOR_GROQ_MODELS = [
+    "llama-3.3-70b-versatile",
+    "llama-3.1-8b-instant",
+]
+_GROQ_URL = "https://api.groq.com/openai/v1/chat/completions"
+
+
+def _groq_stream(system, user_content):
+    """Yield Groq text (SSE). Raises if all models fail."""
+    import json as _json
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}",
+               "Content-Type": "application/json"}
+    messages = [{"role": "system", "content": system},
+                {"role": "user", "content": user_content}]
+    last_err = None
+    for model in AI_ADVISOR_GROQ_MODELS:
+        try:
+            with requests.post(_GROQ_URL, headers=headers, json={
+                "model": model, "messages": messages,
+                "max_tokens": 2048, "stream": True,
+            }, stream=True, timeout=60) as r:
+                if r.status_code != 200:
+                    last_err = f"{model}: HTTP {r.status_code} {r.text[:120]}"
+                    continue
+                got = False
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    s = line.decode("utf-8", "ignore").strip()
+                    if not s.startswith("data:"):
+                        continue
+                    payload = s[5:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        delta = _json.loads(payload)["choices"][0]["delta"].get("content")
+                    except Exception:
+                        delta = None
+                    if delta:
+                        got = True
+                        yield delta
+                if got:
+                    return
+                last_err = f"{model}: empty response"
+        except Exception as e:
+            last_err = f"{model}: {str(e)[:160]}"
+            continue
+    raise RuntimeError(f"all Groq models failed ({last_err})")
+
+
+def _claude_stream(system, user_content):
+    """Yield Claude text. Raises on failure."""
+    client = _anthropic_client()
+    if client is None:
+        raise RuntimeError("Claude client init failed (SDK or key).")
+    with client.messages.stream(
+        model=AI_ADVISOR_MODEL, max_tokens=2048,
+        thinking={"type": "adaptive"}, system=system,
+        messages=[{"role": "user", "content": user_content}],
+    ) as stream:
+        for text in stream.text_stream:
+            yield text
+
+
+def ai_advisor_stream(snapshot_text, user_question=None):
+    """Generator yielding the advisor's streamed text. Use with st.write_stream.
+    Tries each available provider in order (Gemini → Groq → Claude) and falls
+    through automatically if one fails — so a dead key/quota never blanks out."""
+    providers = _ai_providers()
+    if not providers:
+        yield ("⚠️ AI Advisor is dormant — set a FREE GEMINI_API_KEY "
+               "(or GROQ_API_KEY, or ANTHROPIC_API_KEY).")
+        return
+    user_content = _ai_user_content(snapshot_text, user_question)
+    prompt = f"{_AI_ADVISOR_SYSTEM}\n\n{user_content}"  # for Gemini (no system role)
+    errors = []
+    for prov in providers:
+        try:
+            if prov == 'gemini':
+                gen = _gemini_stream(prompt)
+            elif prov == 'groq':
+                gen = _groq_stream(_AI_ADVISOR_SYSTEM, user_content)
+            else:
+                gen = _claude_stream(_AI_ADVISOR_SYSTEM, user_content)
+            produced = False
+            for piece in gen:
+                produced = True
+                yield piece
+            if produced:
+                return
+            errors.append(f"{prov}: no output")
+        except Exception as e:
+            errors.append(f"{prov}: {str(e)[:140]}")
+            continue
+    yield ("\n\n⚠️ All AI providers failed:\n- " + "\n- ".join(errors) +
+           "\nUse 🔧 Test AI connection for details.")
+
+
+def render_ai_advisor(bias, spot_price):
+    """AI Trade Advisor UI: auto verdict panel + ask-the-market chatbox."""
+    st.markdown("### 🤖 AI Trade Advisor")
+    providers = _ai_providers()
+    if not providers:
+        st.info(
+            "AI Advisor is **dormant** — no AI key set. "
+            "Add a **FREE** `GEMINI_API_KEY` to your Streamlit secrets to enable "
+            "AI entry calls. Get one free at "
+            "[aistudio.google.com/apikey](https://aistudio.google.com/apikey) "
+            "(no card needed). _Free backup: `GROQ_API_KEY` from console.groq.com. "
+            "Optional paid: `ANTHROPIC_API_KEY`._"
+        )
+        return
+    _names = {'gemini': '🆓 Google Gemini', 'groq': '🆓 Groq', 'claude': 'Anthropic Claude'}
+    _chain = " → ".join(_names.get(p, p) for p in providers)
+    st.caption(f"Powered by {_chain} (auto-fallback)")
+
+    # Self-diagnostics so failures are visible, not silent.
+    with st.expander("🔧 AI status / test connection", expanded=False):
+        _ok, _diag = ai_advisor_diagnostics()
+        for _l in _diag:
+            st.write(_l)
+        if st.button("🔧 Test AI connection", key="ai_test_btn"):
+            with st.spinner("Pinging the AI…"):
+                _tok, _tmsg = ai_test_connection()
+            (st.success if _tok else st.error)(_tmsg)
+
+    snapshot = build_ai_market_snapshot(bias, spot_price)
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        go_verdict = st.button("🧠 Get AI Entry Verdict", use_container_width=True,
+                               key="ai_verdict_btn")
+    with c2:
+        send_tg = st.checkbox("Also send verdict to Telegram/Discord",
+                              key="ai_verdict_send", value=False)
+
+    if go_verdict:
+        with st.chat_message("assistant"):
+            verdict = st.write_stream(ai_advisor_stream(snapshot))
+        st.session_state['_ai_last_verdict'] = verdict
+        if send_tg and verdict:
+            try:
+                send_telegram_message_sync(
+                    f"🤖 <b>AI ENTRY VERDICT</b>\n{verdict}", force=True)
+            except Exception:
+                pass
+
+    with st.expander("📸 Snapshot the AI is reading", expanded=False):
+        st.code(snapshot, language="text")
+
+    # Ask-the-market chatbox
+    st.markdown("**💬 Ask the market** (e.g. \"should I buy ATM CE now?\")")
+    q = st.chat_input("Ask Claude about the current market…", key="ai_chat_input")
+    history = st.session_state.setdefault('_ai_chat_history', [])
+    for role, msg in history[-6:]:
+        with st.chat_message(role):
+            st.markdown(msg)
+    if q:
+        with st.chat_message("user"):
+            st.markdown(q)
+        history.append(("user", q))
+        with st.chat_message("assistant"):
+            answer = st.write_stream(ai_advisor_stream(snapshot, user_question=q))
+        history.append(("assistant", answer))
+
+
+def build_leg_bias_table(spot_price):
+    """One consolidated table of per-leg signal biases for all 14 ATM±3 CE/PE
+    legs, each leg's net verdict, and an overall NIFTY verdict.
+
+    Each signal is expressed in the LEG's own direction. The per-leg verdict
+    is the net vote. The NIFTY implication flips for PE legs (a rising PE =
+    NIFTY falling). Overall verdict aggregates the per-leg NIFTY directions.
+
+    Returns (rows: list[dict], overall: dict)."""
+    leg_dfs = st.session_state.get('_atm_leg_dfs') or {}
+    vpfr_legs = (st.session_state.get('_atm_pm1_vpfr') or {}).get('legs') or []
+    mfp_by_tag = {l.get('tag'): l.get('mfp_bias') for l in vpfr_legs}
+
+    def _em(d):
+        return '🟢' if d == 'bull' else ('🔴' if d == 'bear' else '⚪')
+
+    _order = {'ATM-3': 0, 'ATM-2': 1, 'ATM-1': 2, 'ATM': 3,
+              'ATM+1': 4, 'ATM+2': 5, 'ATM+3': 6}
+
+    def _sortkey(tag):
+        side = 0 if ' CE ' in f' {tag} ' else 1
+        atm = next((k for k in _order if tag.startswith(k + ' ')), 'ATM')
+        return (side, _order.get(atm, 3))
+
+    rows, nifty_bull, nifty_bear = [], 0, 0
+    # Per-speed NIFTY leg tallies [bull, bear]: Fast / Lagging / Misguiding.
+    _SPEED_GROUPS = {
+        'fast': ['VOB', 'S/R', 'Div', 'Ign'],
+        'lag': ['VIDYA', 'VWAP'],
+        'mis': ['MFP'],
+    }
+    _cat_tally = {'fast': [0, 0], 'lag': [0, 0], 'mis': [0, 0]}
+    for tag in sorted(leg_dfs.keys(), key=_sortkey):
+        df_l = leg_dfs.get(tag)
+        if df_l is None or getattr(df_l, 'empty', True) or len(df_l) < 10:
+            continue
+        is_ce = ' CE ' in f' {tag} '
+        ltp = float(df_l['close'].iloc[-1])
+        v = {}
+        # Compute VOB zones once (reused by VOB + S/R columns)
+        try:
+            zones = analyze_vob_volume(df_l, ltp) or []
+        except Exception:
+            zones = []
+        # 1) VOB — event (BUILDING/BREAKING) first, else continuous buy/sell flow
+        try:
+            vb = 0
+            for z in zones:
+                s_, zt = z.get('status'), z.get('zone_type')
+                if s_ == 'BUILDING':
+                    vb += 1 if zt == 'bullish' else -1
+                elif s_ == 'BREAKING':
+                    vb += -1 if zt == 'bullish' else 1
+            if vb > 0:
+                v['VOB'] = 'bull'
+            elif vb < 0:
+                v['VOB'] = 'bear'
+            else:
+                # Continuous: net buyer/seller flow across the leg's VOB zones
+                _buy = sum(float(z.get('buy_vol', 0) or 0) for z in zones)
+                _sell = sum(float(z.get('sell_vol', 0) or 0) for z in zones)
+                _tot = _buy + _sell
+                if _tot > 0 and _buy >= _sell * 1.15:
+                    v['VOB'] = 'bull'
+                elif _tot > 0 and _sell >= _buy * 1.15:
+                    v['VOB'] = 'bear'
+                else:
+                    v['VOB'] = 'neu'
+        except Exception:
+            v['VOB'] = 'neu'
+        # 2) S/R behavior — event first, else position vs nearest support/resistance
+        try:
+            sr = classify_leg_sr_behavior(df_l, ltp)
+            if sr and sr.get('direction') in ('bull', 'bear') and sr.get('state') not in (None, 'NONE'):
+                v['S/R'] = sr['direction']
+            else:
+                # Positional fallback from VOB zones: closer to support → bull,
+                # closer to resistance → bear.
+                _sups = [float(z.get('mid', 0)) for z in zones
+                         if z.get('zone_type') == 'bullish' and float(z.get('mid', 0)) <= ltp]
+                _ress = [float(z.get('mid', 0)) for z in zones
+                         if z.get('zone_type') == 'bearish' and float(z.get('mid', 0)) >= ltp]
+                _ns = max(_sups) if _sups else None
+                _nr = min(_ress) if _ress else None
+                if _ns is not None and _nr is not None:
+                    v['S/R'] = 'bull' if (ltp - _ns) <= (_nr - ltp) else 'bear'
+                elif _ns is not None:
+                    v['S/R'] = 'bull'
+                elif _nr is not None:
+                    v['S/R'] = 'bear'
+                else:
+                    v['S/R'] = 'neu'
+        except Exception:
+            v['S/R'] = 'neu'
+        # 3) Divergence
+        try:
+            dv = detect_divergence(df_l)
+            v['Div'] = 'bull' if dv.get('bull') else ('bear' if dv.get('bear') else 'neu')
+        except Exception:
+            v['Div'] = 'neu'
+        # 4) Ignition
+        try:
+            ig = detect_ignition(df_l)
+            v['Ign'] = ig.get('direction') if ig.get('fired') and ig.get('direction') in ('bull', 'bear') else 'neu'
+        except Exception:
+            v['Ign'] = 'neu'
+        # 5) VWAP
+        try:
+            vw = ReversalDetector.calculate_vwap(df_l)
+            v['VWAP'] = ('bull' if ltp > float(vw.iloc[-1]) else 'bear') if (vw is not None and not vw.empty) else 'neu'
+        except Exception:
+            v['VWAP'] = 'neu'
+        # 6) VIDYA
+        try:
+            t = calculate_vidya(df_l).get('trend')
+            v['VIDYA'] = 'bull' if t == 'Bullish' else ('bear' if t == 'Bearish' else 'neu')
+        except Exception:
+            v['VIDYA'] = 'neu'
+        # 7) MFP POC bias
+        mb = mfp_by_tag.get(tag)
+        v['MFP'] = 'bull' if mb == 'BULL' else ('bear' if mb == 'BEAR' else 'neu')
+
+        score = sum(1 if x == 'bull' else (-1 if x == 'bear' else 0) for x in v.values())
+        leg_dir = 'bull' if score > 0 else ('bear' if score < 0 else 'neu')
+        if leg_dir == 'neu':
+            nifty = 'neu'
+        elif is_ce:
+            nifty = leg_dir
+        else:
+            nifty = 'bear' if leg_dir == 'bull' else 'bull'
+        if nifty == 'bull':
+            nifty_bull += 1
+        elif nifty == 'bear':
+            nifty_bear += 1
+
+        # Per-speed leg tallies (NIFTY direction; PE reversed)
+        for _ck, _sigs in _SPEED_GROUPS.items():
+            _csc = sum(1 if v.get(s) == 'bull' else (-1 if v.get(s) == 'bear' else 0) for s in _sigs)
+            _cdir = 'bull' if _csc > 0 else ('bear' if _csc < 0 else 'neu')
+            if _cdir == 'neu':
+                continue
+            _cn = _cdir if is_ce else ('bear' if _cdir == 'bull' else 'bull')
+            if _cn == 'bull':
+                _cat_tally[_ck][0] += 1
+            else:
+                _cat_tally[_ck][1] += 1
+
+        rows.append({
+            'Leg': tag, 'LTP': f"₹{ltp:.1f}",
+            'VOB': _em(v['VOB']), 'S/R': _em(v['S/R']),
+            'Div': _em(v['Div']), 'Ign': _em(v['Ign']),
+            'VWAP': _em(v['VWAP']), 'VIDYA': _em(v['VIDYA']), 'MFP': _em(v['MFP']),
+            'Leg Verdict': f"{_em(leg_dir)} {leg_dir.upper()} ({score:+d})",
+            '→ NIFTY': f"{_em(nifty)} {nifty.upper()}",
+        })
+
+    def _mk_verdict(b, br):
+        n = b - br
+        if n >= 3:
+            d = {'dir': 'BULL', 'em': '🟢', 'label': 'STRONG BULLISH'}
+        elif n >= 1:
+            d = {'dir': 'BULL', 'em': '🟢', 'label': 'BULLISH'}
+        elif n <= -3:
+            d = {'dir': 'BEAR', 'em': '🔴', 'label': 'STRONG BEARISH'}
+        elif n <= -1:
+            d = {'dir': 'BEAR', 'em': '🔴', 'label': 'BEARISH'}
+        else:
+            d = {'dir': 'NEUTRAL', 'em': '⚪', 'label': 'NEUTRAL / MIXED'}
+        d.update({'bull': b, 'bear': br, 'net': n})
+        return d
+
+    overall = _mk_verdict(nifty_bull, nifty_bear)
+    # Split verdicts by signal speed.
+    overall['by_speed'] = {
+        'fast': _mk_verdict(*_cat_tally['fast']),
+        'lag': _mk_verdict(*_cat_tally['lag']),
+        'mis': _mk_verdict(*_cat_tally['mis']),
+    }
+    return rows, overall
+
+
+def render_leg_bias_table(spot_price):
+    """Render the consolidated ATM±3 CE/PE leg-bias table + overall NIFTY verdict."""
+    try:
+        # Reuse the computation the All-Bias dashboard already did this cycle.
+        _cache = st.session_state.get('_leg_bias_cache')
+        if _cache and _cache[0]:
+            rows, overall = _cache
+        else:
+            rows, overall = build_leg_bias_table(spot_price)
+    except Exception as e:
+        st.caption(f"Leg bias table unavailable: {e}")
+        return
+    if not rows:
+        st.caption("Leg bias table: warming up (need a few cycles of per-leg data).")
+        return
+    st.markdown("### 🧮 ATM±3 Leg Bias Table — per-leg verdict → overall NIFTY")
+    st.caption("Main: VOB build/break · S/R behavior · Divergence · Ignition "
+               "(+ VWAP · VIDYA · MFP). Each cell = that signal's read in the "
+               "LEG's own direction. Leg Verdict = net vote. → NIFTY flips for "
+               "PE (rising PE = NIFTY down).")
+    # Split CALL vs PUT into side-by-side tables for easy comparison.
+    _ce_rows = [r for r in rows if ' CE ' in f" {r['Leg']} "]
+    _pe_rows = [r for r in rows if ' PE ' in f" {r['Leg']} "]
+    _c1, _c2 = st.columns(2)
+    with _c1:
+        st.markdown("#### 🟢 CALL (CE) legs")
+        if _ce_rows:
+            st.dataframe(pd.DataFrame(_ce_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No CE legs yet.")
+    with _c2:
+        st.markdown("#### 🔴 PUT (PE) legs")
+        if _pe_rows:
+            st.dataframe(pd.DataFrame(_pe_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No PE legs yet.")
+    # Split verdict by signal speed: 🚀 Fast / 🐢 Lagging / 🌫️ Misguiding
+    _by = overall.get('by_speed') or {}
+    def _vcard(title, v):
+        if not v:
+            return ""
+        _b = '#00ff88' if v['dir'] == 'BULL' else ('#ff4444' if v['dir'] == 'BEAR' else '#888')
+        _g = '#0a3d2a' if v['dir'] == 'BULL' else ('#3d0a1f' if v['dir'] == 'BEAR' else '#222a3a')
+        return (f"<div style='background:{_g}; border:1px solid {_b}; padding:8px 12px; "
+                f"border-radius:8px;'><b>{title}</b><br>{v['em']} <b>{v['label']}</b><br>"
+                f"<span style='color:#bbb; font-size:12px;'>{v['bull']}↑ / {v['bear']}↓ "
+                f"(net {v['net']:+d})</span></div>")
+    _s1, _s2, _s3 = st.columns(3)
+    with _s1:
+        st.markdown(_vcard("🚀 FAST (VOB·S/R·Div·Ign)", _by.get('fast')), unsafe_allow_html=True)
+    with _s2:
+        st.markdown(_vcard("🐢 LAGGING (VIDYA·VWAP)", _by.get('lag')), unsafe_allow_html=True)
+    with _s3:
+        st.markdown(_vcard("🌫️ MISGUIDING (MFP)", _by.get('mis')), unsafe_allow_html=True)
+
+    bg = '#0a3d2a' if overall['dir'] == 'BULL' else ('#3d0a1f' if overall['dir'] == 'BEAR' else '#222a3a')
+    bd = '#00ff88' if overall['dir'] == 'BULL' else ('#ff4444' if overall['dir'] == 'BEAR' else '#888')
+    st.markdown(
+        f"<div style='background:{bg}; border:2px solid {bd}; padding:12px 16px; "
+        f"border-radius:8px; font-size:18px; margin-top:6px;'>"
+        f"{overall['em']} <b>OVERALL NIFTY VERDICT: {overall['label']}</b> "
+        f"&nbsp;·&nbsp; {overall['bull']}↑ / {overall['bear']}↓ legs "
+        f"(net {overall['net']:+d}) &nbsp;·&nbsp; "
+        f"<span style='font-size:13px; color:#bbb;'>(all 7 signals; act on 🚀 FAST)</span></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def compute_greek_absorption(option_data, spot_price):
+    """Greek Absorption / Capping detector.
+
+    Compares the option premium move EXPECTED from the Greeks against the
+    ACTUAL move, cycle-over-cycle:
+
+        expected = ΔSpot·Delta + 0.5·Gamma·ΔSpot² + Vega·ΔIV
+        absorption = expected − actual
+
+    A large positive absorption on a leg that *should* have risen (spot moved
+    in its favour), confirmed by rising OI, means someone is absorbing/writing:
+      • CE absorbed (calls capped)  → resistance → NIFTY bearish
+      • PE absorbed (puts written)  → support    → NIFTY bullish
+
+    Uses the per-strike Greeks/IV/LTP/OI already in df_summary. Needs a prior
+    snapshot (stored in session_state) — returns {} on the first cycle.
+
+    Returns {rows: [...], ce_capping: int, pe_writing: int, nifty: 'bull'|'bear'|'neutral'}.
+    """
+    out = {'rows': [], 'ce_capping': 0, 'pe_writing': 0, 'nifty': 'neutral'}
+    try:
+        ds = (option_data or {}).get('df_summary') if option_data else None
+        if ds is None or getattr(ds, 'empty', True) or 'Strike' not in ds.columns:
+            return out
+        # ATM ± 3 strikes around spot
+        strikes = sorted(ds['Strike'].dropna().unique().tolist())
+        if len(strikes) < 3:
+            return out
+        atm = min(strikes, key=lambda x: abs(x - spot_price))
+        gap = min((abs(b - a) for a, b in zip(strikes, strikes[1:])), default=50) or 50
+        want = {atm + k * gap for k in range(-3, 4)}
+
+        prev = st.session_state.get('_greek_absorb_prev') or {}
+        prev_spot = prev.get('spot')
+        prev_legs = prev.get('legs', {})
+        cur_legs = {}
+        rows = []
+        bull_v = bear_v = 0
+        dspot = (spot_price - prev_spot) if prev_spot else 0.0
+
+        for _, r in ds.iterrows():
+            K = float(r['Strike'])
+            if K not in want:
+                continue
+            for side in ('CE', 'PE'):
+                ltp = float(r.get(f'lastPrice_{side}', 0) or 0)
+                iv = float(r.get(f'impliedVolatility_{side}', 0) or 0)
+                dlt = float(r.get(f'Delta_{side}', 0) or 0)
+                gma = float(r.get(f'Gamma_{side}', 0) or 0)
+                vga = float(r.get(f'Vega_{side}', 0) or 0)
+                oichg = float(r.get(f'changeinOpenInterest_{side}', 0) or 0)
+                vol = float(r.get(f'totalTradedVolume_{side}', 0) or 0)
+                lk = f"{int(K)}{side}"
+                cur_legs[lk] = {'ltp': ltp, 'iv': iv}
+                p = prev_legs.get(lk)
+                if not p or prev_spot is None:
+                    continue
+                d_ltp = ltp - p['ltp']
+                d_iv = iv - p['iv']
+                expected = dspot * dlt + 0.5 * gma * (dspot ** 2) + vga * d_iv
+                absorption = expected - d_ltp
+                # Only meaningful when the move was non-trivial
+                _thr = max(1.5, 0.4 * abs(expected))
+                verdict = '⚪ Normal'
+                ndir = 'neutral'
+                if abs(expected) >= 1.0 and absorption > _thr and oichg > 0:
+                    if side == 'CE' and expected > 0:
+                        verdict = '🔴 CALL CAPPING (absorbed)'
+                        ndir = 'bear'; bear_v += 1; out['ce_capping'] += 1
+                    elif side == 'PE' and expected > 0:
+                        verdict = '🟢 PUT WRITING (absorbed)'
+                        ndir = 'bull'; bull_v += 1; out['pe_writing'] += 1
+                elif abs(expected) >= 1.0 and absorption < -_thr:
+                    # Premium rose MORE than Greeks imply → genuine demand
+                    if side == 'CE':
+                        verdict = '🟢 CALL DEMAND'
+                        ndir = 'bull'; bull_v += 1
+                    else:
+                        verdict = '🔴 PUT DEMAND'
+                        ndir = 'bear'; bear_v += 1
+                if verdict != '⚪ Normal':
+                    rows.append({
+                        'Strike': f"{int(K)} {side}", 'LTP': f"₹{ltp:.2f}",
+                        'Exp Δ': f"{expected:+.1f}", 'Act Δ': f"{d_ltp:+.1f}",
+                        'Absorb': f"{absorption:+.1f}",
+                        'ΔOI': f"{oichg/1000:+.0f}K", 'Verdict': verdict,
+                    })
+
+        # Save snapshot for next cycle
+        st.session_state['_greek_absorb_prev'] = {'spot': spot_price, 'legs': cur_legs}
+        out['rows'] = rows
+        net = bull_v - bear_v
+        out['nifty'] = 'bull' if net > 0 else ('bear' if net < 0 else 'neutral')
+        out['net'] = net
+        return out
+    except Exception:
+        return out
+
+
+def render_greek_absorption(option_data, spot_price):
+    """Show the Greek absorption / capping table (who is stopping the LTP)."""
+    res = compute_greek_absorption(option_data, spot_price)
+    st.session_state['_greek_absorb_last'] = res
+    st.markdown("### 🧪 Greek Absorption — who is stopping the LTP")
+    st.caption("Expected premium move from Greeks (Δ·ΔSpot + ½·Γ·ΔSpot² + Vega·ΔIV) "
+               "vs actual, confirmed by ΔOI. Large positive 'Absorb' + rising OI = "
+               "writing/absorption. CALL CAPPING → NIFTY bear · PUT WRITING → NIFTY bull.")
+    rows = res.get('rows') or []
+    if not rows:
+        st.caption("No significant absorption this cycle (or warming up — needs 2 cycles).")
+        return
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    _nd = res.get('nifty', 'neutral')
+    _em = '🟢' if _nd == 'bull' else ('🔴' if _nd == 'bear' else '⚪')
+    st.caption(f"{_em} Net absorption read → NIFTY **{_nd.upper()}** "
+               f"(CALL CAPPING {res.get('ce_capping', 0)} · PUT WRITING {res.get('pe_writing', 0)})")
+
+
+def send_overall_bias_entry_alert(overall_label, overall_em, bull_score, bear_score, spot_price, option_data):
+    """Fires when Overall Bias (from All-Bias dashboard) is BULL/BEAR AND:
+      - For Bull setup → spot or any ATM±3 LTP is near a SUPPORT level
+      - For Bear setup → spot or any ATM±3 LTP is near a RESISTANCE level
+
+    Spot S/R from _major_sr_zones (OI+VPFR+Gamma+MF cluster, 25pt prox).
+    LTP S/R from each leg's own VOB zones (bullish=support, bearish=resistance).
+    5-min cooldown per direction. Allow-listed via 'OVERALL BIAS ENTRY' marker."""
+    label_l = (overall_label or '').lower()
+    is_bull = ('bull' in label_l and 'mixed' not in label_l)
+    is_bear = ('bear' in label_l and 'mixed' not in label_l)
+    if not (is_bull or is_bear):
+        return None
+
+    # Check spot proximity to major S/R zones (25pt)
+    spot_at_sup = False
+    spot_at_res = False
+    sup_lvl = res_lvl = None
+    try:
+        _zones = st.session_state.get('_major_sr_zones') or {}
+        for z in (_zones.get('support') or [])[:5]:
+            lvl = float(z.get('price') or z.get('level') or 0)
+            if lvl and abs(spot_price - lvl) <= 25:
+                spot_at_sup = True; sup_lvl = lvl; break
+        for z in (_zones.get('resistance') or [])[:5]:
+            lvl = float(z.get('price') or z.get('level') or 0)
+            if lvl and abs(spot_price - lvl) <= 25:
+                spot_at_res = True; res_lvl = lvl; break
+    except Exception:
+        pass
+
+    # Check LTP at its own VOB support across ATM±3 legs.
+    # Logic: we want the OPTION WE'RE BUYING to have room to RISE.
+    # That means LTP at a BULLISH VOB (support) on that option's own chart.
+    #   - BUY CALL → only CE legs at bullish VOB (CE has support → CE about to rise)
+    #   - BUY PUT  → only PE legs at bullish VOB (PE has support → PE about to rise
+    #                — note: bullish VOB on the PE itself, NOT bearish.
+    #                 Bearish VOB on PE = PE at resistance = PE about to fall = wrong)
+    ce_at_own_sup = []  # CE legs at their own bullish VOB
+    pe_at_own_sup = []  # PE legs at their own bullish VOB
+    try:
+        legs_dfs = st.session_state.get('_atm_leg_dfs') or {}
+        for tag, df_l in legs_dfs.items():
+            if df_l is None or df_l.empty:
+                continue
+            ltp_l = float(df_l['close'].iloc[-1])
+            vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_l) or {}
+            tol = max(ltp_l * 0.005, 0.5)
+            at_bull_vob = False
+            mid_v = None
+            for b in (vob.get('bullish') or []):
+                if (b['lower'] - tol) <= ltp_l <= (b['upper'] + tol):
+                    at_bull_vob = True; mid_v = b['mid']; break
+            if not at_bull_vob:
+                continue
+            if ' CE ' in f' {tag} ':
+                ce_at_own_sup.append((tag, ltp_l, mid_v))
+            elif ' PE ' in f' {tag} ':
+                pe_at_own_sup.append((tag, ltp_l, mid_v))
+    except Exception:
+        pass
+
+    # ── Shared context blocks (one consolidated signal instead of many) ──
+    # 1) All-Bias by speed (Fast / Lagging / Misguiding)
+    _dv = st.session_state.get('_dashboard_verdicts') or {}
+    def _vl(k):
+        d = _dv.get(k)
+        return f"{d['em']} {d['label']} (net {d['net']:+d})" if d else "—"
+    _speed_block = (
+        "📊 <b>All-Bias by speed:</b>\n"
+        f"  🚀 Fast: {_vl('fast')}\n"
+        f"  🐢 Lagging: {_vl('lag')}\n"
+        f"  🌫️ Misguiding: {_vl('mis')}"
+    )
+
+    # 2) Capping / Writing (OI walls) from the option chain
+    _cap_block = ""
+    try:
+        ds = (option_data or {}).get('df_summary') if option_data else None
+        if ds is not None and not getattr(ds, 'empty', True) and {'Strike', 'CE_OI', 'PE_OI'} <= set(ds.columns):
+            _cr = ds.loc[ds['CE_OI'].idxmax()]
+            _pr = ds.loc[ds['PE_OI'].idxmax()]
+            _cap_block = (
+                "🧱 <b>OI walls:</b> "
+                f"CALL CAPPING ₹{_cr['Strike']:.0f} (CE OI {_cr['CE_OI']/100000:.1f}L · resistance) · "
+                f"PUT WRITING ₹{_pr['Strike']:.0f} (PE OI {_pr['PE_OI']/100000:.1f}L · support)"
+            )
+    except Exception:
+        _cap_block = ""
+
+    # 3) LTP S/R behavior across the legs
+    _sr_block = ""
+    try:
+        _srs = st.session_state.get('_atm_leg_sr_behavior') or {}
+        _sr_items = []
+        for _t, _vv in _srs.items():
+            if _t.startswith('sid_') or not _vv:
+                continue
+            _stt = _vv.get('state')
+            if _stt in (None, 'NONE'):
+                continue
+            _de = '🟢' if _vv.get('direction') == 'bull' else ('🔴' if _vv.get('direction') == 'bear' else '⚪')
+            _sr_items.append(f"{_t} {_de}{_stt}")
+        if _sr_items:
+            _sr_block = "📐 <b>LTP S/R behavior:</b> " + " · ".join(_sr_items[:8])
+    except Exception:
+        _sr_block = ""
+
+    # 4) Buy LTP for ALL current ATM±3 legs (CE for bull, PE for bear)
+    def _all_leg_ltps(side):
+        out = []
+        try:
+            for leg in ((st.session_state.get('_atm_pm1_vpfr') or {}).get('legs') or []):
+                tag = leg.get('tag', '')
+                if f" {side} " in f" {tag} ":
+                    out.append(f"  • {tag}: ₹{float(leg.get('ltp') or 0):.2f}")
+        except Exception:
+            pass
+        return out
+
+    msg = None
+    key = None
+    if is_bull and (spot_at_sup or ce_at_own_sup):
+        loc_lines = []
+        if spot_at_sup:
+            loc_lines.append(f"  📍 Spot ₹{spot_price:.1f} at major support ₹{sup_lvl:.0f}")
+        for tag, ltp_l, mid in ce_at_own_sup:
+            loc_lines.append(f"  📍 {tag}: LTP ₹{ltp_l:.2f} at CE bullish VOB (mid ₹{mid:.2f}) — CE about to rise")
+        _all_ce = _all_leg_ltps('CE')
+        msg = (
+            f"🟢🚀 <b>OVERALL BIAS ENTRY — BUY CALL NOW</b> — NIFTY likely to go UP ⬆️\n"
+            f"Overall Bias: <b>{overall_label}</b> ({overall_em}) · Bull {bull_score} vs Bear {bear_score}\n"
+            f"{_speed_block}\n"
+            + (_cap_block + "\n" if _cap_block else "")
+            + (_sr_block + "\n" if _sr_block else "")
+            + "🟢 <b>Entry (CE at its support VOB):</b>\n"
+            + "\n".join(loc_lines) + "\n"
+            + ("💰 <b>Buy LTP — all ATM±3 CALLs:</b>\n" + "\n".join(_all_ce) + "\n" if _all_ce else "")
+            + f"NIFTY Spot ₹{spot_price:.1f}"
+        )
+        key = f"overall_entry_bull_{int(sup_lvl or spot_price)}"
+    elif is_bear and (spot_at_res or pe_at_own_sup):
+        loc_lines = []
+        if spot_at_res:
+            loc_lines.append(f"  📍 Spot ₹{spot_price:.1f} at major resistance ₹{res_lvl:.0f}")
+        for tag, ltp_l, mid in pe_at_own_sup:
+            loc_lines.append(f"  📍 {tag}: LTP ₹{ltp_l:.2f} at PE bullish VOB (mid ₹{mid:.2f}) — PE about to rise")
+        _all_pe = _all_leg_ltps('PE')
+        msg = (
+            f"🔴🚀 <b>OVERALL BIAS ENTRY — BUY PUT NOW</b> — NIFTY likely to go DOWN ⬇️\n"
+            f"Overall Bias: <b>{overall_label}</b> ({overall_em}) · Bull {bull_score} vs Bear {bear_score}\n"
+            f"{_speed_block}\n"
+            + (_cap_block + "\n" if _cap_block else "")
+            + (_sr_block + "\n" if _sr_block else "")
+            + "🔴 <b>Entry (PE at its support VOB):</b>\n"
+            + "\n".join(loc_lines) + "\n"
+            + ("💰 <b>Buy LTP — all ATM±3 PUTs:</b>\n" + "\n".join(_all_pe) + "\n" if _all_pe else "")
+            + f"NIFTY Spot ₹{spot_price:.1f}"
+        )
+        key = f"overall_entry_bear_{int(res_lvl or spot_price)}"
+
+    if msg and key and _throttled_telegram_send(msg, alert_class='overall_bias_entry',
+                                                 key=key, cooldown_s=300,
+                                                 class_limit=3, class_window=600,
+                                                 class_sleep=1800):
+        return msg
+    return None
 
 
 def send_bias_enter_alert(bias):
@@ -15243,6 +18321,8 @@ def _render_main_analyzer():
             except Exception as _ctx_err:
                 st.error(f"Failed: {_ctx_err}")
 
+    # Placeholder — ALL-BIAS dashboard (top of page, filled when compute cycle runs)
+    _all_bias_container = st.container()
     # Placeholder — auto trade section renders here (filled after db/api init below)
     _auto_trade_container = st.container()
     # Placeholder — Per-Strike OI chart renders here (filled after auto trade)
@@ -15639,6 +18719,10 @@ def _render_main_analyzer():
                 })
                 st.session_state._df_1m_trade = _df_1m_new
                 st.session_state._last_1m_candle_fetch = _now_1m
+                # Cache the RAW payload too (with timestamps) so other features
+                # that need 1m NIFTY (e.g. liquidity-grab 3m resample) reuse it
+                # instead of re-fetching the same data → fewer Dhan 429s.
+                st.session_state._raw_1m_trade = _raw_1m
     except Exception:
         pass
 
@@ -16024,12 +19108,16 @@ def _render_main_analyzer():
             _liq_grabs_today = []
             try:
                 _liq_src_df = None
-                # Prefer fresh 1m fetch directly (independent of chart TF)
+                # Reuse the 1m NIFTY payload already fetched (and 60s-cached)
+                # earlier this render — avoids a duplicate Dhan call. Only fetch
+                # if the cache is somehow empty.
                 try:
-                    _raw_1m_liq = api.get_intraday_data(
-                        security_id="13", exchange_segment="IDX_I",
-                        instrument="INDEX", interval="1", days_back=1,
-                    )
+                    _raw_1m_liq = st.session_state.get('_raw_1m_trade')
+                    if not (_raw_1m_liq and _raw_1m_liq.get('open')):
+                        _raw_1m_liq = api.get_intraday_data(
+                            security_id="13", exchange_segment="IDX_I",
+                            instrument="INDEX", interval="1", days_back=1,
+                        )
                     if _raw_1m_liq and 'open' in _raw_1m_liq and _raw_1m_liq.get('open'):
                         _ist_liq = pytz.timezone('Asia/Kolkata')
                         _liq_src_df = pd.DataFrame({
@@ -16466,6 +19554,13 @@ def _render_main_analyzer():
                             st.warning(f"⚠️ Option security-ID lookup empty (expiry {_opt_expiry}). {_oe}")
                         else:
                             st.caption(f"📡 Scrip-master loaded · {len(_sid_map)} option contracts for expiry {_opt_expiry}")
+                        # Dhan rate-limit back-off indicator
+                        _back = st.session_state.get('_dhan_429_until')
+                        _now_b = datetime.now(pytz.timezone('Asia/Kolkata'))
+                        if _back and _now_b < _back:
+                            _secs = int((_back - _now_b).total_seconds())
+                            st.warning(f"⏸️ Dhan rate-limit (429) back-off active — pausing fresh fetches for {_secs}s. "
+                                       "Showing cached data. Reduce strikes / increase TTL if this persists.")
 
                         def _sids_for_strike(strike_val):
                             ce_s = pe_s = None
@@ -16495,18 +19590,51 @@ def _render_main_analyzer():
                                                 pe_s = int(r.iloc[0][_c]); break
                             return (int(ce_s) if ce_s else None), (int(pe_s) if pe_s else None)
 
-                        def _opt_analyze(sid, leg_name, is_atm=False):
+                        def _opt_analyze(sid, leg_name, is_atm=False, ttl_s=60):
                             """Returns (grabs, df_today, vpfr_dict, status_str).
-                            Telegram alerts fire only when is_atm is True (ATM leg only)."""
+                            Telegram alerts fire only when is_atm is True (ATM leg only).
+                            Per-leg cache (default 60s TTL) avoids hitting Dhan rate limits
+                            (429) when 14 legs poll every ~20s cycle."""
                             if not sid:
                                 return [], None, None, "no security ID resolved"
-                            try:
-                                raw = api.get_intraday_data(
-                                    security_id=str(sid), exchange_segment="NSE_FNO",
-                                    instrument="OPTIDX", interval="1", days_back=1,
-                                )
-                            except Exception as _e:
-                                return [], None, None, f"API error: {str(_e)[:60]}"
+                            # Per-leg cache check
+                            _opt_cache = st.session_state.setdefault('_opt_intraday_cache', {})
+                            _cache_now = datetime.now(pytz.timezone('Asia/Kolkata'))
+                            _entry = _opt_cache.get(sid)
+                            raw = None
+                            if _entry and (_cache_now - _entry['ts']).total_seconds() < ttl_s:
+                                raw = _entry['data']
+                                _cache_age = (_cache_now - _entry['ts']).total_seconds()
+                            else:
+                                # Rate-limit back-off: if a 429 happened recently, skip the
+                                # fetch and reuse stale cache (up to 5x TTL).
+                                _back = st.session_state.get('_dhan_429_until')
+                                if _back and _cache_now < _back:
+                                    if _entry and (_cache_now - _entry['ts']).total_seconds() < ttl_s * 5:
+                                        raw = _entry['data']
+                                        _cache_age = (_cache_now - _entry['ts']).total_seconds()
+                                    else:
+                                        return [], None, None, f"⏸️ Dhan rate-limit back-off active"
+                                else:
+                                    try:
+                                        raw = api.get_intraday_data(
+                                            security_id=str(sid), exchange_segment="NSE_FNO",
+                                            instrument="OPTIDX", interval="1", days_back=1,
+                                        )
+                                    except Exception as _e:
+                                        _es = str(_e)
+                                        if '429' in _es:
+                                            # Trip 90s rate-limit back-off; reuse stale cache if any
+                                            st.session_state['_dhan_429_until'] = _cache_now + timedelta(seconds=90)
+                                        if _entry:
+                                            raw = _entry['data']
+                                            _cache_age = (_cache_now - _entry['ts']).total_seconds()
+                                        else:
+                                            return [], None, None, f"API error: {_es[:60]}"
+                                    else:
+                                        if raw and raw.get('open'):
+                                            _opt_cache[sid] = {'ts': _cache_now, 'data': raw}
+                                        _cache_age = 0
                             if not raw or 'open' not in raw or not raw.get('open'):
                                 return [], None, None, "API returned empty (no bars)"
                             df_opt = pd.DataFrame({
@@ -16560,17 +19688,85 @@ def _render_main_analyzer():
                                 _delta_info = None
                                 try:
                                     _delta_info = _compute_leg_delta_volume(df_t)
-                                    # Cache it so the render loop can show it without recomputing
                                     if _delta_info:
                                         _dv_store = st.session_state.setdefault('_atm_leg_delta_vol', {})
+                                        # Store under BOTH leg_name and sid so the render loop can find it
                                         _dv_store[leg_name] = _delta_info
+                                        _dv_store[f"sid_{sid}"] = _delta_info
                                 except Exception:
                                     _delta_info = None
+                                # Per-leg VIDYA trend (Pine Script port)
+                                try:
+                                    _vidya = calculate_vidya(df_t)
+                                    if _vidya:
+                                        _vd_store = st.session_state.setdefault('_atm_leg_vidya', {})
+                                        _vd_store[leg_name] = _vidya
+                                        _vd_store[f"sid_{sid}"] = _vidya
+                                except Exception:
+                                    pass
+                                # Per-leg S/R behavior (using leg's own VOB zones)
+                                try:
+                                    _leg_sr = classify_leg_sr_behavior(df_t, _last_ltp)
+                                    if _leg_sr:
+                                        _sr_store = st.session_state.setdefault('_atm_leg_sr_behavior', {})
+                                        _sr_store[leg_name] = _leg_sr
+                                        _sr_store[f"sid_{sid}"] = _leg_sr
+                                except Exception:
+                                    pass
+                                # Per-leg LuxAlgo LTF delta volume (intrabar buyer/seller from 1m sub-bars)
+                                try:
+                                    _ltf_dv = _ltf_delta_volume(df_t)
+                                    if _ltf_dv:
+                                        _ltf_store = st.session_state.setdefault('_atm_leg_ltf_delta', {})
+                                        _ltf_store[leg_name] = _ltf_dv
+                                        _ltf_store[f"sid_{sid}"] = _ltf_dv
+                                except Exception:
+                                    pass
+                                # Per-leg VOB BUILDING/BREAKING analysis (LTF buyer/seller per zone)
+                                try:
+                                    _vob_vol = analyze_vob_volume(df_t, _last_ltp)
+                                    if _vob_vol:
+                                        _vv_store = st.session_state.setdefault('_atm_leg_vob_volume', {})
+                                        _vv_store[leg_name] = _vob_vol
+                                        _vv_store[f"sid_{sid}"] = _vob_vol
+                                        # OB Retest detection (BigBeluga port):
+                                        # Fire when LTP transitions from OUTSIDE a zone
+                                        # to INSIDE it (price wick re-entered the OB).
+                                        # ATM legs only — keep noise low.
+                                        if is_atm:
+                                            _prev_store = st.session_state.setdefault('_atm_leg_prev_ltp', {})
+                                            _prev_ltp = _prev_store.get(f"sid_{sid}")
+                                            if _prev_ltp is not None and _prev_ltp > 0:
+                                                for _z in _vob_vol:
+                                                    _zlo, _zhi = _z.get('lower', 0), _z.get('upper', 0)
+                                                    if _zlo <= 0 or _zhi <= 0 or _zhi <= _zlo:
+                                                        continue
+                                                    _was_out = (_prev_ltp < _zlo) or (_prev_ltp > _zhi)
+                                                    _is_in = (_zlo <= _last_ltp <= _zhi)
+                                                    if not (_was_out and _is_in):
+                                                        continue
+                                                    # Require meaningful volume imbalance in zone
+                                                    _bull_pct = _z.get('bull_pct', 50)
+                                                    if _z.get('zone_type') == 'bullish' and _bull_pct >= 55:
+                                                        send_vob_retest_alert(
+                                                            leg_name, _z, 'bull',
+                                                            _last_ltp, _spot_now,
+                                                            cooldown_s=1200)
+                                                    elif _z.get('zone_type') == 'bearish' and _bull_pct <= 45:
+                                                        send_vob_retest_alert(
+                                                            leg_name, _z, 'bear',
+                                                            _last_ltp, _spot_now,
+                                                            cooldown_s=1200)
+                                            _prev_store[f"sid_{sid}"] = _last_ltp
+                                except Exception:
+                                    pass
                                 if _cur_dpoc is not None:
+                                    # Prefer LuxAlgo LTF delta in the alert; fall back to legacy
+                                    _alert_delta = _ltf_dv if _ltf_dv else _delta_info
                                     send_ltp_dpoc_move_alert(
                                         leg_name, _cur_dpoc, _last_ltp,
                                         _spot_now, move_pct=10.0, cooldown_s=600,
-                                        delta_info=_delta_info)
+                                        delta_info=_alert_delta)
                             except Exception:
                                 pass
 
@@ -16592,6 +19788,16 @@ def _render_main_analyzer():
                                     send_ltp_vob_hvp_alert(
                                         leg_name, _ltp_vob, _ltp_hvp,
                                         _last_ltp, _spot_now, cooldown_s=1800)
+                                except Exception:
+                                    pass
+
+                                # 0c) Ignition (tank-full) alert on the leg LTP
+                                try:
+                                    _leg_ign = detect_ignition(df_t)
+                                    if _leg_ign.get('fired'):
+                                        send_ignition_alert(
+                                            leg_name, _leg_ign, _last_ltp,
+                                            _spot_now, cooldown_s=900)
                                 except Exception:
                                     pass
 
@@ -16620,7 +19826,8 @@ def _render_main_analyzer():
                                         send_liquidity_grab_alert(latest, _last_ltp, cooldown_s=900)
                                     except Exception:
                                         pass
-                            return grabs, df_t, vpfr_levels, f"OK · {n_bars} 1m bars · {len(df_3)} 3m bars · {len(grabs)} grab(s)"
+                            _cache_tag = f" · cached {_cache_age:.0f}s ago" if _cache_age and _cache_age > 0 else ""
+                            return grabs, df_t, vpfr_levels, f"OK · {n_bars} 1m bars · {len(df_3)} 3m bars · {len(grabs)} grab(s){_cache_tag}"
 
                         # 14 legs: ATM-3..ATM+3 × {CE, PE}
                         _strikes_to_analyze = [
@@ -16632,6 +19839,15 @@ def _render_main_analyzer():
                             (_atm_strike + 2 * _strike_gap, 'ATM+2'),
                             (_atm_strike + 3 * _strike_gap, 'ATM+3'),
                         ]
+                        # Reset per-leg stores each cycle so the ATM strike
+                        # drifting through the day doesn't accumulate STALE
+                        # strikes (which caused 42 rows / repeated legs and
+                        # double-counting in the composite bias). Only the
+                        # current 14 legs are repopulated below.
+                        for _store_key in ('_atm_leg_dfs', '_atm_leg_vob_volume',
+                                           '_atm_leg_vidya', '_atm_leg_sr_behavior',
+                                           '_atm_leg_ltf_delta'):
+                            st.session_state[_store_key] = {}
                         _ce_tables = []  # all CE legs (ATM-3 CE … ATM+3 CE)
                         _pe_tables = []  # all PE legs (ATM-3 PE … ATM+3 PE)
                         _tg_legs = []
@@ -16642,8 +19858,17 @@ def _render_main_analyzer():
                             _pe_g, _pe_df_l, _pe_vp, _pe_st = _opt_analyze(_pe_s, f"PE {_strike_val:.0f}", is_atm=_is_atm_leg)
                             _ce_tables.append((f"🟢 {_atm_tag} CE {_strike_val:.0f}", _ce_g, _ce_df_l, _ce_vp, _ce_s, _ce_st))
                             _pe_tables.append((f"🔴 {_atm_tag} PE {_strike_val:.0f}", _pe_g, _pe_df_l, _pe_vp, _pe_s, _pe_st))
-                        # Render order: all CE charts first (ATM-3 → ATM+3), then all PE charts
-                        _all_tables = _ce_tables + _pe_tables
+                        # Render order: all CE charts first (ATM-3 → ATM+3), then all PE charts.
+                        # Dedup by header so a strike's LTP chart can never render
+                        # twice (guards against any repeated/stale leg entries).
+                        _seen_leg_keys = set()
+                        _all_tables = []
+                        for _t in (_ce_tables + _pe_tables):
+                            _k = _t[0]
+                            if _k in _seen_leg_keys:
+                                continue
+                            _seen_leg_keys.add(_k)
+                            _all_tables.append(_t)
                         for _strike_val, _atm_tag in _strikes_to_analyze:
                             # (legacy loop body below still references _ce_s/_pe_s & per-leg vars,
                             # so we re-fetch SIDs lazily for the telegram-block snapshot only)
@@ -16700,8 +19925,38 @@ def _render_main_analyzer():
                         try:
                             _bias = compute_composite_bias(_u, df, _opt_d)
                             st.session_state._composite_bias = _bias
+                            # All-bias consolidated dashboard — render at TOP OF PAGE
+                            # into the placeholder defined earlier, not here.
+                            try:
+                                with _all_bias_container:
+                                    render_all_bias_dashboard(_u, df, _opt_d)
+                            except Exception:
+                                pass
                             render_composite_bias_panel(_bias)
                             send_bias_enter_alert(_bias)
+                            # 🧮 Consolidated ATM±3 leg-bias table + overall NIFTY verdict
+                            try:
+                                render_leg_bias_table(_u)
+                            except Exception as _lbt_err:
+                                st.caption(f"Leg bias table unavailable: {_lbt_err}")
+                            # 🧪 Greek Absorption — who is stopping the LTP
+                            try:
+                                render_greek_absorption(_opt_d, _u)
+                            except Exception as _ga_err:
+                                st.caption(f"Greek absorption unavailable: {_ga_err}")
+                            # 🤖 AI Trade Advisor (auto verdict + chatbox)
+                            try:
+                                render_ai_advisor(_bias, _u)
+                            except Exception as _ai_err:
+                                st.caption(f"AI Advisor unavailable: {_ai_err}")
+                            # Spot ignition (tank-full) alert
+                            try:
+                                _spot_ign = detect_ignition(df)
+                                if _spot_ign.get('fired'):
+                                    send_ignition_alert(
+                                        'NIFTY Spot', _spot_ign, _u, _u, cooldown_s=900)
+                            except Exception:
+                                pass
                         except Exception as _be_err:
                             st.caption(f"Composite Bias unavailable: {_be_err}")
 
@@ -16805,30 +20060,78 @@ def _render_main_analyzer():
                                     font=dict(color='#fafafa'),
                                 )
                                 # VOB zones + HVP markers on the LTP chart
+                                # Each VOB rect is SPLIT horizontally at the
+                                # buy/sell volume boundary (BigBeluga V-T OB
+                                # engine style): bottom = buy% (green), top =
+                                # sell% (red). Labels inside each half.
                                 try:
                                     _lv = VolumeOrderBlocks(sensitivity=5).detect_blocks(_ldf)
+                                    _lp_last = float(_ldf['close'].iloc[-1]) if not _ldf.empty else 0
+                                    _zones = analyze_vob_volume(_ldf, _lp_last)
+                                    _bull_pct_by_mid = {
+                                        round(float(z.get('mid', 0)), 2): float(z.get('bull_pct', 50))
+                                        for z in (_zones or [])
+                                    }
+
+                                    def _vob_split_draw(_b, _zone_type):
+                                        _lo, _hi = float(_b['lower']), float(_b['upper'])
+                                        if _hi <= _lo:
+                                            return
+                                        _mid_key = round((_lo + _hi) / 2, 2)
+                                        _bp = _bull_pct_by_mid.get(
+                                            _mid_key,
+                                            (60 if _zone_type == 'bullish' else 40))
+                                        _sp = 100 - _bp
+                                        _split = _lo + (_hi - _lo) * (_bp / 100.0)
+                                        _border = '#26ba9f' if _zone_type == 'bullish' else '#ba2646'
+                                        _em = '🟢' if _zone_type == 'bullish' else '🔴'
+                                        # Bottom half = BUY (green)
+                                        if _split > _lo:
+                                            _fig_l.add_shape(type='rect', x0=_x0, x1=_x1,
+                                                             y0=_lo, y1=_split,
+                                                             fillcolor='rgba(38,186,159,0.32)',
+                                                             line=dict(width=0),
+                                                             layer='below')
+                                        # Top half = SELL (red)
+                                        if _hi > _split:
+                                            _fig_l.add_shape(type='rect', x0=_x0, x1=_x1,
+                                                             y0=_split, y1=_hi,
+                                                             fillcolor='rgba(186,38,70,0.32)',
+                                                             line=dict(width=0),
+                                                             layer='below')
+                                        # Border around full zone
+                                        _fig_l.add_shape(type='rect', x0=_x0, x1=_x1,
+                                                         y0=_lo, y1=_hi,
+                                                         fillcolor='rgba(0,0,0,0)',
+                                                         line=dict(color=_border, width=2),
+                                                         layer='below')
+                                        # Range label outside (above for bull, below for bear)
+                                        _fig_l.add_annotation(
+                                            x=_x0,
+                                            y=_hi if _zone_type == 'bullish' else _lo,
+                                            text=f"{_em} VOB {_lo:.1f}–{_hi:.1f}",
+                                            showarrow=False, xanchor='left',
+                                            yanchor='bottom' if _zone_type == 'bullish' else 'top',
+                                            font=dict(color=_border, size=8))
+                                        # In-rect labels (BigBeluga style): only if half tall enough
+                                        if _hi - _lo > 0:
+                                            if _bp >= 8:  # buy half tall enough to label
+                                                _fig_l.add_annotation(
+                                                    x=_x1, y=(_lo + _split) / 2,
+                                                    text=f"Buy: {_bp:.0f}%",
+                                                    showarrow=False, xanchor='right', yanchor='middle',
+                                                    font=dict(color='#26ba9f', size=9))
+                                            if _sp >= 8:  # sell half tall enough to label
+                                                _fig_l.add_annotation(
+                                                    x=_x1, y=(_split + _hi) / 2,
+                                                    text=f"Sell: {_sp:.0f}%",
+                                                    showarrow=False, xanchor='right', yanchor='middle',
+                                                    font=dict(color='#ba2646', size=9))
+
                                     for _b in (_lv.get('bullish') or [])[-3:]:
-                                        _fig_l.add_shape(type='rect', x0=_x0, x1=_x1,
-                                                         y0=_b['lower'], y1=_b['upper'],
-                                                         fillcolor='rgba(38,186,159,0.28)',
-                                                         line=dict(color='#26ba9f', width=2),
-                                                         layer='below')
-                                        _fig_l.add_annotation(
-                                            x=_x0, y=_b['upper'],
-                                            text=f"🟢 VOB {_b['lower']:.1f}–{_b['upper']:.1f}",
-                                            showarrow=False, xanchor='left', yanchor='bottom',
-                                            font=dict(color='#26ba9f', size=8))
+                                        _vob_split_draw(_b, 'bullish')
                                     for _b in (_lv.get('bearish') or [])[-3:]:
-                                        _fig_l.add_shape(type='rect', x0=_x0, x1=_x1,
-                                                         y0=_b['lower'], y1=_b['upper'],
-                                                         fillcolor='rgba(186,38,70,0.28)',
-                                                         line=dict(color='#ba2646', width=2),
-                                                         layer='below')
-                                        _fig_l.add_annotation(
-                                            x=_x0, y=_b['lower'],
-                                            text=f"🔴 VOB {_b['lower']:.1f}–{_b['upper']:.1f}",
-                                            showarrow=False, xanchor='left', yanchor='top',
-                                            font=dict(color='#ba2646', size=8))
+                                        _vob_split_draw(_b, 'bearish')
                                     _lh = detect_hvp(_ldf, left_bars=15, right_bars=15, vol_filter=2.0)
                                     _hx_b = [h['time'] for h in (_lh.get('bullish_hvp') or [])]
                                     _hy_b = [h['price'] for h in (_lh.get('bullish_hvp') or [])]
@@ -16848,6 +20151,87 @@ def _render_main_analyzer():
                                                         line=dict(color='#a00866', width=1)),
                                             text=['🔴HVP']*len(_hx_r), textposition='top center',
                                             textfont=dict(color='#e60e93', size=9), name='HVP↓'))
+                                except Exception:
+                                    pass
+
+                                # Price–OBV/Δ Divergence markers (regular div only)
+                                try:
+                                    _div = detect_divergence(_ldf, pivot_lookback=5, max_bars_back=80)
+                                    _off2 = (_ldf['high'].max() - _ldf['low'].min()) * 0.015
+                                    if _div.get('bull') and len(_div.get('bull_pivot_times', [])) == 2:
+                                        _t1, _t2 = _div['bull_pivot_times']
+                                        _y1 = float(_ldf.loc[_ldf['datetime'] == _t1, 'low'].iloc[0])
+                                        _y2 = float(_ldf.loc[_ldf['datetime'] == _t2, 'low'].iloc[0])
+                                        _ind = _div.get('indicator', '').upper()
+                                        _fig_l.add_trace(go.Scatter(
+                                            x=[_t1, _t2], y=[_y1 - _off2, _y2 - _off2],
+                                            mode='lines+markers+text',
+                                            line=dict(color='#00ffaa', width=2, dash='dot'),
+                                            marker=dict(symbol='circle', size=9, color='#00ffaa',
+                                                        line=dict(color='#003322', width=1)),
+                                            text=['', f"🟢 BULL DIV ({_ind})"],
+                                            textposition='bottom center',
+                                            textfont=dict(color='#00ffaa', size=9),
+                                            name='Bull Div'))
+                                    if _div.get('bear') and len(_div.get('bear_pivot_times', [])) == 2:
+                                        _t1, _t2 = _div['bear_pivot_times']
+                                        _y1 = float(_ldf.loc[_ldf['datetime'] == _t1, 'high'].iloc[0])
+                                        _y2 = float(_ldf.loc[_ldf['datetime'] == _t2, 'high'].iloc[0])
+                                        _ind = _div.get('indicator', '').upper()
+                                        _fig_l.add_trace(go.Scatter(
+                                            x=[_t1, _t2], y=[_y1 + _off2, _y2 + _off2],
+                                            mode='lines+markers+text',
+                                            line=dict(color='#ff3366', width=2, dash='dot'),
+                                            marker=dict(symbol='circle', size=9, color='#ff3366',
+                                                        line=dict(color='#330011', width=1)),
+                                            text=['', f"🔴 BEAR DIV ({_ind})"],
+                                            textposition='top center',
+                                            textfont=dict(color='#ff3366', size=9),
+                                            name='Bear Div'))
+                                except Exception:
+                                    pass
+
+                                # Ignition marker (tank-full) on last bar
+                                try:
+                                    _ign = detect_ignition(_ldf)
+                                    if _ign.get('fired') and _ign.get('direction') in ('bull', 'bear'):
+                                        _it = _ldf['datetime'].iloc[-1]
+                                        _off3 = (_ldf['high'].max() - _ldf['low'].min()) * 0.03
+                                        _na = (_ign.get('bull_count') if _ign['direction'] == 'bull'
+                                               else _ign.get('bear_count'))
+                                        if _ign['direction'] == 'bull':
+                                            _iy = float(_ldf['low'].iloc[-1]) - _off3
+                                            _fig_l.add_trace(go.Scatter(
+                                                x=[_it], y=[_iy], mode='markers+text',
+                                                marker=dict(symbol='star', size=16, color='#ffd000',
+                                                            line=dict(color='#7a6500', width=1)),
+                                                text=[f"🔋🚀 IGNITION×{_na}"], textposition='bottom center',
+                                                textfont=dict(color='#ffd000', size=10), name='Ignition↑'))
+                                        else:
+                                            _iy = float(_ldf['high'].iloc[-1]) + _off3
+                                            _fig_l.add_trace(go.Scatter(
+                                                x=[_it], y=[_iy], mode='markers+text',
+                                                marker=dict(symbol='star', size=16, color='#ff8800',
+                                                            line=dict(color='#7a4000', width=1)),
+                                                text=[f"🔋💥 IGNITION×{_na}"], textposition='top center',
+                                                textfont=dict(color='#ff8800', size=10), name='Ignition↓'))
+                                except Exception:
+                                    pass
+
+                                # VWAP line on the leg LTP chart (intraday session VWAP)
+                                try:
+                                    _vw = ReversalDetector.calculate_vwap(_ldf)
+                                    if _vw is not None and not _vw.empty:
+                                        _fig_l.add_trace(go.Scatter(
+                                            x=_ldf['datetime'], y=_vw, mode='lines',
+                                            line=dict(color='#f5a623', width=1.6, dash='dash'),
+                                            name='VWAP'))
+                                        _cur_vw = float(_vw.iloc[-1])
+                                        _fig_l.add_annotation(
+                                            x=_ldf['datetime'].iloc[-1], y=_cur_vw,
+                                            text=f"VWAP ₹{_cur_vw:.1f}", showarrow=False,
+                                            xanchor='left', yanchor='middle',
+                                            font=dict(color='#f5a623', size=9))
                                 except Exception:
                                     pass
 
@@ -16897,6 +20281,40 @@ def _render_main_analyzer():
                                                 key=f"opt_chart_{_sid_used or _hdr}")
                             except Exception as _ce:
                                 st.caption(f"chart error: {_ce}")
+
+                            # ── VOB BUILDING/BREAKING status (directly under chart) ─
+                            try:
+                                _vv_store = st.session_state.get('_atm_leg_vob_volume') or {}
+                                _vv = _vv_store.get(f"sid_{_sid_used}") if _sid_used else None
+                                if _vv is None:
+                                    _hdr_parts = _hdr.split()
+                                    if len(_hdr_parts) >= 2:
+                                        _vv = _vv_store.get(' '.join(_hdr_parts[-2:]))
+                                if _vv:
+                                    _status_em = {'BUILDING': '🚀', 'BREAKING': '⚠️',
+                                                  'INTACT': '·', 'FADING': '🌫️'}
+                                    # Active states (BUILDING/BREAKING) on top — most important
+                                    _active = [z for z in _vv if z.get('status') in ('BUILDING', 'BREAKING')]
+                                    _other  = [z for z in _vv if z.get('status') in ('FADING', 'INTACT')]
+                                    if _active or _other:
+                                        st.markdown("**📐 VOB Status (LTF buyer/seller per zone):**")
+                                    for _z in _active + _other:
+                                        ztype_em = '🟩' if _z['zone_type'] == 'bullish' else '🟪'
+                                        st_em = _status_em.get(_z['status'], '·')
+                                        dom = _z.get('dominant', '')
+                                        dom_em = '🟢' if dom == 'buyers' else ('🔴' if dom == 'sellers' else '⚪')
+                                        _line = (f"{ztype_em} {_z['role'].title()} VOB "
+                                                  f"₹{_z['lower']:.2f}–{_z['upper']:.2f} · "
+                                                  f"{st_em} <b>{_z['status']}</b> · "
+                                                  f"{dom_em} {dom} ({_z['bull_pct']:.0f}% buy, "
+                                                  f"{_z['buy_vol']:,.0f}↑/{_z['sell_vol']:,.0f}↓)")
+                                        if _z['zone_type'] == 'bullish' and _z.get('max_buy_price'):
+                                            _line += f" · max buy @ ₹{_z['max_buy_price']:.2f}"
+                                        elif _z['zone_type'] == 'bearish' and _z.get('max_sell_price'):
+                                            _line += f" · max sell @ ₹{_z['max_sell_price']:.2f}"
+                                        st.caption(_line, unsafe_allow_html=True)
+                            except Exception:
+                                pass
 
                             # ── Money Flow Profile (full panel width, below chart) ─
                             try:
@@ -16971,7 +20389,15 @@ def _render_main_analyzer():
                             # Delta volume + divergence summary for this leg
                             try:
                                 _dv_store = st.session_state.get('_atm_leg_delta_vol') or {}
-                                _dv = _dv_store.get(leg_name)
+                                # Look up by sid (most reliable) — falls back to
+                                # leg_name derived from _hdr if needed.
+                                _dv = _dv_store.get(f"sid_{_sid_used}") if _sid_used else None
+                                if _dv is None:
+                                    # Derive leg_name from header (e.g. "🟢 ATM CE 24050" → "CE 24050")
+                                    _hdr_parts = _hdr.split()
+                                    if len(_hdr_parts) >= 2:
+                                        _derived_ln = ' '.join(_hdr_parts[-2:])
+                                        _dv = _dv_store.get(_derived_ln)
                                 if _dv:
                                     _dv_em = '🟢' if _dv.get('delta', 0) > 0 else (
                                         '🔴' if _dv.get('delta', 0) < 0 else '⚪')
@@ -16983,6 +20409,109 @@ def _render_main_analyzer():
                                     dvc3.metric("Δ Vol", f"{_dv.get('delta', 0):+,.0f}",
                                                 f"{_dv.get('delta_pct', 0):+.1f}%")
                                     dvc4.metric("Divergence", f"{_div_em} {_div_lbl}")
+                            except Exception:
+                                pass
+
+                            # VIDYA trend per leg
+                            try:
+                                _vd_store = st.session_state.get('_atm_leg_vidya') or {}
+                                _vd = _vd_store.get(f"sid_{_sid_used}") if _sid_used else None
+                                if _vd is None:
+                                    _hdr_parts = _hdr.split()
+                                    if len(_hdr_parts) >= 2:
+                                        _vd = _vd_store.get(' '.join(_hdr_parts[-2:]))
+                                if _vd:
+                                    _vd_trend = _vd.get('trend', 'Unknown')
+                                    _vd_em = '🟢' if _vd_trend == 'Bullish' else ('🔴' if _vd_trend == 'Bearish' else '⚪')
+                                    _vd_dpct = _vd.get('delta_pct', 0)
+                                    _vd_cup = _vd.get('cross_up', False)
+                                    _vd_cdn = _vd.get('cross_down', False)
+                                    _cross_tag = ' ▲ Fresh Cross-Up' if _vd_cup else (' ▼ Fresh Cross-Dn' if _vd_cdn else '')
+                                    vc1, vc2, vc3 = st.columns(3)
+                                    vc1.metric("VIDYA Trend", f"{_vd_em} {_vd_trend}", _cross_tag or None)
+                                    vc2.metric("VIDYA Δ%", f"{_vd_dpct:+.0f}%",
+                                                f"Buy {int(_vd.get('buy_vol',0)):,}")
+                                    vc3.metric("VIDYA Sell Vol", f"{int(_vd.get('sell_vol',0)):,}")
+                            except Exception:
+                                pass
+
+                            # Per-leg S/R Behavior (VOB-based)
+                            try:
+                                _sr_store = st.session_state.get('_atm_leg_sr_behavior') or {}
+                                _leg_sr = _sr_store.get(f"sid_{_sid_used}") if _sid_used else None
+                                if _leg_sr is None:
+                                    _hdr_parts = _hdr.split()
+                                    if len(_hdr_parts) >= 2:
+                                        _leg_sr = _sr_store.get(' '.join(_hdr_parts[-2:]))
+                                if _leg_sr and _leg_sr.get('state') not in (None, 'NONE'):
+                                    _s = _leg_sr.get('state', '')
+                                    _d = _leg_sr.get('direction', '')
+                                    _side = _leg_sr.get('side', '')
+                                    _lvl = _leg_sr.get('level') or 0
+                                    _em = '🟢' if _d == 'bull' else ('🔴' if _d == 'bear' else '⚪')
+                                    st.caption(
+                                        f"📐 S/R Behavior: {_em} <b>{_s}</b> {_side} @ ₹{_lvl:.2f} → leg {_d.upper()}",
+                                        unsafe_allow_html=True,
+                                    )
+                            except Exception:
+                                pass
+
+                            # VWAP bias for this leg (price vs intraday VWAP)
+                            try:
+                                _vw = ReversalDetector.calculate_vwap(_ldf)
+                                if _vw is not None and not _vw.empty:
+                                    _vwv = float(_vw.iloc[-1])
+                                    _above = _last_ltp > _vwv
+                                    _gap = (_last_ltp - _vwv) / _vwv * 100 if _vwv else 0
+                                    _is_ce = ' CE ' in f' {_hdr} '
+                                    # Leg above VWAP = leg bullish. NIFTY: CE→same, PE→reversed.
+                                    _leg_bias = 'BULL' if _above else 'BEAR'
+                                    _nifty = (_leg_bias if _is_ce
+                                              else ('BEAR' if _leg_bias == 'BULL' else 'BULL'))
+                                    _em2 = '🟢' if _above else '🔴'
+                                    _ndir_em = '🟢' if _nifty == 'BULL' else '🔴'
+                                    st.caption(
+                                        f"📈 VWAP ₹{_vwv:.2f} · LTP {'ABOVE' if _above else 'BELOW'} "
+                                        f"({_gap:+.1f}%) · {_em2} leg <b>{_leg_bias}</b> → "
+                                        f"NIFTY {_ndir_em} <b>{_nifty}</b>",
+                                        unsafe_allow_html=True,
+                                    )
+                            except Exception:
+                                pass
+
+                            # LuxAlgo LTF Volume Delta Candles — buyers vs sellers
+                            try:
+                                _ltf_store = st.session_state.get('_atm_leg_ltf_delta') or {}
+                                _ltf = _ltf_store.get(f"sid_{_sid_used}") if _sid_used else None
+                                if _ltf is None:
+                                    _hdr_parts = _hdr.split()
+                                    if len(_hdr_parts) >= 2:
+                                        _ltf = _ltf_store.get(' '.join(_hdr_parts[-2:]))
+                                if _ltf:
+                                    _bt = _ltf.get('buy_total', 0)
+                                    _st = _ltf.get('sell_total', 0)
+                                    _dpct = _ltf.get('delta_pct', 0)
+                                    _dem = '🟢' if _dpct > 0 else ('🔴' if _dpct < 0 else '⚪')
+                                    _mbp = _ltf.get('max_buy_price')
+                                    _msp = _ltf.get('max_sell_price')
+                                    _mside = _ltf.get('max_print_side', 'buy')
+                                    _mprice = _ltf.get('max_print_price')
+                                    lc1, lc2, lc3 = st.columns(3)
+                                    lc1.metric("LTF Buyers", f"{_bt:,.0f}",
+                                                f"max buy @ ₹{_mbp:.2f}" if _mbp else None)
+                                    lc2.metric("LTF Sellers", f"{_st:,.0f}",
+                                                f"max sell @ ₹{_msp:.2f}" if _msp else None)
+                                    lc3.metric("LTF Δ%", f"{_dem} {_dpct:+.1f}%",
+                                                f"dominant print: {_mside.upper()}"
+                                                + (f" @ ₹{_mprice:.2f}" if _mprice else ""))
+                                    # Dominant print caption (LuxAlgo's maxV concept)
+                                    if _mprice:
+                                        _print_em = '🟢' if _mside == 'buy' else '🔴'
+                                        st.caption(
+                                            f"{_print_em} LTF dominant print: <b>{_mside.upper()}</b> @ ₹{_mprice:.2f} "
+                                            f"— biggest single 1m bar volume on the {'buy' if _mside == 'buy' else 'sell'} side",
+                                            unsafe_allow_html=True,
+                                        )
                             except Exception:
                                 pass
 
