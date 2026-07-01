@@ -17278,6 +17278,15 @@ def send_master_signal_telegram(result, underlying_price, option_data=None, forc
                         f"Top {_mfp.get('highest_sentiment_direction','—')} "
                         f"@ ₹{_mfp.get('highest_sentiment_price',0):.2f}"
                     )
+                # MFP (last 50 candles) row — recency-focused bins
+                _mfp50 = leg.get('mfp_50') or {}
+                if _mfp50:
+                    _ov_lines.append(
+                        f"    MFP(50): POC ₹{_mfp50.get('poc_price',0):.2f} · "
+                        f"VA ₹{_mfp50.get('value_area_low',0):.2f}–₹{_mfp50.get('value_area_high',0):.2f} · "
+                        f"Top {_mfp50.get('highest_sentiment_direction','—')} "
+                        f"@ ₹{_mfp50.get('highest_sentiment_price',0):.2f}"
+                    )
 
                 # POC-touch flag: which TF POC is within 0.5% of current LTP
                 _touches = []
@@ -19999,14 +20008,19 @@ def _render_main_analyzer():
                                 ('CE', _ce_g_s, _ce_df_l_s, _ce_vp_s),
                                 ('PE', _pe_g_s, _pe_df_l_s, _pe_vp_s),
                             ]:
-                                # Compute MFP for telegram block (per leg)
+                                # Compute MFP for telegram block (per leg) — full-day bins
+                                # plus a recency-focused last-50-candle version.
                                 _leg_mfp_tg = None
+                                _leg_mfp_tg_50 = None
                                 try:
                                     if _ldf is not None and not _ldf.empty:
                                         _leg_mfp_tg = calculate_money_flow_profile(
                                             _ldf, num_rows=5, source='Money Flow')
+                                        _leg_mfp_tg_50 = calculate_money_flow_profile(
+                                            _ldf.tail(50), num_rows=5, source='Money Flow')
                                 except Exception:
                                     _leg_mfp_tg = None
+                                    _leg_mfp_tg_50 = None
                                 # Stash all ATM±3 1m dfs for alignment + composite bias
                                 if _ldf is not None and not _ldf.empty:
                                     _leg_dfs = st.session_state.setdefault('_atm_leg_dfs', {})
@@ -20016,6 +20030,7 @@ def _render_main_analyzer():
                                     'ltp': float(_ldf['close'].iloc[-1]) if _ldf is not None and not _ldf.empty else 0,
                                     'vpfr': _vp,
                                     'mfp': _leg_mfp_tg,
+                                    'mfp_50': _leg_mfp_tg_50,
                                     'mfp_bias': _mfp_poc_bias(_leg_mfp_tg) if _leg_mfp_tg else 'NEUTRAL',
                                     'latest_grab': _g[-1] if _g else None,
                                 })
@@ -20475,6 +20490,56 @@ def _render_main_analyzer():
                                     st.caption("MFP: insufficient bars")
                             except Exception as _me:
                                 st.caption(f"MFP error: {_me}")
+
+                            # ── Money Flow Profile — Last 50 Candles (recency-focused bins) ─
+                            try:
+                                _mfp_50 = calculate_money_flow_profile(_ldf.tail(50), num_rows=5, source='Money Flow')
+                                if _mfp_50 and _mfp_50.get('rows'):
+                                    _mfp50_rows = []
+                                    for r in reversed(_mfp_50['rows']):
+                                        _is_bull50 = r['sentiment'].lower().startswith('bull')
+                                        _is_bear50 = r['sentiment'].lower().startswith('bear')
+                                        if r.get('is_poc'):
+                                            _poc_cell50 = '🟢🎯 POC' if _is_bull50 else ('🔴🎯 POC' if _is_bear50 else '⚪🎯 POC')
+                                        else:
+                                            _poc_cell50 = r.get('node_type', '')
+                                        _mfp50_rows.append({
+                                            '_sent_dir': 'bull' if _is_bull50 else ('bear' if _is_bear50 else 'neutral'),
+                                            'Price Bin': f"₹{r['bin_low']:.1f}–{r['bin_high']:.1f}",
+                                            'Mid': f"₹{r['price_level']:.1f}",
+                                            'Total Vol': f"{r['total_volume']:,.0f}",
+                                            'Bull': f"{r['bull_volume']:,.0f}",
+                                            'Bear': f"{r['bear_volume']:,.0f}",
+                                            'Δ': f"{r['delta']:+,.0f}",
+                                            'Vol %': f"{r['volume_pct']:.1f}%",
+                                            'Node': _poc_cell50,
+                                            'Sentiment': f"{r['sentiment']} ({r['sentiment_strength']:.0f}%)",
+                                        })
+                                    st.markdown(
+                                        f"**Money Flow Profile — Last 50 Candles** · POC ₹{_mfp_50['poc_price']:.1f} · "
+                                        f"VAH ₹{_mfp_50['value_area_high']:.1f} · "
+                                        f"VAL ₹{_mfp_50['value_area_low']:.1f} · "
+                                        f"Top: {_mfp_50.get('highest_sentiment_direction', '—')} "
+                                        f"@ ₹{_mfp_50.get('highest_sentiment_price', 0):.1f} · "
+                                        f"({_mfp_50.get('num_bars', 0)} bars)"
+                                    )
+                                    _leg_mfp50_df = pd.DataFrame(_mfp50_rows)
+
+                                    def _color_leg_mfp50(row):
+                                        sd = row.get('_sent_dir', 'neutral')
+                                        if sd == 'bull':
+                                            return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
+                                        if sd == 'bear':
+                                            return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
+                                        return [''] * len(row)
+                                    _styled_leg50 = (_leg_mfp50_df.style
+                                                     .apply(_color_leg_mfp50, axis=1)
+                                                     .hide(axis='columns', subset=['_sent_dir']))
+                                    st.dataframe(_styled_leg50, use_container_width=True, hide_index=True)
+                                else:
+                                    st.caption("MFP (last 50 candles): insufficient bars")
+                            except Exception as _me50:
+                                st.caption(f"MFP (last 50 candles) error: {_me50}")
 
                             # Latest grab summary (compact one-line under chart)
                             if _gr:
