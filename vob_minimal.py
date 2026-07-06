@@ -13701,12 +13701,13 @@ MOBILE_SNAPSHOT_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mobile_snapshot.json'))
 
 
-def export_mobile_snapshot(spot_price, bias, option_data):
+def export_mobile_snapshot(spot_price, bias, option_data, df_spot=None):
     """Write this cycle's computed signals to MOBILE_SNAPSHOT_PATH as JSON for
     the mobile companion app (vob_mobile.py). Atomic write (tmp + os.replace)
     so the reader never sees a half-written file; throttled to one write per
     ~5s. Everything is read from session state already computed this cycle —
-    only the VOB rise/fall watch re-scans the cached leg dataframes."""
+    only the VOB rise/fall watch re-scans the cached leg dataframes (and now
+    also captures compact candle+VOB chart payloads for the mobile charts)."""
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     _last = st.session_state.get('_mobile_snap_ts')
@@ -13755,13 +13756,46 @@ def export_mobile_snapshot(spot_price, bias, option_data):
 
     # VOB watch — same logic as the ENTRY / LTP FALL alerts, both sides:
     # LTP at its own bullish VOB → premium about to RISE; at bearish → FALL.
+    # The same pass also captures a compact candle+VOB payload per leg for
+    # the 📈 Charts section of the mobile view.
+    def _chart_payload(df_c, vob, n_bars=80):
+        d = df_c.tail(n_bars)
+        if 'datetime' in d.columns:
+            t = [x.strftime('%H:%M') for x in d['datetime']]
+        else:
+            t = [str(x) for x in d.index]
+        return {
+            't': t,
+            'o': [round(float(x), 2) for x in d['open']],
+            'h': [round(float(x), 2) for x in d['high']],
+            'l': [round(float(x), 2) for x in d['low']],
+            'c': [round(float(x), 2) for x in d['close']],
+            'vob_bull': [{'lower': float(b['lower']), 'upper': float(b['upper'])}
+                         for b in (vob.get('bullish') or [])[:6]],
+            'vob_bear': [{'lower': float(b['lower']), 'upper': float(b['upper'])}
+                         for b in (vob.get('bearish') or [])[:6]],
+        }
+
     vob_watch = {'rise': [], 'fall': []}
+    charts = {}
+    # Spot chart first so it's the selectbox default in the mobile view.
+    try:
+        if df_spot is not None and not getattr(df_spot, 'empty', True) and len(df_spot) >= 10:
+            _spot_vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_spot) or {}
+            charts['NIFTY Spot'] = _chart_payload(df_spot, _spot_vob)
+    except Exception:
+        pass
     try:
         for tag, df_l in (st.session_state.get('_atm_leg_dfs') or {}).items():
             if df_l is None or getattr(df_l, 'empty', True):
                 continue
             ltp_l = float(df_l['close'].iloc[-1])
             vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_l) or {}
+            try:
+                if len(df_l) >= 10 and {'open', 'high', 'low', 'close'} <= set(df_l.columns):
+                    charts[tag] = _chart_payload(df_l, vob)
+            except Exception:
+                pass
             tol = max(ltp_l * 0.005, 0.5)
             side = 'CE' if ' CE ' in f' {tag} ' else ('PE' if ' PE ' in f' {tag} ' else '?')
             for b in (vob.get('bullish') or []):
@@ -13777,6 +13811,7 @@ def export_mobile_snapshot(spot_price, bias, option_data):
     except Exception:
         pass
     snap['vob_watch'] = vob_watch
+    snap['charts'] = charts
 
     # Major S/R zones for the spot
     try:
@@ -20417,7 +20452,7 @@ def _render_main_analyzer():
                             send_bias_enter_alert(_bias)
                             # 📱 Snapshot for the mobile companion app (vob_mobile.py)
                             try:
-                                export_mobile_snapshot(_u, _bias, _opt_d)
+                                export_mobile_snapshot(_u, _bias, _opt_d, df)
                             except Exception:
                                 pass
                             # 🧮 Consolidated ATM±3 leg-bias table + overall NIFTY verdict
