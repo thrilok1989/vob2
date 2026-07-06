@@ -30,11 +30,26 @@ except Exception:
     _HAS_GEMINI = False
 from indicators.volume_delta import calculate_volume_delta
 
+# 📱 ?view=mobile on the URL switches this same app into the phone-friendly
+# view rendered by vob_mobile.py — one deployment serves both desktop & mobile.
+def _qp_view():
+    try:
+        v = st.query_params.get('view')
+    except Exception:
+        try:
+            v = (st.experimental_get_query_params().get('view') or [None])[0]
+        except Exception:
+            v = None
+    return (v or '').lower()
+
+
+_VIEW_MOBILE = _qp_view() in ('mobile', 'm', 'phone')
+
 st.set_page_config(
-    page_title="Nifty Trading & Options Analyzer",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="VOB Mobile" if _VIEW_MOBILE else "Nifty Trading & Options Analyzer",
+    page_icon="📱" if _VIEW_MOBILE else "📈",
+    layout="centered" if _VIEW_MOBILE else "wide",
+    initial_sidebar_state="collapsed" if _VIEW_MOBILE else "expanded"
 )
 
 # Only auto-refresh during market hours (8:30 AM - 3:45 PM IST, weekdays)
@@ -13699,6 +13714,8 @@ def export_mobile_snapshot(spot_price, bias, option_data):
         return
     snap = {
         'ts': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'hb_ts': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'status': 'ok',
         'spot': float(spot_price or 0),
     }
 
@@ -13811,11 +13828,44 @@ def export_mobile_snapshot(spot_price, bias, option_data):
     # Recent alerts fired by the throttled Telegram sender
     snap['alerts'] = list(st.session_state.get('_recent_alerts') or [])[-15:]
 
+    # In-session copy for the embedded ?view=mobile mode (no file needed).
+    st.session_state['_mobile_snapshot'] = snap
     tmp = MOBILE_SNAPSHOT_PATH + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(snap, f, ensure_ascii=False, default=str)
     os.replace(tmp, MOBILE_SNAPSHOT_PATH)
     st.session_state['_mobile_snap_ts'] = now
+
+
+def export_mobile_heartbeat(status):
+    """Keep mobile_snapshot.json alive even when the full data cycle can't run
+    (market closed, option chain not loaded yet, API errors). Runs on every
+    rerun of the main app: preserves the last full snapshot's data and only
+    refreshes the heartbeat fields, so vob_mobile.py can tell 'backend up but
+    waiting for data' apart from 'backend not running at all'. The full
+    export_mobile_snapshot() overwrites status with 'ok' once data flows."""
+    try:
+        ist = pytz.timezone('Asia/Kolkata')
+        now = datetime.now(ist)
+        _last = st.session_state.get('_mobile_hb_ts')
+        if _last and (now - _last).total_seconds() < 10:
+            return
+        try:
+            with open(MOBILE_SNAPSHOT_PATH, encoding='utf-8') as f:
+                snap = json.load(f) or {}
+        except Exception:
+            snap = {}
+        snap['hb_ts'] = now.strftime('%Y-%m-%d %H:%M:%S')
+        # Don't clobber a healthy 'ok' from this same cycle's full export.
+        if snap.get('status') != 'ok' or not snap.get('ts'):
+            snap['status'] = status
+        tmp = MOBILE_SNAPSHOT_PATH + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump(snap, f, ensure_ascii=False, default=str)
+        os.replace(tmp, MOBILE_SNAPSHOT_PATH)
+        st.session_state['_mobile_hb_ts'] = now
+    except Exception:
+        pass
 
 
 def _ai_providers():
@@ -18753,6 +18803,11 @@ def _render_main_analyzer():
             The app will be fully functional during market hours.
             """)
         st.caption("You can still view cached data if available.")
+
+    # 📱 Keep the mobile companion snapshot alive on every rerun, even before
+    # (or without) a full data cycle, so vob_mobile.py can show backend state.
+    export_mobile_heartbeat('running — waiting for data cycle'
+                            if (is_market_hours and is_weekday) else 'market closed')
 
     for key, default in [('pcr_history', []), ('pcr_last_valid_data', None),
                           ('gex_history', []), ('gex_last_valid_data', None),
@@ -26096,7 +26151,33 @@ def _render_main_analyzer():
     st.sidebar.info(f"Last Updated: {current_time}")
 
 
+def _render_mobile_mode():
+    """📱 ?view=mobile — run the FULL engine in this same session, hide the
+    desktop dashboard via CSS, and render the phone-friendly cards from
+    vob_mobile.py on top. Works as a single deployment (Streamlit Cloud):
+    the phone opens the main app's URL with ?view=mobile appended."""
+    import vob_mobile
+    vob_mobile.inject_mobile_css()
+    _top = st.container()  # mobile cards fill this after the engine runs
+    try:
+        _engine = st.container(key='vob_desktop_engine')
+        st.markdown("<style>.st-key-vob_desktop_engine{display:none;}</style>",
+                    unsafe_allow_html=True)
+    except TypeError:
+        # Streamlit < 1.39 has no container keys: the desktop dashboard stays
+        # visible below the mobile cards instead of being hidden.
+        _engine = st.container()
+    with _engine:
+        _render_main_analyzer()
+    snap = st.session_state.get('_mobile_snapshot') or vob_mobile.load_snapshot()
+    with _top:
+        vob_mobile.render_mobile_view(snap, embedded=True)
+
+
 def main():
+    if _VIEW_MOBILE:
+        _render_mobile_mode()
+        return
     st.title("📈 Nifty Trading & Options Analyzer")
     _render_main_analyzer()
 
