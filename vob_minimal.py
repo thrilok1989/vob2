@@ -4853,6 +4853,15 @@ def _throttled_telegram_send(msg, alert_class, key, cooldown_s=900,
         return False
 
     keys[key] = now
+    # Feed the mobile companion app's recent-alerts list (plain text, cap 30)
+    try:
+        import re as _re
+        _log = st.session_state.setdefault('_recent_alerts', [])
+        _log.append({'ts': now.strftime('%H:%M:%S'), 'class': alert_class,
+                     'text': _re.sub(r'<[^>]+>', '', msg or '')})
+        del _log[:-30]
+    except Exception:
+        pass
     # roll history window, append, then check burst
     cs['history'] = [t for t in cs['history']
                      if (now - t).total_seconds() < class_window]
@@ -13669,6 +13678,146 @@ def build_ai_market_snapshot(bias, spot_price):
     return "\n".join(lines)
 
 
+# ── 📱 Mobile companion app (vob_mobile.py) snapshot export ─────────────────
+# vob_minimal stays the single backend: it computes everything each cycle and
+# dumps a compact JSON snapshot here; vob_mobile.py only reads this file.
+MOBILE_SNAPSHOT_PATH = os.environ.get(
+    'VOB_MOBILE_SNAPSHOT',
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mobile_snapshot.json'))
+
+
+def export_mobile_snapshot(spot_price, bias, option_data):
+    """Write this cycle's computed signals to MOBILE_SNAPSHOT_PATH as JSON for
+    the mobile companion app (vob_mobile.py). Atomic write (tmp + os.replace)
+    so the reader never sees a half-written file; throttled to one write per
+    ~5s. Everything is read from session state already computed this cycle —
+    only the VOB rise/fall watch re-scans the cached leg dataframes."""
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist)
+    _last = st.session_state.get('_mobile_snap_ts')
+    if _last and (now - _last).total_seconds() < 5:
+        return
+    snap = {
+        'ts': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'spot': float(spot_price or 0),
+    }
+
+    # Composite bias engine (the headline verdict + action)
+    if bias:
+        snap['composite'] = {
+            'score': bias.get('score'),
+            'label': bias.get('label'),
+            'direction': bias.get('direction'),
+            'action': bias.get('action'),
+            'confidence': bias.get('confidence'),
+            'enter_now': bool(bias.get('enter_now')),
+            'emoji': bias.get('emoji'),
+            'atm_strike': bias.get('atm_strike'),
+            'ce_ltp': bias.get('ce_ltp'),
+            'pe_ltp': bias.get('pe_ltp'),
+            'reasons': [l for _, _, l in (bias.get('reasons') or [])[:10]],
+            'contradictions': [l for _, _, l in (bias.get('contradictions') or [])[:6]],
+        }
+
+    # All-Bias dashboard: speed verdicts + per-engine table
+    snap['verdicts'] = st.session_state.get('_dashboard_verdicts') or {}
+    snap['engines'] = [
+        {'engine': r.get('Engine'), 'bias': r.get('Bias'),
+         'cat': r.get('_cat'), 'detail': r.get('Detail')}
+        for r in (st.session_state.get('_all_bias_rows') or [])
+    ]
+
+    # 14-leg bias table + overall NIFTY verdict (incl. by_speed)
+    try:
+        _rows, _overall = st.session_state.get('_leg_bias_cache') or (None, None)
+        if _rows:
+            snap['leg_rows'] = _rows
+            snap['leg_overall'] = _overall
+    except Exception:
+        pass
+
+    # VOB watch — same logic as the ENTRY / LTP FALL alerts, both sides:
+    # LTP at its own bullish VOB → premium about to RISE; at bearish → FALL.
+    vob_watch = {'rise': [], 'fall': []}
+    try:
+        for tag, df_l in (st.session_state.get('_atm_leg_dfs') or {}).items():
+            if df_l is None or getattr(df_l, 'empty', True):
+                continue
+            ltp_l = float(df_l['close'].iloc[-1])
+            vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_l) or {}
+            tol = max(ltp_l * 0.005, 0.5)
+            side = 'CE' if ' CE ' in f' {tag} ' else ('PE' if ' PE ' in f' {tag} ' else '?')
+            for b in (vob.get('bullish') or []):
+                if (b['lower'] - tol) <= ltp_l <= (b['upper'] + tol):
+                    vob_watch['rise'].append({'tag': tag, 'side': side,
+                                              'ltp': ltp_l, 'mid': float(b['mid'])})
+                    break
+            for b in (vob.get('bearish') or []):
+                if (b['lower'] - tol) <= ltp_l <= (b['upper'] + tol):
+                    vob_watch['fall'].append({'tag': tag, 'side': side,
+                                              'ltp': ltp_l, 'mid': float(b['mid'])})
+                    break
+    except Exception:
+        pass
+    snap['vob_watch'] = vob_watch
+
+    # Major S/R zones for the spot
+    try:
+        _z = st.session_state.get('_major_sr_zones') or {}
+        snap['sr_zones'] = {
+            'support': [float(z.get('price') or z.get('level') or 0)
+                        for z in (_z.get('support') or [])[:5]],
+            'resistance': [float(z.get('price') or z.get('level') or 0)
+                           for z in (_z.get('resistance') or [])[:5]],
+        }
+    except Exception:
+        pass
+
+    # ATM±3 leg LTP board (+ per-leg MFP bias)
+    try:
+        snap['legs'] = [
+            {'tag': l.get('tag'), 'ltp': float(l.get('ltp') or 0), 'mfp': l.get('mfp_bias')}
+            for l in ((st.session_state.get('_atm_pm1_vpfr') or {}).get('legs') or [])
+        ]
+    except Exception:
+        pass
+
+    # Per-leg S/R behavior (BUILDING / BREAKING)
+    try:
+        snap['sr_behavior'] = {
+            t: {'state': v.get('state'), 'direction': v.get('direction')}
+            for t, v in (st.session_state.get('_atm_leg_sr_behavior') or {}).items()
+            if v and not t.startswith('sid_') and v.get('state') not in (None, 'NONE')
+        }
+    except Exception:
+        pass
+
+    # OI walls + PCR from the option chain summary
+    try:
+        ds = (option_data or {}).get('df_summary') if option_data else None
+        if ds is not None and not getattr(ds, 'empty', True) and {'Strike', 'CE_OI', 'PE_OI'} <= set(ds.columns):
+            _cr = ds.loc[ds['CE_OI'].idxmax()]
+            _pr = ds.loc[ds['PE_OI'].idxmax()]
+            _tce = float(ds['CE_OI'].sum())
+            _tpe = float(ds['PE_OI'].sum())
+            snap['oi'] = {
+                'call_wall': {'strike': float(_cr['Strike']), 'oi': float(_cr['CE_OI'])},
+                'put_wall': {'strike': float(_pr['Strike']), 'oi': float(_pr['PE_OI'])},
+                'pcr': round(_tpe / _tce, 2) if _tce else None,
+            }
+    except Exception:
+        pass
+
+    # Recent alerts fired by the throttled Telegram sender
+    snap['alerts'] = list(st.session_state.get('_recent_alerts') or [])[-15:]
+
+    tmp = MOBILE_SNAPSHOT_PATH + '.tmp'
+    with open(tmp, 'w', encoding='utf-8') as f:
+        json.dump(snap, f, ensure_ascii=False, default=str)
+    os.replace(tmp, MOBILE_SNAPSHOT_PATH)
+    st.session_state['_mobile_snap_ts'] = now
+
+
 def _ai_providers():
     """Ordered list of available AI backends. All FREE first (Gemini, then
     Groq), paid Claude last. The advisor tries them in order and falls
@@ -20211,6 +20360,11 @@ def _render_main_analyzer():
                                 pass
                             render_composite_bias_panel(_bias)
                             send_bias_enter_alert(_bias)
+                            # 📱 Snapshot for the mobile companion app (vob_mobile.py)
+                            try:
+                                export_mobile_snapshot(_u, _bias, _opt_d)
+                            except Exception:
+                                pass
                             # 🧮 Consolidated ATM±3 leg-bias table + overall NIFTY verdict
                             try:
                                 render_leg_bias_table(_u)
