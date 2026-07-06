@@ -150,10 +150,12 @@ def render_mobile_view(snap, embedded=False):
     if not snap:
         st.markdown("## 📱 VOB Mobile")
         if embedded:
-            st.info("⏳ Engine is warming up — the first data cycle hasn't "
-                    "completed yet. This page auto-refreshes; data appears "
-                    "once the option chain loads (market hours: 8:30–15:45 "
-                    "IST, Mon–Fri).")
+            st.info("⏳ First load — the engine has started its first cycle in "
+                    "the background. This page refreshes itself (every 20s "
+                    "during market hours, 60s when closed) and will switch to "
+                    "a status card, then to live data once the option chain "
+                    "loads (market hours: 8:30–15:45 IST, Mon–Fri). No action "
+                    "needed — just leave it open.")
         else:
             st.warning(
                 "No snapshot found yet.\n\n"

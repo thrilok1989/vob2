@@ -13894,10 +13894,16 @@ def export_mobile_heartbeat(status):
         # Don't clobber a healthy 'ok' from this same cycle's full export.
         if snap.get('status') != 'ok' or not snap.get('ts'):
             snap['status'] = status
-        tmp = MOBILE_SNAPSHOT_PATH + '.tmp'
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(snap, f, ensure_ascii=False, default=str)
-        os.replace(tmp, MOBILE_SNAPSHOT_PATH)
+        # Session copy for the embedded ?view=mobile mode — keeps the mobile
+        # status card working even if the disk isn't writable.
+        st.session_state['_mobile_hb_snap'] = dict(snap)
+        try:
+            tmp = MOBILE_SNAPSHOT_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(snap, f, ensure_ascii=False, default=str)
+            os.replace(tmp, MOBILE_SNAPSHOT_PATH)
+        except Exception:
+            pass
         st.session_state['_mobile_hb_ts'] = now
     except Exception:
         pass
@@ -26200,7 +26206,9 @@ def _render_mobile_mode():
     import vob_mobile
     vob_mobile.inject_mobile_css()
 
-    snap = st.session_state.get('_mobile_snapshot') or vob_mobile.load_snapshot()
+    snap = (st.session_state.get('_mobile_snapshot')
+            or vob_mobile.load_snapshot()
+            or st.session_state.get('_mobile_hb_snap'))
     vob_mobile.render_mobile_view(snap, embedded=True)
     _eng_err = st.session_state.get('_mobile_engine_err')
     if _eng_err:
