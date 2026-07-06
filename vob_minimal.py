@@ -201,6 +201,7 @@ _ALLOWED_ALERT_MARKERS = (
     'MAJOR S/R TOUCH',
     'BIAS ENTER',
     'OVERALL BIAS ENTRY',
+    'LTP FALL',
     'CALL CAPPING',
     'PUT WRITING',
     'PUT CAPPING',
@@ -13335,6 +13336,13 @@ def render_all_bias_dashboard(spot_price, df, option_data):
                                        spot_price, option_data)
     except Exception:
         pass
+    # Reverse-side alert: any CE/PE leg whose LTP sits at its own BEARISH VOB
+    # (resistance on the option's own chart) → that premium about to FALL.
+    try:
+        send_ltp_fall_alert(_fast_label, _fast_em, fast_bull, fast_bear,
+                             spot_price, option_data)
+    except Exception:
+        pass
 
     def _verdict(net):
         if net >= 4:
@@ -14416,6 +14424,149 @@ def send_overall_bias_entry_alert(overall_label, overall_em, bull_score, bear_sc
                                                  key=key, cooldown_s=300,
                                                  class_limit=3, class_window=600,
                                                  class_sleep=1800):
+        return msg
+    return None
+
+
+def send_ltp_fall_alert(overall_label, overall_em, bull_score, bear_score, spot_price, option_data):
+    """Mirror of send_overall_bias_entry_alert, but for the SELL side of the
+    premium: fires when any ATM±3 leg's LTP — CE or PE — is sitting at a
+    BEARISH VOB on that option's own chart.
+
+    Logic (reverse of the entry alert): a bearish VOB is resistance on the
+    option's own chart, so LTP at it means THAT option's premium is about to
+    FALL — regardless of which way NIFTY goes:
+      - CE at its bearish VOB → CE about to fall (avoid buying / exit CE)
+      - PE at its bearish VOB → PE about to fall (avoid buying / exit PE)
+
+    Fires on any overall bias (bull/bear/mixed) since the falling leg itself
+    carries the signal. 5-min cooldown per leg-combination. Allow-listed via
+    the 'LTP FALL' marker."""
+    ce_at_own_res = []  # CE legs at their own bearish VOB
+    pe_at_own_res = []  # PE legs at their own bearish VOB
+    try:
+        legs_dfs = st.session_state.get('_atm_leg_dfs') or {}
+        for tag, df_l in legs_dfs.items():
+            if df_l is None or df_l.empty:
+                continue
+            ltp_l = float(df_l['close'].iloc[-1])
+            vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_l) or {}
+            tol = max(ltp_l * 0.005, 0.5)
+            at_bear_vob = False
+            mid_v = None
+            for b in (vob.get('bearish') or []):
+                if (b['lower'] - tol) <= ltp_l <= (b['upper'] + tol):
+                    at_bear_vob = True; mid_v = b['mid']; break
+            if not at_bear_vob:
+                continue
+            if ' CE ' in f' {tag} ':
+                ce_at_own_res.append((tag, ltp_l, mid_v))
+            elif ' PE ' in f' {tag} ':
+                pe_at_own_res.append((tag, ltp_l, mid_v))
+    except Exception:
+        pass
+
+    if not (ce_at_own_res or pe_at_own_res):
+        return None
+
+    # ── Shared context blocks (same as the entry alert) ──
+    _dv = st.session_state.get('_dashboard_verdicts') or {}
+    def _vl(k):
+        d = _dv.get(k)
+        return f"{d['em']} {d['label']} (net {d['net']:+d})" if d else "—"
+    _speed_block = (
+        "📊 <b>All-Bias by speed:</b>\n"
+        f"  🚀 Fast: {_vl('fast')}\n"
+        f"  🐢 Lagging: {_vl('lag')}\n"
+        f"  🌫️ Misguiding: {_vl('mis')}"
+    )
+
+    _cap_block = ""
+    try:
+        ds = (option_data or {}).get('df_summary') if option_data else None
+        if ds is not None and not getattr(ds, 'empty', True) and {'Strike', 'CE_OI', 'PE_OI'} <= set(ds.columns):
+            _cr = ds.loc[ds['CE_OI'].idxmax()]
+            _pr = ds.loc[ds['PE_OI'].idxmax()]
+            _cap_block = (
+                "🧱 <b>OI walls:</b> "
+                f"CALL CAPPING ₹{_cr['Strike']:.0f} (CE OI {_cr['CE_OI']/100000:.1f}L · resistance) · "
+                f"PUT WRITING ₹{_pr['Strike']:.0f} (PE OI {_pr['PE_OI']/100000:.1f}L · support)"
+            )
+    except Exception:
+        _cap_block = ""
+
+    _sr_block = ""
+    try:
+        _srs = st.session_state.get('_atm_leg_sr_behavior') or {}
+        _sr_items = []
+        for _t, _vv in _srs.items():
+            if _t.startswith('sid_') or not _vv:
+                continue
+            _stt = _vv.get('state')
+            if _stt in (None, 'NONE'):
+                continue
+            _de = '🟢' if _vv.get('direction') == 'bull' else ('🔴' if _vv.get('direction') == 'bear' else '⚪')
+            _sr_items.append(f"{_t} {_de}{_stt}")
+        if _sr_items:
+            _sr_block = "📐 <b>LTP S/R behavior:</b> " + " · ".join(_sr_items[:8])
+    except Exception:
+        _sr_block = ""
+
+    def _all_leg_ltps(side):
+        out = []
+        try:
+            for leg in ((st.session_state.get('_atm_pm1_vpfr') or {}).get('legs') or []):
+                tag = leg.get('tag', '')
+                if f" {side} " in f" {tag} ":
+                    out.append(f"  • {tag}: ₹{float(leg.get('ltp') or 0):.2f}")
+        except Exception:
+            pass
+        return out
+
+    loc_lines = []
+    for tag, ltp_l, mid in ce_at_own_res:
+        loc_lines.append(f"  📍 {tag}: LTP ₹{ltp_l:.2f} at CE bearish VOB (mid ₹{mid:.2f}) — CE about to fall")
+    for tag, ltp_l, mid in pe_at_own_res:
+        loc_lines.append(f"  📍 {tag}: LTP ₹{ltp_l:.2f} at PE bearish VOB (mid ₹{mid:.2f}) — PE about to fall")
+
+    _ltp_blocks = ""
+    if ce_at_own_res:
+        _all_ce = _all_leg_ltps('CE')
+        if _all_ce:
+            _ltp_blocks += "💰 <b>Current LTP — all ATM±3 CALLs:</b>\n" + "\n".join(_all_ce) + "\n"
+    if pe_at_own_res:
+        _all_pe = _all_leg_ltps('PE')
+        if _all_pe:
+            _ltp_blocks += "💰 <b>Current LTP — all ATM±3 PUTs:</b>\n" + "\n".join(_all_pe) + "\n"
+
+    n_ce, n_pe = len(ce_at_own_res), len(pe_at_own_res)
+    if n_ce and n_pe:
+        _what = f"{n_ce} CALL + {n_pe} PUT legs"
+    elif n_ce:
+        _what = f"{n_ce} CALL leg{'s' if n_ce > 1 else ''}"
+    else:
+        _what = f"{n_pe} PUT leg{'s' if n_pe > 1 else ''}"
+    msg = (
+        f"🔻⚠️ <b>LTP FALL — {_what} at bearish VOB</b> — premium likely to DROP ⬇️ (avoid buy / exit)\n"
+        f"Overall Bias: <b>{overall_label}</b> ({overall_em}) · Bull {bull_score} vs Bear {bear_score}\n"
+        f"{_speed_block}\n"
+        + (_cap_block + "\n" if _cap_block else "")
+        + (_sr_block + "\n" if _sr_block else "")
+        + "🔻 <b>Falling (LTP at its resistance VOB):</b>\n"
+        + "\n".join(loc_lines) + "\n"
+        + _ltp_blocks
+        + f"NIFTY Spot ₹{spot_price:.1f}"
+    )
+    # Dedup on the exact combination of falling legs (compact: C24400_P24350…)
+    _combo = "_".join(
+        ('C' if ' CE ' in f' {t} ' else 'P') + t.split()[-1]
+        for t, _, _ in sorted(ce_at_own_res + pe_at_own_res)
+    )
+    key = f"ltp_fall_{_combo}"
+    if _throttled_telegram_send(msg, alert_class='ltp_fall',
+                                 key=key, cooldown_s=300,
+                                 class_limit=3, class_window=600,
+                                 class_sleep=1800):
         return msg
     return None
 
