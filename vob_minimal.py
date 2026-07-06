@@ -14258,10 +14258,9 @@ def send_overall_bias_entry_alert(overall_label, overall_em, bull_score, bear_sc
 
     Spot S/R from _major_sr_zones (OI+VPFR+Gamma+MF cluster, 25pt prox).
     LTP S/R from each leg's own VOB zones (bullish=support, bearish=resistance).
-    Each flagged leg also reports a downside/invalidation read: the cushion
-    (points) left to its own VOB zone floor, and — if that floor breaks too —
-    the next deeper support where price should reverse or stop (next lower
-    bullish VOB on that leg, else today's low as a last-resort floor).
+    Each flagged leg also reports how far the rise should run before it stops
+    and reverses: the nearest bearish VOB (resistance) above current LTP on
+    that same leg's own chart, else today's high as a soft cap.
     5-min cooldown per direction. Allow-listed via 'OVERALL BIAS ENTRY' marker."""
     label_l = (overall_label or '').lower()
     is_bull = ('bull' in label_l and 'mixed' not in label_l)
@@ -14305,34 +14304,35 @@ def send_overall_bias_entry_alert(overall_label, overall_em, bull_score, bear_sc
             tol = max(ltp_l * 0.005, 0.5)
             at_bull_vob = False
             mid_v = None
-            cur_block = None
-            bulls = sorted(vob.get('bullish') or [], key=lambda x: x['mid'])
-            for b in bulls:
+            for b in (vob.get('bullish') or []):
                 if (b['lower'] - tol) <= ltp_l <= (b['upper'] + tol):
-                    at_bull_vob = True; mid_v = b['mid']; cur_block = b; break
+                    at_bull_vob = True; mid_v = b['mid']; break
             if not at_bull_vob:
                 continue
-            # Downside risk if this VOB fails instead of holding: how many
-            # points of cushion remain to the zone's own floor, and — if that
-            # floor breaks too — the next deeper support where it should
-            # reverse/stop (next lower bullish VOB, else today's low as a
-            # last-resort floor).
-            floor_px = cur_block['lower']
-            cushion_pts = max(0.0, ltp_l - floor_px)
-            deeper = [s for s in bulls if s['mid'] < cur_block['mid'] - 1e-9]
-            if deeper:
-                next_sup = max(deeper, key=lambda s: s['mid'])
-                next_sup_px = next_sup['mid']
+            # Rise is expected to stop and reverse at the nearest resistance
+            # (bearish VOB) sitting ABOVE current LTP on this same leg's own
+            # chart — that's the "how far up before it turns around" target.
+            # Same rule for CE and PE legs alike (whichever side is flagged
+            # "about to rise" here), so BUY CALL and BUY PUT get identical
+            # mirrored logic, just applied to that leg's own VOB data.
+            resistances_above = [
+                r for r in (vob.get('bearish') or []) if r['mid'] > ltp_l
+            ]
+            if resistances_above:
+                nearest_res = min(resistances_above, key=lambda r: r['mid'])
+                target_px = nearest_res['mid']
+                res_src = 'VOB'
             else:
                 try:
-                    next_sup_px = float(df_l['low'].min())
+                    target_px = float(df_l['high'].max())
                 except Exception:
-                    next_sup_px = floor_px
-            next_sup_pts = max(0.0, ltp_l - next_sup_px)
+                    target_px = ltp_l
+                res_src = 'day-high'
+            target_pts = max(0.0, target_px - ltp_l)
             if ' CE ' in f' {tag} ':
-                ce_at_own_sup.append((tag, ltp_l, mid_v, floor_px, cushion_pts, next_sup_px, next_sup_pts))
+                ce_at_own_sup.append((tag, ltp_l, mid_v, target_px, target_pts, res_src))
             elif ' PE ' in f' {tag} ':
-                pe_at_own_sup.append((tag, ltp_l, mid_v, floor_px, cushion_pts, next_sup_px, next_sup_pts))
+                pe_at_own_sup.append((tag, ltp_l, mid_v, target_px, target_pts, res_src))
     except Exception:
         pass
 
@@ -14400,11 +14400,11 @@ def send_overall_bias_entry_alert(overall_label, overall_em, bull_score, bear_sc
         loc_lines = []
         if spot_at_sup:
             loc_lines.append(f"  📍 Spot ₹{spot_price:.1f} at major support ₹{sup_lvl:.0f}")
-        for tag, ltp_l, mid, floor_px, cushion_pts, next_sup_px, next_sup_pts in ce_at_own_sup:
+        for tag, ltp_l, mid, target_px, target_pts, res_src in ce_at_own_sup:
             loc_lines.append(f"  📍 {tag}: LTP ₹{ltp_l:.2f} at CE bullish VOB (mid ₹{mid:.2f}) — CE about to rise")
+            _res_note = "nearest CE resistance VOB" if res_src == 'VOB' else "today's high — no resistance VOB yet"
             loc_lines.append(
-                f"     ⚠️ If wrong: ~₹{cushion_pts:.2f} cushion to zone floor ₹{floor_px:.2f} · "
-                f"should reverse/stop near ₹{next_sup_px:.2f} (−{next_sup_pts:.0f} pts) if that floor breaks too"
+                f"     🎯 Should rise ~₹{target_pts:.2f} to ₹{target_px:.2f} before stalling/reversing ({_res_note})"
             )
         _all_ce = _all_leg_ltps('CE')
         msg = (
@@ -14423,11 +14423,11 @@ def send_overall_bias_entry_alert(overall_label, overall_em, bull_score, bear_sc
         loc_lines = []
         if spot_at_res:
             loc_lines.append(f"  📍 Spot ₹{spot_price:.1f} at major resistance ₹{res_lvl:.0f}")
-        for tag, ltp_l, mid, floor_px, cushion_pts, next_sup_px, next_sup_pts in pe_at_own_sup:
+        for tag, ltp_l, mid, target_px, target_pts, res_src in pe_at_own_sup:
             loc_lines.append(f"  📍 {tag}: LTP ₹{ltp_l:.2f} at PE bullish VOB (mid ₹{mid:.2f}) — PE about to rise")
+            _res_note = "nearest PE resistance VOB" if res_src == 'VOB' else "today's high — no resistance VOB yet"
             loc_lines.append(
-                f"     ⚠️ If wrong: ~₹{cushion_pts:.2f} cushion to zone floor ₹{floor_px:.2f} · "
-                f"should reverse/stop near ₹{next_sup_px:.2f} (−{next_sup_pts:.0f} pts) if that floor breaks too"
+                f"     🎯 Should rise ~₹{target_pts:.2f} to ₹{target_px:.2f} before stalling/reversing ({_res_note})"
             )
         _all_pe = _all_leg_ltps('PE')
         msg = (
