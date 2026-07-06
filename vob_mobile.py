@@ -25,6 +25,8 @@ from datetime import datetime
 
 import streamlit as st
 import pytz
+import pandas as pd
+import plotly.graph_objects as go
 
 SNAPSHOT_PATH = os.environ.get(
     'VOB_MOBILE_SNAPSHOT',
@@ -76,6 +78,50 @@ def card(html, bg=None, bd=None):
     style = f"background:{bg}; border:1px solid {bd};" if bg else ""
     st.markdown(f"<div class='vob-card' style='{style}'>{html}</div>",
                 unsafe_allow_html=True)
+
+
+def candle_chart(ch, sr_zones=None):
+    """Phone-sized candlestick figure with the leg's VOB zones shaded
+    (green = bullish/support, red = bearish/resistance) and, for the spot
+    chart, dashed S/R level lines. Recessive grid, no rangeslider, native
+    per-candle hover."""
+    fig = go.Figure(go.Candlestick(
+        x=ch['t'], open=ch['o'], high=ch['h'], low=ch['l'], close=ch['c'],
+        increasing_line_color=GREEN_BD, decreasing_line_color=RED_BD,
+        increasing_fillcolor=GREEN_BD, decreasing_fillcolor=RED_BD,
+        line_width=1, whiskerwidth=0.4, name='',
+    ))
+    lo, hi = min(ch['l']), max(ch['h'])
+    pad = (hi - lo) * 0.25 or 1
+    for z in ch.get('vob_bull') or []:
+        if z['upper'] > lo - pad and z['lower'] < hi + pad:
+            fig.add_hrect(y0=z['lower'], y1=z['upper'], line_width=0,
+                          fillcolor='rgba(0,255,136,0.14)')
+    for z in ch.get('vob_bear') or []:
+        if z['upper'] > lo - pad and z['lower'] < hi + pad:
+            fig.add_hrect(y0=z['lower'], y1=z['upper'], line_width=0,
+                          fillcolor='rgba(255,68,68,0.14)')
+    for lv in (sr_zones or {}).get('support') or []:
+        if lo - pad < lv < hi + pad:
+            fig.add_hline(y=lv, line_dash='dot', line_width=1, line_color=GREEN_BD,
+                          annotation_text=f"S {lv:,.0f}", annotation_font_size=10,
+                          annotation_font_color=GREEN_BD)
+    for lv in (sr_zones or {}).get('resistance') or []:
+        if lo - pad < lv < hi + pad:
+            fig.add_hline(y=lv, line_dash='dot', line_width=1, line_color=RED_BD,
+                          annotation_text=f"R {lv:,.0f}", annotation_font_size=10,
+                          annotation_font_color=RED_BD)
+    fig.update_layout(
+        height=320, margin=dict(l=0, r=4, t=8, b=0), showlegend=False,
+        paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
+        font=dict(color='#8892a6', size=10),
+        xaxis=dict(rangeslider_visible=False, nticks=6, showgrid=False,
+                   fixedrange=True),
+        yaxis=dict(side='right', gridcolor='rgba(136,146,166,0.18)',
+                   fixedrange=True),
+        dragmode=False, hovermode='x',
+    )
+    return fig
 
 
 def load_snapshot():
@@ -227,6 +273,38 @@ def render_mobile_view(snap, embedded=False):
             card(f"<b style='color:{RED_BD};'>FALL ⬇️ — LTP at its bearish VOB (resistance) · avoid buy / exit</b>{rows}",
                  RED_BG, RED_BD)
 
+    # ── 📈 Charts: spot + every ATM±3 leg, candles with VOB zones ───────────
+    charts = snap.get('charts') or {}
+    if charts:
+        st.markdown("#### 📈 Charts")
+        tags = list(charts.keys())
+        _rise_tags = {r['tag'] for r in rise}
+        _fall_tags = {r['tag'] for r in fall}
+
+        def _label(t):
+            if t in _rise_tags:
+                return f"{t} ⬆️ at bullish VOB"
+            if t in _fall_tags:
+                return f"{t} ⬇️ at bearish VOB"
+            return t
+
+        sel = st.selectbox("Chart", tags, index=0, key='vob_chart_sel',
+                           format_func=_label, label_visibility='collapsed')
+        ch = charts.get(sel)
+        if ch and ch.get('c'):
+            _chg = ch['c'][-1] - ch['o'][0]
+            _cc = GREEN_BD if _chg >= 0 else RED_BD
+            st.markdown(
+                f"<div class='vob-sub' style='margin-bottom:2px;'>{sel} · "
+                f"last <b style='color:inherit;'>₹{ch['c'][-1]:,.2f}</b> · "
+                f"<span style='color:{_cc};'>{_chg:+,.2f}</span> over shown bars · "
+                f"🟩 bullish VOB (support) · 🟥 bearish VOB (resistance)</div>",
+                unsafe_allow_html=True)
+            st.plotly_chart(
+                candle_chart(ch, sr_zones=(snap.get('sr_zones') if sel == 'NIFTY Spot' else None)),
+                use_container_width=True,
+                config={'displayModeBar': False})
+
     # ── LTP board: ATM±3 CE / PE ────────────────────────────────────────────
     legs = snap.get('legs') or []
     if legs:
@@ -258,6 +336,21 @@ def render_mobile_view(snap, embedded=False):
             card(f"<b style='color:{GREEN_BD};'>CALLs (CE)</b>{ce_rows}")
         if pe_rows:
             card(f"<b style='color:{RED_BD};'>PUTs (PE)</b>{pe_rows}")
+
+    # ── 📋 Tables: full 14-leg signal table (swipe sideways to scroll) ──────
+    leg_rows = snap.get('leg_rows') or []
+    if leg_rows:
+        st.markdown("#### 📋 Leg bias tables")
+        st.caption("Every signal per leg — swipe the table sideways to see all columns.")
+        _clean = [{k: v for k, v in r.items() if not k.startswith('_')} for r in leg_rows]
+        _ce_t = [r for r in _clean if ' CE ' in f" {r.get('Leg', '')} "]
+        _pe_t = [r for r in _clean if ' PE ' in f" {r.get('Leg', '')} "]
+        if _ce_t:
+            with st.expander(f"🟢 CALL (CE) legs — {len(_ce_t)}", expanded=False):
+                st.dataframe(pd.DataFrame(_ce_t), use_container_width=True, hide_index=True)
+        if _pe_t:
+            with st.expander(f"🔴 PUT (PE) legs — {len(_pe_t)}", expanded=False):
+                st.dataframe(pd.DataFrame(_pe_t), use_container_width=True, hide_index=True)
 
     # ── Spot S/R zones + OI walls ───────────────────────────────────────────
     zones = snap.get('sr_zones') or {}
