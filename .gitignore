@@ -25,3 +25,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Mobile companion app snapshot (regenerated every cycle by vob_minimal.py)
+mobile_snapshot.json
+mobile_snapshot.json.tmp
