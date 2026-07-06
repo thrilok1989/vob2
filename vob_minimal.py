@@ -26155,10 +26155,32 @@ def _render_mobile_mode():
     """📱 ?view=mobile — run the FULL engine in this same session, hide the
     desktop dashboard via CSS, and render the phone-friendly cards from
     vob_mobile.py on top. Works as a single deployment (Streamlit Cloud):
-    the phone opens the main app's URL with ?view=mobile appended."""
+    the phone opens the main app's URL with ?view=mobile appended.
+
+    ORDER MATTERS: the mobile cards render FIRST, from the last completed
+    cycle's snapshot, so the page is never blank — the engine below can take
+    a minute of API calls on first load, and its trade-management branches
+    may st.rerun()/st.stop() mid-script, which would otherwise abort the run
+    before anything visible was drawn."""
     import vob_mobile
     vob_mobile.inject_mobile_css()
-    _top = st.container()  # mobile cards fill this after the engine runs
+
+    snap = st.session_state.get('_mobile_snapshot') or vob_mobile.load_snapshot()
+    vob_mobile.render_mobile_view(snap, embedded=True)
+    _eng_err = st.session_state.get('_mobile_engine_err')
+    if _eng_err:
+        st.caption(f"⚠️ Engine error last cycle: {_eng_err}")
+
+    # Off-hours the module-level 20s autorefresh is disabled; keep a slow tick
+    # so the phone still picks up fresh data without a manual reload.
+    if not _is_market_open:
+        try:
+            st_autorefresh(interval=60000, key="mobilerefresh")
+        except Exception:
+            pass
+
+    # Now run the FULL engine hidden below — it computes everything (and the
+    # next snapshot) that the mobile cards show on the following refresh.
     try:
         _engine = st.container(key='vob_desktop_engine')
         st.markdown("<style>.st-key-vob_desktop_engine{display:none;}</style>",
@@ -26167,11 +26189,21 @@ def _render_mobile_mode():
         # Streamlit < 1.39 has no container keys: the desktop dashboard stays
         # visible below the mobile cards instead of being hidden.
         _engine = st.container()
-    with _engine:
-        _render_main_analyzer()
-    snap = st.session_state.get('_mobile_snapshot') or vob_mobile.load_snapshot()
-    with _top:
-        vob_mobile.render_mobile_view(snap, embedded=True)
+    try:
+        with _engine:
+            _render_main_analyzer()
+        st.session_state['_mobile_engine_err'] = None
+    except Exception as _e:
+        # Let Streamlit's control-flow exceptions (rerun/stop) propagate —
+        # the mobile view is already on screen. Swallow real engine errors
+        # so one bad cycle doesn't blank the phone; surface them next run.
+        try:
+            from streamlit.runtime.scriptrunner import RerunException, StopException
+            if isinstance(_e, (RerunException, StopException)):
+                raise
+        except ImportError:
+            pass
+        st.session_state['_mobile_engine_err'] = f"{type(_e).__name__}: {str(_e)[:200]}"
 
 
 def main():
