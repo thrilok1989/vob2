@@ -14032,6 +14032,53 @@ def _exp(default=True):
     return default
 
 
+def _compact_hidden_call(label, key, render_fn):
+    """Compact-mode wrapper for sections that contain their OWN expanders (so
+    wrapping them in st.expander would be illegal nesting) or that must keep
+    computing while minimized (e.g. live trade management): shows a one-line
+    toggle; while off, the section renders inside a CSS-hidden keyed container
+    — fully computed (alerts/session-state stay live), just not displayed.
+    On Streamlit < 1.39 (no container keys) the section stays visible."""
+    if (not st.session_state.get('_compact_mode', True)) or st.toggle(
+            f"{label} — open panel", key=key):
+        render_fn()
+        return
+    try:
+        _c = st.container(key=f"hid_{key}")
+        st.markdown(f"<style>div.st-key-hid_{key}{{display:none;}}</style>",
+                    unsafe_allow_html=True)
+    except TypeError:
+        _c = st.container()
+    with _c:
+        render_fn()
+
+
+def _compact_tail_toggle(label, key):
+    """Compact-mode stub for a heavy INLINE region: everything rendered AFTER
+    this call inside the same parent block is CSS-hidden — but still computes
+    — until the toggle is switched on. Used where the region is thousands of
+    inline lines that can't be wrapped in a container without re-indenting.
+    On Streamlit < 1.39 (no container keys) the region stays visible."""
+    if not st.session_state.get('_compact_mode', True):
+        return
+    _open = st.toggle(f"{label} — open panel", key=key)
+    try:
+        with st.container(key=f"mark_{key}"):
+            st.empty()
+        if not _open:
+            # The keyed class lands on the inner stVerticalBlock; the sibling
+            # unit in the parent flow is its stLayoutWrapper — target both
+            # layouts so the rule survives Streamlit DOM variations.
+            st.markdown(
+                f"<style>"
+                f"div[data-testid='stLayoutWrapper']:has(.st-key-mark_{key}) ~ div,"
+                f"div.st-key-mark_{key} ~ div {{ display:none; }}"
+                f"</style>",
+                unsafe_allow_html=True)
+    except TypeError:
+        pass
+
+
 def render_sidebar_quick_nav():
     """Sidebar table of contents — jump links to the major desktop sections
     (each target is a _nav_anchor placed just before that section's header),
@@ -19491,7 +19538,12 @@ def _render_main_analyzer():
         try:
             _opt_data_top = st.session_state.get('_cached_option_data')
             _df_5m_top = getattr(st.session_state, '_df_5m', None)
-            show_auto_trade_section(_opt_data_top, _df_5m_top, api, db)
+            # Keeps computing while minimized — active-trade SL/TP monitoring
+            # and auto exits must run every cycle even when the panel is hidden.
+            _compact_hidden_call(
+                "🎯 Zone-Based Auto Trade (incl. ⚙️ Manual Zone & Trade Setup)",
+                '_show_autotrade',
+                lambda: show_auto_trade_section(_opt_data_top, _df_5m_top, api, db))
         except Exception as _ate_top:
             st.caption(f"Auto trade init: {_ate_top}")
 
@@ -21470,19 +21522,30 @@ def _render_main_analyzer():
 
             # ── 🛢️ Cross-Sectional Commodity Risk Dashboard ──────────────────
             try:
-                render_commodity_risk_panel()
+                if st.session_state.get('_compact_mode', True):
+                    with st.expander("🛢️ Cross-Sectional Commodity Risk Dashboard", expanded=False):
+                        render_commodity_risk_panel()
+                else:
+                    render_commodity_risk_panel()
             except Exception as _cr_err:
                 st.caption(f"Commodity panel unavailable: {_cr_err}")
 
             # ── 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily) ──
             try:
-                render_global_indices_panel()
+                # Has its own inner expanders → CSS-hidden toggle, not st.expander
+                _compact_hidden_call(
+                    "🌍 Global Indices · Money Flow + VPFR + Dynamic PoC",
+                    '_show_global_idx', render_global_indices_panel)
             except Exception as _gi_err:
                 st.caption(f"Global indices panel unavailable: {_gi_err}")
 
             # ── 💰 NIFTY Futures Money Flow Profile (10 rows) ────────────────
             try:
-                render_gift_nifty_moneyflow_panel()
+                if st.session_state.get('_compact_mode', True):
+                    with st.expander("💰 NIFTY Futures Money Flow Profile (10 rows)", expanded=False):
+                        render_gift_nifty_moneyflow_panel()
+                else:
+                    render_gift_nifty_moneyflow_panel()
             except Exception as _gm_err:
                 st.caption(f"NIFTY futures money flow unavailable: {_gm_err}")
 
@@ -21605,6 +21668,10 @@ def _render_main_analyzer():
                     st.info(f"Volume Delta: No data yet. df rows={len(df) if not df.empty else 0}, volume_delta_data={'computed' if volume_delta_data else 'None'}")
 
             st.markdown("---")
+            # Everything after this stub (Reversal Detector + Triple POC +
+            # Future Swing) is CSS-hidden in compact mode but keeps computing.
+            _compact_tail_toggle("🔄 Reversal Detector · 📊 Triple POC + Future Swing",
+                                 '_show_reversal_suite')
             _nav_anchor('sec-reversal')
             st.markdown("## 🔄 Intraday Reversal Detector")
             try:
@@ -21872,6 +21939,14 @@ def _render_main_analyzer():
 
     if option_data and option_data.get('underlying'):
         st.markdown("---")
+        # Everything after this stub (Options Chain Analysis → Money Flow →
+        # OI Unwinding → HTF S/R → Deep Analysis → Signal History → PCR / OI /
+        # ChgOI / Volume / Bid / Ask time series …) is CSS-hidden in compact
+        # mode but keeps computing, so alerts and histories stay live.
+        _compact_tail_toggle(
+            "📊 Deep analytics suite — option chain · money flow · unwinding · "
+            "HTF S/R · deep analysis · PCR/OI/volume time series",
+            '_show_deep_suite')
         _nav_anchor('sec-chain')
         st.header("📊 Options Chain Analysis")
         st.markdown("## Open Interest Change (in Lakhs)")
