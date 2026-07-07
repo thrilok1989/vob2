@@ -58,7 +58,9 @@ _is_market_open = (
     _ist_now.weekday() < 5 and
     _ist_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _ist_now <= _ist_now.replace(hour=15, minute=45, second=0, microsecond=0)
 )
-if _is_market_open:
+# Pause the 20s refresh while a mobile popup chart is open (?view=mobile) so
+# it isn't dismissed on every cycle; the desktop app never sets _popup_leg.
+if _is_market_open and not st.session_state.get('_popup_leg'):
     st_autorefresh(interval=20000, key="datarefresh")
 
 st.markdown("""
@@ -26215,8 +26217,9 @@ def _render_mobile_mode():
         st.caption(f"⚠️ Engine error last cycle: {_eng_err}")
 
     # Off-hours the module-level 20s autorefresh is disabled; keep a slow tick
-    # so the phone still picks up fresh data without a manual reload.
-    if not _is_market_open:
+    # so the phone still picks up fresh data without a manual reload — but not
+    # while a popup chart is open (it would dismiss the dialog).
+    if not _is_market_open and not st.session_state.get('_popup_leg'):
         try:
             st_autorefresh(interval=60000, key="mobilerefresh")
         except Exception:
