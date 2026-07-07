@@ -13862,6 +13862,102 @@ def export_mobile_snapshot(spot_price, bias, option_data, df_spot=None):
     except Exception:
         pass
 
+    # ⛓️ Option chain table (ATM±5 strikes, key columns only)
+    try:
+        ds = (option_data or {}).get('df_summary') if option_data else None
+        if ds is not None and not getattr(ds, 'empty', True) and 'Strike' in ds.columns:
+            _strikes = sorted(ds['Strike'].dropna().unique().tolist())
+            if _strikes:
+                _atm_c = min(_strikes, key=lambda x: abs(x - float(spot_price or 0)))
+                _ix = _strikes.index(_atm_c)
+                _keep = set(_strikes[max(0, _ix - 5):_ix + 6])
+                _cands = {
+                    'CE LTP': ['lastPrice_CE', 'CE_LTP'],
+                    'CE OI': ['CE_OI', 'openInterest_CE'],
+                    'CE ChgOI': ['changeinOpenInterest_CE', 'CE_ChgOI'],
+                    'CE Vol': ['totalTradedVolume_CE', 'CE_Volume'],
+                    'CE IV': ['impliedVolatility_CE'],
+                    'PE LTP': ['lastPrice_PE', 'PE_LTP'],
+                    'PE OI': ['PE_OI', 'openInterest_PE'],
+                    'PE ChgOI': ['changeinOpenInterest_PE', 'PE_ChgOI'],
+                    'PE Vol': ['totalTradedVolume_PE', 'PE_Volume'],
+                    'PE IV': ['impliedVolatility_PE'],
+                }
+                _crows = []
+                for _, _r in ds[ds['Strike'].isin(_keep)].sort_values('Strike').iterrows():
+                    _row = {'Strike': int(_r['Strike'])}
+                    for _lbl, _cols in _cands.items():
+                        for _c in _cols:
+                            if _c in ds.columns:
+                                try:
+                                    _row[_lbl] = round(float(_r[_c] or 0), 2)
+                                except Exception:
+                                    _row[_lbl] = 0
+                                break
+                    _crows.append(_row)
+                snap['chain'] = {'atm': float(_atm_c), 'rows': _crows}
+    except Exception:
+        pass
+
+    # 📉 Trends — session timelines compacted to (t, v) series
+    try:
+        def _tl(e):
+            tm = e.get('time')
+            return tm.strftime('%H:%M') if hasattr(tm, 'strftime') else str(tm)[:5]
+
+        def _series(hist, suffix):
+            tt, vv = [], []
+            for e in hist[-120:]:
+                vals = [v for k, v in e.items() if k != 'time' and k.endswith(suffix)]
+                if vals:
+                    tt.append(_tl(e))
+                    vv.append(round(float(sum(vals)), 2))
+            return {'t': tt, 'v': vv}
+
+        trends = {}
+        _ph = st.session_state.get('pcr_history') or []
+        if _ph:
+            tt, vv = [], []
+            for e in _ph[-120:]:
+                vals = [v for k, v in e.items() if k != 'time']
+                if vals:
+                    tt.append(_tl(e))
+                    vv.append(round(sum(vals) / len(vals), 3))
+            trends['pcr'] = {'t': tt, 'v': vv}
+        _oh = st.session_state.get('oi_history') or []
+        if _oh:
+            trends['oi_ce'] = _series(_oh, '_CE')
+            trends['oi_pe'] = _series(_oh, '_PE')
+        _ch = st.session_state.get('chgoi_history') or []
+        if _ch:
+            trends['chgoi_ce'] = _series(_ch, '_CE')
+            trends['chgoi_pe'] = _series(_ch, '_PE')
+        _vh = st.session_state.get('vol_history') or []
+        if _vh:
+            trends['vol_ce'] = _series(_vh, '_CE')
+            trends['vol_pe'] = _series(_vh, '_PE')
+        _ivh = st.session_state.get('_iv_history') or []
+        if _ivh:
+            trends['iv'] = {'t': list(range(len(_ivh[-120:]))),
+                            'v': [float(x) for x in _ivh[-120:]]}
+        if trends:
+            snap['trends'] = trends
+    except Exception:
+        pass
+
+    # 🧪 Greek Absorption / Capping table
+    try:
+        _ga = st.session_state.get('_greek_absorb_last') or {}
+        if _ga.get('rows'):
+            snap['greek_absorb'] = {
+                'rows': list(_ga.get('rows') or [])[:14],
+                'nifty': _ga.get('nifty'),
+                'ce_capping': _ga.get('ce_capping', 0),
+                'pe_writing': _ga.get('pe_writing', 0),
+            }
+    except Exception:
+        pass
+
     # Recent alerts fired by the throttled Telegram sender
     snap['alerts'] = list(st.session_state.get('_recent_alerts') or [])[-15:]
 
