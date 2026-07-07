@@ -8159,6 +8159,7 @@ def compute_commodity_risk():
 
 def render_commodity_risk_panel():
     data = st.session_state.get('_commodity_risk')
+    _nav_anchor('sec-commodity')
     st.markdown("## 🛢️ Cross-Sectional Commodity Risk Dashboard")
     if not data:
         st.info("Commodity data not loaded yet — fetches with the ~20s Master Signal cycle.")
@@ -8455,6 +8456,7 @@ def compute_global_nifty_bias():
 def render_global_indices_panel():
     """Display Money Flow Profile + VPFR + Dynamic PoC + VOB + HVP for global instruments."""
     data = st.session_state.get('_global_indices') or {}
+    _nav_anchor('sec-global')
     st.markdown("## 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily)")
     if not data:
         st.info("Global indices not yet loaded — fetches with the ~20s cycle.")
@@ -13334,6 +13336,7 @@ def render_all_bias_dashboard(spot_price, df, option_data):
         pass
 
     # ── Header
+    _nav_anchor('sec-allbias')
     st.markdown("## 📊 All Bias — Split by Speed: 🚀 Fast / 🐢 Lagging / 🌫️ Misguiding")
     if not rows:
         st.info("Bias engines not yet computed (cycle warming up).")
@@ -14007,6 +14010,144 @@ def export_mobile_heartbeat(status):
         pass
 
 
+def _nav_anchor(aid):
+    """Invisible anchor target for the sidebar 🧭 Quick Navigation links."""
+    try:
+        st.markdown(f"<div id='{aid}'></div>", unsafe_allow_html=True)
+    except Exception:
+        pass
+
+
+def render_sidebar_quick_nav():
+    """Sidebar table of contents — jump links to the major desktop sections
+    (each target is a _nav_anchor placed just before that section's header)."""
+    try:
+        with st.sidebar.expander("🧭 Quick Navigation", expanded=True):
+            st.markdown(
+                "[⚡ Cockpit (top)](#cockpit)\n\n"
+                "[📊 All Bias dashboard](#sec-allbias)\n\n"
+                "[🧮 Leg Bias table](#sec-legbias)\n\n"
+                "[🧪 Greek Absorption](#sec-absorb)\n\n"
+                "[🤖 AI Trade Advisor](#sec-ai)\n\n"
+                "[🎯 Zone-Based Auto Trade](#sec-autotrade)\n\n"
+                "[📈 Trading Chart](#sec-chart)\n\n"
+                "[💧 Stop Hunt + VPFR (14 legs)](#sec-stophunt)\n\n"
+                "[🔄 Reversal Detector](#sec-reversal)\n\n"
+                "[📊 Options Chain Analysis](#sec-chain)\n\n"
+                "[🔍 OC Deep Analysis](#sec-deep)\n\n"
+                "[📊 PCR Time Series](#sec-pcr)\n\n"
+                "[📊 OI Time Series](#sec-oi)\n\n"
+                "[🌍 Global Indices](#sec-global)\n\n"
+                "[🛢️ Commodity Risk](#sec-commodity)"
+            )
+    except Exception:
+        pass
+
+
+def _render_desktop_cockpit():
+    """⚡ Instant summary strip at the very top of the desktop app, rendered
+    from the LAST COMPLETED cycle's snapshot (session copy, falling back to
+    mobile_snapshot.json) BEFORE the heavy engine below re-runs — so the most
+    important read is always the first thing on screen, immediately."""
+    snap = (st.session_state.get('_mobile_snapshot')
+            or st.session_state.get('_mobile_hb_snap'))
+    if not snap:
+        try:
+            with open(MOBILE_SNAPSHOT_PATH, encoding='utf-8') as f:
+                snap = json.load(f)
+        except Exception:
+            snap = None
+    _nav_anchor('cockpit')
+    if not snap or not snap.get('ts'):
+        st.caption("⚡ Cockpit summary appears here after the first data cycle.")
+        return
+
+    def _tone2(txt):
+        t = (txt or '').lower()
+        if 'bull' in t or 'buy' in t or t == 'up':
+            return '#0a3d2a', '#00ff88'
+        if 'bear' in t or 'sell' in t or t == 'down':
+            return '#3d0a1f', '#ff4444'
+        return '#222a3a', '#888'
+
+    def _card(title, value, sub, bg, bd):
+        return (f"<div style='flex:1 1 200px; min-width:190px; background:{bg}; "
+                f"border:1px solid {bd}; border-radius:10px; padding:10px 14px;'>"
+                f"<div style='color:#aab; font-size:12px;'>{title}</div>"
+                f"<div style='color:#fff; font-size:18px; font-weight:800; "
+                f"line-height:1.25;'>{value}</div>"
+                f"<div style='color:#bbc; font-size:12px; margin-top:2px;'>{sub}</div></div>")
+
+    cards = []
+    # 1) Spot + freshness
+    try:
+        _ts = snap.get('ts', '')
+        _age = (datetime.now(pytz.timezone('Asia/Kolkata'))
+                - pytz.timezone('Asia/Kolkata').localize(
+                    datetime.strptime(_ts, '%Y-%m-%d %H:%M:%S'))).total_seconds()
+        _fr = (f"<span style='color:#00ff88;'>● {_age:.0f}s ago</span>" if _age <= 120
+               else f"<span style='color:#ffaa00;'>⚠ {_age/60:.0f} min old</span>")
+    except Exception:
+        _fr = ''
+    cards.append(_card("NIFTY Spot", f"₹{snap.get('spot', 0):,.1f}",
+                       f"{snap.get('ts', '—')} · {_fr}", '#1a2030', '#445'))
+    # 2) 14-leg overall verdict
+    ov = snap.get('leg_overall') or {}
+    if ov:
+        bg, bd = _tone2(ov.get('dir'))
+        cards.append(_card("Overall NIFTY (14-leg)",
+                           f"{ov.get('em', '')} {ov.get('label', '—')}",
+                           f"{ov.get('bull', 0)}↑ / {ov.get('bear', 0)}↓ · net {ov.get('net', 0):+d}",
+                           bg, bd))
+    # 3) Composite bias + action
+    cb = snap.get('composite') or {}
+    if cb:
+        bg, bd = _tone2(cb.get('direction') or cb.get('label'))
+        _enter = (" <span style='background:#00ff88; color:#003018; border-radius:10px; "
+                  "padding:1px 8px; font-size:12px;'>⚡ ENTER NOW</span>"
+                  if cb.get('enter_now') else "")
+        cards.append(_card("Composite Bias",
+                           f"{cb.get('emoji', '')} {cb.get('label', '—')} "
+                           f"({cb.get('score', 0):+.1f}){_enter}",
+                           f"{cb.get('action', '')} · Conf {cb.get('confidence', '—')}",
+                           bg, bd))
+    # 4) FAST verdict (the actionable speed)
+    _fv = (snap.get('verdicts') or {}).get('fast') or {}
+    if _fv:
+        bg, bd = _tone2(_fv.get('label'))
+        cards.append(_card("🚀 Fast Bias",
+                           f"{_fv.get('em', '')} {_fv.get('label', '—')}",
+                           f"net {_fv.get('net', 0):+d} · act on this one", bg, bd))
+    # 5) OI walls + PCR
+    oi = snap.get('oi') or {}
+    if oi:
+        cw, pw = oi.get('call_wall') or {}, oi.get('put_wall') or {}
+        cards.append(_card("🧱 OI Walls · PCR",
+                           f"C ₹{cw.get('strike', 0):,.0f} · P ₹{pw.get('strike', 0):,.0f}",
+                           f"resistance / support · PCR {oi.get('pcr', '—')}",
+                           '#1a2030', '#445'))
+    # 6) VOB watch counts + chips
+    vw = snap.get('vob_watch') or {}
+    rise, fall = vw.get('rise') or [], vw.get('fall') or []
+    if rise or fall:
+        _chips = "".join(
+            f"<span style='color:#00ff88;'>⬆{r['tag'].replace('ATM', '').strip()}</span> "
+            for r in rise[:3]) + "".join(
+            f"<span style='color:#ff4444;'>⬇{r['tag'].replace('ATM', '').strip()}</span> "
+            for r in fall[:3])
+        bg, bd = ('#0a3d2a', '#00ff88') if len(rise) >= len(fall) else ('#3d0a1f', '#ff4444')
+        cards.append(_card("🧲 VOB Watch (premium)",
+                           f"⬆️ {len(rise)} rising · ⬇️ {len(fall)} falling",
+                           _chips or '—', bg, bd))
+
+    st.markdown(
+        "<div style='display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px;'>"
+        + "".join(cards) + "</div>",
+        unsafe_allow_html=True)
+    st.caption("⚡ Cockpit — last completed cycle at a glance; full panels below "
+               "refresh each cycle. Use 🧭 Quick Navigation in the sidebar to jump.")
+
+
 def _ai_providers():
     """Ordered list of available AI backends. All FREE first (Gemini, then
     Groq), paid Claude last. The advisor tries them in order and falls
@@ -14164,6 +14305,7 @@ def ai_advisor_stream(snapshot_text, user_question=None):
 
 def render_ai_advisor(bias, spot_price):
     """AI Trade Advisor UI: auto verdict panel + ask-the-market chatbox."""
+    _nav_anchor('sec-ai')
     st.markdown("### 🤖 AI Trade Advisor")
     providers = _ai_providers()
     if not providers:
@@ -14426,6 +14568,7 @@ def render_leg_bias_table(spot_price):
     if not rows:
         st.caption("Leg bias table: warming up (need a few cycles of per-leg data).")
         return
+    _nav_anchor('sec-legbias')
     st.markdown("### 🧮 ATM±3 Leg Bias Table — per-leg verdict → overall NIFTY")
     st.caption("Main: VOB build/break · S/R behavior · Divergence · Ignition "
                "(+ VWAP · VIDYA · MFP). Each cell = that signal's read in the "
@@ -14582,6 +14725,7 @@ def render_greek_absorption(option_data, spot_price):
     """Show the Greek absorption / capping table (who is stopping the LTP)."""
     res = compute_greek_absorption(option_data, spot_price)
     st.session_state['_greek_absorb_last'] = res
+    _nav_anchor('sec-absorb')
     st.markdown("### 🧪 Greek Absorption — who is stopping the LTP")
     st.caption("Expected premium move from Greeks (Δ·ΔSpot + ½·Γ·ΔSpot² + Vega·ΔIV) "
                "vs actual, confirmed by ΔOI. Large positive 'Absorb' + rising OI = "
@@ -18545,6 +18689,7 @@ def _render_per_strike_oi_top():
 def show_auto_trade_section(option_data, df_5m, api, db):
     """Render the full auto-trade UI section."""
     st.markdown("---")
+    _nav_anchor('sec-autotrade')
     st.markdown("## 🎯 Zone-Based Auto Trade")
 
     # ── Load persisted config from Supabase ──
@@ -19396,6 +19541,7 @@ def _render_main_analyzer():
     vob_data = None
 
     with col1:
+        _nav_anchor('sec-chart')
         st.header("📈 Trading Chart")
         df = pd.DataFrame()
         current_price = None
@@ -20086,6 +20232,7 @@ def _render_main_analyzer():
                         st.caption(f"Liquidity table unavailable: {_lg_e}")
 
             # ── 💧 Stop Hunt / Liquidity Grab + VPFR on ATM±3 CE & PE ───────
+            _nav_anchor('sec-stophunt')
             with st.expander(f"💧 Stop Hunt + VPFR on ATM±3 CE & PE (14 legs) — {_today_str} (3m)", expanded=True):
                 try:
                     _opt_d = st.session_state.get('_cached_option_data') or {}
@@ -21427,6 +21574,7 @@ def _render_main_analyzer():
                     st.info(f"Volume Delta: No data yet. df rows={len(df) if not df.empty else 0}, volume_delta_data={'computed' if volume_delta_data else 'None'}")
 
             st.markdown("---")
+            _nav_anchor('sec-reversal')
             st.markdown("## 🔄 Intraday Reversal Detector")
             try:
                 pivot_lows = []
@@ -21693,6 +21841,7 @@ def _render_main_analyzer():
 
     if option_data and option_data.get('underlying'):
         st.markdown("---")
+        _nav_anchor('sec-chain')
         st.header("📊 Options Chain Analysis")
         st.markdown("## Open Interest Change (in Lakhs)")
         oi_col1, oi_col2 = st.columns(2)
@@ -22103,6 +22252,7 @@ def _render_main_analyzer():
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
         st.markdown("---")
+        _nav_anchor('sec-deep')
         st.markdown("## 🔍 Option Chain Deep Analysis (ATM ± 5)")
         try:
             sa_df_summary = option_data.get('df_summary')
@@ -22435,6 +22585,7 @@ def _render_main_analyzer():
             st.warning(f"OC history unavailable: {_e}")
 
         st.markdown("---")
+        _nav_anchor('sec-pcr')
         st.markdown("## 📊 PCR Analysis - Time Series (ATM ± 2)")
         def create_pcr_chart(history_df, col_name, color, title_prefix):
             """Helper to create individual PCR chart - col_name is now just strike price"""
@@ -22675,6 +22826,7 @@ def _render_main_analyzer():
         else:
             st.info("📊 PCR history will build up as the app refreshes. Please wait for data collection...")
         st.markdown("---")
+        _nav_anchor('sec-oi')
         st.markdown("## 📊 OI Analysis - Time Series (ATM ± 2)")
         if len(st.session_state.oi_history) > 0:
             try:
@@ -26353,6 +26505,12 @@ def main():
         _render_mobile_mode()
         return
     st.title("📈 Nifty Trading & Options Analyzer")
+    # ⚡ Instant cockpit summary + sidebar quick-nav (desktop only)
+    try:
+        _render_desktop_cockpit()
+        render_sidebar_quick_nav()
+    except Exception:
+        pass
     _render_main_analyzer()
 
 
