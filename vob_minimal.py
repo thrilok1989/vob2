@@ -14018,11 +14018,30 @@ def _nav_anchor(aid):
         pass
 
 
+def _exp(default=True):
+    """Default 'expanded' state for data panels: collapsed while 🗜️ Compact
+    mode is on (the default) so the page stays minimal and the user opens
+    only what they need. Turning the sidebar toggle off restores the classic
+    always-expanded view. Panels still compute while collapsed — alerts and
+    the mobile snapshot are unaffected."""
+    try:
+        if st.session_state.get('_compact_mode', True):
+            return False
+    except Exception:
+        pass
+    return default
+
+
 def render_sidebar_quick_nav():
     """Sidebar table of contents — jump links to the major desktop sections
-    (each target is a _nav_anchor placed just before that section's header)."""
+    (each target is a _nav_anchor placed just before that section's header),
+    plus the 🗜️ Compact mode toggle."""
     try:
-        with st.sidebar.expander("🧭 Quick Navigation", expanded=True):
+        with st.sidebar.expander("🧭 View & Navigation", expanded=True):
+            st.toggle("🗜️ Compact mode — minimize all panels",
+                      value=True, key='_compact_mode',
+                      help="All data panels start collapsed; tap one to open "
+                           "it. Turn off for the classic fully-expanded view.")
             st.markdown(
                 "[⚡ Cockpit (top)](#cockpit)\n\n"
                 "[📊 All Bias dashboard](#sec-allbias)\n\n"
@@ -18275,7 +18294,7 @@ def _render_fii_dii_futures_section():
     breadth = st.session_state.get('_nse_breadth')
     if not any([fut, cash, deriv, breadth]):
         return
-    with st.expander("🏦 NIFTY Futures · FII/DII · Market Breadth", expanded=True):
+    with st.expander("🏦 NIFTY Futures · FII/DII · Market Breadth", expanded=_exp()):
         if fut:
             st.markdown(f"**📊 NIFTY Futures** — {fut['symbol']} (exp {fut['expiry']})")
             c1, c2, c3, c4, c5 = st.columns(5)
@@ -18346,7 +18365,7 @@ def _render_alignment_capping_top():
 
     # ── Alignment panel ──
     with _ac_col1:
-        with st.expander("🌍 Alignment (10m|1h|4h|1D|4D|Pat)", expanded=True):
+        with st.expander("🌍 Alignment (10m|1h|4h|1D|4D|Pat)", expanded=_exp()):
             if _master is None:
                 st.info("Alignment data loads after first signal calculation.")
             else:
@@ -18388,7 +18407,7 @@ def _render_alignment_capping_top():
 
     # ── Index/Stock Capping panel ──
     with _ac_col2:
-        with st.expander("📡 Index/Stock Capping", expanded=True):
+        with st.expander("📡 Index/Stock Capping", expanded=_exp()):
             if _sa is None:
                 st.info("Capping data loads after option chain analysis.")
             else:
@@ -19478,9 +19497,9 @@ def _render_main_analyzer():
 
     # Fill Per-Strike OI chart right below auto trade section
     with _per_strike_oi_container:
-        with st.expander("⚡ Buy Volume vs Sell Volume (Delta Chart)", expanded=True):
+        with st.expander("⚡ Buy Volume vs Sell Volume (Delta Chart)", expanded=_exp()):
             _render_vol_delta_chart()
-        with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
+        with st.expander("📊 Per-Strike Call vs Put OI", expanded=_exp()):
             _render_per_strike_oi_top()
 
     # Fill Alignment + Index/Stock Capping below Per-Strike OI
@@ -19490,31 +19509,31 @@ def _render_main_analyzer():
             render_sector_heatmap()
             st.caption("1-row heatmap of sector strengths (green = leading, red = lagging). "
                        "Sourced from the same data used in the master signal's Sector Rotation block.")
-        with st.expander("📊 Bull / Bear Meter (Tier-1 composite)", expanded=True):
+        with st.expander("📊 Bull / Bear Meter (Tier-1 composite)", expanded=_exp()):
             render_bull_bear_meter(getattr(st.session_state, '_bull_bear_meter', None))
             st.caption("Score = weighted sum of Master Signal · FII Net · Futures P+OI · GEX+Flip · OI Cap/Decap. "
                        "Range −100 (strong bear) → +100 (strong bull).")
-        with st.expander("🎯 Spike Probability (pre-ignition setup)", expanded=True):
+        with st.expander("🎯 Spike Probability (pre-ignition setup)", expanded=_exp()):
             render_spike_meter(getattr(st.session_state, '_spike_score', None))
             st.caption("Score 0–8 of leading conditions that often precede a spike "
                        "(ATR compression · vol drying · OI accumulation · gamma-squeeze · "
                        "cum-delta divergence · S/R convergence · VIX flat-low · vol window). "
                        "≥5 → Telegram alert (15-min cooldown). ≥6 → arms a 30-min spike-watch window: "
                        "if Ignition then fires within it, the alert is tagged 🔥 HIGH-CONVICTION COMBO.")
-        with st.expander("💰 Smart Money / Footprint (Accumulation vs Distribution)", expanded=True):
+        with st.expander("💰 Smart Money / Footprint (Accumulation vs Distribution)", expanded=_exp()):
             render_smart_money_panel(getattr(st.session_state, '_accum_dist_score', None))
             st.caption("Composite of 6 institutional-footprint signals — VWAP relation, "
                        "cum-delta direction, cum-delta divergence, bid/ask absorption, "
                        "per-5m-candle Futures P×OI classifier, volume-profile shape (D/P/b/Trend). "
                        "Telegram alert when |score| ≥ 70 (15-min cooldown per direction).")
-        with st.expander("🚀 Movement Ignition Score", expanded=True):
+        with st.expander("🚀 Movement Ignition Score", expanded=_exp()):
             render_ws_health_badge()
             render_ignition_meter(getattr(st.session_state, '_ignition_score', None))
             st.caption("Fires a Telegram alert when 5+/7 ignition conditions hit simultaneously "
                        "(near S/R · delta ratio ≥3 · gamma flip · CE decap/PE depeg · vol spike · "
                        "S/R cross · order-flow sweep). 5-min per-direction cooldown. "
                        "Sweep prefers the WebSocket worker feed; falls back to the in-app cycle detector when not live.")
-        with st.expander("📊 Open Interest — CE vs PE & ΔOI", expanded=True):
+        with st.expander("📊 Open Interest — CE vs PE & ΔOI", expanded=_exp()):
             _od_oi = getattr(st.session_state, '_cached_option_data', None) or {}
             _spot_oi = _od_oi.get('underlying') if _od_oi else None
             if _spot_oi:
@@ -19523,7 +19542,7 @@ def _render_main_analyzer():
                 st.caption("Waiting for option chain…")
             st.markdown("**📈 Total OI over time** — track how the whole chain's Call vs Put OI evolves through the session")
             render_total_oi_timeseries()
-        with st.expander("🎯 Major Support / Resistance Zones (OI + VPFR + Gamma + Money Flow)", expanded=True):
+        with st.expander("🎯 Major Support / Resistance Zones (OI + VPFR + Gamma + Money Flow)", expanded=_exp()):
             _zones_ui = getattr(st.session_state, '_major_sr_zones', None)
             _od_ui = getattr(st.session_state, '_cached_option_data', None) or {}
             _spot_ui = _od_ui.get('underlying') if _od_ui else None
@@ -19952,7 +19971,7 @@ def _render_main_analyzer():
             st.plotly_chart(fig, use_container_width=True)
 
             # ── 📊 NIFTY VPFR + Money Flow Profile — tabulation ──────────────
-            with st.expander("📊 NIFTY VPFR + Money Flow Profile (tabulation)", expanded=True):
+            with st.expander("📊 NIFTY VPFR + Money Flow Profile (tabulation)", expanded=_exp()):
                 _vc1, _vc2, _vc3 = st.columns(3)
                 for _col, (_k, _lbl) in zip(
                     [_vc1, _vc2, _vc3],
@@ -20192,7 +20211,7 @@ def _render_main_analyzer():
 
             # ── 💧 Liquidity Grab / Stop Hunt / Sweep — Today (3-min bars) ───
             _today_str = df['datetime'].iloc[-1].strftime('%d-%b-%Y') if not df.empty else 'Today'
-            with st.expander(f"💧 Liquidity Grab / Stop Hunt / Sweep — {_today_str} (3m bars)", expanded=True):
+            with st.expander(f"💧 Liquidity Grab / Stop Hunt / Sweep — {_today_str} (3m bars)", expanded=_exp()):
                 if not _liq_grabs_today:
                     st.info("No liquidity grab / stop hunt / sweep candles detected on 3m bars today.")
                 else:
@@ -20233,7 +20252,7 @@ def _render_main_analyzer():
 
             # ── 💧 Stop Hunt / Liquidity Grab + VPFR on ATM±3 CE & PE ───────
             _nav_anchor('sec-stophunt')
-            with st.expander(f"💧 Stop Hunt + VPFR on ATM±3 CE & PE (14 legs) — {_today_str} (3m)", expanded=True):
+            with st.expander(f"💧 Stop Hunt + VPFR on ATM±3 CE & PE (14 legs) — {_today_str} (3m)", expanded=_exp()):
                 try:
                     _opt_d = st.session_state.get('_cached_option_data') or {}
                     _df_s = _opt_d.get('df_summary')
@@ -20696,7 +20715,11 @@ def _render_main_analyzer():
                             # into the placeholder defined earlier, not here.
                             try:
                                 with _all_bias_container:
-                                    render_all_bias_dashboard(_u, df, _opt_d)
+                                    if st.session_state.get('_compact_mode', True):
+                                        with st.expander("📊 All Bias dashboard — 🚀 Fast / 🐢 Lagging / 🌫️ Misguiding", expanded=False):
+                                            render_all_bias_dashboard(_u, df, _opt_d)
+                                    else:
+                                        render_all_bias_dashboard(_u, df, _opt_d)
                             except Exception:
                                 pass
                             render_composite_bias_panel(_bias)
@@ -20708,12 +20731,20 @@ def _render_main_analyzer():
                                 pass
                             # 🧮 Consolidated ATM±3 leg-bias table + overall NIFTY verdict
                             try:
-                                render_leg_bias_table(_u)
+                                if st.session_state.get('_compact_mode', True):
+                                    with st.expander("🧮 ATM±3 Leg Bias Table — per-leg verdict → overall NIFTY", expanded=False):
+                                        render_leg_bias_table(_u)
+                                else:
+                                    render_leg_bias_table(_u)
                             except Exception as _lbt_err:
                                 st.caption(f"Leg bias table unavailable: {_lbt_err}")
                             # 🧪 Greek Absorption — who is stopping the LTP
                             try:
-                                render_greek_absorption(_opt_d, _u)
+                                if st.session_state.get('_compact_mode', True):
+                                    with st.expander("🧪 Greek Absorption — who is stopping the LTP", expanded=False):
+                                        render_greek_absorption(_opt_d, _u)
+                                else:
+                                    render_greek_absorption(_opt_d, _u)
                             except Exception as _ga_err:
                                 st.caption(f"Greek absorption unavailable: {_ga_err}")
                             # 🤖 AI Trade Advisor (auto verdict + chatbox)
@@ -23976,7 +24007,7 @@ def _render_main_analyzer():
         _gm_valid = _last_gm and _last_gm.get('time') and not str(_last_gm.get('text', '')).startswith('⚠️')
         _gm_oc_valid = _last_gm_oc and _last_gm_oc.get('time') and not str(_last_gm_oc.get('text', '')).startswith('⚠️')
         if _gm_valid or _gm_oc_valid:
-            with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=True):
+            with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=_exp()):
                 if _gm_valid:
                     st.markdown(f"**Master Signal** — {_last_gm.get('time', '')}")
                     st.markdown(_last_gm.get('text', ''))
