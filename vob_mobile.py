@@ -80,7 +80,7 @@ def card(html, bg=None, bd=None):
                 unsafe_allow_html=True)
 
 
-def candle_chart(ch, sr_zones=None):
+def candle_chart(ch, sr_zones=None, height=320):
     """Phone-sized candlestick figure with the leg's VOB zones shaded
     (green = bullish/support, red = bearish/resistance) and, for the spot
     chart, dashed S/R level lines. Recessive grid, no rangeslider, native
@@ -112,7 +112,7 @@ def candle_chart(ch, sr_zones=None):
                           annotation_text=f"R {lv:,.0f}", annotation_font_size=10,
                           annotation_font_color=RED_BD)
     fig.update_layout(
-        height=320, margin=dict(l=0, r=4, t=8, b=0), showlegend=False,
+        height=height, margin=dict(l=0, r=4, t=8, b=0), showlegend=False,
         paper_bgcolor='rgba(0,0,0,0)', plot_bgcolor='rgba(0,0,0,0)',
         font=dict(color='#8892a6', size=10),
         xaxis=dict(rangeslider_visible=False, nticks=6, showgrid=False,
@@ -307,6 +307,57 @@ def render_mobile_view(snap, embedded=False):
                 use_container_width=True,
                 config={'displayModeBar': False})
 
+        # 🔍 Tap-to-popup: one button per chart opens a big modal dialog.
+        # The dialog lives for one refresh cycle (it closes on the next data
+        # refresh or on ✕) — tap again to reopen with fresh candles.
+        if hasattr(st, 'dialog'):
+            st.caption("🔍 Tap a leg to open its LTP chart as a popup:")
+
+            def _short(t):
+                if t == 'NIFTY Spot':
+                    return '📊 SPOT'
+                parts = t.split()
+                side_strike = ' '.join(parts[-2:]) if len(parts) >= 2 else t
+                mark = '⬆️' if t in _rise_tags else ('⬇️' if t in _fall_tags else '')
+                return f"{mark}{side_strike}"
+
+            _cols = st.columns(3)
+            for _i, _t in enumerate(tags):
+                with _cols[_i % 3]:
+                    if st.button(_short(_t), key=f"pop_{_t}", use_container_width=True):
+                        st.session_state['_popup_leg'] = _t
+                        st.rerun()
+
+            _open = st.session_state.get('_popup_leg')
+            if _open and _open in charts:
+                try:
+                    _dlg_deco = st.dialog(f"📈 {_label(_open)}", width="large")
+                except TypeError:
+                    _dlg_deco = st.dialog(f"📈 {_label(_open)}")
+
+                @_dlg_deco
+                def _chart_popup():
+                    chp = charts[_open]
+                    _pchg = chp['c'][-1] - chp['o'][0]
+                    _pcc = GREEN_BD if _pchg >= 0 else RED_BD
+                    st.markdown(
+                        f"<div class='vob-sub'>last <b style='color:inherit;'>₹{chp['c'][-1]:,.2f}</b> · "
+                        f"<span style='color:{_pcc};'>{_pchg:+,.2f}</span> over shown bars · "
+                        f"🟩 bullish VOB · 🟥 bearish VOB</div>",
+                        unsafe_allow_html=True)
+                    st.plotly_chart(
+                        candle_chart(chp,
+                                     sr_zones=(snap.get('sr_zones') if _open == 'NIFTY Spot' else None),
+                                     height=480),
+                        use_container_width=True,
+                        config={'displayModeBar': False})
+                    st.caption("Auto-refresh is paused while this chart is open.")
+                    if st.button("✖ Close chart", key="pop_close", use_container_width=True):
+                        st.session_state.pop('_popup_leg', None)
+                        st.rerun()
+
+                _chart_popup()
+
     # ── LTP board: ATM±3 CE / PE ────────────────────────────────────────────
     legs = snap.get('legs') or []
     if legs:
@@ -422,7 +473,8 @@ def main():
         paused = st.toggle("Pause refresh", value=False)
         st.caption(f"Snapshot file:\n`{SNAPSHOT_PATH}`")
 
-    if not paused:
+    # Pause refresh while a popup chart is open so it doesn't dismiss itself.
+    if not paused and not st.session_state.get('_popup_leg'):
         st_autorefresh(interval=refresh_s * 1000, key="vob_mobile_refresh")
 
     render_mobile_view(load_snapshot(), embedded=False)
