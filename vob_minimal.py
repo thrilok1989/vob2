@@ -14032,51 +14032,65 @@ def _exp(default=True):
     return default
 
 
-def _compact_hidden_call(label, key, render_fn):
-    """Compact-mode wrapper for sections that contain their OWN expanders (so
-    wrapping them in st.expander would be illegal nesting) or that must keep
-    computing while minimized (e.g. live trade management): shows a one-line
-    toggle; while off, the section renders inside a CSS-hidden keyed container
-    — fully computed (alerts/session-state stay live), just not displayed.
-    On Streamlit < 1.39 (no container keys) the section stays visible."""
-    if (not st.session_state.get('_compact_mode', True)) or st.toggle(
-            f"{label} — open panel", key=key):
-        render_fn()
-        return
-    try:
-        _c = st.container(key=f"hid_{key}")
-        st.markdown(f"<style>div.st-key-hid_{key}{{display:none;}}</style>",
-                    unsafe_allow_html=True)
-    except TypeError:
-        _c = st.container()
-    with _c:
-        render_fn()
+# ── 🖥️ Desktop panel launcher: open one heavy section at a time ─────────────
+# Buttons live under the cockpit; clicking one opens that section's panel and
+# collapses the rest. State: st.session_state['_open_section'] (a section id or
+# None). Each section still renders EVERY cycle (its alerts + session-state
+# stashes must run), but only the open one is displayed — the others render
+# into a CSS-hidden keyed container, so there is no double-compute and nothing
+# breaks while a panel is closed.
+_LAUNCHER_SECTIONS = [
+    ('allbias',   '📊 All Bias'),
+    ('legbias',   '🧮 Leg Bias'),
+    ('absorb',    '🧪 Greek Absorption'),
+    ('autotrade', '🎯 Auto Trade'),
+    ('commodity', '🛢️ Commodity Risk'),
+    ('global',    '🌍 Global Indices'),
+    ('futmfp',    '💰 Futures MoneyFlow'),
+]
 
 
-def _compact_tail_toggle(label, key):
-    """Compact-mode stub for a heavy INLINE region: everything rendered AFTER
-    this call inside the same parent block is CSS-hidden — but still computes
-    — until the toggle is switched on. Used where the region is thousands of
-    inline lines that can't be wrapped in a container without re-indenting.
-    On Streamlit < 1.39 (no container keys) the region stays visible."""
-    if not st.session_state.get('_compact_mode', True):
-        return
-    _open = st.toggle(f"{label} — open panel", key=key)
-    try:
-        with st.container(key=f"mark_{key}"):
-            st.empty()
-        if not _open:
-            # The keyed class lands on the inner stVerticalBlock; the sibling
-            # unit in the parent flow is its stLayoutWrapper — target both
-            # layouts so the rule survives Streamlit DOM variations.
-            st.markdown(
-                f"<style>"
-                f"div[data-testid='stLayoutWrapper']:has(.st-key-mark_{key}) ~ div,"
-                f"div.st-key-mark_{key} ~ div {{ display:none; }}"
-                f"</style>",
+def render_section_launcher():
+    """Row of toggle buttons under the cockpit. Tap one → that panel opens
+    (and any other open panel closes); tap it again → it goes back / closes.
+    Only sets state + reruns; the panels themselves render at their place in
+    the engine below via _panel()."""
+    st.markdown("<div style='color:#aab; font-size:13px; margin:4px 0 2px;'>"
+                "🖥️ <b>Panels</b> — tap to open one, tap again to close:</div>",
                 unsafe_allow_html=True)
+    cur = st.session_state.get('_open_section')
+    cols = st.columns(len(_LAUNCHER_SECTIONS))
+    for (sid, label), col in zip(_LAUNCHER_SECTIONS, cols):
+        with col:
+            _on = (cur == sid)
+            if st.button(('✅ ' if _on else '') + label, key=f'launch_{sid}',
+                         use_container_width=True,
+                         type='primary' if _on else 'secondary'):
+                st.session_state['_open_section'] = None if _on else sid
+                st.rerun()
+    if cur:
+        st.caption(f"Showing **{dict(_LAUNCHER_SECTIONS).get(cur, cur)}** — "
+                   "tap its button again to close, or pick another panel.")
+
+
+def _panel(sid, render_fn):
+    """Render `render_fn` every cycle (so its alerts and session-state stashes
+    always run) inside a keyed container, but DISPLAY it only when the launcher
+    has this section open — otherwise the container is CSS-hidden. One panel is
+    visible at a time; the rest are hidden-but-computing (single render, no
+    double side effects). On Streamlit < 1.39 (no container keys) it falls back
+    to a collapsed expander."""
+    try:
+        _c = st.container(key=f"panel_{sid}")
+        if st.session_state.get('_open_section') != sid:
+            st.markdown(f"<style>div.st-key-panel_{sid}{{display:none;}}</style>",
+                        unsafe_allow_html=True)
+        with _c:
+            render_fn()
     except TypeError:
-        pass
+        with st.expander(dict(_LAUNCHER_SECTIONS).get(sid, sid),
+                         expanded=(st.session_state.get('_open_section') == sid)):
+            render_fn()
 
 
 def render_sidebar_quick_nav():
@@ -19538,12 +19552,10 @@ def _render_main_analyzer():
         try:
             _opt_data_top = st.session_state.get('_cached_option_data')
             _df_5m_top = getattr(st.session_state, '_df_5m', None)
-            # Keeps computing while minimized — active-trade SL/TP monitoring
-            # and auto exits must run every cycle even when the panel is hidden.
-            _compact_hidden_call(
-                "🎯 Zone-Based Auto Trade (incl. ⚙️ Manual Zone & Trade Setup)",
-                '_show_autotrade',
-                lambda: show_auto_trade_section(_opt_data_top, _df_5m_top, api, db))
+            # Renders every cycle (active-trade SL/TP monitoring + auto exits
+            # must run even when the panel is closed); shown only when open.
+            _panel('autotrade',
+                   lambda: show_auto_trade_section(_opt_data_top, _df_5m_top, api, db))
         except Exception as _ate_top:
             st.caption(f"Auto trade init: {_ate_top}")
 
@@ -20767,11 +20779,8 @@ def _render_main_analyzer():
                             # into the placeholder defined earlier, not here.
                             try:
                                 with _all_bias_container:
-                                    if st.session_state.get('_compact_mode', True):
-                                        with st.expander("📊 All Bias dashboard — 🚀 Fast / 🐢 Lagging / 🌫️ Misguiding", expanded=False):
-                                            render_all_bias_dashboard(_u, df, _opt_d)
-                                    else:
-                                        render_all_bias_dashboard(_u, df, _opt_d)
+                                    _panel('allbias',
+                                           lambda: render_all_bias_dashboard(_u, df, _opt_d))
                             except Exception:
                                 pass
                             render_composite_bias_panel(_bias)
@@ -20783,20 +20792,12 @@ def _render_main_analyzer():
                                 pass
                             # 🧮 Consolidated ATM±3 leg-bias table + overall NIFTY verdict
                             try:
-                                if st.session_state.get('_compact_mode', True):
-                                    with st.expander("🧮 ATM±3 Leg Bias Table — per-leg verdict → overall NIFTY", expanded=False):
-                                        render_leg_bias_table(_u)
-                                else:
-                                    render_leg_bias_table(_u)
+                                _panel('legbias', lambda: render_leg_bias_table(_u))
                             except Exception as _lbt_err:
                                 st.caption(f"Leg bias table unavailable: {_lbt_err}")
                             # 🧪 Greek Absorption — who is stopping the LTP
                             try:
-                                if st.session_state.get('_compact_mode', True):
-                                    with st.expander("🧪 Greek Absorption — who is stopping the LTP", expanded=False):
-                                        render_greek_absorption(_opt_d, _u)
-                                else:
-                                    render_greek_absorption(_opt_d, _u)
+                                _panel('absorb', lambda: render_greek_absorption(_opt_d, _u))
                             except Exception as _ga_err:
                                 st.caption(f"Greek absorption unavailable: {_ga_err}")
                             # 🤖 AI Trade Advisor (auto verdict + chatbox)
@@ -21522,30 +21523,19 @@ def _render_main_analyzer():
 
             # ── 🛢️ Cross-Sectional Commodity Risk Dashboard ──────────────────
             try:
-                if st.session_state.get('_compact_mode', True):
-                    with st.expander("🛢️ Cross-Sectional Commodity Risk Dashboard", expanded=False):
-                        render_commodity_risk_panel()
-                else:
-                    render_commodity_risk_panel()
+                _panel('commodity', render_commodity_risk_panel)
             except Exception as _cr_err:
                 st.caption(f"Commodity panel unavailable: {_cr_err}")
 
             # ── 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily) ──
             try:
-                # Has its own inner expanders → CSS-hidden toggle, not st.expander
-                _compact_hidden_call(
-                    "🌍 Global Indices · Money Flow + VPFR + Dynamic PoC",
-                    '_show_global_idx', render_global_indices_panel)
+                _panel('global', render_global_indices_panel)
             except Exception as _gi_err:
                 st.caption(f"Global indices panel unavailable: {_gi_err}")
 
             # ── 💰 NIFTY Futures Money Flow Profile (10 rows) ────────────────
             try:
-                if st.session_state.get('_compact_mode', True):
-                    with st.expander("💰 NIFTY Futures Money Flow Profile (10 rows)", expanded=False):
-                        render_gift_nifty_moneyflow_panel()
-                else:
-                    render_gift_nifty_moneyflow_panel()
+                _panel('futmfp', render_gift_nifty_moneyflow_panel)
             except Exception as _gm_err:
                 st.caption(f"NIFTY futures money flow unavailable: {_gm_err}")
 
@@ -21668,10 +21658,6 @@ def _render_main_analyzer():
                     st.info(f"Volume Delta: No data yet. df rows={len(df) if not df.empty else 0}, volume_delta_data={'computed' if volume_delta_data else 'None'}")
 
             st.markdown("---")
-            # Everything after this stub (Reversal Detector + Triple POC +
-            # Future Swing) is CSS-hidden in compact mode but keeps computing.
-            _compact_tail_toggle("🔄 Reversal Detector · 📊 Triple POC + Future Swing",
-                                 '_show_reversal_suite')
             _nav_anchor('sec-reversal')
             st.markdown("## 🔄 Intraday Reversal Detector")
             try:
@@ -21939,14 +21925,6 @@ def _render_main_analyzer():
 
     if option_data and option_data.get('underlying'):
         st.markdown("---")
-        # Everything after this stub (Options Chain Analysis → Money Flow →
-        # OI Unwinding → HTF S/R → Deep Analysis → Signal History → PCR / OI /
-        # ChgOI / Volume / Bid / Ask time series …) is CSS-hidden in compact
-        # mode but keeps computing, so alerts and histories stay live.
-        _compact_tail_toggle(
-            "📊 Deep analytics suite — option chain · money flow · unwinding · "
-            "HTF S/R · deep analysis · PCR/OI/volume time series",
-            '_show_deep_suite')
         _nav_anchor('sec-chain')
         st.header("📊 Options Chain Analysis")
         st.markdown("## Open Interest Change (in Lakhs)")
@@ -26611,9 +26589,10 @@ def main():
         _render_mobile_mode()
         return
     st.title("📈 Nifty Trading & Options Analyzer")
-    # ⚡ Instant cockpit summary + sidebar quick-nav (desktop only)
+    # ⚡ Instant cockpit summary + 🖥️ panel launcher + sidebar quick-nav (desktop)
     try:
         _render_desktop_cockpit()
+        render_section_launcher()
         render_sidebar_quick_nav()
     except Exception:
         pass
