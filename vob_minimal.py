@@ -212,13 +212,14 @@ def _balanced_telegram_chunks(text, limit=3900):
 # Allow-list of headline markers that bypass the global mute. Every other
 # automated alert is suppressed. force=True bypasses unconditionally.
 _ALLOWED_ALERT_MARKERS = (
-    'DYNAMIC POC',
+    # 'DYNAMIC POC',  # ⏸️ muted per user request (BIG MOVE + PoC-cross BUY
+    #                 # CALL/PUT variants) — uncomment to re-enable
     'SPOT STOP-HUNT ALIGNED',
     'CIE ALIGNED',
     'MAJOR S/R TOUCH',
     'BIAS ENTER',
     'OVERALL BIAS ENTRY',
-    'LTP FALL',
+    # 'LTP FALL',     # ⏸️ muted per user request — uncomment to re-enable
     'CALL CAPPING',
     'PUT WRITING',
     'PUT CAPPING',
