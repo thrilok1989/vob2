@@ -14039,35 +14039,54 @@ def _exp(default=True):
 # stashes must run), but only the open one is displayed — the others render
 # into a CSS-hidden keyed container, so there is no double-compute and nothing
 # breaks while a panel is closed.
-_LAUNCHER_SECTIONS = [
-    ('allbias',   '📊 All Bias'),
-    ('legbias',   '🧮 Leg Bias'),
-    ('absorb',    '🧪 Greek Absorption'),
-    ('autotrade', '🎯 Auto Trade'),
-    ('commodity', '🛢️ Commodity Risk'),
-    ('global',    '🌍 Global Indices'),
-    ('futmfp',    '💰 Futures MoneyFlow'),
+_LAUNCHER_GROUPS = [
+    ("📊 Bias & Signals", [
+        ('allbias', '📊 All Bias'),
+        ('legbias', '🧮 Leg Bias'),
+        ('absorb',  '🧪 Absorption'),
+        ('ai',      '🤖 AI Advisor'),
+    ]),
+    ("🎯 Trading & Deep Analysis", [
+        ('autotrade', '🎯 Auto Trade'),
+        ('reversal',  '🔄 Reversal · Triple POC'),
+        ('deep',      '📊 Deep Analytics (chain · PCR · OI)'),
+    ]),
+    ("🌍 Markets", [
+        ('commodity', '🛢️ Commodity'),
+        ('global',    '🌍 Global Indices'),
+        ('futmfp',    '💰 Futures MFP'),
+    ]),
 ]
+_LAUNCHER_SECTIONS = [s for _, _row in _LAUNCHER_GROUPS for s in _row]
 
 
 def render_section_launcher():
-    """Row of toggle buttons under the cockpit. Tap one → that panel opens
-    (and any other open panel closes); tap it again → it goes back / closes.
-    Only sets state + reruns; the panels themselves render at their place in
-    the engine below via _panel()."""
+    """Grouped rows of toggle buttons under the cockpit — the desktop's
+    'tabs'. Tap one → that panel opens (and any other open panel closes);
+    tap it again → it closes. Only sets state + reruns; the panels
+    themselves render at their place in the engine below via _panel() /
+    _suite_start(). Hidden in classic view (🗜️ Compact mode off)."""
+    if not st.session_state.get('_compact_mode', True):
+        st.caption("🖥️ Classic view — every section is visible below "
+                   "(🗜️ Compact mode is off).")
+        return
+    cur = st.session_state.get('_open_section')
     st.markdown("<div style='color:#aab; font-size:13px; margin:4px 0 2px;'>"
                 "🖥️ <b>Panels</b> — tap to open one, tap again to close:</div>",
                 unsafe_allow_html=True)
-    cur = st.session_state.get('_open_section')
-    cols = st.columns(len(_LAUNCHER_SECTIONS))
-    for (sid, label), col in zip(_LAUNCHER_SECTIONS, cols):
-        with col:
-            _on = (cur == sid)
-            if st.button(('✅ ' if _on else '') + label, key=f'launch_{sid}',
-                         use_container_width=True,
-                         type='primary' if _on else 'secondary'):
-                st.session_state['_open_section'] = None if _on else sid
-                st.rerun()
+    for _gname, _row in _LAUNCHER_GROUPS:
+        _gc, *_bc = st.columns([1.1] + [1] * len(_row))
+        with _gc:
+            st.markdown(f"<div style='color:#889; font-size:12px; padding-top:9px; "
+                        f"text-align:right;'>{_gname}</div>", unsafe_allow_html=True)
+        for (sid, label), col in zip(_row, _bc):
+            with col:
+                _on = (cur == sid)
+                if st.button(('✅ ' if _on else '') + label, key=f'launch_{sid}',
+                             use_container_width=True,
+                             type='primary' if _on else 'secondary'):
+                    st.session_state['_open_section'] = None if _on else sid
+                    st.rerun()
     if cur:
         st.caption(f"Showing **{dict(_LAUNCHER_SECTIONS).get(cur, cur)}** — "
                    "tap its button again to close, or pick another panel.")
@@ -14078,8 +14097,12 @@ def _panel(sid, render_fn):
     always run) inside a keyed container, but DISPLAY it only when the launcher
     has this section open — otherwise the container is CSS-hidden. One panel is
     visible at a time; the rest are hidden-but-computing (single render, no
-    double side effects). On Streamlit < 1.39 (no container keys) it falls back
-    to a collapsed expander."""
+    double side effects). In classic view (🗜️ Compact mode off) the section
+    renders plainly, always visible. On Streamlit < 1.39 (no container keys)
+    it falls back to a collapsed expander."""
+    if not st.session_state.get('_compact_mode', True):
+        render_fn()
+        return
     try:
         _c = st.container(key=f"panel_{sid}")
         if st.session_state.get('_open_section') != sid:
@@ -14091,6 +14114,30 @@ def _panel(sid, render_fn):
         with st.expander(dict(_LAUNCHER_SECTIONS).get(sid, sid),
                          expanded=(st.session_state.get('_open_section') == sid)):
             render_fn()
+
+
+def _suite_start(sid):
+    """Launcher binding for a heavy INLINE suite that can't be wrapped in a
+    container without re-indenting thousands of lines: in compact mode,
+    everything rendered AFTER this call inside the same parent block is
+    CSS-hidden (but still computes — alerts and histories stay live) unless
+    this suite is the launcher's open section. Classic view: no-op."""
+    if not st.session_state.get('_compact_mode', True):
+        return
+    try:
+        with st.container(key=f"suite_{sid}"):
+            st.empty()
+        if st.session_state.get('_open_section') != sid:
+            # The keyed class lands on the inner stVerticalBlock; the sibling
+            # unit in the parent flow is its stLayoutWrapper — target both.
+            st.markdown(
+                f"<style>"
+                f"div[data-testid='stLayoutWrapper']:has(.st-key-suite_{sid}) ~ div,"
+                f"div.st-key-suite_{sid} ~ div {{ display:none; }}"
+                f"</style>",
+                unsafe_allow_html=True)
+    except TypeError:
+        pass
 
 
 def render_sidebar_quick_nav():
@@ -20802,7 +20849,7 @@ def _render_main_analyzer():
                                 st.caption(f"Greek absorption unavailable: {_ga_err}")
                             # 🤖 AI Trade Advisor (auto verdict + chatbox)
                             try:
-                                render_ai_advisor(_bias, _u)
+                                _panel('ai', lambda: render_ai_advisor(_bias, _u))
                             except Exception as _ai_err:
                                 st.caption(f"AI Advisor unavailable: {_ai_err}")
                             # Spot ignition (tank-full) alert
@@ -21658,6 +21705,9 @@ def _render_main_analyzer():
                     st.info(f"Volume Delta: No data yet. df rows={len(df) if not df.empty else 0}, volume_delta_data={'computed' if volume_delta_data else 'None'}")
 
             st.markdown("---")
+            # 🔄 Suite bound to the panel launcher ('Reversal · Triple POC'):
+            # hidden unless opened, but still computes every cycle.
+            _suite_start('reversal')
             _nav_anchor('sec-reversal')
             st.markdown("## 🔄 Intraday Reversal Detector")
             try:
@@ -21925,6 +21975,11 @@ def _render_main_analyzer():
 
     if option_data and option_data.get('underlying'):
         st.markdown("---")
+        # 📊 Suite bound to the panel launcher ('Deep Analytics'): everything
+        # from Options Chain Analysis through the PCR/OI/ChgOI/Volume time
+        # series is hidden unless opened, but still computes every cycle so
+        # alerts and session histories stay live.
+        _suite_start('deep')
         _nav_anchor('sec-chain')
         st.header("📊 Options Chain Analysis")
         st.markdown("## Open Interest Change (in Lakhs)")
