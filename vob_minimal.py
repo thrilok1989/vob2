@@ -89,6 +89,22 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# ── 🪶 LIGHT MODE — all graphs/charts removed (app was overloaded) ──────────
+# Every st.plotly_chart render becomes a no-op and the heavy figure-builder /
+# graph-panel functions return early (candlestick charts, OI charts, MFP bin
+# charts, global indices / commodity / sector / GIFT-nifty panels, volume
+# delta + per-strike OI + total-OI timeseries graphs). Tables, alerts,
+# auto-trade and ALL compute (bias engines, master signal, MFP legs) still
+# run untouched. Set to False to bring every chart back.
+DISABLE_ALL_CHARTS = True
+if DISABLE_ALL_CHARTS:
+    st.plotly_chart = lambda *args, **kwargs: None
+
+# ── Auto Trade section removed per user request. NOTE: this also disables
+# the automatic target/SL exit management of any ACTIVE trade — do not flip
+# this on with a live position open. Set to False to bring the section back.
+DISABLE_AUTO_TRADE = True
+
 try:
     DHAN_CLIENT_ID = st.secrets.get("DHAN_CLIENT_ID", "") or st.secrets.get("dhan", {}).get("client_id", "")
     DHAN_ACCESS_TOKEN = st.secrets.get("DHAN_ACCESS_TOKEN", "") or st.secrets.get("dhan", {}).get("access_token", "")
@@ -4905,6 +4921,8 @@ def _capture_atm_mfp_bins(side, mfp, max_points=400):
 
 
 def render_atm_mfp_bin_charts(side, n_bins=5):
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     """Render one bull(green)-vs-bear(red) time-series line chart per MFP bin
     (index 1=top … n=bottom) for the ATM CE or PE leg. X-axis is the live
     session timeline (grows per data cycle, like the OI chart)."""
@@ -5665,6 +5683,8 @@ def send_ignition_alert(tag, ign, ltp, spot, cooldown_s=900):
 
 
 def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, money_flow_data=None, volume_delta_data=None, cie_signals=None, geo_patterns=None, candle_patterns=None, liquidity_grabs=None, vpfr_data=None, dynamic_poc=None):
+    if DISABLE_ALL_CHARTS:
+        return None  # 🪶 light mode: graphs removed
     if df.empty:
         return go.Figure()
 
@@ -8285,6 +8305,8 @@ def compute_commodity_risk():
 
 
 def render_commodity_risk_panel():
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     data = st.session_state.get('_commodity_risk')
     st.markdown("## 🛢️ Cross-Sectional Commodity Risk Dashboard")
     if not data:
@@ -8580,6 +8602,8 @@ def compute_global_nifty_bias():
 
 
 def render_global_indices_panel():
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     """Display Money Flow Profile + VPFR + Dynamic PoC + VOB + HVP for global instruments."""
     data = st.session_state.get('_global_indices') or {}
     st.markdown("## 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily)")
@@ -8765,6 +8789,8 @@ def compute_gift_nifty_moneyflow(api, num_rows=10):
 
 
 def render_gift_nifty_moneyflow_panel():
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     data = st.session_state.get('_gift_mf')
     st.markdown("## 💰 NIFTY Futures Money Flow Profile (10 rows)")
     st.caption(
@@ -11236,6 +11262,8 @@ def render_major_sr_table(zones, underlying_price):
 
 
 def render_oi_charts(option_data, underlying_price, atm_band=10):
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     """Two side-by-side bar charts:
       • Total CE vs PE OI per strike (ATM ± atm_band)
       • Change in CE vs PE OI per strike (intraday delta)
@@ -15175,6 +15203,8 @@ def send_premarket_telegram(api):
 #  SECTOR HEATMAP — 1-row colored bar
 # ═══════════════════════════════════════════════════════════════════════════
 def render_sector_heatmap():
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     """Render a single-row colored heatmap of sector strengths."""
     sectors = st.session_state.get('_sector_rotation') or st.session_state.get('_sector_rotation_data')
     if not sectors or not isinstance(sectors, dict):
@@ -15813,6 +15843,8 @@ def _track_total_oi_timeseries(option_data, underlying_price=None, max_points=50
 
 
 def render_total_oi_timeseries():
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     """Two time-series line charts: TOTAL CE vs PE OI (whole chain) and TOTAL ΔOI."""
     hist = st.session_state.get('_total_oi_history') or []
     if len(hist) < 2:
@@ -18293,6 +18325,8 @@ def _render_alignment_capping_top():
 
 
 def _render_vol_delta_chart():
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     """Render Buy Volume vs Sell Volume as time-series lines, styled like Per-Strike Call vs Put OI."""
     import plotly.graph_objects as go
     vd = getattr(st.session_state, '_volume_delta_data', None)
@@ -18403,6 +18437,8 @@ def _render_vol_delta_chart():
 
 
 def _render_per_strike_oi_top():
+    if DISABLE_ALL_CHARTS:
+        return  # 🪶 light mode: graphs removed
     """Render Per-Strike CE vs PE OI charts + signals from session state."""
     import plotly.graph_objects as go
     oi_history = st.session_state.get('oi_history', [])
@@ -18504,6 +18540,8 @@ def _render_per_strike_oi_top():
 
 def show_auto_trade_section(option_data, df_5m, api, db):
     """Render the full auto-trade UI section."""
+    if DISABLE_AUTO_TRADE:
+        return  # 🪶 light mode: auto trade removed
     st.markdown("---")
     st.markdown("## 🎯 Zone-Based Auto Trade")
 
