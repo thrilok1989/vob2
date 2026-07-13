@@ -20847,6 +20847,56 @@ def _render_main_analyzer():
                             except Exception as _me50:
                                 st.caption(f"MFP (last 50 candles) error: {_me50}")
 
+                            # ── Money Flow Profile — Last 20 Candles (fast recency bins) ─
+                            try:
+                                _mfp_20 = calculate_money_flow_profile(_ldf.tail(20), num_rows=5, source='Money Flow')
+                                if _mfp_20 and _mfp_20.get('rows'):
+                                    _mfp20_rows = []
+                                    for r in reversed(_mfp_20['rows']):
+                                        _is_bull20 = r['sentiment'].lower().startswith('bull')
+                                        _is_bear20 = r['sentiment'].lower().startswith('bear')
+                                        if r.get('is_poc'):
+                                            _poc_cell20 = '🟢🎯 POC' if _is_bull20 else ('🔴🎯 POC' if _is_bear20 else '⚪🎯 POC')
+                                        else:
+                                            _poc_cell20 = r.get('node_type', '')
+                                        _mfp20_rows.append({
+                                            '_sent_dir': 'bull' if _is_bull20 else ('bear' if _is_bear20 else 'neutral'),
+                                            'Price Bin': f"₹{r['bin_low']:.1f}–{r['bin_high']:.1f}",
+                                            'Mid': f"₹{r['price_level']:.1f}",
+                                            'Total Vol': f"{r['total_volume']:,.0f}",
+                                            'Bull': f"{r['bull_volume']:,.0f}",
+                                            'Bear': f"{r['bear_volume']:,.0f}",
+                                            'Δ': f"{r['delta']:+,.0f}",
+                                            'Vol %': f"{r['volume_pct']:.1f}%",
+                                            'Node': _poc_cell20,
+                                            'Sentiment': f"{r['sentiment']} ({r['sentiment_strength']:.0f}%)",
+                                        })
+                                    st.markdown(
+                                        f"**Money Flow Profile — Last 20 Candles** · POC ₹{_mfp_20['poc_price']:.1f} · "
+                                        f"VAH ₹{_mfp_20['value_area_high']:.1f} · "
+                                        f"VAL ₹{_mfp_20['value_area_low']:.1f} · "
+                                        f"Top: {_mfp_20.get('highest_sentiment_direction', '—')} "
+                                        f"@ ₹{_mfp_20.get('highest_sentiment_price', 0):.1f} · "
+                                        f"({_mfp_20.get('num_bars', 0)} bars)"
+                                    )
+                                    _leg_mfp20_df = pd.DataFrame(_mfp20_rows)
+
+                                    def _color_leg_mfp20(row):
+                                        sd = row.get('_sent_dir', 'neutral')
+                                        if sd == 'bull':
+                                            return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
+                                        if sd == 'bear':
+                                            return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
+                                        return [''] * len(row)
+                                    _styled_leg20 = (_leg_mfp20_df.style
+                                                     .apply(_color_leg_mfp20, axis=1)
+                                                     .hide(axis='columns', subset=['_sent_dir']))
+                                    st.dataframe(_styled_leg20, width='stretch', hide_index=True)
+                                else:
+                                    st.caption("MFP (last 20 candles): insufficient bars")
+                            except Exception as _me20:
+                                st.caption(f"MFP (last 20 candles) error: {_me20}")
+
                             # Latest grab summary (compact one-line under chart)
                             if _gr:
                                 _lg = _gr[-1]
