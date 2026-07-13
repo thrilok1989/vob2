@@ -566,7 +566,7 @@ def display_market_depth_dashboard(spot, depth_analysis, depth_signals, enhanced
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             xaxis=dict(tickformat=",.0f", tickprefix="₹", range=[x_min, x_max]),
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
 
 # -----------------------
 # 🎯 COMPREHENSIVE MARKET DEPTH DASHBOARD (ADVANCED)
@@ -670,7 +670,7 @@ def display_comprehensive_depth_analysis(analysis_results):
             })
 
         impact_df = pd.DataFrame(impact_data)
-        st.dataframe(impact_df, use_container_width=True)
+        st.dataframe(impact_df, width='stretch')
 
         # Slippage
         st.markdown("**💸 Slippage Costs:**")

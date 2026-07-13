@@ -235,7 +235,7 @@ limit_price = st.number_input(
     disabled=(order_type == "MARKET"),
 )
 
-if st.button(f"🟢 BUY {opt_type} {strike:,.0f}  ·  {lots} lot(s) / {quantity} qty", type="primary", use_container_width=True):
+if st.button(f"🟢 BUY {opt_type} {strike:,.0f}  ·  {lots} lot(s) / {quantity} qty", type="primary", width='stretch'):
     with st.spinner("Resolving contract and placing order…"):
         sec_id = resolve_option_security_id(expiry, strike, opt_type)
         if not sec_id:
