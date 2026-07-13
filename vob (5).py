@@ -6633,7 +6633,7 @@ def render_smart_money_master_analysis(option_data, current_price):
             "PCR":        f"{gv(row,'PCR',1.0):.2f}" if 'PCR' in ds.columns else "—",
         })
     if snap_rows:
-        st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(snap_rows), width='stretch', hide_index=True)
 
     # Strike Migration + Smart Money
     mig1, mig2 = st.columns(2)
@@ -7181,7 +7181,7 @@ def render_pre_market_intelligence_report(option_data, current_price):
                 "PCR":            f"{_gv(row,'PCR',1.0):.2f}" if 'PCR' in ds.columns else "—",
             })
         if snap_rows:
-            st.dataframe(pd.DataFrame(snap_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(snap_rows), width='stretch', hide_index=True)
 
     # ── Trap Signals Detail ────────────────────────────────────────────────
     with st.expander("🪤 Trap Detection Detail", expanded=trap_prob == "High"):
@@ -7278,7 +7278,7 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
                 height=300,
                 margin=dict(l=0, r=0, t=30, b=0)
             )
-            st.plotly_chart(fig_price, use_container_width=True)
+            st.plotly_chart(fig_price, width='stretch')
         
         with col2:
             fig_volume = go.Figure()
@@ -7295,7 +7295,7 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
                 height=300,
                 margin=dict(l=0, r=0, t=30, b=0)
             )
-            st.plotly_chart(fig_volume, use_container_width=True)
+            st.plotly_chart(fig_volume, width='stretch')
         
         st.subheader("30-Day Summary")
         col1, col2, col3, col4 = st.columns(4)
@@ -8068,7 +8068,7 @@ def show_bn_dashboard(nifty_df: pd.DataFrame = None, interval: str = "1"):
                                .hide(axis="index")\
                                .hide(["_pct_d", "_pct_tf1", "_pct_tf2", "_inverse"], axis="columns")
 
-    st.dataframe(df_final, use_container_width=True, height=420)
+    st.dataframe(df_final, width='stretch', height=420)
 
     # ── Macro Section ──────────────────────────────────────────────────
     st.markdown("#### ⚠ Macro Signals (Inverse — Up = Bearish for Market)")
@@ -8096,7 +8096,7 @@ def show_bn_dashboard(nifty_df: pd.DataFrame = None, interval: str = "1"):
             macro_styled.style.apply(lambda _: _style_macro(macro_styled), axis=None)
                                .hide(axis="index")
                                .hide(["_pct_d", "_pct_tf1", "_pct_tf2", "_inverse"], axis="columns"),
-            use_container_width=True, height=160
+            width='stretch', height=160
         )
 
     # ── Indicator Dashboard (NIFTY 50 across 3 TFs) ───────────────────
@@ -8233,7 +8233,7 @@ def show_bn_dashboard(nifty_df: pd.DataFrame = None, interval: str = "1"):
               .apply(lambda _: _style_ind_table(df_ind[ind_cols + ["_up_curr","_up_tf1","_up_tf2"]]), axis=None)
               .hide(axis="index")
               .hide(["_up_curr", "_up_tf1", "_up_tf2"], axis="columns"),
-        use_container_width=True, height=310
+        width='stretch', height=310
     )
 
 
@@ -8512,7 +8512,7 @@ def show_futures_analysis_engine(df: pd.DataFrame, option_data: dict, current_pr
 
     st.dataframe(
         sum_df.style.apply(_style_fae, axis=1),
-        use_container_width=True, hide_index=True
+        width='stretch', hide_index=True
     )
 
     # Alerts
@@ -8553,7 +8553,7 @@ def show_futures_analysis_engine(df: pd.DataFrame, option_data: dict, current_pr
                 c = "background-color:#1a3a1a; color:#00e676" if row["Result"] == "WIN" \
                     else "background-color:#3a1a1a; color:#ff5252"
                 return [c] * len(row)
-            st.dataframe(bt_df.style.apply(_bt_style, axis=1), use_container_width=True, hide_index=True)
+            st.dataframe(bt_df.style.apply(_bt_style, axis=1), width='stretch', hide_index=True)
         else:
             st.info("No completed EMA crossover trades in the last 50 bars.")
 
@@ -8939,7 +8939,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
                     return [""] + ["background-color:#1a0a3a;color:#ce93d8;font-weight:bold"] * (len(row)-1)
                 return [""] + ["background-color:#1a3a1a;color:#00e676"] * (len(row)-1)
             st.dataframe(sup_df.style.apply(_sup_major_style, axis=1),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
 
     with msr2:
         st.markdown("##### 🔴 Major Resistance Levels")
@@ -8962,7 +8962,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
                     return [""] + ["background-color:#1a0a3a;color:#ce93d8;font-weight:bold"] * (len(row)-1)
                 return [""] + ["background-color:#3a1a1a;color:#ff5252"] * (len(row)-1)
             st.dataframe(res_df.style.apply(_res_major_style, axis=1),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
 
     # ── MODULE 3+4+7: Full Depth Table ────────────────────────────────
     st.markdown("#### 📋 Full Order Book — 10 Levels Each Side")
@@ -9001,7 +9001,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
 
         st.dataframe(
             bid_df.style.apply(_bid_style, axis=1),
-            use_container_width=True, hide_index=True
+            width='stretch', hide_index=True
         )
 
     # Resistance (Asks) table
@@ -9035,7 +9035,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
 
         st.dataframe(
             ask_df.style.apply(_ask_style, axis=1),
-            use_container_width=True, hide_index=True
+            width='stretch', hide_index=True
         )
 
     # ── MODULE 5: Liquidity Clusters ─────────────────────────────────
@@ -9059,7 +9059,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
                 return ["", "", "color:#00e676", "", "background-color:#1a3a1a;color:#00e676;font-weight:bold", ""]
             return ["", "", "color:#ff5252", "", "background-color:#3a1a1a;color:#ff5252;font-weight:bold", ""]
 
-        st.dataframe(cl_df.style.apply(_cl_style, axis=1), use_container_width=True, hide_index=True)
+        st.dataframe(cl_df.style.apply(_cl_style, axis=1), width='stretch', hide_index=True)
 
     # ── MODULE 9: Chart Visualization ────────────────────────────────
     with st.expander("📈 Depth Chart — Liquidity Profile", expanded=False):
@@ -9107,7 +9107,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
                 height=500,
                 yaxis=dict(tickformat=","),
             )
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         except Exception as _chart_err:
             st.info(f"Chart unavailable: {_chart_err}")
 
@@ -9144,7 +9144,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
 
                 st.dataframe(
                     chg_df.drop(columns=["_bull"]).style.apply(_chg_style, axis=1),
-                    use_container_width=True, hide_index=True
+                    width='stretch', hide_index=True
                 )
             else:
                 st.success("✅ No significant liquidity changes since last snapshot.")
@@ -9252,7 +9252,7 @@ def show_market_depth_engine(api=None, option_data: dict = None,
                     return ["", "", "", "", "", c]
 
                 st.dataframe(bt_df.style.apply(_bt_style, axis=1),
-                             use_container_width=True, hide_index=True)
+                             width='stretch', hide_index=True)
             else:
                 st.info("No price data overlaps with current depth levels for backtesting.")
         else:
@@ -9473,7 +9473,7 @@ def show_market_sentiment_engine(api=None, option_data: dict = None,
                 paper_bgcolor="#0e1117", font={"color": "#e0e0e0"},
                 height=280, margin=dict(t=40, b=20, l=20, r=20)
             )
-            st.plotly_chart(fig_gauge, use_container_width=True)
+            st.plotly_chart(fig_gauge, width='stretch')
         except Exception:
             st.markdown(
                 f"<div style='text-align:center;padding:20px;background:#1e1e1e;"
@@ -9528,7 +9528,7 @@ def show_market_sentiment_engine(api=None, option_data: dict = None,
         return [""] * len(row)
 
     st.dataframe(pd.DataFrame(near_rows).style.apply(_near_style, axis=1),
-                 use_container_width=True, hide_index=True)
+                 width='stretch', hide_index=True)
 
     # ── MODULE 7: Smart Money Table ───────────────────────────────────
     if absorptions:
@@ -9541,7 +9541,7 @@ def show_market_sentiment_engine(api=None, option_data: dict = None,
             return ["background-color:#3a1a1a; color:#ff5252"] * len(row)
 
         st.dataframe(abs_df.style.apply(_abs_style, axis=1),
-                     use_container_width=True, hide_index=True)
+                     width='stretch', hide_index=True)
 
     # ── MODULE 6+10: Shift Alerts ─────────────────────────────────────
     st.markdown("#### 🚨 Sentiment Alerts")
@@ -9960,7 +9960,7 @@ def show_fii_dii_analysis(df: pd.DataFrame = None, option_data: dict = None,
 
     st.dataframe(
         hist_df.style.apply(_hist_style, axis=1),
-        use_container_width=True, hide_index=True
+        width='stretch', hide_index=True
     )
 
     # Futures positions table
@@ -10014,7 +10014,7 @@ def show_fii_dii_analysis(df: pd.DataFrame = None, option_data: dict = None,
 
         st.dataframe(
             fut_df.style.apply(_fut_style, axis=1),
-            use_container_width=True, hide_index=True
+            width='stretch', hide_index=True
         )
 
     # ── MODULE 3 summary row ──────────────────────────────────────────
@@ -10070,11 +10070,11 @@ def show_fii_dii_analysis(df: pd.DataFrame = None, option_data: dict = None,
                 height=350,
             )
             fig.add_hline(y=0, line_dash="dash", line_color="#555")
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
         except Exception:
             # Fallback: simple table
             chart_df2 = cash_df[["Date","FII Net","DII Net"]].iloc[::-1].reset_index(drop=True)
-            st.dataframe(chart_df2, use_container_width=True, hide_index=True)
+            st.dataframe(chart_df2, width='stretch', hide_index=True)
 
     # ── MODULE 9: Backtest ────────────────────────────────────────────
     with st.expander("📊 FII Signal Backtest — Historical Win Rate", expanded=False):
@@ -10115,7 +10115,7 @@ def show_fii_dii_analysis(df: pd.DataFrame = None, option_data: dict = None,
                 return [c] * len(row)
             st.dataframe(
                 bt_df.style.apply(_bt_style, axis=1),
-                use_container_width=True, hide_index=True
+                width='stretch', hide_index=True
             )
         else:
             st.info("Need at least 5 days of data for backtest.")
@@ -10474,7 +10474,7 @@ def show_news_intelligence_engine(df: pd.DataFrame = None,
 
         st.dataframe(
             panel_df.style.apply(_panel_style, axis=1),
-            use_container_width=True, hide_index=True, height=400
+            width='stretch', hide_index=True, height=400
         )
     else:
         st.info("No articles match the selected filters.")
@@ -10511,7 +10511,7 @@ def show_news_intelligence_engine(df: pd.DataFrame = None,
                  "color:#bdbdbd")
             return ["", "", "", c]
         st.dataframe(sect_df.style.apply(_sect_style, axis=1),
-                     use_container_width=True, hide_index=True)
+                     width='stretch', hide_index=True)
     else:
         st.info("No sector-specific news detected.")
 
@@ -10655,7 +10655,7 @@ def show_news_intelligence_engine(df: pd.DataFrame = None,
 
     st.dataframe(
         ci_df.drop(columns=["_clr"]).style.apply(_ci_style, axis=1),
-        use_container_width=True, hide_index=True
+        width='stretch', hide_index=True
     )
 
     # Final verdict
@@ -10719,7 +10719,7 @@ def show_news_intelligence_engine(df: pd.DataFrame = None,
                 f"Win Rate: **{win_rate:.0f}%**"
             )
             st.dataframe(bt_df.style.apply(_bt_news_style, axis=1),
-                         use_container_width=True, hide_index=True)
+                         width='stretch', hide_index=True)
 
     # ── MODULE 11: News event markers hint ───────────────────────────
     with st.expander("📌 Chart Event Markers", expanded=False):
@@ -10738,7 +10738,7 @@ def show_news_intelligence_engine(df: pd.DataFrame = None,
                 "Sector Impact": a["sectors"],
             })
         if marker_rows:
-            st.dataframe(pd.DataFrame(marker_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(marker_rows), width='stretch', hide_index=True)
         else:
             st.info("No high-impact events to mark on chart in current feed.")
 
@@ -10973,7 +10973,7 @@ def show_sector_rotation_engine():
     st.markdown("#### 📊 Sector Rotation Table")
     st.dataframe(
         disp_df.style.apply(_sre_style_row, axis=1),
-        use_container_width=True, hide_index=True
+        width='stretch', hide_index=True
     )
 
     # ── MODULE 3: Money Flow Heatmap ──────────────────────────────────
@@ -10995,7 +10995,7 @@ def show_sector_rotation_engine():
 
     st.dataframe(
         heat_df.style.map(_heat_color, subset=["1W%"]),
-        use_container_width=True, hide_index=True
+        width='stretch', hide_index=True
     )
 
     # ── MODULE 4: Relative Strength Rankings ─────────────────────────
@@ -11021,7 +11021,7 @@ def show_sector_rotation_engine():
             return [""] + ["background-color:#1a3a1a; color:#00e676"] * (len(row)-1)
         return [""] + ["background-color:#3a1a1a; color:#ff5252"] * (len(row)-1)
 
-    st.dataframe(rs_df.style.apply(_rs_style, axis=1), use_container_width=True, hide_index=True)
+    st.dataframe(rs_df.style.apply(_rs_style, axis=1), width='stretch', hide_index=True)
 
     # ── MODULE 5: Rotation Signals Summary ───────────────────────────
     leading   = [r["Sector"] for r in rows if r["Phase"] == "LEADING"]
@@ -11055,7 +11055,7 @@ def show_sector_rotation_engine():
             except Exception:
                 c = ""
             return ["", "", c, ""]
-        st.dataframe(intra_df.style.apply(_intra_style, axis=1), use_container_width=True, hide_index=True)
+        st.dataframe(intra_df.style.apply(_intra_style, axis=1), width='stretch', hide_index=True)
 
     # ── MODULE 7: Alerts ──────────────────────────────────────────────
     st.markdown("#### 🚨 Sector Rotation Alerts")
@@ -11352,7 +11352,7 @@ def show_intraday_sector_rotation():
 
     st.dataframe(
         disp_df.style.apply(_intra_style, axis=1),
-        use_container_width=True, hide_index=True, height=380
+        width='stretch', hide_index=True, height=380
     )
 
     # ── Phase Summary ─────────────────────────────────────────────────
@@ -12050,7 +12050,7 @@ def show_global_correlation_engine():
         })
 
     df_gc = pd.DataFrame(rows)
-    st.dataframe(df_gc, use_container_width=True, hide_index=True)
+    st.dataframe(df_gc, width='stretch', hide_index=True)
 
     # ── Contribution bar chart ────────────────────────────────────────────
     import plotly.graph_objects as go
@@ -12076,7 +12076,7 @@ def show_global_correlation_engine():
                        font=dict(size=12)),
         )
         fig_gc.add_hline(y=0, line_color="#666", line_width=1)
-        st.plotly_chart(fig_gc, use_container_width=True)
+        st.plotly_chart(fig_gc, width='stretch')
 
     # ── Narrative ─────────────────────────────────────────────────────────
     bull_mkts = [r["Market"] for r in valid_rows if float(r["NIFTY Impact"]) > 0.05]
@@ -12977,7 +12977,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
     )
     _fig_radar.add_hline(y=0.12,  line_dash='dash', line_color='#00C853', line_width=1)
     _fig_radar.add_hline(y=-0.12, line_dash='dash', line_color='#FF5252', line_width=1)
-    st.plotly_chart(_fig_radar, use_container_width=True)
+    st.plotly_chart(_fig_radar, width='stretch')
 
     # Narrative sections
     st.markdown("#### 🗣️ Plain-English Market Narrative")
@@ -13105,7 +13105,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         )
         _fig_clust.add_vline(x=0.1,  line_dash='dot', line_color='#00C853', line_width=1)
         _fig_clust.add_vline(x=-0.1, line_dash='dot', line_color='#FF5252', line_width=1)
-        st.plotly_chart(_fig_clust, use_container_width=True, config={'displayModeBar': False})
+        st.plotly_chart(_fig_clust, width='stretch', config={'displayModeBar': False})
         st.markdown(f"""
         <div style="background:#0d1117;border:1px solid {cluster_align_col}33;border-left:3px solid {cluster_align_col};
                     border-radius:0 0 8px 8px;padding:6px 14px 12px 14px;margin-top:-24px;margin-bottom:10px;">
@@ -13283,7 +13283,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
         xaxis=dict(tickangle=-35, gridcolor='#333'),
         title=dict(text=f'Weighted Contributions → Final Score: {ensemble_score:+.3f}', font=dict(size=12)),
     )
-    st.plotly_chart(_fig_c, use_container_width=True)
+    st.plotly_chart(_fig_c, width='stretch')
 
     # Ensemble score history (store in session_state)
     if 'ml_report_history' not in st.session_state:
@@ -13319,7 +13319,7 @@ def show_ml_market_report(option_data=None, df=None, current_price=None):
             xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333', range=[-1.1, 1.1]),
             showlegend=False,
         )
-        st.plotly_chart(_fig_mh, use_container_width=True)
+        st.plotly_chart(_fig_mh, width='stretch')
 
     st.caption(f"🤖 ML Ensemble: 25 signals · {len(weights)} weighted features · Updates every ~30s · "
                f"{len(st.session_state.ml_report_history)} data points")
@@ -13489,7 +13489,7 @@ def show_advanced_market_intelligence_engine(
         return styles
 
     styled = df_table.style.apply(_amie_style, axis=1)
-    st.dataframe(styled, use_container_width=True)
+    st.dataframe(styled, width='stretch')
 
     # ── ATM ±2 Intelligence Table ─────────────────────────────────────
     if atm_result['strikes']:
@@ -13521,7 +13521,7 @@ def show_advanced_market_intelligence_engine(
                 return [""] * len(row)
             st.dataframe(
                 df_atm.style.apply(_atm_highlight, axis=1),
-                use_container_width=True
+                width='stretch'
             )
 
         # Migration signal
@@ -13811,7 +13811,7 @@ def show_final_intelligence_dashboard(df: pd.DataFrame = None,
 
     st.dataframe(
         pillar_df.drop(columns=["_clr"]).style.apply(_pillar_style, axis=1),
-        use_container_width=True, hide_index=True
+        width='stretch', hide_index=True
     )
 
     # ── SECTION 3: Options Pressure Panel ────────────────────────────
@@ -14426,7 +14426,7 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
                 'Confidence': p['confidence'],
                 'Move %': f"{p['move_pct']:+.2f}%",
             })
-        st.dataframe(pd.DataFrame(_alert_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(_alert_rows), width='stretch', hide_index=True)
     else:
         st.info("No geometric patterns detected on current price data. Patterns will appear when confirmed breakouts occur.")
 
@@ -14472,7 +14472,7 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
                     'Vol Spikes': spikes,
                     'Spike %': f"{spikes / total * 100:.0f}%" if total > 0 else '0%',
                 })
-            st.dataframe(pd.DataFrame(heatmap_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(heatmap_rows), width='stretch', hide_index=True)
 
             # Most frequent pattern indicator
             top_pat = max(pat_counts, key=pat_counts.get)
@@ -14538,7 +14538,7 @@ def render_geo_pattern_analysis(df, df_full, date_label='Today'):
                     'Confidence': r['confidence'],
                 })
             if bt_table_rows:
-                st.dataframe(pd.DataFrame(bt_table_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(bt_table_rows), width='stretch', hide_index=True)
         else:
             st.info("Not enough historical data to run backtest scan.")
     else:
@@ -16739,7 +16739,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
 
                     st.dataframe(
                         _t5_tbl.style.apply(_t5_style, axis=1),
-                        use_container_width=True,
+                        width='stretch',
                         hide_index=True,
                     )
                     _t5_und_dir = "↑" if _t5_und_up else "↓"
@@ -16759,7 +16759,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
         st.markdown("---")
         st.markdown("## Option Chain Bias Summary")
         if option_data.get('styled_df') is not None:
-            st.dataframe(option_data['styled_df'], use_container_width=True)
+            st.dataframe(option_data['styled_df'], width='stretch')
 
     # ===== HTF SUPPORT & RESISTANCE TABLES (SPLIT) =====
     with st.expander("📈 HTF Support & Resistance Levels", expanded=False):
@@ -16780,7 +16780,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                 st.markdown("### 🟢 SUPPORT LEVELS")
                 if support_data:
                     support_df = pd.DataFrame(support_data)
-                    st.dataframe(support_df, use_container_width=True, hide_index=True)
+                    st.dataframe(support_df, width='stretch', hide_index=True)
                 else:
                     st.info("No support levels identified")
 
@@ -16788,7 +16788,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                 st.markdown("### 🔴 RESISTANCE LEVELS")
                 if resistance_data:
                     resistance_df = pd.DataFrame(resistance_data)
-                    st.dataframe(resistance_df, use_container_width=True, hide_index=True)
+                    st.dataframe(resistance_df, width='stretch', hide_index=True)
                 else:
                     st.info("No resistance levels identified")
 
@@ -16894,7 +16894,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         plot_bgcolor='#1e1e1e',
                         paper_bgcolor='#1e1e1e',
                     )
-                    st.plotly_chart(_fig_d, use_container_width=True, key=f"{idx_key}_pc001_{_col_idx}")
+                    st.plotly_chart(_fig_d, width='stretch', key=f"{idx_key}_pc001_{_col_idx}")
                     _caption = f"{'PE Bid' if _side=='S' else 'CE Ask'} {_cur_qty:,.0f}"
                     if _cur_price is not None:
                         _caption += f" @ {_price_str}"
@@ -16905,7 +16905,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                 option_data.get('underlying')
             )
             if depth_fig is not None:
-                st.plotly_chart(depth_fig, use_container_width=True, key=f"{idx_key}_pc002")
+                st.plotly_chart(depth_fig, width='stretch', key=f"{idx_key}_pc002")
 
     # ===== PRE-COMPUTE GEX + TRACK HISTORY (before comparison view) =====
     _gex_pre_summary = option_data.get('df_summary')
@@ -17047,7 +17047,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         margin=dict(l=50, r=60, t=55, b=40)
                     )
-                    st.plotly_chart(_fig_cs, use_container_width=True, key=f"{idx_key}_pc003")
+                    st.plotly_chart(_fig_cs, width='stretch', key=f"{idx_key}_pc003")
                 with _cc2:
                     _fig_cs2 = go.Figure()
                     if 'avg_pcr' in _cs_df.columns:
@@ -17085,7 +17085,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         margin=dict(l=40, r=55, t=55, b=40)
                     )
-                    st.plotly_chart(_fig_cs2, use_container_width=True, key=f"{idx_key}_pc004")
+                    st.plotly_chart(_fig_cs2, width='stretch', key=f"{idx_key}_pc004")
 
             st.caption(f"📊 {len(_cs_hist)} data points · updates every ~30s · "
                        f"Full analysis with per-strike breakdown further below ↓")
@@ -17719,7 +17719,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 legend=dict(orientation='h', y=-0.35, font=dict(size=9)),
                                 paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
                             )
-                            st.plotly_chart(_fig_st, use_container_width=True, key=f"{idx_key}_pc005")
+                            st.plotly_chart(_fig_st, width='stretch', key=f"{idx_key}_pc005")
 
                         with _mc2:
                             # IV Skew Engine Chart
@@ -17756,7 +17756,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 legend=dict(orientation='h', y=-0.35, font=dict(size=9)),
                                 paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
                             )
-                            st.plotly_chart(_fig_iv2, use_container_width=True, key=f"{idx_key}_pc006")
+                            st.plotly_chart(_fig_iv2, width='stretch', key=f"{idx_key}_pc006")
 
                         _mc3, _mc4 = st.columns(2)
 
@@ -17804,7 +17804,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 legend=dict(orientation='h', y=-0.35, font=dict(size=9)),
                                 paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
                             )
-                            st.plotly_chart(_fig_pcr2, use_container_width=True, key=f"{idx_key}_pc007")
+                            st.plotly_chart(_fig_pcr2, width='stretch', key=f"{idx_key}_pc007")
 
                         with _mc4:
                             # Gamma Pressure Chart
@@ -17839,7 +17839,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 showlegend=False,
                                 paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
                             )
-                            st.plotly_chart(_fig_gam, use_container_width=True, key=f"{idx_key}_pc008")
+                            st.plotly_chart(_fig_gam, width='stretch', key=f"{idx_key}_pc008")
 
                         # ══════════════════════════════════════════════════════
                         # BOTTOM CHARTS  (3 columns)
@@ -17879,7 +17879,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 legend=dict(orientation='h', y=-0.4, font=dict(size=9)),
                                 paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
                             )
-                            st.plotly_chart(_fig_pres2, use_container_width=True, key=f"{idx_key}_pc009")
+                            st.plotly_chart(_fig_pres2, width='stretch', key=f"{idx_key}_pc009")
                             _p_sig = ("🚀 Call Dominating" if _pro_call_pres > _pro_put_pres + 0.1
                                       else "🔥 Put Dominating" if _pro_put_pres > _pro_call_pres + 0.1
                                       else "⚖️ Balanced")
@@ -17919,7 +17919,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 showlegend=False,
                                 paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
                             )
-                            st.plotly_chart(_fig_nd, use_container_width=True, key=f"{idx_key}_pc010")
+                            st.plotly_chart(_fig_nd, width='stretch', key=f"{idx_key}_pc010")
                             _nd_sig = ("📈 Bullish Positioning" if _pro_net_delta > 0
                                        else "📉 Bearish Positioning")
                             st.caption(_nd_sig)
@@ -17956,7 +17956,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 showlegend=False,
                                 paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'),
                             )
-                            st.plotly_chart(_fig_bs, use_container_width=True, key=f"{idx_key}_pc011")
+                            st.plotly_chart(_fig_bs, width='stretch', key=f"{idx_key}_pc011")
                             st.caption(f"Straddle {_s1}/20 · IV {_s2}/20 · Gamma {_s3}/20 · "
                                        f"Volume {_s4}/20 · Pressure {_s5}/20")
 
@@ -18008,13 +18008,13 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             legend=dict(orientation='h', y=-0.3, font=dict(size=9)),
                             margin=dict(l=40, r=65, t=45, b=30),
                             paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'))
-                        st.plotly_chart(_fig_sent, use_container_width=True, key=f"{idx_key}_pc012")
+                        st.plotly_chart(_fig_sent, width='stretch', key=f"{idx_key}_pc012")
 
                     # ── Per-Strike Breakdown ─────────────────────────────────────
                     if _comp_strike_details:
                         with st.expander("📋 Per-Strike Direction Breakdown"):
                             st.dataframe(pd.DataFrame(_comp_strike_details),
-                                         use_container_width=True, hide_index=True)
+                                         width='stretch', hide_index=True)
 
                     # Controls
                     _pro_cl, _pro_cm, _pro_cr = st.columns([3, 1, 1])
@@ -18338,7 +18338,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             legend=dict(orientation='h', y=-0.3, font=dict(size=9)),
                             margin=dict(l=40, r=120, t=45, b=30),
                             paper_bgcolor='#111', plot_bgcolor='#111', font=dict(color='#ccc'))
-                        st.plotly_chart(_fig_itm, use_container_width=True, key=f"{idx_key}_pc013")
+                        st.plotly_chart(_fig_itm, width='stretch', key=f"{idx_key}_pc013")
 
                     # Source breakdown
                     with st.expander("📖 Level Sources"):
@@ -18356,7 +18356,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         ]
                         st.dataframe(pd.DataFrame(_src_data,
                             columns=['Level', 'Value', 'Source']),
-                            use_container_width=True, hide_index=True)
+                            width='stretch', hide_index=True)
                 else:
                     st.info("ATM strike not identified in option chain.")
             else:
@@ -18709,7 +18709,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             paper_bgcolor='#1e1e1e',
                         )
 
-                        st.plotly_chart(fig, use_container_width=True, key=f"{idx_key}_pc014_{i}")
+                        st.plotly_chart(fig, width='stretch', key=f"{idx_key}_pc014_{i}")
 
                         # Signal summary below chart
                         cur_pcr = history_df[strike_col].iloc[-1] if (
@@ -18876,7 +18876,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             plot_bgcolor='#1e1e1e',
                             paper_bgcolor='#1e1e1e',
                         )
-                        st.plotly_chart(fig_gex, use_container_width=True, key=f"{idx_key}_pc015_{i}")
+                        st.plotly_chart(fig_gex, width='stretch', key=f"{idx_key}_pc015_{i}")
                         gex_sig = "📍 Pin" if cur_gex > 10 else ("⚡ Accel" if cur_gex < -10 else "➡️ Ntrl")
                         st.caption(f"GEX {cur_gex:+.1f}L {gex_sig}")
 
@@ -19014,7 +19014,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             yaxis=dict(title='OI', range=[_cp_oi_ymin, _cp_oi_ymax]),
                             plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         )
-                        st.plotly_chart(_cp_fig, use_container_width=True, key=f"{idx_key}_pc016_{_ci}")
+                        st.plotly_chart(_cp_fig, width='stretch', key=f"{idx_key}_pc016_{_ci}")
 
                         # Signal: which side dominates
                         if _cp_ce_cur is not None and _cp_pe_cur is not None and _cp_ce_cur > 0:
@@ -19110,7 +19110,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                            zeroline=True, zerolinecolor='white', zerolinewidth=1),
                                 plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                             )
-                            st.plotly_chart(_chg_fig, use_container_width=True, key=f"{idx_key}_pc017_{_ci}")
+                            st.plotly_chart(_chg_fig, width='stretch', key=f"{idx_key}_pc017_{_ci}")
 
                             # Signal: net change direction
                             if _chg_ce_cur is not None and _chg_pe_cur is not None:
@@ -19309,7 +19309,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             yaxis=dict(title='Volume', range=[_cv_ymin, _cv_ymax]),
                             plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         )
-                        st.plotly_chart(_cv_fig, use_container_width=True, key=f"{idx_key}_pc018_{_vi}")
+                        st.plotly_chart(_cv_fig, width='stretch', key=f"{idx_key}_pc018_{_vi}")
 
                         # Signal: which side dominates
                         if _cv_ce_cur is not None and _cv_pe_cur is not None and _cv_ce_cur > 0:
@@ -19405,7 +19405,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                            zeroline=True, zerolinecolor='white', zerolinewidth=1),
                                 plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                             )
-                            st.plotly_chart(_cvchg_fig, use_container_width=True, key=f"{idx_key}_pc019_{_vi}")
+                            st.plotly_chart(_cvchg_fig, width='stretch', key=f"{idx_key}_pc019_{_vi}")
 
                             # Signal: net change direction
                             if _cvchg_ce_cur is not None and _cvchg_pe_cur is not None:
@@ -19500,7 +19500,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                zeroline=True, zerolinecolor='white', zerolinewidth=1),
                     plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                 )
-                st.plotly_chart(_ph_fig, use_container_width=True, key=f"{idx_key}_pc020")
+                st.plotly_chart(_ph_fig, width='stretch', key=f"{idx_key}_pc020")
 
                 # Summary metrics
                 _ph_c1, _ph_c2, _ph_c3, _ph_c4 = st.columns(4)
@@ -19578,7 +19578,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
 
                     # Display table
                     _oi_tbl = pd.DataFrame(_oi_rows)
-                    st.dataframe(_oi_tbl, use_container_width=True, hide_index=True)
+                    st.dataframe(_oi_tbl, width='stretch', hide_index=True)
 
                     _oi_dir = "↑" if _oi_price_up else "↓"
                     st.caption(f"Price {_oi_dir} ₹{_oi_spot:.0f} | "
@@ -19697,7 +19697,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         'Breakdown %': f"{_sr['breakdown_prob']}%",
                         'Reaction': f"{_sr_emoji} {_sr['reaction']}",
                     })
-                st.dataframe(pd.DataFrame(_sr_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_sr_rows), width='stretch', hide_index=True)
             else:
                 st.info("No S/R levels within proximity (0.3%). Price is in open space.")
         except Exception as _sr_err:
@@ -19837,7 +19837,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     legend=dict(orientation='h', y=-0.15),
                     margin=dict(l=40, r=20, t=30, b=40),
                     xaxis_title='Strike', yaxis_title='OI (Lakhs)')
-                st.plotly_chart(_sop_fig, use_container_width=True, key=f"{idx_key}_pc021")
+                st.plotly_chart(_sop_fig, width='stretch', key=f"{idx_key}_pc021")
 
             # Row 4 — Institutional Activity + Smart Money Entries
             _sop_r4c1, _sop_r4c2 = st.columns(2)
@@ -19968,7 +19968,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             'Signal': '⏳ No data yet',
                         })
 
-                st.dataframe(pd.DataFrame(_tl_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_tl_rows), width='stretch', hide_index=True)
                 st.caption("Compares current ATM ± 2 OI with historical snapshots. "
                            "Data accumulates over the session — more windows become available over time.")
             else:
@@ -20064,7 +20064,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         legend=dict(orientation='h', y=-0.15),
                         margin=dict(l=40, r=20, t=30, b=40),
                         xaxis_title='Strike', yaxis_title='Quantity')
-                    st.plotly_chart(_mdp_fig, use_container_width=True, key=f"{idx_key}_pc022")
+                    st.plotly_chart(_mdp_fig, width='stretch', key=f"{idx_key}_pc022")
 
                 # Row 4 — Institutional Walls + Institutional Control
                 _mdp_r4c1, _mdp_r4c2, _mdp_r4c3 = st.columns(3)
@@ -20201,7 +20201,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         'Volume': f"{_vol_e} {_s['Volume']}",
                         'Verdict': f"{_v_emoji} {_v}",
                     })
-                st.dataframe(pd.DataFrame(_tc_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_tc_rows), width='stretch', hide_index=True)
 
                 st.caption("OI = Put OI vs Call OI | Depth = Put Ask (writers) vs Call Ask | "
                            "Volume = Put Volume vs Call Volume | "
@@ -20319,7 +20319,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     })
                 if _sd_rows:
                     _sd_df = pd.DataFrame(_sd_rows)
-                    st.dataframe(_sd_df, use_container_width=True, hide_index=True)
+                    st.dataframe(_sd_df, width='stretch', hide_index=True)
 
             # ── Time-Series Chart: Spot + Support Zone + Resistance Zone ─
             st.markdown("#### 📈 Zone Tracker — Spot vs Support vs Resistance")
@@ -20400,7 +20400,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     hovermode='x unified',
                 )
 
-                st.plotly_chart(_fig_zone, use_container_width=True, key=f"{idx_key}_zone_tracker_chart")
+                st.plotly_chart(_fig_zone, width='stretch', key=f"{idx_key}_zone_tracker_chart")
 
                 # ── Support & Resistance Score Chart ─────────────────
                 st.markdown("#### 📊 Zone Strength Over Time")
@@ -20426,7 +20426,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                showgrid=True, gridcolor='rgba(255,255,255,0.1)'),
                     hovermode='x unified',
                 )
-                st.plotly_chart(_fig_score, use_container_width=True, key=f"{idx_key}_zone_score_chart")
+                st.plotly_chart(_fig_score, width='stretch', key=f"{idx_key}_zone_score_chart")
 
                 # ── Confidence + Market Bias timeline ────────────────
                 st.markdown("#### 🎯 Confidence & Bias Timeline")
@@ -20455,7 +20455,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     hovermode='x unified',
                     barmode='overlay',
                 )
-                st.plotly_chart(_fig_conf, use_container_width=True, key=f"{idx_key}_zone_confidence_chart")
+                st.plotly_chart(_fig_conf, width='stretch', key=f"{idx_key}_zone_confidence_chart")
             else:
                 st.info("Zone history accumulating... charts appear after 2+ snapshots (every 30s).")
 
@@ -20583,7 +20583,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         yaxis=dict(title='Vol PCR', range=[_vp_ymin, _vp_ymax]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     )
-                    st.plotly_chart(_vfig, use_container_width=True, key=f"{idx_key}_pc026_{_vi}")
+                    st.plotly_chart(_vfig, width='stretch', key=f"{idx_key}_pc026_{_vi}")
                     _vsig = "🟢 Bull" if _vcur > 1.2 else ("🔴 Bear" if _vcur < 0.7 else "🟡 Ntrl")
                     st.caption(f"Vol PCR {_vcur:.2f} {_vsig}")
         else:
@@ -20663,7 +20663,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         yaxis=dict(title='Premium (₹)', range=[_sy_min, _sy_max]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     )
-                    st.plotly_chart(_sfig, use_container_width=True, key=f"{idx_key}_pc027_{_si}")
+                    st.plotly_chart(_sfig, width='stretch', key=f"{idx_key}_pc027_{_si}")
                     _move_lbl = "💥 Explosive" if _st_dir == "rising" else ("🐌 Grinding" if _st_dir == "falling" else "⬛ Range")
                     st.caption(f"₹{_st_cur:.1f} → {_move_lbl}")
         else:
@@ -21091,7 +21091,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         margin=dict(l=50, r=50, t=60, b=50)
                     )
 
-                    st.plotly_chart(fig_gex, use_container_width=True, key=f"{idx_key}_pc028")
+                    st.plotly_chart(fig_gex, width='stretch', key=f"{idx_key}_pc028")
 
                     # ===== GEX Breakdown Table =====
                     with st.expander("📋 GEX Breakdown by Strike"):
@@ -21116,7 +21116,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 return ''
 
                         styled_gex = gex_display.style.map(color_gex, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
-                        st.dataframe(styled_gex, use_container_width=True, hide_index=True)
+                        st.dataframe(styled_gex, width='stretch', hide_index=True)
 
                         st.markdown("""
                         **GEX Interpretation:**
@@ -21151,7 +21151,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                 return ''
 
                         styled_gex_table = gex_display.style.map(style_gex_val, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
-                        st.dataframe(styled_gex_table, use_container_width=True, hide_index=True)
+                        st.dataframe(styled_gex_table, width='stretch', hide_index=True)
 
                         st.caption("GEX > 10 = Pin Zone | GEX < -10 = Acceleration Zone | "
                                    "Time-series charts shown in comparison view above")
@@ -21303,7 +21303,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     margin=dict(l=50, r=50, t=60, b=50)
                 )
 
-                st.plotly_chart(fig_pcr_chgoi, use_container_width=True, key=f"{idx_key}_pc029")
+                st.plotly_chart(fig_pcr_chgoi, width='stretch', key=f"{idx_key}_pc029")
 
                 # Status bar
                 pcr_info1, pcr_info2 = st.columns([3, 1])
@@ -21452,7 +21452,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
 
                 def display_pcr_chgoi_with_signal(container, fig, pcr_val):
                     if fig:
-                        container.plotly_chart(fig, use_container_width=True)
+                        container.plotly_chart(fig, width='stretch')
                         if pcr_val > 1.2:
                             container.success("Bullish")
                         elif pcr_val < 0.7:
@@ -21494,7 +21494,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     chgoi_display['CE ΔOI (L)'] = (display_chgoi_df['changeinOpenInterest_CE'] / 100000).round(2)
                     chgoi_display['PE ΔOI (L)'] = (display_chgoi_df['changeinOpenInterest_PE'] / 100000).round(2)
                     chgoi_display.rename(columns={'PCR_ChgOI': 'PCR (ΔOI)', 'PCR_ChgOI_Signal': 'Signal'}, inplace=True)
-                    st.dataframe(chgoi_display, use_container_width=True, hide_index=True)
+                    st.dataframe(chgoi_display, width='stretch', hide_index=True)
 
                 # Status bar and clear button
                 chgoi_info1, chgoi_info2 = st.columns([3, 1])
@@ -21616,7 +21616,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     yaxis=dict(title='Score %', zeroline=True, zerolinecolor='white'),
                     plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     margin=dict(l=50, r=50, t=60, b=50))
-                st.plotly_chart(fig_score, use_container_width=True, key=f"{idx_key}_pc030")
+                st.plotly_chart(fig_score, width='stretch', key=f"{idx_key}_pc030")
 
                 # Charts: PCR components + GEX (2 col)
                 ind_col1, ind_col2 = st.columns(2)
@@ -21644,7 +21644,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                    range=[max(0, min(_all_pcr)*0.9), max(_all_pcr)*1.1]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         margin=dict(l=40, r=10, t=50, b=30))
-                    st.plotly_chart(fig_pcr_ts, use_container_width=True, key=f"{idx_key}_pc031")
+                    st.plotly_chart(fig_pcr_ts, width='stretch', key=f"{idx_key}_pc031")
                 with ind_col2:
                     fig_gex_ts = go.Figure()
                     _gex_c2 = ['#00ff88' if g > 10 else '#ff4444' if g < -10 else '#FFD700'
@@ -21667,7 +21667,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         yaxis=dict(title='GEX (Lakhs)', zeroline=True, zerolinecolor='white'),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         margin=dict(l=40, r=50, t=50, b=30))
-                    st.plotly_chart(fig_gex_ts, use_container_width=True, key=f"{idx_key}_pc032")
+                    st.plotly_chart(fig_gex_ts, width='stretch', key=f"{idx_key}_pc032")
 
                 # Per-strike score time series
                 score_cols = [c for c in comp_hist_df.columns if c.startswith('score_')]
@@ -21693,13 +21693,13 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         yaxis=dict(title='Weighted Score', zeroline=True, zerolinecolor='white'),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         margin=dict(l=50, r=20, t=50, b=40))
-                    st.plotly_chart(fig_strike_ts, use_container_width=True, key=f"{idx_key}_pc033")
+                    st.plotly_chart(fig_strike_ts, width='stretch', key=f"{idx_key}_pc033")
 
                 # Per-strike breakdown table
                 if last_valid and last_valid.get('strike_details'):
                     st.markdown("### Per-Strike Breakdown")
                     st.dataframe(pd.DataFrame(last_valid['strike_details']),
-                                 use_container_width=True, hide_index=True)
+                                 width='stretch', hide_index=True)
 
                 # Status / clear
                 comp_info1, comp_info2 = st.columns([3, 1])
@@ -21828,7 +21828,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     margin=dict(l=50, r=50, t=60, b=50)
                 )
 
-                st.plotly_chart(fig_total_gex, use_container_width=True, key=f"{idx_key}_pc034")
+                st.plotly_chart(fig_total_gex, width='stretch', key=f"{idx_key}_pc034")
 
                 # Interpretation box
                 st.markdown(f"""
@@ -21974,14 +21974,14 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                     fig_gs.update_yaxes(title_text="Cumul Net Gamma (L)", row=2, col=1)
                     fig_gs.update_xaxes(title_text="Strike Price", row=2, col=1)
 
-                    st.plotly_chart(fig_gs, use_container_width=True, key=f"{idx_key}_pc035")
+                    st.plotly_chart(fig_gs, width='stretch', key=f"{idx_key}_pc035")
 
                     # Gamma sequence table
                     with st.expander("📋 Gamma Sequence Data"):
                         gs_display = gs_df[['Strike', 'Zone', 'CE_Gamma_Exp', 'PE_Gamma_Exp', 'Net_Gamma',
                                             'Cumul_Net_Gamma', 'Gamma_Accel']].copy()
                         gs_display['Strike'] = gs_display['Strike'].apply(lambda x: f"₹{x:.0f}")
-                        st.dataframe(gs_display, use_container_width=True, hide_index=True)
+                        st.dataframe(gs_display, width='stretch', hide_index=True)
 
                         st.markdown("""
                         **Gamma Sequence Interpretation:**
@@ -22238,7 +22238,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333'),
                             showlegend=True, legend=dict(orientation='h', y=-0.3)
                         )
-                        st.plotly_chart(_fig_iv, use_container_width=True, key=f"{idx_key}_pc036")
+                        st.plotly_chart(_fig_iv, width='stretch', key=f"{idx_key}_pc036")
 
                     # ---- Pressure Time-Series Chart ----
                     if len(st.session_state.pressure_history) >= 2:
@@ -22284,7 +22284,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                             xaxis=dict(gridcolor='#333'), yaxis=dict(gridcolor='#333'),
                             showlegend=True, legend=dict(orientation='h', y=-0.3)
                         )
-                        st.plotly_chart(_fig_pr, use_container_width=True, key=f"{idx_key}_pc037")
+                        st.plotly_chart(_fig_pr, width='stretch', key=f"{idx_key}_pc037")
 
                     # ---- ATM ±2 Strike Comparison — CE IV · PE IV (5-column per-strike) ----
                     if len(st.session_state.iv_skew_history) >= 2:
@@ -22356,7 +22356,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                     yaxis=dict(title='IV%', tickfont=dict(size=8)),
                                     plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                                 )
-                                st.plotly_chart(_fig_ivs, use_container_width=True, key=f"{idx_key}_pc038_{_ivc_i}")
+                                st.plotly_chart(_fig_ivs, width='stretch', key=f"{idx_key}_pc038_{_ivc_i}")
                                 # Net pressure caption
                                 _pres_cur = _ivh_df[_prk].iloc[-1] if (_prk in _ivh_df.columns and len(_ivh_df) > 0) else None
                                 _pres_sig = "🟢Bull" if (_pres_cur and _pres_cur > 0.15) else ("🔴Bear" if (_pres_cur and _pres_cur < -0.15) else "🟡Ntrl")
@@ -22845,7 +22845,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                         })
                     if _dg_snap_rows:
                         _dg_snap_df = pd.DataFrame(_dg_snap_rows)
-                        st.dataframe(_dg_snap_df, use_container_width=True, hide_index=True)
+                        st.dataframe(_dg_snap_df, width='stretch', hide_index=True)
 
                     # ---- Overall Delta & Gamma Time-Series ----
                     if len(st.session_state.delta_gamma_history) >= 2:
@@ -22897,7 +22897,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                         overlaying='y', side='right', showgrid=False),
                             showlegend=True, legend=dict(orientation='h', y=-0.3)
                         )
-                        st.plotly_chart(_fig_dg, use_container_width=True, key=f"{idx_key}_pc039")
+                        st.plotly_chart(_fig_dg, width='stretch', key=f"{idx_key}_pc039")
 
                         # ---- ATM ±2 Strike Comparison — Delta · Gamma (5-column per-strike) ----
                         st.markdown("### 📊 ATM ±2 Strike Comparison — Delta · Gamma")
@@ -22972,7 +22972,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                                                 tickfont=dict(size=8)),
                                     plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                                 )
-                                st.plotly_chart(_fig_dg_ps, use_container_width=True, key=f"{idx_key}_pc040_{_dg_ci}")
+                                st.plotly_chart(_fig_dg_ps, width='stretch', key=f"{idx_key}_pc040_{_dg_ci}")
                                 _sig_d = "🟢" if _ps_cur_d and _ps_cur_d > 0.05 else ("🔴" if _ps_cur_d and _ps_cur_d < -0.05 else "🟡")
                                 _sig_g = "📍Pin" if _ps_cur_g and _ps_cur_g > 5 else ("⚡Acc" if _ps_cur_g and _ps_cur_g < -5 else "➡️Ntrl")
                                 _ps_d_str = f'{_ps_cur_d:+.4f}' if _ps_cur_d is not None else '—'
@@ -23005,7 +23005,7 @@ def render_options_analysis_panel(option_data, current_price, api, db,
                            'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']
             detail_cols = [col for col in detail_cols if col in df_summary.columns]
             if detail_cols:
-                st.dataframe(df_summary[detail_cols].style.apply(highlight_atm_row, axis=1), use_container_width=True)
+                st.dataframe(df_summary[detail_cols].style.apply(highlight_atm_row, axis=1), width='stretch')
 
         # Add download button for CSV
         csv_data = create_csv_download(option_data['df_summary'])
@@ -23765,7 +23765,7 @@ def main():
             except Exception:
                 pass  # visual overlays are optional — don't break the chart
 
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
             
             # Show data info
             col1_info, col2_info, col3_info, col4_info = st.columns(4)
@@ -23838,7 +23838,7 @@ def main():
                     })
 
                 if _vol_rows:
-                    st.dataframe(pd.DataFrame(_vol_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_vol_rows), width='stretch', hide_index=True)
 
                 # Volume summary metrics
                 _total_vol = int(_vol_df['volume'].sum())
@@ -24021,7 +24021,7 @@ def main():
                                 yaxis=dict(autorange=True),
                             )
 
-                            st.plotly_chart(_mfp_fig, use_container_width=True)
+                            st.plotly_chart(_mfp_fig, width='stretch')
 
                             # ── Metrics row ──
                             _mfp_mc1, _mfp_mc2, _mfp_mc3, _mfp_mc4 = st.columns(4)
@@ -24065,7 +24065,7 @@ def main():
                                     'Sentiment': f"{_sent_icon} {_mfp_sentiments[_i]}",
                                 })
                             if _mfp_rows:
-                                st.dataframe(pd.DataFrame(_mfp_rows), use_container_width=True, hide_index=True)
+                                st.dataframe(pd.DataFrame(_mfp_rows), width='stretch', hide_index=True)
 
                             st.caption("🟡 High Traded = consolidation/value area | 🔵 Average | 🔴 Low Traded = supply/demand/liquidity | ⭐ = Point of Control (POC)")
                     else:
@@ -24136,7 +24136,7 @@ def main():
                             plot_bgcolor='#111', paper_bgcolor='#111', font=dict(color='#ccc'),
                         )
 
-                        st.plotly_chart(_vdc_fig1, use_container_width=True)
+                        st.plotly_chart(_vdc_fig1, width='stretch')
 
                         # ── 2) Delta Volume Line Chart (PCR-style) ──
                         st.markdown("##### 📈 Delta Volume Trend")
@@ -24206,7 +24206,7 @@ def main():
                             font=dict(color='#ccc'),
                         )
 
-                        st.plotly_chart(_vdc_fig2, use_container_width=True)
+                        st.plotly_chart(_vdc_fig2, width='stretch')
 
                         # ── Metrics ──
                         _vdc_total_delta = float(_vdc_df['delta'].sum())
@@ -24256,7 +24256,7 @@ def main():
                                 'Cum Delta': f"{int(float(_r['cum_delta'])):+,}",
                             })
                         if _vdc_rows:
-                            st.dataframe(pd.DataFrame(_vdc_rows), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(_vdc_rows), width='stretch', hide_index=True)
 
                         st.caption("Buy/Sell volume estimated via candle body position: Buy% = (Close-Low)/(High-Low). Delta = Buy Vol - Sell Vol. Positive delta = buying pressure dominant.")
                     else:
@@ -24375,7 +24375,7 @@ def main():
                         'Nearest HTF Pivot': _htf_label,
                         'Nearest VOB': _vob_label,
                     })
-                st.dataframe(pd.DataFrame(_ctype_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(_ctype_rows), width='stretch', hide_index=True)
 
             # ── Geometric & Reversal Pattern Analysis ──────────────────────
             render_geo_pattern_analysis(_df_today, df, date_label=_date_label)
@@ -24413,7 +24413,7 @@ def main():
                 for _v in _vob_supports[:5]:
                     _sup_rows.append({'Type': 'VOB↑', 'Level (₹)': f"{_v:.1f}"})
                 if _sup_rows:
-                    st.dataframe(pd.DataFrame(_sup_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_sup_rows), width='stretch', hide_index=True)
                 else:
                     st.info("No support levels detected")
 
@@ -24425,7 +24425,7 @@ def main():
                 for _v in _vob_resistances[:5]:
                     _res_rows.append({'Type': 'VOB↓', 'Level (₹)': f"{_v:.1f}"})
                 if _res_rows:
-                    st.dataframe(pd.DataFrame(_res_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(_res_rows), width='stretch', hide_index=True)
                 else:
                     st.info("No resistance levels detected")
 
@@ -24619,7 +24619,7 @@ def main():
                             return 'background-color: #FFD70040; color: white'
 
                     styled_poc = poc_df.style.map(style_poc_signal, subset=['Signal'])
-                    st.dataframe(styled_poc, use_container_width=True, hide_index=True)
+                    st.dataframe(styled_poc, width='stretch', hide_index=True)
 
                     st.markdown("""
                     **POC Interpretation:**
@@ -24699,7 +24699,7 @@ def main():
                     })
 
                     swing_pct_df = pd.DataFrame(swing_pct_data)
-                    st.dataframe(swing_pct_df, use_container_width=True, hide_index=True)
+                    st.dataframe(swing_pct_df, width='stretch', hide_index=True)
 
                 # Swing Levels Table
                 st.markdown("### 📍 Swing Levels")
@@ -24724,7 +24724,7 @@ def main():
 
                 if swing_levels_data:
                     swing_levels_df = pd.DataFrame(swing_levels_data)
-                    st.dataframe(swing_levels_df, use_container_width=True, hide_index=True)
+                    st.dataframe(swing_levels_df, width='stretch', hide_index=True)
 
                 st.markdown("""
                 **Swing Analysis Interpretation:**
@@ -24786,7 +24786,7 @@ def main():
                         return 'background-color: #80808040; color: white'
 
                     styled_sz = sz_df.style.map(style_sz_signal, subset=['Breakout'])
-                    st.dataframe(styled_sz, use_container_width=True, hide_index=True)
+                    st.dataframe(styled_sz, width='stretch', hide_index=True)
 
                 st.markdown("""
                 **RSI Suppression Zone Interpretation:**
@@ -25181,7 +25181,7 @@ def main():
                             yaxis=dict(title='Gamma'),
                             plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                         )
-                        st.plotly_chart(_fig_gs, use_container_width=True)
+                        st.plotly_chart(_fig_gs, width='stretch')
                     else:
                         st.info("Building Spike/Gamma history...")
 
@@ -25206,7 +25206,7 @@ def main():
                         yaxis=dict(title='Gamma Value'),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     )
-                    st.plotly_chart(_fig_gmap, use_container_width=True)
+                    st.plotly_chart(_fig_gmap, width='stretch')
 
                 # Expiry Spike Score chart (3rd chart, full width if active)
                 if _expiry_spike['active'] and len(st.session_state.expiry_spike_history) >= 2:
@@ -25236,7 +25236,7 @@ def main():
                         yaxis=dict(title='Expiry Spike Score', range=[0, 110]),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     )
-                    st.plotly_chart(_fig_esh, use_container_width=True)
+                    st.plotly_chart(_fig_esh, width='stretch')
 
                 # Gamma Sequence over time (multi-strike)
                 if len(st.session_state.gamma_seq_history) >= 3:
@@ -25259,7 +25259,7 @@ def main():
                         showlegend=True, legend=dict(orientation='h', y=-0.3),
                         plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e',
                     )
-                    st.plotly_chart(_fig_gsh, use_container_width=True)
+                    st.plotly_chart(_fig_gsh, width='stretch')
 
                 # Clear button
                 _mae_btn_col1, _mae_btn_col2 = st.columns([4, 1])
@@ -25399,7 +25399,7 @@ def main():
                                     'Confidence': _conf_val,
                                     'Strength': _h.get('strength', ''),
                                 })
-                            st.dataframe(pd.DataFrame(_today_rows), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(_today_rows), width='stretch', hide_index=True)
                         else:
                             st.caption("No signals recorded today yet.")
                     else:
@@ -25563,7 +25563,7 @@ def main():
                             xaxis=dict(type='category', tickangle=-45, nticks=15,
                                        tickfont=dict(size=8)),
                         )
-                        st.plotly_chart(_cie_fig, use_container_width=True)
+                        st.plotly_chart(_cie_fig, width='stretch')
 
                         # Support / Resistance level table
                         st.markdown("**Detected S/R Levels**")
@@ -25572,7 +25572,7 @@ def main():
                             [{'Level': f'₹{s:.0f}', 'Type': '🟢 Support', 'Zone': 'S'} for s in sorted(_cie_sup, reverse=True)[:6]]
                         )
                         if _cie_sr_rows:
-                            st.dataframe(pd.DataFrame(_cie_sr_rows), use_container_width=True, hide_index=True)
+                            st.dataframe(pd.DataFrame(_cie_sr_rows), width='stretch', hide_index=True)
 
                         # ── Detected Reversal Candle Table ─────────────────
                         st.markdown("**Reversal & Continuation Candles Detected**")
@@ -25612,7 +25612,7 @@ def main():
                                 return [clr] * len(row)
                             st.dataframe(
                                 _cie_candle_df.style.apply(_cie_color_row, axis=1),
-                                use_container_width=True, hide_index=True
+                                width='stretch', hide_index=True
                             )
                         else:
                             st.info("No patterns detected near S/R levels.")
@@ -25648,7 +25648,7 @@ def main():
                                 xaxis=dict(title='Snapshot', showticklabels=False),
                                 yaxis=dict(title='Skew'),
                             )
-                            st.plotly_chart(_cie_iv_fig, use_container_width=True)
+                            st.plotly_chart(_cie_iv_fig, width='stretch')
                         else:
                             st.info("IV Skew history building…")
 
@@ -25679,7 +25679,7 @@ def main():
                                 xaxis=dict(title='Snapshot', showticklabels=False),
                                 yaxis=dict(title='Pressure'),
                             )
-                            st.plotly_chart(_cie_pres_fig, use_container_width=True)
+                            st.plotly_chart(_cie_pres_fig, width='stretch')
                         else:
                             st.info("Pressure history building…")
 
@@ -25704,7 +25704,7 @@ def main():
                             xaxis=dict(title='Snapshot', showticklabels=False),
                             yaxis=dict(title='Straddle ₹'),
                         )
-                        st.plotly_chart(_cie_strad_fig, use_container_width=True)
+                        st.plotly_chart(_cie_strad_fig, width='stretch')
 
                     # Gamma Exposure history
                     _cie_gex_hist = st.session_state.get('total_gex_history', [])
@@ -25728,7 +25728,7 @@ def main():
                             xaxis=dict(title='Snapshot', showticklabels=False),
                             yaxis=dict(title='GEX (L)'),
                         )
-                        st.plotly_chart(_cie_gex_fig, use_container_width=True)
+                        st.plotly_chart(_cie_gex_fig, width='stretch')
 
                 # ── TAB 4: Signal History ─────────────────────────────────
                 with _cie_tab4:
@@ -25749,7 +25749,7 @@ def main():
                                 'Confidence': _h.get('confidence', 0),
                                 'Strength': _h.get('strength', ''),
                             })
-                        st.dataframe(pd.DataFrame(_cie_hist_rows), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(_cie_hist_rows), width='stretch', hide_index=True)
 
                     _cie_bcol1, _cie_bcol2 = st.columns([4, 1])
                     with _cie_bcol2:
@@ -25925,7 +25925,7 @@ def main():
                 _md_rows.append({'Engine': _mk, 'Score': _mv['score'],
                     'Weight': f"{int(_md_weights.get(_mk, 0.1) * 100)}%",
                     'Signal': _mv['signal']})
-            st.dataframe(pd.DataFrame(_md_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_md_rows), width='stretch', hide_index=True)
 
             # Intraday targets summary
             st.markdown("**Intraday Targets:**")
@@ -25973,7 +25973,7 @@ def main():
                     return ''
 
                 _styled = _sig_display.style.map(_dir_color, subset=['Direction'] if 'Direction' in _sig_display.columns else [])
-                st.dataframe(_styled, use_container_width=True, hide_index=True)
+                st.dataframe(_styled, width='stretch', hide_index=True)
 
                 # Download button
                 _csv_data = _sig_df[_display_cols].to_csv(index=False).encode('utf-8')
@@ -26676,7 +26676,7 @@ def show_cross_market_confirmation_engine(
             if sel_mode == "trap" and m.get("trap_type", "None") != "None":
                 row["Trap Type"] = m.get("trap_type", "-")
             idx_rows.append(row)
-        st.dataframe(pd.DataFrame(idx_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(idx_rows), width='stretch', hide_index=True)
         st.caption(f"Index Sub-Score: **{analysis['index_score']} / 5**  (≥3 = strong cross-index confirmation)")
 
     with tab_rev:
@@ -26689,7 +26689,7 @@ def show_cross_market_confirmation_engine(
             }
             for r in analysis["reverse_indicators"]
         ]
-        st.dataframe(pd.DataFrame(rev_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(rev_rows), width='stretch', hide_index=True)
         st.caption(f"Risk Sub-Score: **{analysis['reverse_score']} / 5**  (≥3 = macro alignment confirmed)")
 
     if analysis["divergence_detected"]:
@@ -27245,7 +27245,7 @@ def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list
             "Detail":       res["gamma_detail"],
         },
     ]
-    st.dataframe(pd.DataFrame(comp_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(comp_rows), width='stretch', hide_index=True)
 
     # ── Institutional Zones ────────────────────────────────────────────
     zones = res["zones"]
@@ -27266,7 +27266,7 @@ def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list
             {"Zone": zone_labels.get(k, k), "Level (₹)": f"₹{v:,.0f}"}
             for k, v in non_null_zones.items()
         ]
-        st.dataframe(pd.DataFrame(zone_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(zone_rows), width='stretch', hide_index=True)
 
     # ── Adjusted CIE Signals ───────────────────────────────────────────
     if res["adjusted_signals"]:
@@ -27281,7 +27281,7 @@ def show_iofce(option_data: dict, df, underlying_price: float, cie_signals: list
                 "Trap Risk":    s.get("iofce_trap_risk", "-"),
                 "Strength":     s.get("signal_strength", "-"),
             })
-        st.dataframe(pd.DataFrame(sig_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(sig_rows), width='stretch', hide_index=True)
     else:
         st.info("No CIE signals available for IOFCE adjustment.")
 
