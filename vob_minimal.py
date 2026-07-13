@@ -5286,6 +5286,149 @@ def _mfp_poc_bias(mfp):
     return 'BULL' if d > 0 else ('BEAR' if d < 0 else 'NEUTRAL')
 
 
+def _mfp_totals(mfp):
+    """Sum (buy_volume, sell_volume) across all bins of an MFP. (0,0) if empty."""
+    rows = (mfp or {}).get('rows') or []
+    buy = sum(float(r.get('bull_volume', 0) or 0) for r in rows)
+    sell = sum(float(r.get('bear_volume', 0) or 0) for r in rows)
+    return buy, sell
+
+
+def render_leg_buy_sell_volume_table():
+    """14-leg tabulation: total buy vs sell volume per leg (full-session MFP),
+    with CALL vs PUT totals and a comparison verdict."""
+    legs = (st.session_state.get('_atm_pm1_vpfr') or {}).get('legs') or []
+    st.markdown("## 💥 ATM±3 Legs — Total Buy vs Sell Volume (full session)")
+    if not legs:
+        st.caption("Leg data not yet computed (cycle warming up).")
+        return
+    rows = []
+    tot = {'CE': [0.0, 0.0], 'PE': [0.0, 0.0]}
+    for leg in legs:
+        tag = leg.get('tag', '')
+        side = 'CE' if ' CE ' in f' {tag} ' else ('PE' if ' PE ' in f' {tag} ' else None)
+        buy, sell = _mfp_totals(leg.get('mfp'))
+        if side is None or (buy == 0 and sell == 0):
+            continue
+        tot[side][0] += buy
+        tot[side][1] += sell
+        net = buy - sell
+        pct = buy / (buy + sell) * 100 if (buy + sell) > 0 else 0
+        rows.append({
+            '_dir': 'bull' if net > 0 else ('bear' if net < 0 else 'neutral'),
+            'Leg': tag,
+            'LTP': f"₹{float(leg.get('ltp') or 0):.2f}",
+            'Buy Vol': f"{buy:,.0f}",
+            'Sell Vol': f"{sell:,.0f}",
+            'Δ (Buy−Sell)': f"{net:+,.0f}",
+            'Buy %': f"{pct:.1f}%",
+            'Dominant': '🟢 BUYERS' if net > 0 else ('🔴 SELLERS' if net < 0 else '⚪ EVEN'),
+        })
+    if not rows:
+        st.caption("No per-leg money-flow volume yet.")
+        return
+
+    def _color_bsv(row):
+        sd = row.get('_dir', 'neutral')
+        if sd == 'bull':
+            return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
+        if sd == 'bear':
+            return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
+        return [''] * len(row)
+    _bsv_df = pd.DataFrame(rows)
+    st.dataframe(_bsv_df.style.apply(_color_bsv, axis=1).hide(axis='columns', subset=['_dir']),
+                 width='stretch', hide_index=True)
+
+    ce_b, ce_s = tot['CE']
+    pe_b, pe_s = tot['PE']
+    st.dataframe(pd.DataFrame([
+        {'Side': '🟢 CALLs (7 legs)', 'Total Buy Vol': f"{ce_b:,.0f}", 'Total Sell Vol': f"{ce_s:,.0f}",
+         'Net Δ': f"{ce_b - ce_s:+,.0f}"},
+        {'Side': '🔴 PUTs (7 legs)', 'Total Buy Vol': f"{pe_b:,.0f}", 'Total Sell Vol': f"{pe_s:,.0f}",
+         'Net Δ': f"{pe_b - pe_s:+,.0f}"},
+    ]), width='stretch', hide_index=True)
+
+    buy_side = 'CALLs' if ce_b > pe_b else ('PUTs' if pe_b > ce_b else 'TIE')
+    sell_side = 'CALLs' if ce_s > pe_s else ('PUTs' if pe_s > ce_s else 'TIE')
+    _b_em = '🟢' if buy_side == 'CALLs' else ('🔴' if buy_side == 'PUTs' else '⚪')
+    _s_em = '🔴' if sell_side == 'CALLs' else ('🟢' if sell_side == 'PUTs' else '⚪')
+    st.markdown(
+        f"{_b_em} **More BUY volume: {buy_side}** ({ce_b:,.0f} CE vs {pe_b:,.0f} PE)  \n"
+        f"{_s_em} **More SELL volume: {sell_side}** ({ce_s:,.0f} CE vs {pe_s:,.0f} PE)"
+    )
+    if buy_side == 'CALLs' and sell_side == 'PUTs':
+        st.success("🟢 CALL buying + PUT selling dominate → bullish premium flow (NIFTY up bias)")
+    elif buy_side == 'PUTs' and sell_side == 'CALLs':
+        st.error("🔴 PUT buying + CALL selling dominate → bearish premium flow (NIFTY down bias)")
+    elif buy_side == 'CALLs' and sell_side == 'CALLs':
+        st.info("⚪ CALLs dominate BOTH buy & sell volume → churn/two-way fight on calls, no clean direction")
+    elif buy_side == 'PUTs' and sell_side == 'PUTs':
+        st.info("⚪ PUTs dominate BOTH buy & sell volume → churn/two-way fight on puts, no clean direction")
+    else:
+        st.info("⚪ Buy/Sell volume mixed between CALLs and PUTs — no dominant flow")
+
+
+def render_leg_mfp_consolidated_table():
+    """Consolidated MFP matrix for all 14 legs: All-bars vs Last-50 vs Last-20
+    profiles side by side — POC, LTP-vs-POC position and net Δ sign per horizon,
+    plus a majority verdict per leg."""
+    legs = (st.session_state.get('_atm_pm1_vpfr') or {}).get('legs') or []
+    st.markdown("## 🧮 ATM±3 Legs — Consolidated MFP: All bars · Last 50 · Last 20")
+    if not legs:
+        st.caption("Leg data not yet computed (cycle warming up).")
+        return
+
+    def _cell(mfp, ltp):
+        """'₹poc 🟢> Δ+' → POC price, LTP above/below POC, net-delta sign. Returns (text, vote)."""
+        if not mfp or not mfp.get('rows'):
+            return '—', 0
+        poc = float(mfp.get('poc_price') or 0)
+        net_d = sum(float(r.get('delta', 0) or 0) for r in mfp['rows'])
+        pos_em, vote = ('🟢>', 1) if ltp > poc else (('🔴<', -1) if ltp < poc else ('⚪=', 0))
+        d_em = 'Δ+' if net_d > 0 else ('Δ−' if net_d < 0 else 'Δ0')
+        if net_d > 0:
+            vote += 1
+        elif net_d < 0:
+            vote -= 1
+        return f"₹{poc:.1f} {pos_em} {d_em}", vote
+
+    rows = []
+    for leg in legs:
+        tag = leg.get('tag', '')
+        ltp = float(leg.get('ltp') or 0)
+        c_all, v_all = _cell(leg.get('mfp'), ltp)
+        c_50, v_50 = _cell(leg.get('mfp_50'), ltp)
+        c_20, v_20 = _cell(leg.get('mfp_20'), ltp)
+        v = v_all + v_50 + v_20
+        verdict = '🟢 BULL' if v >= 2 else ('🔴 BEAR' if v <= -2 else '⚪ MIXED')
+        rows.append({
+            '_dir': 'bull' if v >= 2 else ('bear' if v <= -2 else 'neutral'),
+            'Leg': tag,
+            'LTP': f"₹{ltp:.2f}",
+            'All bars (POC · LTP · Δ)': c_all,
+            'Last 50 (POC · LTP · Δ)': c_50,
+            'Last 20 (POC · LTP · Δ)': c_20,
+            'Verdict': verdict,
+        })
+    if not rows:
+        st.caption("No per-leg MFP data yet.")
+        return
+
+    def _color_cons(row):
+        sd = row.get('_dir', 'neutral')
+        if sd == 'bull':
+            return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
+        if sd == 'bear':
+            return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
+        return [''] * len(row)
+    _cons_df = pd.DataFrame(rows)
+    st.dataframe(_cons_df.style.apply(_color_cons, axis=1).hide(axis='columns', subset=['_dir']),
+                 width='stretch', hide_index=True)
+    st.caption("🟢> / 🔴< : LTP above/below that horizon's POC (premium strength/weakness) · "
+               "Δ+/Δ− : net buy-minus-sell volume of the profile · Verdict = majority across the three horizons. "
+               "On an OPTION's own chart: its LTP above POC with Δ+ = that premium is being accumulated.")
+
+
 def send_atm_poc_touch_alert(leg_tag, ltp, vpfr, mfp, spot, cooldown_s=900, tol_pct=0.5):
     """Fires when ATM CE/PE LTP comes within tol_pct of any VPFR POC (Short/Med/Long).
     Per-leg per-POC dedup. tol_pct = 0.5% of LTP (e.g. ~₹1 on a ₹200 option).
@@ -13342,8 +13485,13 @@ def render_all_bias_dashboard(spot_price, df, option_data):
         _fast_label = 'MIXED / NEUTRAL'
         _fast_em = '⚪'
     try:
-        send_overall_bias_entry_alert(_fast_label, _fast_em, fast_bull, fast_bear,
-                                       spot_price, option_data)
+        # Only fire on a STRONG fast verdict (|net| >= 3). A 1-2 vote margin
+        # (e.g. Bull 6 vs Bear 7 → net -1) is coin-flip noise: the dashboard
+        # itself labels |net| < 2 as MIXED/NEUTRAL, yet the alert used to fire
+        # BUY CALL/PUT NOW on it — often against the larger context.
+        if abs(fast_net) >= 3:
+            send_overall_bias_entry_alert(_fast_label, _fast_em, fast_bull, fast_bear,
+                                           spot_price, option_data)
     except Exception:
         pass
     # Reverse-side alert: any CE/PE leg whose LTP sits at its own BEARISH VOB
@@ -20313,15 +20461,19 @@ def _render_main_analyzer():
                                 # plus a recency-focused last-50-candle version.
                                 _leg_mfp_tg = None
                                 _leg_mfp_tg_50 = None
+                                _leg_mfp_tg_20 = None
                                 try:
                                     if _ldf is not None and not _ldf.empty:
                                         _leg_mfp_tg = calculate_money_flow_profile(
                                             _ldf, num_rows=5, source='Money Flow')
                                         _leg_mfp_tg_50 = calculate_money_flow_profile(
                                             _ldf.tail(50), num_rows=5, source='Money Flow')
+                                        _leg_mfp_tg_20 = calculate_money_flow_profile(
+                                            _ldf.tail(20), num_rows=5, source='Money Flow')
                                 except Exception:
                                     _leg_mfp_tg = None
                                     _leg_mfp_tg_50 = None
+                                    _leg_mfp_tg_20 = None
                                 # Stash all ATM±3 1m dfs for alignment + composite bias
                                 if _ldf is not None and not _ldf.empty:
                                     _leg_dfs = st.session_state.setdefault('_atm_leg_dfs', {})
@@ -20332,6 +20484,7 @@ def _render_main_analyzer():
                                     'vpfr': _vp,
                                     'mfp': _leg_mfp_tg,
                                     'mfp_50': _leg_mfp_tg_50,
+                                    'mfp_20': _leg_mfp_tg_20,
                                     'mfp_bias': _mfp_poc_bias(_leg_mfp_tg) if _leg_mfp_tg else 'NEUTRAL',
                                     'latest_grab': _g[-1] if _g else None,
                                 })
@@ -20347,6 +20500,16 @@ def _render_main_analyzer():
                             'spot': _u,
                             'legs': _tg_legs,
                         }
+
+                        # ── Consolidated 14-leg MFP matrix + Buy-vs-Sell volume tables ──
+                        try:
+                            render_leg_mfp_consolidated_table()
+                        except Exception as _cons_err:
+                            st.caption(f"Consolidated MFP table error: {_cons_err}")
+                        try:
+                            render_leg_buy_sell_volume_table()
+                        except Exception as _bsv_err:
+                            st.caption(f"Buy/Sell volume table error: {_bsv_err}")
 
                         # ── 🧭 Composite Bias Engine — compute, render, alert ───
                         try:
