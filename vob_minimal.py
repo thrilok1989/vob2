@@ -30,11 +30,26 @@ except Exception:
     _HAS_GEMINI = False
 from indicators.volume_delta import calculate_volume_delta
 
+# 📱 ?view=mobile on the URL switches this same app into the phone-friendly
+# view rendered by vob_mobile.py — one deployment serves both desktop & mobile.
+def _qp_view():
+    try:
+        v = st.query_params.get('view')
+    except Exception:
+        try:
+            v = (st.experimental_get_query_params().get('view') or [None])[0]
+        except Exception:
+            v = None
+    return (v or '').lower()
+
+
+_VIEW_MOBILE = _qp_view() in ('mobile', 'm', 'phone')
+
 st.set_page_config(
-    page_title="Nifty Trading & Options Analyzer",
-    page_icon="📈",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="VOB Mobile" if _VIEW_MOBILE else "Nifty Trading & Options Analyzer",
+    page_icon="📱" if _VIEW_MOBILE else "📈",
+    layout="centered" if _VIEW_MOBILE else "wide",
+    initial_sidebar_state="collapsed" if _VIEW_MOBILE else "expanded"
 )
 
 # Only auto-refresh during market hours (8:30 AM - 3:45 PM IST, weekdays)
@@ -43,7 +58,9 @@ _is_market_open = (
     _ist_now.weekday() < 5 and
     _ist_now.replace(hour=8, minute=30, second=0, microsecond=0) <= _ist_now <= _ist_now.replace(hour=15, minute=45, second=0, microsecond=0)
 )
-if _is_market_open:
+# Pause the 20s refresh while a mobile popup chart is open (?view=mobile) so
+# it isn't dismissed on every cycle; the desktop app never sets _popup_leg.
+if _is_market_open and not st.session_state.get('_popup_leg'):
     st_autorefresh(interval=20000, key="datarefresh")
 
 st.markdown("""
@@ -195,14 +212,14 @@ def _balanced_telegram_chunks(text, limit=3900):
 # Allow-list of headline markers that bypass the global mute. Every other
 # automated alert is suppressed. force=True bypasses unconditionally.
 _ALLOWED_ALERT_MARKERS = (
-    # 'DYNAMIC POC',  # 😴 sleep mode per user request (CAME ABOVE — EXIT, BUY
-    #                 # CALL/PUT FELL BELOW LTP, BIG MOVE) — uncomment to re-enable
+    # 'DYNAMIC POC',  # ⏸️ muted per user request (BIG MOVE + PoC-cross BUY
+    #                 # CALL/PUT variants) — uncomment to re-enable
     'SPOT STOP-HUNT ALIGNED',
     'CIE ALIGNED',
     'MAJOR S/R TOUCH',
     'BIAS ENTER',
     'OVERALL BIAS ENTRY',
-    # 'LTP FALL',     # 😴 sleep mode per user request — uncomment to re-enable
+    # 'LTP FALL',     # ⏸️ muted per user request — uncomment to re-enable
     'CALL CAPPING',
     'PUT WRITING',
     'PUT CAPPING',
@@ -8143,6 +8160,7 @@ def compute_commodity_risk():
 
 def render_commodity_risk_panel():
     data = st.session_state.get('_commodity_risk')
+    _nav_anchor('sec-commodity')
     st.markdown("## 🛢️ Cross-Sectional Commodity Risk Dashboard")
     if not data:
         st.info("Commodity data not loaded yet — fetches with the ~20s Master Signal cycle.")
@@ -8439,6 +8457,7 @@ def compute_global_nifty_bias():
 def render_global_indices_panel():
     """Display Money Flow Profile + VPFR + Dynamic PoC + VOB + HVP for global instruments."""
     data = st.session_state.get('_global_indices') or {}
+    _nav_anchor('sec-global')
     st.markdown("## 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily)")
     if not data:
         st.info("Global indices not yet loaded — fetches with the ~20s cycle.")
@@ -13318,6 +13337,7 @@ def render_all_bias_dashboard(spot_price, df, option_data):
         pass
 
     # ── Header
+    _nav_anchor('sec-allbias')
     st.markdown("## 📊 All Bias — Split by Speed: 🚀 Fast / 🐢 Lagging / 🌫️ Misguiding")
     if not rows:
         st.info("Bias engines not yet computed (cycle warming up).")
@@ -13687,12 +13707,13 @@ MOBILE_SNAPSHOT_PATH = os.environ.get(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), 'mobile_snapshot.json'))
 
 
-def export_mobile_snapshot(spot_price, bias, option_data):
+def export_mobile_snapshot(spot_price, bias, option_data, df_spot=None):
     """Write this cycle's computed signals to MOBILE_SNAPSHOT_PATH as JSON for
     the mobile companion app (vob_mobile.py). Atomic write (tmp + os.replace)
     so the reader never sees a half-written file; throttled to one write per
     ~5s. Everything is read from session state already computed this cycle —
-    only the VOB rise/fall watch re-scans the cached leg dataframes."""
+    only the VOB rise/fall watch re-scans the cached leg dataframes (and now
+    also captures compact candle+VOB chart payloads for the mobile charts)."""
     ist = pytz.timezone('Asia/Kolkata')
     now = datetime.now(ist)
     _last = st.session_state.get('_mobile_snap_ts')
@@ -13700,6 +13721,8 @@ def export_mobile_snapshot(spot_price, bias, option_data):
         return
     snap = {
         'ts': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'hb_ts': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'status': 'ok',
         'spot': float(spot_price or 0),
     }
 
@@ -13739,13 +13762,46 @@ def export_mobile_snapshot(spot_price, bias, option_data):
 
     # VOB watch — same logic as the ENTRY / LTP FALL alerts, both sides:
     # LTP at its own bullish VOB → premium about to RISE; at bearish → FALL.
+    # The same pass also captures a compact candle+VOB payload per leg for
+    # the 📈 Charts section of the mobile view.
+    def _chart_payload(df_c, vob, n_bars=80):
+        d = df_c.tail(n_bars)
+        if 'datetime' in d.columns:
+            t = [x.strftime('%H:%M') for x in d['datetime']]
+        else:
+            t = [str(x) for x in d.index]
+        return {
+            't': t,
+            'o': [round(float(x), 2) for x in d['open']],
+            'h': [round(float(x), 2) for x in d['high']],
+            'l': [round(float(x), 2) for x in d['low']],
+            'c': [round(float(x), 2) for x in d['close']],
+            'vob_bull': [{'lower': float(b['lower']), 'upper': float(b['upper'])}
+                         for b in (vob.get('bullish') or [])[:6]],
+            'vob_bear': [{'lower': float(b['lower']), 'upper': float(b['upper'])}
+                         for b in (vob.get('bearish') or [])[:6]],
+        }
+
     vob_watch = {'rise': [], 'fall': []}
+    charts = {}
+    # Spot chart first so it's the selectbox default in the mobile view.
+    try:
+        if df_spot is not None and not getattr(df_spot, 'empty', True) and len(df_spot) >= 10:
+            _spot_vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_spot) or {}
+            charts['NIFTY Spot'] = _chart_payload(df_spot, _spot_vob)
+    except Exception:
+        pass
     try:
         for tag, df_l in (st.session_state.get('_atm_leg_dfs') or {}).items():
             if df_l is None or getattr(df_l, 'empty', True):
                 continue
             ltp_l = float(df_l['close'].iloc[-1])
             vob = VolumeOrderBlocks(sensitivity=5).detect_blocks(df_l) or {}
+            try:
+                if len(df_l) >= 10 and {'open', 'high', 'low', 'close'} <= set(df_l.columns):
+                    charts[tag] = _chart_payload(df_l, vob)
+            except Exception:
+                pass
             tol = max(ltp_l * 0.005, 0.5)
             side = 'CE' if ' CE ' in f' {tag} ' else ('PE' if ' PE ' in f' {tag} ' else '?')
             for b in (vob.get('bullish') or []):
@@ -13761,6 +13817,7 @@ def export_mobile_snapshot(spot_price, bias, option_data):
     except Exception:
         pass
     snap['vob_watch'] = vob_watch
+    snap['charts'] = charts
 
     # Major S/R zones for the spot
     try:
@@ -13809,14 +13866,414 @@ def export_mobile_snapshot(spot_price, bias, option_data):
     except Exception:
         pass
 
+    # ⛓️ Option chain table (ATM±5 strikes, key columns only)
+    try:
+        ds = (option_data or {}).get('df_summary') if option_data else None
+        if ds is not None and not getattr(ds, 'empty', True) and 'Strike' in ds.columns:
+            _strikes = sorted(ds['Strike'].dropna().unique().tolist())
+            if _strikes:
+                _atm_c = min(_strikes, key=lambda x: abs(x - float(spot_price or 0)))
+                _ix = _strikes.index(_atm_c)
+                _keep = set(_strikes[max(0, _ix - 5):_ix + 6])
+                _cands = {
+                    'CE LTP': ['lastPrice_CE', 'CE_LTP'],
+                    'CE OI': ['CE_OI', 'openInterest_CE'],
+                    'CE ChgOI': ['changeinOpenInterest_CE', 'CE_ChgOI'],
+                    'CE Vol': ['totalTradedVolume_CE', 'CE_Volume'],
+                    'CE IV': ['impliedVolatility_CE'],
+                    'PE LTP': ['lastPrice_PE', 'PE_LTP'],
+                    'PE OI': ['PE_OI', 'openInterest_PE'],
+                    'PE ChgOI': ['changeinOpenInterest_PE', 'PE_ChgOI'],
+                    'PE Vol': ['totalTradedVolume_PE', 'PE_Volume'],
+                    'PE IV': ['impliedVolatility_PE'],
+                }
+                _crows = []
+                for _, _r in ds[ds['Strike'].isin(_keep)].sort_values('Strike').iterrows():
+                    _row = {'Strike': int(_r['Strike'])}
+                    for _lbl, _cols in _cands.items():
+                        for _c in _cols:
+                            if _c in ds.columns:
+                                try:
+                                    _row[_lbl] = round(float(_r[_c] or 0), 2)
+                                except Exception:
+                                    _row[_lbl] = 0
+                                break
+                    _crows.append(_row)
+                snap['chain'] = {'atm': float(_atm_c), 'rows': _crows}
+    except Exception:
+        pass
+
+    # 📉 Trends — session timelines compacted to (t, v) series
+    try:
+        def _tl(e):
+            tm = e.get('time')
+            return tm.strftime('%H:%M') if hasattr(tm, 'strftime') else str(tm)[:5]
+
+        def _series(hist, suffix):
+            tt, vv = [], []
+            for e in hist[-120:]:
+                vals = [v for k, v in e.items() if k != 'time' and k.endswith(suffix)]
+                if vals:
+                    tt.append(_tl(e))
+                    vv.append(round(float(sum(vals)), 2))
+            return {'t': tt, 'v': vv}
+
+        trends = {}
+        _ph = st.session_state.get('pcr_history') or []
+        if _ph:
+            tt, vv = [], []
+            for e in _ph[-120:]:
+                vals = [v for k, v in e.items() if k != 'time']
+                if vals:
+                    tt.append(_tl(e))
+                    vv.append(round(sum(vals) / len(vals), 3))
+            trends['pcr'] = {'t': tt, 'v': vv}
+        _oh = st.session_state.get('oi_history') or []
+        if _oh:
+            trends['oi_ce'] = _series(_oh, '_CE')
+            trends['oi_pe'] = _series(_oh, '_PE')
+        _ch = st.session_state.get('chgoi_history') or []
+        if _ch:
+            trends['chgoi_ce'] = _series(_ch, '_CE')
+            trends['chgoi_pe'] = _series(_ch, '_PE')
+        _vh = st.session_state.get('vol_history') or []
+        if _vh:
+            trends['vol_ce'] = _series(_vh, '_CE')
+            trends['vol_pe'] = _series(_vh, '_PE')
+        _ivh = st.session_state.get('_iv_history') or []
+        if _ivh:
+            trends['iv'] = {'t': list(range(len(_ivh[-120:]))),
+                            'v': [float(x) for x in _ivh[-120:]]}
+        if trends:
+            snap['trends'] = trends
+    except Exception:
+        pass
+
+    # 🧪 Greek Absorption / Capping table
+    try:
+        _ga = st.session_state.get('_greek_absorb_last') or {}
+        if _ga.get('rows'):
+            snap['greek_absorb'] = {
+                'rows': list(_ga.get('rows') or [])[:14],
+                'nifty': _ga.get('nifty'),
+                'ce_capping': _ga.get('ce_capping', 0),
+                'pe_writing': _ga.get('pe_writing', 0),
+            }
+    except Exception:
+        pass
+
     # Recent alerts fired by the throttled Telegram sender
     snap['alerts'] = list(st.session_state.get('_recent_alerts') or [])[-15:]
 
+    # In-session copy for the embedded ?view=mobile mode (no file needed).
+    st.session_state['_mobile_snapshot'] = snap
     tmp = MOBILE_SNAPSHOT_PATH + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as f:
         json.dump(snap, f, ensure_ascii=False, default=str)
     os.replace(tmp, MOBILE_SNAPSHOT_PATH)
     st.session_state['_mobile_snap_ts'] = now
+
+
+def export_mobile_heartbeat(status):
+    """Keep mobile_snapshot.json alive even when the full data cycle can't run
+    (market closed, option chain not loaded yet, API errors). Runs on every
+    rerun of the main app: preserves the last full snapshot's data and only
+    refreshes the heartbeat fields, so vob_mobile.py can tell 'backend up but
+    waiting for data' apart from 'backend not running at all'. The full
+    export_mobile_snapshot() overwrites status with 'ok' once data flows."""
+    try:
+        ist = pytz.timezone('Asia/Kolkata')
+        now = datetime.now(ist)
+        _last = st.session_state.get('_mobile_hb_ts')
+        if _last and (now - _last).total_seconds() < 10:
+            return
+        try:
+            with open(MOBILE_SNAPSHOT_PATH, encoding='utf-8') as f:
+                snap = json.load(f) or {}
+        except Exception:
+            snap = {}
+        snap['hb_ts'] = now.strftime('%Y-%m-%d %H:%M:%S')
+        # Don't clobber a healthy 'ok' from this same cycle's full export.
+        if snap.get('status') != 'ok' or not snap.get('ts'):
+            snap['status'] = status
+        # Session copy for the embedded ?view=mobile mode — keeps the mobile
+        # status card working even if the disk isn't writable.
+        st.session_state['_mobile_hb_snap'] = dict(snap)
+        try:
+            tmp = MOBILE_SNAPSHOT_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(snap, f, ensure_ascii=False, default=str)
+            os.replace(tmp, MOBILE_SNAPSHOT_PATH)
+        except Exception:
+            pass
+        st.session_state['_mobile_hb_ts'] = now
+    except Exception:
+        pass
+
+
+def _nav_anchor(aid):
+    """Invisible anchor target for the sidebar 🧭 Quick Navigation links."""
+    try:
+        st.markdown(f"<div id='{aid}'></div>", unsafe_allow_html=True)
+    except Exception:
+        pass
+
+
+def _exp(default=True):
+    """Default 'expanded' state for data panels: collapsed while 🗜️ Compact
+    mode is on (the default) so the page stays minimal and the user opens
+    only what they need. Turning the sidebar toggle off restores the classic
+    always-expanded view. Panels still compute while collapsed — alerts and
+    the mobile snapshot are unaffected."""
+    try:
+        if st.session_state.get('_compact_mode', True):
+            return False
+    except Exception:
+        pass
+    return default
+
+
+# ── 🖥️ Desktop panel launcher: open one heavy section at a time ─────────────
+# Buttons live under the cockpit; clicking one opens that section's panel and
+# collapses the rest. State: st.session_state['_open_section'] (a section id or
+# None). Each section still renders EVERY cycle (its alerts + session-state
+# stashes must run), but only the open one is displayed — the others render
+# into a CSS-hidden keyed container, so there is no double-compute and nothing
+# breaks while a panel is closed.
+_LAUNCHER_GROUPS = [
+    ("📊 Bias & Signals", [
+        ('allbias', '📊 All Bias'),
+        ('legbias', '🧮 Leg Bias'),
+        ('absorb',  '🧪 Absorption'),
+        ('ai',      '🤖 AI Advisor'),
+    ]),
+    ("🎯 Trading & Deep Analysis", [
+        ('autotrade', '🎯 Auto Trade'),
+        ('reversal',  '🔄 Reversal · Triple POC'),
+        ('deep',      '📊 Deep Analytics (chain · PCR · OI)'),
+    ]),
+    ("🌍 Markets", [
+        ('commodity', '🛢️ Commodity'),
+        ('global',    '🌍 Global Indices'),
+        ('futmfp',    '💰 Futures MFP'),
+    ]),
+]
+_LAUNCHER_SECTIONS = [s for _, _row in _LAUNCHER_GROUPS for s in _row]
+
+
+def render_section_launcher():
+    """Grouped rows of toggle buttons under the cockpit — the desktop's
+    'tabs'. Tap one → that panel opens (and any other open panel closes);
+    tap it again → it closes. Only sets state + reruns; the panels
+    themselves render at their place in the engine below via _panel() /
+    _suite_start(). Hidden in classic view (🗜️ Compact mode off)."""
+    if not st.session_state.get('_compact_mode', True):
+        st.caption("🖥️ Classic view — every section is visible below "
+                   "(🗜️ Compact mode is off).")
+        return
+    cur = st.session_state.get('_open_section')
+    st.markdown("<div style='color:#aab; font-size:13px; margin:4px 0 2px;'>"
+                "🖥️ <b>Panels</b> — tap to open one, tap again to close:</div>",
+                unsafe_allow_html=True)
+    for _gname, _row in _LAUNCHER_GROUPS:
+        _gc, *_bc = st.columns([1.1] + [1] * len(_row))
+        with _gc:
+            st.markdown(f"<div style='color:#889; font-size:12px; padding-top:9px; "
+                        f"text-align:right;'>{_gname}</div>", unsafe_allow_html=True)
+        for (sid, label), col in zip(_row, _bc):
+            with col:
+                _on = (cur == sid)
+                if st.button(('✅ ' if _on else '') + label, key=f'launch_{sid}',
+                             use_container_width=True,
+                             type='primary' if _on else 'secondary'):
+                    st.session_state['_open_section'] = None if _on else sid
+                    st.rerun()
+    if cur:
+        st.caption(f"Showing **{dict(_LAUNCHER_SECTIONS).get(cur, cur)}** — "
+                   "tap its button again to close, or pick another panel.")
+
+
+def _panel(sid, render_fn):
+    """Render `render_fn` every cycle (so its alerts and session-state stashes
+    always run) inside a keyed container, but DISPLAY it only when the launcher
+    has this section open — otherwise the container is CSS-hidden. One panel is
+    visible at a time; the rest are hidden-but-computing (single render, no
+    double side effects). In classic view (🗜️ Compact mode off) the section
+    renders plainly, always visible. On Streamlit < 1.39 (no container keys)
+    it falls back to a collapsed expander."""
+    if not st.session_state.get('_compact_mode', True):
+        render_fn()
+        return
+    try:
+        _c = st.container(key=f"panel_{sid}")
+        if st.session_state.get('_open_section') != sid:
+            st.markdown(f"<style>div.st-key-panel_{sid}{{display:none;}}</style>",
+                        unsafe_allow_html=True)
+        with _c:
+            render_fn()
+    except TypeError:
+        with st.expander(dict(_LAUNCHER_SECTIONS).get(sid, sid),
+                         expanded=(st.session_state.get('_open_section') == sid)):
+            render_fn()
+
+
+def _suite_start(sid):
+    """Launcher binding for a heavy INLINE suite that can't be wrapped in a
+    container without re-indenting thousands of lines: in compact mode,
+    everything rendered AFTER this call inside the same parent block is
+    CSS-hidden (but still computes — alerts and histories stay live) unless
+    this suite is the launcher's open section. Classic view: no-op."""
+    if not st.session_state.get('_compact_mode', True):
+        return
+    try:
+        with st.container(key=f"suite_{sid}"):
+            st.empty()
+        if st.session_state.get('_open_section') != sid:
+            # The keyed class lands on the inner stVerticalBlock; the sibling
+            # unit in the parent flow is its stLayoutWrapper — target both.
+            st.markdown(
+                f"<style>"
+                f"div[data-testid='stLayoutWrapper']:has(.st-key-suite_{sid}) ~ div,"
+                f"div.st-key-suite_{sid} ~ div {{ display:none; }}"
+                f"</style>",
+                unsafe_allow_html=True)
+    except TypeError:
+        pass
+
+
+def render_sidebar_quick_nav():
+    """Sidebar table of contents — jump links to the major desktop sections
+    (each target is a _nav_anchor placed just before that section's header),
+    plus the 🗜️ Compact mode toggle."""
+    try:
+        with st.sidebar.expander("🧭 View & Navigation", expanded=True):
+            st.toggle("🗜️ Compact mode — minimize all panels",
+                      value=True, key='_compact_mode',
+                      help="All data panels start collapsed; tap one to open "
+                           "it. Turn off for the classic fully-expanded view.")
+            st.markdown(
+                "[⚡ Cockpit (top)](#cockpit)\n\n"
+                "[📊 All Bias dashboard](#sec-allbias)\n\n"
+                "[🧮 Leg Bias table](#sec-legbias)\n\n"
+                "[🧪 Greek Absorption](#sec-absorb)\n\n"
+                "[🤖 AI Trade Advisor](#sec-ai)\n\n"
+                "[🎯 Zone-Based Auto Trade](#sec-autotrade)\n\n"
+                "[📈 Trading Chart](#sec-chart)\n\n"
+                "[💧 Stop Hunt + VPFR (14 legs)](#sec-stophunt)\n\n"
+                "[🔄 Reversal Detector](#sec-reversal)\n\n"
+                "[📊 Options Chain Analysis](#sec-chain)\n\n"
+                "[🔍 OC Deep Analysis](#sec-deep)\n\n"
+                "[📊 PCR Time Series](#sec-pcr)\n\n"
+                "[📊 OI Time Series](#sec-oi)\n\n"
+                "[🌍 Global Indices](#sec-global)\n\n"
+                "[🛢️ Commodity Risk](#sec-commodity)"
+            )
+    except Exception:
+        pass
+
+
+def _render_desktop_cockpit():
+    """⚡ Instant summary strip at the very top of the desktop app, rendered
+    from the LAST COMPLETED cycle's snapshot (session copy, falling back to
+    mobile_snapshot.json) BEFORE the heavy engine below re-runs — so the most
+    important read is always the first thing on screen, immediately."""
+    snap = (st.session_state.get('_mobile_snapshot')
+            or st.session_state.get('_mobile_hb_snap'))
+    if not snap:
+        try:
+            with open(MOBILE_SNAPSHOT_PATH, encoding='utf-8') as f:
+                snap = json.load(f)
+        except Exception:
+            snap = None
+    _nav_anchor('cockpit')
+    if not snap or not snap.get('ts'):
+        st.caption("⚡ Cockpit summary appears here after the first data cycle.")
+        return
+
+    def _tone2(txt):
+        t = (txt or '').lower()
+        if 'bull' in t or 'buy' in t or t == 'up':
+            return '#0a3d2a', '#00ff88'
+        if 'bear' in t or 'sell' in t or t == 'down':
+            return '#3d0a1f', '#ff4444'
+        return '#222a3a', '#888'
+
+    def _card(title, value, sub, bg, bd):
+        return (f"<div style='flex:1 1 200px; min-width:190px; background:{bg}; "
+                f"border:1px solid {bd}; border-radius:10px; padding:10px 14px;'>"
+                f"<div style='color:#aab; font-size:12px;'>{title}</div>"
+                f"<div style='color:#fff; font-size:18px; font-weight:800; "
+                f"line-height:1.25;'>{value}</div>"
+                f"<div style='color:#bbc; font-size:12px; margin-top:2px;'>{sub}</div></div>")
+
+    cards = []
+    # 1) Spot + freshness
+    try:
+        _ts = snap.get('ts', '')
+        _age = (datetime.now(pytz.timezone('Asia/Kolkata'))
+                - pytz.timezone('Asia/Kolkata').localize(
+                    datetime.strptime(_ts, '%Y-%m-%d %H:%M:%S'))).total_seconds()
+        _fr = (f"<span style='color:#00ff88;'>● {_age:.0f}s ago</span>" if _age <= 120
+               else f"<span style='color:#ffaa00;'>⚠ {_age/60:.0f} min old</span>")
+    except Exception:
+        _fr = ''
+    cards.append(_card("NIFTY Spot", f"₹{snap.get('spot', 0):,.1f}",
+                       f"{snap.get('ts', '—')} · {_fr}", '#1a2030', '#445'))
+    # 2) 14-leg overall verdict
+    ov = snap.get('leg_overall') or {}
+    if ov:
+        bg, bd = _tone2(ov.get('dir'))
+        cards.append(_card("Overall NIFTY (14-leg)",
+                           f"{ov.get('em', '')} {ov.get('label', '—')}",
+                           f"{ov.get('bull', 0)}↑ / {ov.get('bear', 0)}↓ · net {ov.get('net', 0):+d}",
+                           bg, bd))
+    # 3) Composite bias + action
+    cb = snap.get('composite') or {}
+    if cb:
+        bg, bd = _tone2(cb.get('direction') or cb.get('label'))
+        _enter = (" <span style='background:#00ff88; color:#003018; border-radius:10px; "
+                  "padding:1px 8px; font-size:12px;'>⚡ ENTER NOW</span>"
+                  if cb.get('enter_now') else "")
+        cards.append(_card("Composite Bias",
+                           f"{cb.get('emoji', '')} {cb.get('label', '—')} "
+                           f"({cb.get('score', 0):+.1f}){_enter}",
+                           f"{cb.get('action', '')} · Conf {cb.get('confidence', '—')}",
+                           bg, bd))
+    # 4) FAST verdict (the actionable speed)
+    _fv = (snap.get('verdicts') or {}).get('fast') or {}
+    if _fv:
+        bg, bd = _tone2(_fv.get('label'))
+        cards.append(_card("🚀 Fast Bias",
+                           f"{_fv.get('em', '')} {_fv.get('label', '—')}",
+                           f"net {_fv.get('net', 0):+d} · act on this one", bg, bd))
+    # 5) OI walls + PCR
+    oi = snap.get('oi') or {}
+    if oi:
+        cw, pw = oi.get('call_wall') or {}, oi.get('put_wall') or {}
+        cards.append(_card("🧱 OI Walls · PCR",
+                           f"C ₹{cw.get('strike', 0):,.0f} · P ₹{pw.get('strike', 0):,.0f}",
+                           f"resistance / support · PCR {oi.get('pcr', '—')}",
+                           '#1a2030', '#445'))
+    # 6) VOB watch counts + chips
+    vw = snap.get('vob_watch') or {}
+    rise, fall = vw.get('rise') or [], vw.get('fall') or []
+    if rise or fall:
+        _chips = "".join(
+            f"<span style='color:#00ff88;'>⬆{r['tag'].replace('ATM', '').strip()}</span> "
+            for r in rise[:3]) + "".join(
+            f"<span style='color:#ff4444;'>⬇{r['tag'].replace('ATM', '').strip()}</span> "
+            for r in fall[:3])
+        bg, bd = ('#0a3d2a', '#00ff88') if len(rise) >= len(fall) else ('#3d0a1f', '#ff4444')
+        cards.append(_card("🧲 VOB Watch (premium)",
+                           f"⬆️ {len(rise)} rising · ⬇️ {len(fall)} falling",
+                           _chips or '—', bg, bd))
+
+    st.markdown(
+        "<div style='display:flex; gap:10px; flex-wrap:wrap; margin-bottom:8px;'>"
+        + "".join(cards) + "</div>",
+        unsafe_allow_html=True)
+    st.caption("⚡ Cockpit — last completed cycle at a glance; full panels below "
+               "refresh each cycle. Use 🧭 Quick Navigation in the sidebar to jump.")
 
 
 def _ai_providers():
@@ -13976,6 +14433,7 @@ def ai_advisor_stream(snapshot_text, user_question=None):
 
 def render_ai_advisor(bias, spot_price):
     """AI Trade Advisor UI: auto verdict panel + ask-the-market chatbox."""
+    _nav_anchor('sec-ai')
     st.markdown("### 🤖 AI Trade Advisor")
     providers = _ai_providers()
     if not providers:
@@ -14238,6 +14696,7 @@ def render_leg_bias_table(spot_price):
     if not rows:
         st.caption("Leg bias table: warming up (need a few cycles of per-leg data).")
         return
+    _nav_anchor('sec-legbias')
     st.markdown("### 🧮 ATM±3 Leg Bias Table — per-leg verdict → overall NIFTY")
     st.caption("Main: VOB build/break · S/R behavior · Divergence · Ignition "
                "(+ VWAP · VIDYA · MFP). Each cell = that signal's read in the "
@@ -14394,6 +14853,7 @@ def render_greek_absorption(option_data, spot_price):
     """Show the Greek absorption / capping table (who is stopping the LTP)."""
     res = compute_greek_absorption(option_data, spot_price)
     st.session_state['_greek_absorb_last'] = res
+    _nav_anchor('sec-absorb')
     st.markdown("### 🧪 Greek Absorption — who is stopping the LTP")
     st.caption("Expected premium move from Greeks (Δ·ΔSpot + ½·Γ·ΔSpot² + Vega·ΔIV) "
                "vs actual, confirmed by ΔOI. Large positive 'Absorb' + rising OI = "
@@ -17943,7 +18403,7 @@ def _render_fii_dii_futures_section():
     breadth = st.session_state.get('_nse_breadth')
     if not any([fut, cash, deriv, breadth]):
         return
-    with st.expander("🏦 NIFTY Futures · FII/DII · Market Breadth", expanded=True):
+    with st.expander("🏦 NIFTY Futures · FII/DII · Market Breadth", expanded=_exp()):
         if fut:
             st.markdown(f"**📊 NIFTY Futures** — {fut['symbol']} (exp {fut['expiry']})")
             c1, c2, c3, c4, c5 = st.columns(5)
@@ -18014,7 +18474,7 @@ def _render_alignment_capping_top():
 
     # ── Alignment panel ──
     with _ac_col1:
-        with st.expander("🌍 Alignment (10m|1h|4h|1D|4D|Pat)", expanded=True):
+        with st.expander("🌍 Alignment (10m|1h|4h|1D|4D|Pat)", expanded=_exp()):
             if _master is None:
                 st.info("Alignment data loads after first signal calculation.")
             else:
@@ -18056,7 +18516,7 @@ def _render_alignment_capping_top():
 
     # ── Index/Stock Capping panel ──
     with _ac_col2:
-        with st.expander("📡 Index/Stock Capping", expanded=True):
+        with st.expander("📡 Index/Stock Capping", expanded=_exp()):
             if _sa is None:
                 st.info("Capping data loads after option chain analysis.")
             else:
@@ -18357,6 +18817,7 @@ def _render_per_strike_oi_top():
 def show_auto_trade_section(option_data, df_5m, api, db):
     """Render the full auto-trade UI section."""
     st.markdown("---")
+    _nav_anchor('sec-autotrade')
     st.markdown("## 🎯 Zone-Based Auto Trade")
 
     # ── Load persisted config from Supabase ──
@@ -18755,6 +19216,11 @@ def _render_main_analyzer():
             """)
         st.caption("You can still view cached data if available.")
 
+    # 📱 Keep the mobile companion snapshot alive on every rerun, even before
+    # (or without) a full data cycle, so vob_mobile.py can show backend state.
+    export_mobile_heartbeat('running — waiting for data cycle'
+                            if (is_market_hours and is_weekday) else 'market closed')
+
     for key, default in [('pcr_history', []), ('pcr_last_valid_data', None),
                           ('gex_history', []), ('gex_last_valid_data', None),
                           ('last_gex_alert', None), ('gex_current_strikes', []),
@@ -19134,15 +19600,18 @@ def _render_main_analyzer():
         try:
             _opt_data_top = st.session_state.get('_cached_option_data')
             _df_5m_top = getattr(st.session_state, '_df_5m', None)
-            show_auto_trade_section(_opt_data_top, _df_5m_top, api, db)
+            # Renders every cycle (active-trade SL/TP monitoring + auto exits
+            # must run even when the panel is closed); shown only when open.
+            _panel('autotrade',
+                   lambda: show_auto_trade_section(_opt_data_top, _df_5m_top, api, db))
         except Exception as _ate_top:
             st.caption(f"Auto trade init: {_ate_top}")
 
     # Fill Per-Strike OI chart right below auto trade section
     with _per_strike_oi_container:
-        with st.expander("⚡ Buy Volume vs Sell Volume (Delta Chart)", expanded=True):
+        with st.expander("⚡ Buy Volume vs Sell Volume (Delta Chart)", expanded=_exp()):
             _render_vol_delta_chart()
-        with st.expander("📊 Per-Strike Call vs Put OI", expanded=True):
+        with st.expander("📊 Per-Strike Call vs Put OI", expanded=_exp()):
             _render_per_strike_oi_top()
 
     # Fill Alignment + Index/Stock Capping below Per-Strike OI
@@ -19152,31 +19621,31 @@ def _render_main_analyzer():
             render_sector_heatmap()
             st.caption("1-row heatmap of sector strengths (green = leading, red = lagging). "
                        "Sourced from the same data used in the master signal's Sector Rotation block.")
-        with st.expander("📊 Bull / Bear Meter (Tier-1 composite)", expanded=True):
+        with st.expander("📊 Bull / Bear Meter (Tier-1 composite)", expanded=_exp()):
             render_bull_bear_meter(getattr(st.session_state, '_bull_bear_meter', None))
             st.caption("Score = weighted sum of Master Signal · FII Net · Futures P+OI · GEX+Flip · OI Cap/Decap. "
                        "Range −100 (strong bear) → +100 (strong bull).")
-        with st.expander("🎯 Spike Probability (pre-ignition setup)", expanded=True):
+        with st.expander("🎯 Spike Probability (pre-ignition setup)", expanded=_exp()):
             render_spike_meter(getattr(st.session_state, '_spike_score', None))
             st.caption("Score 0–8 of leading conditions that often precede a spike "
                        "(ATR compression · vol drying · OI accumulation · gamma-squeeze · "
                        "cum-delta divergence · S/R convergence · VIX flat-low · vol window). "
                        "≥5 → Telegram alert (15-min cooldown). ≥6 → arms a 30-min spike-watch window: "
                        "if Ignition then fires within it, the alert is tagged 🔥 HIGH-CONVICTION COMBO.")
-        with st.expander("💰 Smart Money / Footprint (Accumulation vs Distribution)", expanded=True):
+        with st.expander("💰 Smart Money / Footprint (Accumulation vs Distribution)", expanded=_exp()):
             render_smart_money_panel(getattr(st.session_state, '_accum_dist_score', None))
             st.caption("Composite of 6 institutional-footprint signals — VWAP relation, "
                        "cum-delta direction, cum-delta divergence, bid/ask absorption, "
                        "per-5m-candle Futures P×OI classifier, volume-profile shape (D/P/b/Trend). "
                        "Telegram alert when |score| ≥ 70 (15-min cooldown per direction).")
-        with st.expander("🚀 Movement Ignition Score", expanded=True):
+        with st.expander("🚀 Movement Ignition Score", expanded=_exp()):
             render_ws_health_badge()
             render_ignition_meter(getattr(st.session_state, '_ignition_score', None))
             st.caption("Fires a Telegram alert when 5+/7 ignition conditions hit simultaneously "
                        "(near S/R · delta ratio ≥3 · gamma flip · CE decap/PE depeg · vol spike · "
                        "S/R cross · order-flow sweep). 5-min per-direction cooldown. "
                        "Sweep prefers the WebSocket worker feed; falls back to the in-app cycle detector when not live.")
-        with st.expander("📊 Open Interest — CE vs PE & ΔOI", expanded=True):
+        with st.expander("📊 Open Interest — CE vs PE & ΔOI", expanded=_exp()):
             _od_oi = getattr(st.session_state, '_cached_option_data', None) or {}
             _spot_oi = _od_oi.get('underlying') if _od_oi else None
             if _spot_oi:
@@ -19185,7 +19654,7 @@ def _render_main_analyzer():
                 st.caption("Waiting for option chain…")
             st.markdown("**📈 Total OI over time** — track how the whole chain's Call vs Put OI evolves through the session")
             render_total_oi_timeseries()
-        with st.expander("🎯 Major Support / Resistance Zones (OI + VPFR + Gamma + Money Flow)", expanded=True):
+        with st.expander("🎯 Major Support / Resistance Zones (OI + VPFR + Gamma + Money Flow)", expanded=_exp()):
             _zones_ui = getattr(st.session_state, '_major_sr_zones', None)
             _od_ui = getattr(st.session_state, '_cached_option_data', None) or {}
             _spot_ui = _od_ui.get('underlying') if _od_ui else None
@@ -19203,6 +19672,7 @@ def _render_main_analyzer():
     vob_data = None
 
     with col1:
+        _nav_anchor('sec-chart')
         st.header("📈 Trading Chart")
         df = pd.DataFrame()
         current_price = None
@@ -19613,7 +20083,7 @@ def _render_main_analyzer():
             st.plotly_chart(fig, use_container_width=True)
 
             # ── 📊 NIFTY VPFR + Money Flow Profile — tabulation ──────────────
-            with st.expander("📊 NIFTY VPFR + Money Flow Profile (tabulation)", expanded=True):
+            with st.expander("📊 NIFTY VPFR + Money Flow Profile (tabulation)", expanded=_exp()):
                 _vc1, _vc2, _vc3 = st.columns(3)
                 for _col, (_k, _lbl) in zip(
                     [_vc1, _vc2, _vc3],
@@ -19853,7 +20323,7 @@ def _render_main_analyzer():
 
             # ── 💧 Liquidity Grab / Stop Hunt / Sweep — Today (3-min bars) ───
             _today_str = df['datetime'].iloc[-1].strftime('%d-%b-%Y') if not df.empty else 'Today'
-            with st.expander(f"💧 Liquidity Grab / Stop Hunt / Sweep — {_today_str} (3m bars)", expanded=True):
+            with st.expander(f"💧 Liquidity Grab / Stop Hunt / Sweep — {_today_str} (3m bars)", expanded=_exp()):
                 if not _liq_grabs_today:
                     st.info("No liquidity grab / stop hunt / sweep candles detected on 3m bars today.")
                 else:
@@ -19893,7 +20363,8 @@ def _render_main_analyzer():
                         st.caption(f"Liquidity table unavailable: {_lg_e}")
 
             # ── 💧 Stop Hunt / Liquidity Grab + VPFR on ATM±3 CE & PE ───────
-            with st.expander(f"💧 Stop Hunt + VPFR on ATM±3 CE & PE (14 legs) — {_today_str} (3m)", expanded=True):
+            _nav_anchor('sec-stophunt')
+            with st.expander(f"💧 Stop Hunt + VPFR on ATM±3 CE & PE (14 legs) — {_today_str} (3m)", expanded=_exp()):
                 try:
                     _opt_d = st.session_state.get('_cached_option_data') or {}
                     _df_s = _opt_d.get('df_summary')
@@ -20356,29 +20827,30 @@ def _render_main_analyzer():
                             # into the placeholder defined earlier, not here.
                             try:
                                 with _all_bias_container:
-                                    render_all_bias_dashboard(_u, df, _opt_d)
+                                    _panel('allbias',
+                                           lambda: render_all_bias_dashboard(_u, df, _opt_d))
                             except Exception:
                                 pass
                             render_composite_bias_panel(_bias)
                             send_bias_enter_alert(_bias)
                             # 📱 Snapshot for the mobile companion app (vob_mobile.py)
                             try:
-                                export_mobile_snapshot(_u, _bias, _opt_d)
+                                export_mobile_snapshot(_u, _bias, _opt_d, df)
                             except Exception:
                                 pass
                             # 🧮 Consolidated ATM±3 leg-bias table + overall NIFTY verdict
                             try:
-                                render_leg_bias_table(_u)
+                                _panel('legbias', lambda: render_leg_bias_table(_u))
                             except Exception as _lbt_err:
                                 st.caption(f"Leg bias table unavailable: {_lbt_err}")
                             # 🧪 Greek Absorption — who is stopping the LTP
                             try:
-                                render_greek_absorption(_opt_d, _u)
+                                _panel('absorb', lambda: render_greek_absorption(_opt_d, _u))
                             except Exception as _ga_err:
                                 st.caption(f"Greek absorption unavailable: {_ga_err}")
                             # 🤖 AI Trade Advisor (auto verdict + chatbox)
                             try:
-                                render_ai_advisor(_bias, _u)
+                                _panel('ai', lambda: render_ai_advisor(_bias, _u))
                             except Exception as _ai_err:
                                 st.caption(f"AI Advisor unavailable: {_ai_err}")
                             # Spot ignition (tank-full) alert
@@ -21099,19 +21571,19 @@ def _render_main_analyzer():
 
             # ── 🛢️ Cross-Sectional Commodity Risk Dashboard ──────────────────
             try:
-                render_commodity_risk_panel()
+                _panel('commodity', render_commodity_risk_panel)
             except Exception as _cr_err:
                 st.caption(f"Commodity panel unavailable: {_cr_err}")
 
             # ── 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily) ──
             try:
-                render_global_indices_panel()
+                _panel('global', render_global_indices_panel)
             except Exception as _gi_err:
                 st.caption(f"Global indices panel unavailable: {_gi_err}")
 
             # ── 💰 NIFTY Futures Money Flow Profile (10 rows) ────────────────
             try:
-                render_gift_nifty_moneyflow_panel()
+                _panel('futmfp', render_gift_nifty_moneyflow_panel)
             except Exception as _gm_err:
                 st.caption(f"NIFTY futures money flow unavailable: {_gm_err}")
 
@@ -21234,6 +21706,10 @@ def _render_main_analyzer():
                     st.info(f"Volume Delta: No data yet. df rows={len(df) if not df.empty else 0}, volume_delta_data={'computed' if volume_delta_data else 'None'}")
 
             st.markdown("---")
+            # 🔄 Suite bound to the panel launcher ('Reversal · Triple POC'):
+            # hidden unless opened, but still computes every cycle.
+            _suite_start('reversal')
+            _nav_anchor('sec-reversal')
             st.markdown("## 🔄 Intraday Reversal Detector")
             try:
                 pivot_lows = []
@@ -21500,6 +21976,12 @@ def _render_main_analyzer():
 
     if option_data and option_data.get('underlying'):
         st.markdown("---")
+        # 📊 Suite bound to the panel launcher ('Deep Analytics'): everything
+        # from Options Chain Analysis through the PCR/OI/ChgOI/Volume time
+        # series is hidden unless opened, but still computes every cycle so
+        # alerts and session histories stay live.
+        _suite_start('deep')
+        _nav_anchor('sec-chain')
         st.header("📊 Options Chain Analysis")
         st.markdown("## Open Interest Change (in Lakhs)")
         oi_col1, oi_col2 = st.columns(2)
@@ -21910,6 +22392,7 @@ def _render_main_analyzer():
             if max_pain_strike:
                 st.info(f"🎯 **Max Pain Level:** ₹{max_pain_strike:.0f} - Price magnet at expiry")
         st.markdown("---")
+        _nav_anchor('sec-deep')
         st.markdown("## 🔍 Option Chain Deep Analysis (ATM ± 5)")
         try:
             sa_df_summary = option_data.get('df_summary')
@@ -22242,6 +22725,7 @@ def _render_main_analyzer():
             st.warning(f"OC history unavailable: {_e}")
 
         st.markdown("---")
+        _nav_anchor('sec-pcr')
         st.markdown("## 📊 PCR Analysis - Time Series (ATM ± 2)")
         def create_pcr_chart(history_df, col_name, color, title_prefix):
             """Helper to create individual PCR chart - col_name is now just strike price"""
@@ -22482,6 +22966,7 @@ def _render_main_analyzer():
         else:
             st.info("📊 PCR history will build up as the app refreshes. Please wait for data collection...")
         st.markdown("---")
+        _nav_anchor('sec-oi')
         st.markdown("## 📊 OI Analysis - Time Series (ATM ± 2)")
         if len(st.session_state.oi_history) > 0:
             try:
@@ -23631,7 +24116,7 @@ def _render_main_analyzer():
         _gm_valid = _last_gm and _last_gm.get('time') and not str(_last_gm.get('text', '')).startswith('⚠️')
         _gm_oc_valid = _last_gm_oc and _last_gm_oc.get('time') and not str(_last_gm_oc.get('text', '')).startswith('⚠️')
         if _gm_valid or _gm_oc_valid:
-            with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=True):
+            with st.expander("🤖 Latest Gemini Analysis (auto)", expanded=_exp()):
                 if _gm_valid:
                     st.markdown(f"**Master Signal** — {_last_gm.get('time', '')}")
                     st.markdown(_last_gm.get('text', ''))
@@ -26097,8 +26582,76 @@ def _render_main_analyzer():
     st.sidebar.info(f"Last Updated: {current_time}")
 
 
+def _render_mobile_mode():
+    """📱 ?view=mobile — run the FULL engine in this same session, hide the
+    desktop dashboard via CSS, and render the phone-friendly cards from
+    vob_mobile.py on top. Works as a single deployment (Streamlit Cloud):
+    the phone opens the main app's URL with ?view=mobile appended.
+
+    ORDER MATTERS: the mobile cards render FIRST, from the last completed
+    cycle's snapshot, so the page is never blank — the engine below can take
+    a minute of API calls on first load, and its trade-management branches
+    may st.rerun()/st.stop() mid-script, which would otherwise abort the run
+    before anything visible was drawn."""
+    import vob_mobile
+    vob_mobile.inject_mobile_css()
+
+    snap = (st.session_state.get('_mobile_snapshot')
+            or vob_mobile.load_snapshot()
+            or st.session_state.get('_mobile_hb_snap'))
+    vob_mobile.render_mobile_view(snap, embedded=True)
+    _eng_err = st.session_state.get('_mobile_engine_err')
+    if _eng_err:
+        st.caption(f"⚠️ Engine error last cycle: {_eng_err}")
+
+    # Off-hours the module-level 20s autorefresh is disabled; keep a slow tick
+    # so the phone still picks up fresh data without a manual reload — but not
+    # while a popup chart is open (it would dismiss the dialog).
+    if not _is_market_open and not st.session_state.get('_popup_leg'):
+        try:
+            st_autorefresh(interval=60000, key="mobilerefresh")
+        except Exception:
+            pass
+
+    # Now run the FULL engine hidden below — it computes everything (and the
+    # next snapshot) that the mobile cards show on the following refresh.
+    try:
+        _engine = st.container(key='vob_desktop_engine')
+        st.markdown("<style>.st-key-vob_desktop_engine{display:none;}</style>",
+                    unsafe_allow_html=True)
+    except TypeError:
+        # Streamlit < 1.39 has no container keys: the desktop dashboard stays
+        # visible below the mobile cards instead of being hidden.
+        _engine = st.container()
+    try:
+        with _engine:
+            _render_main_analyzer()
+        st.session_state['_mobile_engine_err'] = None
+    except Exception as _e:
+        # Let Streamlit's control-flow exceptions (rerun/stop) propagate —
+        # the mobile view is already on screen. Swallow real engine errors
+        # so one bad cycle doesn't blank the phone; surface them next run.
+        try:
+            from streamlit.runtime.scriptrunner import RerunException, StopException
+            if isinstance(_e, (RerunException, StopException)):
+                raise
+        except ImportError:
+            pass
+        st.session_state['_mobile_engine_err'] = f"{type(_e).__name__}: {str(_e)[:200]}"
+
+
 def main():
+    if _VIEW_MOBILE:
+        _render_mobile_mode()
+        return
     st.title("📈 Nifty Trading & Options Analyzer")
+    # ⚡ Instant cockpit summary + 🖥️ panel launcher + sidebar quick-nav (desktop)
+    try:
+        _render_desktop_cockpit()
+        render_section_launcher()
+        render_sidebar_quick_nav()
+    except Exception:
+        pass
     _render_main_analyzer()
 
 
