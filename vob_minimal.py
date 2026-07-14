@@ -19398,7 +19398,14 @@ def _render_main_analyzer():
         need_fetch = not use_cache or df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_convert(pytz.UTC)).total_seconds() > 300
         if need_fetch:
             with st.spinner("Fetching data from API..."):
-                data = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval=interval, days_back=days_back)
+                # De-dupe: when the chart is on the 1m/1-day view, the identical
+                # NIFTY 1m payload was already fetched (and 60s-cached) above for
+                # zone analysis — reuse it instead of issuing a second Dhan call.
+                _reuse_1m = st.session_state.get('_raw_1m_trade') if (interval == "1" and days_back == 1) else None
+                if _reuse_1m and _reuse_1m.get('open'):
+                    data = _reuse_1m
+                else:
+                    data = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval=interval, days_back=days_back)
                 if data:
                     df = process_candle_data(data, interval)
                     db.upsert_candles("NIFTY50", "IDX_I", interval, df)
