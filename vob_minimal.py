@@ -609,9 +609,23 @@ class DhanAPI:
                 st.session_state['_nifty_fut_err'] = f"ltp net err: {str(e)[:120]}"
         return None
 
-@st.cache_data(ttl=300)
 def get_dhan_expiry_list_cached(underlying_scrip: int, underlying_seg: str):
-    return get_dhan_expiry_list(underlying_scrip, underlying_seg)
+    """Expiry list with a 5-min SUCCESS-ONLY cache. Unlike @st.cache_data, an
+    empty/None result (e.g. a fetch that bailed during a Dhan 429 back-off) is
+    NOT cached — otherwise that None would be served for the full 5 min and keep
+    'expiry None' stuck long after the rate-limit cleared. On a failed fetch we
+    return the last good value if we have one, else None, and retry next cycle."""
+    _key = f"_expiry_cache_{underlying_scrip}_{underlying_seg}"
+    _now = datetime.now(pytz.timezone('Asia/Kolkata'))
+    _ent = st.session_state.get(_key)
+    if _ent and _ent.get('data') and (_now - _ent['ts']).total_seconds() < 300:
+        return _ent['data']
+    _res = get_dhan_expiry_list(underlying_scrip, underlying_seg)
+    if _res and _res.get('data'):
+        st.session_state[_key] = {'ts': _now, 'data': _res}
+        return _res
+    # Fetch failed/empty — serve last good value (stale but usable) if any.
+    return (_ent or {}).get('data')
 
 def _dhan_post(url, payload, max_retries=4):
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
