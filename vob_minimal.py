@@ -97,6 +97,9 @@ st.markdown("""
 # auto-trade and ALL compute (bias engines, master signal, MFP legs) still
 # run untouched. Set to False to bring every chart back.
 DISABLE_ALL_CHARTS = True
+# Handle to the real renderer — the two ATM MFP bin-chart panels (CE & PE) are
+# kept and draw through this even while every other st.plotly_chart is a no-op.
+_real_plotly_chart = st.plotly_chart
 if DISABLE_ALL_CHARTS:
     st.plotly_chart = lambda *args, **kwargs: None
 
@@ -4921,8 +4924,6 @@ def _capture_atm_mfp_bins(side, mfp, max_points=400):
 
 
 def render_atm_mfp_bin_charts(side, n_bins=5):
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     """Render one bull(green)-vs-bear(red) time-series line chart per MFP bin
     (index 1=top … n=bottom) for the ATM CE or PE leg. X-axis is the live
     session timeline (grows per data cycle, like the OI chart)."""
@@ -4973,8 +4974,8 @@ def render_atm_mfp_bin_charts(side, n_bins=5):
         _cols = st.columns(2)
         for _c, (_bidx, _bfig) in zip(_cols, _pair):
             with _c:
-                st.plotly_chart(_bfig, width='stretch',
-                                key=f"atm_mfp_bin_{side}_{_bidx}")
+                _real_plotly_chart(_bfig, width='stretch',
+                                   key=f"atm_mfp_bin_{side}_{_bidx}")
 
 
 def send_ltp_extreme_alert(leg_tag, ltp, day_high, day_low, spot, near_pct=10.0, cooldown_s=900):
