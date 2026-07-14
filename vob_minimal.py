@@ -89,25 +89,6 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# ── 🪶 LIGHT MODE — all graphs/charts removed (app was overloaded) ──────────
-# Every st.plotly_chart render becomes a no-op and the heavy figure-builder /
-# graph-panel functions return early (candlestick charts, OI charts, MFP bin
-# charts, global indices / commodity / sector / GIFT-nifty panels, volume
-# delta + per-strike OI + total-OI timeseries graphs). Tables, alerts,
-# auto-trade and ALL compute (bias engines, master signal, MFP legs) still
-# run untouched. Set to False to bring every chart back.
-DISABLE_ALL_CHARTS = True
-# Handle to the real renderer — the two ATM MFP bin-chart panels (CE & PE) are
-# kept and draw through this even while every other st.plotly_chart is a no-op.
-_real_plotly_chart = st.plotly_chart
-if DISABLE_ALL_CHARTS:
-    st.plotly_chart = lambda *args, **kwargs: None
-
-# ── Auto Trade section removed per user request. NOTE: this also disables
-# the automatic target/SL exit management of any ACTIVE trade — do not flip
-# this on with a live position open. Set to False to bring the section back.
-DISABLE_AUTO_TRADE = True
-
 try:
     DHAN_CLIENT_ID = st.secrets.get("DHAN_CLIENT_ID", "") or st.secrets.get("dhan", {}).get("client_id", "")
     DHAN_ACCESS_TOKEN = st.secrets.get("DHAN_ACCESS_TOKEN", "") or st.secrets.get("dhan", {}).get("access_token", "")
@@ -617,14 +598,9 @@ def _dhan_post(url, payload, max_retries=4):
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
         st.error("Dhan API credentials not configured")
         return None
-    _ist_bp = pytz.timezone('Asia/Kolkata')
-    # Respect the shared 429 back-off window — bail fast so we serve cached data
-    # instead of piling more requests onto an already rate-limited API.
-    _back = st.session_state.get('_dhan_429_until')
-    if _back and datetime.now(_ist_bp) < _back:
-        return None
     headers = {'access-token': DHAN_ACCESS_TOKEN, 'client-id': DHAN_CLIENT_ID, 'Content-Type': 'application/json'}
-    for attempt in range(2):  # one quick retry for a transient network blip only
+    delays = [2, 4, 8, 16]
+    for attempt in range(max_retries + 1):
         try:
             response = requests.post(url, headers=headers, json=payload)
             if response.status_code == 401:
@@ -632,22 +608,18 @@ def _dhan_post(url, payload, max_retries=4):
                 st.error("🔑 **Dhan token expired.** Open **Refresh Dhan Token** in the sidebar and paste your new token.")
                 return None
             if response.status_code == 429:
-                # Trip the shared 90s back-off so every other caller stops
-                # hammering; notify at most once per 30s (no per-call spam,
-                # no multi-second blocking sleeps that froze the whole run).
-                _now = datetime.now(_ist_bp)
-                st.session_state['_dhan_429_until'] = _now + timedelta(seconds=90)
-                _last = st.session_state.get('_dhan_429_notified')
-                if not _last or (_now - _last).total_seconds() > 30:
-                    st.session_state['_dhan_429_notified'] = _now
-                    st.warning("⏸️ Dhan rate-limited (DH-904). Throttling for 90s — "
-                               "showing cached data until it clears.")
+                if attempt < max_retries:
+                    d = delays[min(attempt, 3)]
+                    st.warning(f"⏳ Rate limited by Dhan API. Retrying in {d}s... (Attempt {attempt+1}/{max_retries})")
+                    time.sleep(d)
+                    continue
+                st.error("❌ Rate limit exceeded after multiple retries. Please wait a moment and refresh.")
                 return None
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            if attempt == 0 and "429" not in str(e):
-                time.sleep(1)
+            if attempt < max_retries and "429" in str(e):
+                time.sleep(delays[min(attempt, 3)])
                 continue
             st.error(f"Request error: {e}")
             return None
@@ -4983,8 +4955,8 @@ def render_atm_mfp_bin_charts(side, n_bins=5):
         _cols = st.columns(2)
         for _c, (_bidx, _bfig) in zip(_cols, _pair):
             with _c:
-                _real_plotly_chart(_bfig, width='stretch',
-                                   key=f"atm_mfp_bin_{side}_{_bidx}")
+                st.plotly_chart(_bfig, use_container_width=True,
+                                key=f"atm_mfp_bin_{side}_{_bidx}")
 
 
 def send_ltp_extreme_alert(leg_tag, ltp, day_high, day_low, spot, near_pct=10.0, cooldown_s=900):
@@ -5314,149 +5286,6 @@ def _mfp_poc_bias(mfp):
     return 'BULL' if d > 0 else ('BEAR' if d < 0 else 'NEUTRAL')
 
 
-def _mfp_totals(mfp):
-    """Sum (buy_volume, sell_volume) across all bins of an MFP. (0,0) if empty."""
-    rows = (mfp or {}).get('rows') or []
-    buy = sum(float(r.get('bull_volume', 0) or 0) for r in rows)
-    sell = sum(float(r.get('bear_volume', 0) or 0) for r in rows)
-    return buy, sell
-
-
-def render_leg_buy_sell_volume_table():
-    """14-leg tabulation: total buy vs sell volume per leg (full-session MFP),
-    with CALL vs PUT totals and a comparison verdict."""
-    legs = (st.session_state.get('_atm_pm1_vpfr') or {}).get('legs') or []
-    st.markdown("## 💥 ATM±3 Legs — Total Buy vs Sell Volume (full session)")
-    if not legs:
-        st.caption("Leg data not yet computed (cycle warming up).")
-        return
-    rows = []
-    tot = {'CE': [0.0, 0.0], 'PE': [0.0, 0.0]}
-    for leg in legs:
-        tag = leg.get('tag', '')
-        side = 'CE' if ' CE ' in f' {tag} ' else ('PE' if ' PE ' in f' {tag} ' else None)
-        buy, sell = _mfp_totals(leg.get('mfp'))
-        if side is None or (buy == 0 and sell == 0):
-            continue
-        tot[side][0] += buy
-        tot[side][1] += sell
-        net = buy - sell
-        pct = buy / (buy + sell) * 100 if (buy + sell) > 0 else 0
-        rows.append({
-            '_dir': 'bull' if net > 0 else ('bear' if net < 0 else 'neutral'),
-            'Leg': tag,
-            'LTP': f"₹{float(leg.get('ltp') or 0):.2f}",
-            'Buy Vol': f"{buy:,.0f}",
-            'Sell Vol': f"{sell:,.0f}",
-            'Δ (Buy−Sell)': f"{net:+,.0f}",
-            'Buy %': f"{pct:.1f}%",
-            'Dominant': '🟢 BUYERS' if net > 0 else ('🔴 SELLERS' if net < 0 else '⚪ EVEN'),
-        })
-    if not rows:
-        st.caption("No per-leg money-flow volume yet.")
-        return
-
-    def _color_bsv(row):
-        sd = row.get('_dir', 'neutral')
-        if sd == 'bull':
-            return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
-        if sd == 'bear':
-            return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
-        return [''] * len(row)
-    _bsv_df = pd.DataFrame(rows)
-    st.dataframe(_bsv_df.style.apply(_color_bsv, axis=1).hide(axis='columns', subset=['_dir']),
-                 width='stretch', hide_index=True)
-
-    ce_b, ce_s = tot['CE']
-    pe_b, pe_s = tot['PE']
-    st.dataframe(pd.DataFrame([
-        {'Side': '🟢 CALLs (7 legs)', 'Total Buy Vol': f"{ce_b:,.0f}", 'Total Sell Vol': f"{ce_s:,.0f}",
-         'Net Δ': f"{ce_b - ce_s:+,.0f}"},
-        {'Side': '🔴 PUTs (7 legs)', 'Total Buy Vol': f"{pe_b:,.0f}", 'Total Sell Vol': f"{pe_s:,.0f}",
-         'Net Δ': f"{pe_b - pe_s:+,.0f}"},
-    ]), width='stretch', hide_index=True)
-
-    buy_side = 'CALLs' if ce_b > pe_b else ('PUTs' if pe_b > ce_b else 'TIE')
-    sell_side = 'CALLs' if ce_s > pe_s else ('PUTs' if pe_s > ce_s else 'TIE')
-    _b_em = '🟢' if buy_side == 'CALLs' else ('🔴' if buy_side == 'PUTs' else '⚪')
-    _s_em = '🔴' if sell_side == 'CALLs' else ('🟢' if sell_side == 'PUTs' else '⚪')
-    st.markdown(
-        f"{_b_em} **More BUY volume: {buy_side}** ({ce_b:,.0f} CE vs {pe_b:,.0f} PE)  \n"
-        f"{_s_em} **More SELL volume: {sell_side}** ({ce_s:,.0f} CE vs {pe_s:,.0f} PE)"
-    )
-    if buy_side == 'CALLs' and sell_side == 'PUTs':
-        st.success("🟢 CALL buying + PUT selling dominate → bullish premium flow (NIFTY up bias)")
-    elif buy_side == 'PUTs' and sell_side == 'CALLs':
-        st.error("🔴 PUT buying + CALL selling dominate → bearish premium flow (NIFTY down bias)")
-    elif buy_side == 'CALLs' and sell_side == 'CALLs':
-        st.info("⚪ CALLs dominate BOTH buy & sell volume → churn/two-way fight on calls, no clean direction")
-    elif buy_side == 'PUTs' and sell_side == 'PUTs':
-        st.info("⚪ PUTs dominate BOTH buy & sell volume → churn/two-way fight on puts, no clean direction")
-    else:
-        st.info("⚪ Buy/Sell volume mixed between CALLs and PUTs — no dominant flow")
-
-
-def render_leg_mfp_consolidated_table():
-    """Consolidated MFP matrix for all 14 legs: All-bars vs Last-50 vs Last-20
-    profiles side by side — POC, LTP-vs-POC position and net Δ sign per horizon,
-    plus a majority verdict per leg."""
-    legs = (st.session_state.get('_atm_pm1_vpfr') or {}).get('legs') or []
-    st.markdown("## 🧮 ATM±3 Legs — Consolidated MFP: All bars · Last 50 · Last 20")
-    if not legs:
-        st.caption("Leg data not yet computed (cycle warming up).")
-        return
-
-    def _cell(mfp, ltp):
-        """'₹poc 🟢> Δ+' → POC price, LTP above/below POC, net-delta sign. Returns (text, vote)."""
-        if not mfp or not mfp.get('rows'):
-            return '—', 0
-        poc = float(mfp.get('poc_price') or 0)
-        net_d = sum(float(r.get('delta', 0) or 0) for r in mfp['rows'])
-        pos_em, vote = ('🟢>', 1) if ltp > poc else (('🔴<', -1) if ltp < poc else ('⚪=', 0))
-        d_em = 'Δ+' if net_d > 0 else ('Δ−' if net_d < 0 else 'Δ0')
-        if net_d > 0:
-            vote += 1
-        elif net_d < 0:
-            vote -= 1
-        return f"₹{poc:.1f} {pos_em} {d_em}", vote
-
-    rows = []
-    for leg in legs:
-        tag = leg.get('tag', '')
-        ltp = float(leg.get('ltp') or 0)
-        c_all, v_all = _cell(leg.get('mfp'), ltp)
-        c_50, v_50 = _cell(leg.get('mfp_50'), ltp)
-        c_20, v_20 = _cell(leg.get('mfp_20'), ltp)
-        v = v_all + v_50 + v_20
-        verdict = '🟢 BULL' if v >= 2 else ('🔴 BEAR' if v <= -2 else '⚪ MIXED')
-        rows.append({
-            '_dir': 'bull' if v >= 2 else ('bear' if v <= -2 else 'neutral'),
-            'Leg': tag,
-            'LTP': f"₹{ltp:.2f}",
-            'All bars (POC · LTP · Δ)': c_all,
-            'Last 50 (POC · LTP · Δ)': c_50,
-            'Last 20 (POC · LTP · Δ)': c_20,
-            'Verdict': verdict,
-        })
-    if not rows:
-        st.caption("No per-leg MFP data yet.")
-        return
-
-    def _color_cons(row):
-        sd = row.get('_dir', 'neutral')
-        if sd == 'bull':
-            return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
-        if sd == 'bear':
-            return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
-        return [''] * len(row)
-    _cons_df = pd.DataFrame(rows)
-    st.dataframe(_cons_df.style.apply(_color_cons, axis=1).hide(axis='columns', subset=['_dir']),
-                 width='stretch', hide_index=True)
-    st.caption("🟢> / 🔴< : LTP above/below that horizon's POC (premium strength/weakness) · "
-               "Δ+/Δ− : net buy-minus-sell volume of the profile · Verdict = majority across the three horizons. "
-               "On an OPTION's own chart: its LTP above POC with Δ+ = that premium is being accumulated.")
-
-
 def send_atm_poc_touch_alert(leg_tag, ltp, vpfr, mfp, spot, cooldown_s=900, tol_pct=0.5):
     """Fires when ATM CE/PE LTP comes within tol_pct of any VPFR POC (Short/Med/Long).
     Per-leg per-POC dedup. tol_pct = 0.5% of LTP (e.g. ~₹1 on a ₹200 option).
@@ -5693,8 +5522,6 @@ def send_ignition_alert(tag, ign, ltp, spot, cooldown_s=900):
 
 
 def create_candlestick_chart(df, title, interval, show_pivots=True, pivot_settings=None, vob_blocks=None, poc_data=None, swing_data=None, money_flow_data=None, volume_delta_data=None, cie_signals=None, geo_patterns=None, candle_patterns=None, liquidity_grabs=None, vpfr_data=None, dynamic_poc=None):
-    if DISABLE_ALL_CHARTS:
-        return None  # 🪶 light mode: graphs removed
     if df.empty:
         return go.Figure()
 
@@ -7008,7 +6835,7 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
                 height=300,
                 margin=dict(l=0, r=0, t=30, b=0)
             )
-            st.plotly_chart(fig_price, width='stretch')
+            st.plotly_chart(fig_price, use_container_width=True)
         with col2:
             fig_volume = go.Figure()
             fig_volume.add_trace(go.Bar(
@@ -7023,7 +6850,7 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
                 height=300,
                 margin=dict(l=0, r=0, t=30, b=0)
             )
-            st.plotly_chart(fig_volume, width='stretch')
+            st.plotly_chart(fig_volume, use_container_width=True)
         st.subheader("30-Day Summary")
         metrics = [
             ("Average Price", f"₹{analytics_df['day_close'].mean():,.2f}"),
@@ -8315,8 +8142,6 @@ def compute_commodity_risk():
 
 
 def render_commodity_risk_panel():
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     data = st.session_state.get('_commodity_risk')
     st.markdown("## 🛢️ Cross-Sectional Commodity Risk Dashboard")
     if not data:
@@ -8366,7 +8191,7 @@ def render_commodity_risk_panel():
             '3d':  '—' if r['3d']  is None else f"{r['3d']:+.1f}%",
             '1w':  '—' if r['1w']  is None else f"{r['1w']:+.1f}%",
         })
-    st.dataframe(pd.DataFrame(df_rows), width='stretch', hide_index=True)
+    st.dataframe(pd.DataFrame(df_rows), use_container_width=True, hide_index=True)
     lc, sc = st.columns(2)
     with lc:
         st.markdown("**Long Candidates**")
@@ -8612,8 +8437,6 @@ def compute_global_nifty_bias():
 
 
 def render_global_indices_panel():
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     """Display Money Flow Profile + VPFR + Dynamic PoC + VOB + HVP for global instruments."""
     data = st.session_state.get('_global_indices') or {}
     st.markdown("## 🌍 Global Indices · Money Flow + VPFR + Dynamic PoC (daily)")
@@ -8638,7 +8461,7 @@ def render_global_indices_panel():
                 'NIFTY Impact': r['nifty_impact'],
                 'Top reasons': ', '.join(r['reasons'][:3]) if r['reasons'] else '—',
             })
-        st.dataframe(pd.DataFrame(_bias_rows), width='stretch', hide_index=True)
+        st.dataframe(pd.DataFrame(_bias_rows), use_container_width=True, hide_index=True)
         st.caption(
             "Per-instrument bias from MFP POC bin · VPFR POC · Dynamic PoC · "
             "day % change · VOB net volume · HVP recency. NIFTY Corr: direct "
@@ -8690,7 +8513,7 @@ def render_global_indices_panel():
                                       'Mid': f"{b['mid']:,.1f}",
                                       'Volume': f"{b['volume']:,.0f}"})
                 if _vob_rows:
-                    st.dataframe(pd.DataFrame(_vob_rows), width='stretch', hide_index=True)
+                    st.dataframe(pd.DataFrame(_vob_rows), use_container_width=True, hide_index=True)
             # HVP markers (most recent few each side)
             _bull_h = (_hvp.get('bullish_hvp') or [])[-3:]
             _bear_h = (_hvp.get('bearish_hvp') or [])[-3:]
@@ -8712,7 +8535,7 @@ def render_global_indices_panel():
                                       'Price': f"{h['price']:,.1f}",
                                       'Volume': f"{h['volume']:,.0f}"})
                 if _hvp_rows:
-                    st.dataframe(pd.DataFrame(_hvp_rows), width='stretch', hide_index=True)
+                    st.dataframe(pd.DataFrame(_hvp_rows), use_container_width=True, hide_index=True)
             if _m and _m.get('rows'):
                 st.markdown(
                     f"**MFP** — POC {_m.get('poc_price',0):,.1f} · "
@@ -8744,7 +8567,7 @@ def render_global_indices_panel():
                         return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
                     return [''] * len(row)
                 st.dataframe(df_x.style.apply(_color, axis=1).hide(axis='columns', subset=['_sd']),
-                             width='stretch', hide_index=True)
+                             use_container_width=True, hide_index=True)
 
 
 def compute_gift_nifty_moneyflow(api, num_rows=10):
@@ -8799,8 +8622,6 @@ def compute_gift_nifty_moneyflow(api, num_rows=10):
 
 
 def render_gift_nifty_moneyflow_panel():
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     data = st.session_state.get('_gift_mf')
     st.markdown("## 💰 NIFTY Futures Money Flow Profile (10 rows)")
     st.caption(
@@ -8844,7 +8665,7 @@ def render_gift_nifty_moneyflow_panel():
                     'Node': ('🎯 POC' if r['is_poc'] else r['node_type']),
                     'Sentiment': f"{r['sentiment']} ({r['sentiment_strength']:.0f}%)",
                 })
-            st.dataframe(pd.DataFrame(_tbl), width='stretch', hide_index=True)
+            st.dataframe(pd.DataFrame(_tbl), use_container_width=True, hide_index=True)
         except Exception:
             pass
     # Horizontal money-flow bars per price bin (bull green / bear red stacked)
@@ -8861,7 +8682,7 @@ def render_gift_nifty_moneyflow_panel():
             fig.update_layout(barmode='stack', height=340,
                               margin=dict(l=10, r=10, t=28, b=10),
                               title="Money Flow by Price (today, 5m futures bars)")
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
     except Exception:
         pass
 
@@ -11266,14 +11087,12 @@ def render_major_sr_table(zones, underlying_price):
             'Levels': z['detail'],
         })
     if rows:
-        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     else:
         st.caption("No major S/R zones detected yet.")
 
 
 def render_oi_charts(option_data, underlying_price, atm_band=10):
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     """Two side-by-side bar charts:
       • Total CE vs PE OI per strike (ATM ± atm_band)
       • Change in CE vs PE OI per strike (intraday delta)
@@ -11331,7 +11150,7 @@ def render_oi_charts(option_data, underlying_price, atm_band=10):
             plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
-        st.plotly_chart(fig1, width='stretch')
+        st.plotly_chart(fig1, use_container_width=True)
 
     with col2:
         fig2 = go.Figure()
@@ -11351,7 +11170,7 @@ def render_oi_charts(option_data, underlying_price, atm_band=10):
             plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
-        st.plotly_chart(fig2, width='stretch')
+        st.plotly_chart(fig2, use_container_width=True)
 
     # Quick aggregate row below the charts
     total_ce, total_pe = sum(ce_oi_l), sum(pe_oi_l)
@@ -11537,7 +11356,7 @@ def render_bull_bear_meter(meter):
             'Contribution': '—' if s is None else f"{s * c['weight']:+.1f}",
             'Detail': c['note'],
         })
-    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -13523,13 +13342,8 @@ def render_all_bias_dashboard(spot_price, df, option_data):
         _fast_label = 'MIXED / NEUTRAL'
         _fast_em = '⚪'
     try:
-        # Only fire on a STRONG fast verdict (|net| >= 3). A 1-2 vote margin
-        # (e.g. Bull 6 vs Bear 7 → net -1) is coin-flip noise: the dashboard
-        # itself labels |net| < 2 as MIXED/NEUTRAL, yet the alert used to fire
-        # BUY CALL/PUT NOW on it — often against the larger context.
-        if abs(fast_net) >= 3:
-            send_overall_bias_entry_alert(_fast_label, _fast_em, fast_bull, fast_bear,
-                                           spot_price, option_data)
+        send_overall_bias_entry_alert(_fast_label, _fast_em, fast_bull, fast_bear,
+                                       spot_price, option_data)
     except Exception:
         pass
     # Reverse-side alert: any CE/PE leg whose LTP sits at its own BEARISH VOB
@@ -13577,7 +13391,7 @@ def render_all_bias_dashboard(spot_price, df, option_data):
             seen.add(r['Engine'])
             tr.append({'Engine': r['Engine'], 'Bias': r['Bias'], 'Detail': r['Detail']})
         if tr:
-            st.dataframe(pd.DataFrame(tr), width='stretch', hide_index=True)
+            st.dataframe(pd.DataFrame(tr), use_container_width=True, hide_index=True)
         else:
             st.caption("(no engines in this category reporting yet)")
 
@@ -14192,7 +14006,7 @@ def render_ai_advisor(bias, spot_price):
 
     c1, c2 = st.columns([1, 1])
     with c1:
-        go_verdict = st.button("🧠 Get AI Entry Verdict", width='stretch',
+        go_verdict = st.button("🧠 Get AI Entry Verdict", use_container_width=True,
                                key="ai_verdict_btn")
     with c2:
         send_tg = st.checkbox("Also send verdict to Telegram/Discord",
@@ -14436,13 +14250,13 @@ def render_leg_bias_table(spot_price):
     with _c1:
         st.markdown("#### 🟢 CALL (CE) legs")
         if _ce_rows:
-            st.dataframe(pd.DataFrame(_ce_rows), width='stretch', hide_index=True)
+            st.dataframe(pd.DataFrame(_ce_rows), use_container_width=True, hide_index=True)
         else:
             st.caption("No CE legs yet.")
     with _c2:
         st.markdown("#### 🔴 PUT (PE) legs")
         if _pe_rows:
-            st.dataframe(pd.DataFrame(_pe_rows), width='stretch', hide_index=True)
+            st.dataframe(pd.DataFrame(_pe_rows), use_container_width=True, hide_index=True)
         else:
             st.caption("No PE legs yet.")
     # Split verdict by signal speed: 🚀 Fast / 🐢 Lagging / 🌫️ Misguiding
@@ -14588,7 +14402,7 @@ def render_greek_absorption(option_data, spot_price):
     if not rows:
         st.caption("No significant absorption this cycle (or warming up — needs 2 cycles).")
         return
-    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     _nd = res.get('nifty', 'neutral')
     _em = '🟢' if _nd == 'bull' else ('🔴' if _nd == 'bear' else '⚪')
     st.caption(f"{_em} Net absorption read → NIFTY **{_nd.upper()}** "
@@ -15213,8 +15027,6 @@ def send_premarket_telegram(api):
 #  SECTOR HEATMAP — 1-row colored bar
 # ═══════════════════════════════════════════════════════════════════════════
 def render_sector_heatmap():
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     """Render a single-row colored heatmap of sector strengths."""
     sectors = st.session_state.get('_sector_rotation') or st.session_state.get('_sector_rotation_data')
     if not sectors or not isinstance(sectors, dict):
@@ -15252,7 +15064,7 @@ def render_sector_heatmap():
         xaxis=dict(tickfont=dict(size=10)),
         yaxis=dict(showticklabels=False),
     )
-    st.plotly_chart(fig, width='stretch')
+    st.plotly_chart(fig, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -15599,7 +15411,7 @@ def render_ignition_meter(score_data):
     )
     rows = [{'Condition': c['name'], 'Met': '✅' if c['met'] else '❌', 'Detail': c['detail']}
             for c in score_data['conditions']]
-    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def compute_spike_probability(result, option_data, zones, df_5m, df_1m=None):
@@ -15824,7 +15636,7 @@ def render_spike_meter(score_data):
     )
     rows = [{'Condition': c['name'], 'Met': '✅' if c['met'] else '❌', 'Detail': c['detail']}
             for c in score_data['conditions']]
-    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
 def _track_total_oi_timeseries(option_data, underlying_price=None, max_points=500):
@@ -15853,8 +15665,6 @@ def _track_total_oi_timeseries(option_data, underlying_price=None, max_points=50
 
 
 def render_total_oi_timeseries():
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     """Two time-series line charts: TOTAL CE vs PE OI (whole chain) and TOTAL ΔOI."""
     hist = st.session_state.get('_total_oi_history') or []
     if len(hist) < 2:
@@ -15879,7 +15689,7 @@ def render_total_oi_timeseries():
             plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
     with col2:
         fig2 = go.Figure()
         fig2.add_trace(go.Scatter(x=df['time'], y=df['chg_ce'], mode='lines+markers',
@@ -15894,7 +15704,7 @@ def render_total_oi_timeseries():
             plot_bgcolor='#0e1117', paper_bgcolor='#0e1117', font=dict(color='white'),
             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1),
         )
-        st.plotly_chart(fig2, width='stretch')
+        st.plotly_chart(fig2, use_container_width=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -16285,7 +16095,7 @@ def render_smart_money_panel(score_data):
             'Weight': f"{int(c['weight']*100)}%",
             'Detail': c['detail'],
         })
-    st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
     # VWAP bands
     if score_data.get('vwap_bands'):
@@ -16305,7 +16115,7 @@ def render_smart_money_panel(score_data):
             'ΔPrice': f"{r['dp']:+.1f}", 'ΔOI': f"{r['doi']:+,.0f}",
             'Label': f"{r['emoji']} {r['label']}",
         } for r in score_data['pxoi_rows']]
-        st.dataframe(pd.DataFrame(pxoi_rows), width='stretch', hide_index=True)
+        st.dataframe(pd.DataFrame(pxoi_rows), use_container_width=True, hide_index=True)
     else:
         st.caption("Per-candle Futures P×OI unavailable (likely Dhan futures fetch failing).")
 
@@ -18335,8 +18145,6 @@ def _render_alignment_capping_top():
 
 
 def _render_vol_delta_chart():
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     """Render Buy Volume vs Sell Volume as time-series lines, styled like Per-Strike Call vs Put OI."""
     import plotly.graph_objects as go
     vd = getattr(st.session_state, '_volume_delta_data', None)
@@ -18405,7 +18213,7 @@ def _render_vol_delta_chart():
             yaxis=dict(title='Volume (K)'),
             plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
         # Signal badges — mirror the OI chart's strength readouts
         if len(df) >= 3:
@@ -18447,8 +18255,6 @@ def _render_vol_delta_chart():
 
 
 def _render_per_strike_oi_top():
-    if DISABLE_ALL_CHARTS:
-        return  # 🪶 light mode: graphs removed
     """Render Per-Strike CE vs PE OI charts + signals from session state."""
     import plotly.graph_objects as go
     oi_history = st.session_state.get('oi_history', [])
@@ -18500,7 +18306,7 @@ def _render_per_strike_oi_top():
                     yaxis=dict(title='OI (L)'),
                     plot_bgcolor='#1e1e1e', paper_bgcolor='#1e1e1e'
                 )
-                st.plotly_chart(fig_strike, width='stretch')
+                st.plotly_chart(fig_strike, use_container_width=True)
                 # Signal badges
                 if ce_col in oi_history_df.columns and pe_col in oi_history_df.columns and len(oi_history_df) >= 3:
                     ce_s = oi_history_df[ce_col]; pe_s = oi_history_df[pe_col]
@@ -18550,8 +18356,6 @@ def _render_per_strike_oi_top():
 
 def show_auto_trade_section(option_data, df_5m, api, db):
     """Render the full auto-trade UI section."""
-    if DISABLE_AUTO_TRADE:
-        return  # 🪶 light mode: auto trade removed
     st.markdown("---")
     st.markdown("## 🎯 Zone-Based Auto Trade")
 
@@ -18899,7 +18703,7 @@ def _render_main_analyzer():
             "📤 Send Signal to Telegram",
             key="top_send_telegram",
             help="Force-send Master Signal + Option Chain Deep Analysis to Telegram",
-            width='stretch',
+            use_container_width=True,
             type="primary",
         )
         if _top_send_clicked:
@@ -18909,7 +18713,7 @@ def _render_main_analyzer():
             "📚 Send AI Context to Telegram",
             key="send_ai_context",
             help="Send AI glossary/guide to Telegram (once at start of day)",
-            width='stretch',
+            use_container_width=True,
             type="primary",
         )
         if _ctx_clicked:
@@ -19407,14 +19211,7 @@ def _render_main_analyzer():
         need_fetch = not use_cache or df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_convert(pytz.UTC)).total_seconds() > 300
         if need_fetch:
             with st.spinner("Fetching data from API..."):
-                # De-dupe: when the chart is on the 1m/1-day view, the identical
-                # NIFTY 1m payload was already fetched (and 60s-cached) above for
-                # zone analysis — reuse it instead of issuing a second Dhan call.
-                _reuse_1m = st.session_state.get('_raw_1m_trade') if (interval == "1" and days_back == 1) else None
-                if _reuse_1m and _reuse_1m.get('open'):
-                    data = _reuse_1m
-                else:
-                    data = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval=interval, days_back=days_back)
+                data = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval=interval, days_back=days_back)
                 if data:
                     df = process_candle_data(data, interval)
                     db.upsert_candles("NIFTY50", "IDX_I", interval, df)
@@ -19813,7 +19610,7 @@ def _render_main_analyzer():
                 vpfr_data=_spot_vpfr,
                 dynamic_poc=_spot_dynamic_poc,
             )
-            st.plotly_chart(fig, width='stretch')
+            st.plotly_chart(fig, use_container_width=True)
 
             # ── 📊 NIFTY VPFR + Money Flow Profile — tabulation ──────────────
             with st.expander("📊 NIFTY VPFR + Money Flow Profile (tabulation)", expanded=True):
@@ -19844,7 +19641,7 @@ def _render_main_analyzer():
                         })
                 if _vpfr_rows:
                     st.markdown("**VPFR Levels**")
-                    st.dataframe(pd.DataFrame(_vpfr_rows), width='stretch', hide_index=True)
+                    st.dataframe(pd.DataFrame(_vpfr_rows), use_container_width=True, hide_index=True)
 
                 # Money Flow Profile table (10 bins)
                 try:
@@ -19888,7 +19685,7 @@ def _render_main_analyzer():
                                 return ['background-color: rgba(255, 60, 60, 0.18); color: #ff6666'] * len(row)
                             return [''] * len(row)
                         _styled = _mfp_df.style.apply(_color_mfp_row, axis=1).hide(axis='columns', subset=['_sent_dir'])
-                        st.dataframe(_styled, width='stretch', hide_index=True)
+                        st.dataframe(_styled, use_container_width=True, hide_index=True)
                     else:
                         st.caption("Money Flow Profile: insufficient bars.")
                 except Exception as _mfe:
@@ -19925,7 +19722,7 @@ def _render_main_analyzer():
                                 'Options Conf': '✅' if _s.get('options_confirmed') else '—',
                             })
                         if _crows:
-                            st.dataframe(pd.DataFrame(_crows), width='stretch', hide_index=True)
+                            st.dataframe(pd.DataFrame(_crows), use_container_width=True, hide_index=True)
                         else:
                             st.info("No CIE signals detected on the current 5-min chart.")
                     except Exception as _cerr:
@@ -19957,7 +19754,7 @@ def _render_main_analyzer():
                                 'Move %': f"{_g.get('move_pct', 0):+.2f}%",
                             })
                         if _grows:
-                            st.dataframe(pd.DataFrame(_grows), width='stretch', hide_index=True)
+                            st.dataframe(pd.DataFrame(_grows), use_container_width=True, hide_index=True)
                         else:
                             st.info("No geometric patterns detected on the current 5-min chart.")
                     except Exception as _gerr:
@@ -19991,7 +19788,7 @@ def _render_main_analyzer():
                                     'Confirmed': '✅' if _m.get('confirmed') else '➖',
                                     'Score': _m.get('score', 0),
                                 })
-                            st.dataframe(pd.DataFrame(_mrows), width='stretch', hide_index=True)
+                            st.dataframe(pd.DataFrame(_mrows), use_container_width=True, hide_index=True)
                         _opt_legs_ui = _cmce_res_ui.get('option_legs') or []
                         if _opt_legs_ui:
                             st.caption(
@@ -20009,7 +19806,7 @@ def _render_main_analyzer():
                                     'Confirmed': '✅' if _leg.get('confirmed') else '➖',
                                     'LTP': _leg.get('ltp', 0),
                                 })
-                            st.dataframe(pd.DataFrame(_lrows), width='stretch', hide_index=True)
+                            st.dataframe(pd.DataFrame(_lrows), use_container_width=True, hide_index=True)
                     except Exception as _cerr:
                         st.caption(f"CMCE panel unavailable: {_cerr}")
 
@@ -20050,7 +19847,7 @@ def _render_main_analyzer():
                                     'Confidence %': int(_s.get('confidence', 0)),
                                     'IOFCE Adj': _s.get('iofce_adjustment', '-'),
                                 })
-                            st.dataframe(pd.DataFrame(_arows), width='stretch', hide_index=True)
+                            st.dataframe(pd.DataFrame(_arows), use_container_width=True, hide_index=True)
                     except Exception as _ierr:
                         st.caption(f"IOFCE panel unavailable: {_ierr}")
 
@@ -20083,7 +19880,7 @@ def _render_main_analyzer():
                                 'Vol Spike': f"{g.get('vol_spike', 0):.1f}×",
                                 'Volume': f"{g['volume']:,.0f}",
                             })
-                        st.dataframe(pd.DataFrame(_lg_rows), width='stretch', hide_index=True)
+                        st.dataframe(pd.DataFrame(_lg_rows), use_container_width=True, hide_index=True)
                         st.caption(
                             "Stop Hunt = sweep + long wick (>2× body) + close in extreme 30% + 1.5× vol spike. "
                             "Pattern column identifies Hammer / Shooting Star / Dragonfly Doji / "
@@ -20166,7 +19963,7 @@ def _render_main_analyzer():
                                     'ATM Strike': f"₹{h['strike']:.0f}",
                                     'Spot at shift': f"₹{h['spot']:.1f}",
                                 } for h in _atm_hist]
-                                st.dataframe(pd.DataFrame(_hist_rows), width='stretch', hide_index=True)
+                                st.dataframe(pd.DataFrame(_hist_rows), use_container_width=True, hide_index=True)
 
                         _ist_o = pytz.timezone('Asia/Kolkata')
 
@@ -20454,32 +20251,15 @@ def _render_main_analyzer():
                             return grabs, df_t, vpfr_levels, f"OK · {n_bars} 1m bars · {len(df_3)} 3m bars · {len(grabs)} grab(s){_cache_tag}"
 
                         # 14 legs: ATM-3..ATM+3 × {CE, PE}
-                        # When Dhan is rate-limited (429 back-off active), shrink
-                        # the leg set from ATM±3 (14 legs) to ATM±2 (10 legs) to
-                        # cut the per-cycle Dhan call burst. Full ATM±3 resumes
-                        # automatically once the throttle window clears.
-                        _rl_back = st.session_state.get('_dhan_429_until')
-                        _rate_limited = bool(_rl_back and datetime.now(pytz.timezone('Asia/Kolkata')) < _rl_back)
-                        if _rate_limited:
-                            _strikes_to_analyze = [
-                                (_atm_strike - 2 * _strike_gap, 'ATM-2'),
-                                (_atm_strike - _strike_gap,     'ATM-1'),
-                                (_atm_strike,                    'ATM'),
-                                (_atm_strike + _strike_gap,     'ATM+1'),
-                                (_atm_strike + 2 * _strike_gap, 'ATM+2'),
-                            ]
-                            st.caption("⏸️ Rate-limited — narrowed to ATM±2 (10 legs) to ease Dhan load; "
-                                       "ATM±3 resumes when the throttle clears.")
-                        else:
-                            _strikes_to_analyze = [
-                                (_atm_strike - 3 * _strike_gap, 'ATM-3'),
-                                (_atm_strike - 2 * _strike_gap, 'ATM-2'),
-                                (_atm_strike - _strike_gap,     'ATM-1'),
-                                (_atm_strike,                    'ATM'),
-                                (_atm_strike + _strike_gap,     'ATM+1'),
-                                (_atm_strike + 2 * _strike_gap, 'ATM+2'),
-                                (_atm_strike + 3 * _strike_gap, 'ATM+3'),
-                            ]
+                        _strikes_to_analyze = [
+                            (_atm_strike - 3 * _strike_gap, 'ATM-3'),
+                            (_atm_strike - 2 * _strike_gap, 'ATM-2'),
+                            (_atm_strike - _strike_gap,     'ATM-1'),
+                            (_atm_strike,                    'ATM'),
+                            (_atm_strike + _strike_gap,     'ATM+1'),
+                            (_atm_strike + 2 * _strike_gap, 'ATM+2'),
+                            (_atm_strike + 3 * _strike_gap, 'ATM+3'),
+                        ]
                         # Reset per-leg stores each cycle so the ATM strike
                         # drifting through the day doesn't accumulate STALE
                         # strikes (which caused 42 rows / repeated legs and
@@ -20533,19 +20313,15 @@ def _render_main_analyzer():
                                 # plus a recency-focused last-50-candle version.
                                 _leg_mfp_tg = None
                                 _leg_mfp_tg_50 = None
-                                _leg_mfp_tg_20 = None
                                 try:
                                     if _ldf is not None and not _ldf.empty:
                                         _leg_mfp_tg = calculate_money_flow_profile(
                                             _ldf, num_rows=5, source='Money Flow')
                                         _leg_mfp_tg_50 = calculate_money_flow_profile(
                                             _ldf.tail(50), num_rows=5, source='Money Flow')
-                                        _leg_mfp_tg_20 = calculate_money_flow_profile(
-                                            _ldf.tail(20), num_rows=5, source='Money Flow')
                                 except Exception:
                                     _leg_mfp_tg = None
                                     _leg_mfp_tg_50 = None
-                                    _leg_mfp_tg_20 = None
                                 # Stash all ATM±3 1m dfs for alignment + composite bias
                                 if _ldf is not None and not _ldf.empty:
                                     _leg_dfs = st.session_state.setdefault('_atm_leg_dfs', {})
@@ -20556,7 +20332,6 @@ def _render_main_analyzer():
                                     'vpfr': _vp,
                                     'mfp': _leg_mfp_tg,
                                     'mfp_50': _leg_mfp_tg_50,
-                                    'mfp_20': _leg_mfp_tg_20,
                                     'mfp_bias': _mfp_poc_bias(_leg_mfp_tg) if _leg_mfp_tg else 'NEUTRAL',
                                     'latest_grab': _g[-1] if _g else None,
                                 })
@@ -20572,16 +20347,6 @@ def _render_main_analyzer():
                             'spot': _u,
                             'legs': _tg_legs,
                         }
-
-                        # ── Consolidated 14-leg MFP matrix + Buy-vs-Sell volume tables ──
-                        try:
-                            render_leg_mfp_consolidated_table()
-                        except Exception as _cons_err:
-                            st.caption(f"Consolidated MFP table error: {_cons_err}")
-                        try:
-                            render_leg_buy_sell_volume_table()
-                        except Exception as _bsv_err:
-                            st.caption(f"Buy/Sell volume table error: {_bsv_err}")
 
                         # ── 🧭 Composite Bias Engine — compute, render, alert ───
                         try:
@@ -20944,7 +20709,7 @@ def _render_main_analyzer():
                                     pass
                                 _fig_l.update_xaxes(showgrid=False)
                                 _fig_l.update_yaxes(showgrid=True, gridcolor='#1e2a3a')
-                                st.plotly_chart(_fig_l, width='stretch',
+                                st.plotly_chart(_fig_l, use_container_width=True,
                                                 key=f"opt_chart_{_sid_used or _hdr}")
                             except Exception as _ce:
                                 st.caption(f"chart error: {_ce}")
@@ -21026,7 +20791,7 @@ def _render_main_analyzer():
                                     _styled_leg = (_leg_mfp_df.style
                                                    .apply(_color_leg_mfp, axis=1)
                                                    .hide(axis='columns', subset=['_sent_dir']))
-                                    st.dataframe(_styled_leg, width='stretch', hide_index=True)
+                                    st.dataframe(_styled_leg, use_container_width=True, hide_index=True)
                                 else:
                                     st.caption("MFP: insufficient bars")
                             except Exception as _me:
@@ -21076,61 +20841,11 @@ def _render_main_analyzer():
                                     _styled_leg50 = (_leg_mfp50_df.style
                                                      .apply(_color_leg_mfp50, axis=1)
                                                      .hide(axis='columns', subset=['_sent_dir']))
-                                    st.dataframe(_styled_leg50, width='stretch', hide_index=True)
+                                    st.dataframe(_styled_leg50, use_container_width=True, hide_index=True)
                                 else:
                                     st.caption("MFP (last 50 candles): insufficient bars")
                             except Exception as _me50:
                                 st.caption(f"MFP (last 50 candles) error: {_me50}")
-
-                            # ── Money Flow Profile — Last 20 Candles (fast recency bins) ─
-                            try:
-                                _mfp_20 = calculate_money_flow_profile(_ldf.tail(20), num_rows=5, source='Money Flow')
-                                if _mfp_20 and _mfp_20.get('rows'):
-                                    _mfp20_rows = []
-                                    for r in reversed(_mfp_20['rows']):
-                                        _is_bull20 = r['sentiment'].lower().startswith('bull')
-                                        _is_bear20 = r['sentiment'].lower().startswith('bear')
-                                        if r.get('is_poc'):
-                                            _poc_cell20 = '🟢🎯 POC' if _is_bull20 else ('🔴🎯 POC' if _is_bear20 else '⚪🎯 POC')
-                                        else:
-                                            _poc_cell20 = r.get('node_type', '')
-                                        _mfp20_rows.append({
-                                            '_sent_dir': 'bull' if _is_bull20 else ('bear' if _is_bear20 else 'neutral'),
-                                            'Price Bin': f"₹{r['bin_low']:.1f}–{r['bin_high']:.1f}",
-                                            'Mid': f"₹{r['price_level']:.1f}",
-                                            'Total Vol': f"{r['total_volume']:,.0f}",
-                                            'Bull': f"{r['bull_volume']:,.0f}",
-                                            'Bear': f"{r['bear_volume']:,.0f}",
-                                            'Δ': f"{r['delta']:+,.0f}",
-                                            'Vol %': f"{r['volume_pct']:.1f}%",
-                                            'Node': _poc_cell20,
-                                            'Sentiment': f"{r['sentiment']} ({r['sentiment_strength']:.0f}%)",
-                                        })
-                                    st.markdown(
-                                        f"**Money Flow Profile — Last 20 Candles** · POC ₹{_mfp_20['poc_price']:.1f} · "
-                                        f"VAH ₹{_mfp_20['value_area_high']:.1f} · "
-                                        f"VAL ₹{_mfp_20['value_area_low']:.1f} · "
-                                        f"Top: {_mfp_20.get('highest_sentiment_direction', '—')} "
-                                        f"@ ₹{_mfp_20.get('highest_sentiment_price', 0):.1f} · "
-                                        f"({_mfp_20.get('num_bars', 0)} bars)"
-                                    )
-                                    _leg_mfp20_df = pd.DataFrame(_mfp20_rows)
-
-                                    def _color_leg_mfp20(row):
-                                        sd = row.get('_sent_dir', 'neutral')
-                                        if sd == 'bull':
-                                            return ['background-color: rgba(0,200,100,0.18); color: #00ff88'] * len(row)
-                                        if sd == 'bear':
-                                            return ['background-color: rgba(255,60,60,0.18); color: #ff6666'] * len(row)
-                                        return [''] * len(row)
-                                    _styled_leg20 = (_leg_mfp20_df.style
-                                                     .apply(_color_leg_mfp20, axis=1)
-                                                     .hide(axis='columns', subset=['_sent_dir']))
-                                    st.dataframe(_styled_leg20, width='stretch', hide_index=True)
-                                else:
-                                    st.caption("MFP (last 20 candles): insufficient bars")
-                            except Exception as _me20:
-                                st.caption(f"MFP (last 20 candles) error: {_me20}")
 
                             # Latest grab summary (compact one-line under chart)
                             if _gr:
@@ -21376,7 +21091,7 @@ def _render_main_analyzer():
                                 'Nearest VOB': _vob_label,
                             })
                         if _rows:
-                            st.dataframe(pd.DataFrame(_rows), width='stretch', hide_index=True)
+                            st.dataframe(pd.DataFrame(_rows), use_container_width=True, hide_index=True)
                         else:
                             st.info("No candle patterns detected for today on this timeframe.")
                     except Exception as _ct_err:
@@ -21456,7 +21171,7 @@ def _render_main_analyzer():
                         except: pass
                         return styles
                     styled_mf = mf_display.style.apply(_mf_row_style, axis=1)
-                    st.dataframe(styled_mf, width='stretch', hide_index=True)
+                    st.dataframe(styled_mf, use_container_width=True, hide_index=True)
                     st.markdown("""
                     **Money Flow Profile:**
                     - 🟡 **High Traded Nodes**: Consolidation/value areas - price tends to spend time here
@@ -21498,7 +21213,7 @@ def _render_main_analyzer():
                         except: pass
                         return styles
                     styled_vd = vd_display.style.apply(_vd_style, axis=1)
-                    st.dataframe(styled_vd, width='stretch', hide_index=True)
+                    st.dataframe(styled_vd, use_container_width=True, hide_index=True)
                     dc1, dc2 = st.columns(2)
                     with dc1:
                         st.markdown(f"""
@@ -21670,7 +21385,7 @@ def _render_main_analyzer():
                         else:
                             return 'background-color: #FFD70040; color: white'
                     styled_poc = poc_df.style.map(style_poc_signal, subset=['Signal'])
-                    st.dataframe(styled_poc, width='stretch', hide_index=True)
+                    st.dataframe(styled_poc, use_container_width=True, hide_index=True)
                     st.markdown("""
                     **POC Interpretation:**
                     - **POC 1 (25)**: Short-term volume profile - intraday support/resistance
@@ -21717,7 +21432,7 @@ def _render_main_analyzer():
                         'Type': 'Used for projection'
                     })
                     swing_pct_df = pd.DataFrame(swing_pct_data)
-                    st.dataframe(swing_pct_df, width='stretch', hide_index=True)
+                    st.dataframe(swing_pct_df, use_container_width=True, hide_index=True)
                 st.markdown("### 📍 Swing Levels")
                 swing_levels_data = []
                 last_high = swings.get('last_swing_high')
@@ -21736,7 +21451,7 @@ def _render_main_analyzer():
                     })
                 if swing_levels_data:
                     swing_levels_df = pd.DataFrame(swing_levels_data)
-                    st.dataframe(swing_levels_df, width='stretch', hide_index=True)
+                    st.dataframe(swing_levels_df, use_container_width=True, hide_index=True)
                 st.markdown("""
                 **Swing Analysis Interpretation:**
                 - **Swing High**: Resistance level where price reversed down
@@ -21745,15 +21460,7 @@ def _render_main_analyzer():
                 - **Projected Target**: Based on average of historical swing percentages
                 """)
         else:
-            _now_e = datetime.now(pytz.timezone('Asia/Kolkata'))
-            _bo_e = st.session_state.get('_dhan_429_until')
-            if st.session_state.get('_dhan_token_expired'):
-                st.error("🔑 **Dhan token expired** — open **Refresh Dhan Token** in the sidebar and paste a new token.")
-            elif _bo_e and _now_e < _bo_e:
-                st.warning("⏸️ **Dhan rate-limited (DH-904)** — no cached candles yet on this fresh start. "
-                           "This clears on its own in under a minute; please avoid spam-refreshing (it adds calls).")
-            else:
-                st.error("No data available. Please check your API credentials and try again.")
+            st.error("No data available. Please check your API credentials and try again.")
 
     with col2:
         option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
@@ -21802,7 +21509,7 @@ def _render_main_analyzer():
             st.metric("PUT ΔOI", f"{option_data['total_pe_change']:+.1f}L", delta_color="normal")
         st.markdown("## Option Chain Bias Summary")
         if option_data.get('styled_df') is not None:
-            st.dataframe(option_data['styled_df'], width='stretch')
+            st.dataframe(option_data['styled_df'], use_container_width=True)
 
         # === MONEY FLOW ANALYSIS (from Option Chain) ===
         st.markdown("---")
@@ -21996,7 +21703,7 @@ def _render_main_analyzer():
                             elif 'Exiting' in v:
                                 return ['background-color:#88888815;color:white'] * len(row)
                             return [''] * len(row)
-                        st.dataframe(display_mf.style.apply(_style_mf, axis=1), width='stretch', hide_index=True)
+                        st.dataframe(display_mf.style.apply(_style_mf, axis=1), use_container_width=True, hide_index=True)
 
             except Exception as e:
                 st.caption(f"Money flow loading... ({str(e)[:60]})")
@@ -22174,7 +21881,7 @@ def _render_main_analyzer():
                             elif 'Exit' in impact or 'Unwind' in str(row.get('CE', '')) + str(row.get('PE', '')):
                                 return ['background-color:#FFD70010;color:white'] * len(row)
                             return [''] * len(row)
-                        st.dataframe(uw_df.style.apply(_style_unwind, axis=1), width='stretch', hide_index=True)
+                        st.dataframe(uw_df.style.apply(_style_unwind, axis=1), use_container_width=True, hide_index=True)
             except Exception as e:
                 st.caption(f"Unwinding analysis loading... ({str(e)[:60]})")
 
@@ -22197,7 +21904,7 @@ def _render_main_analyzer():
                 with col:
                     st.markdown(title)
                     if data:
-                        st.dataframe(pd.DataFrame(data), width='stretch', hide_index=True)
+                        st.dataframe(pd.DataFrame(data), use_container_width=True, hide_index=True)
                     else:
                         st.info("No levels identified")
             if max_pain_strike:
@@ -22367,7 +22074,7 @@ def _render_main_analyzer():
                                     return ['background-color:#FFD70040;color:white'] * len(row)
                                 return [''] * len(row)
                             styled_res = res_display.style.apply(style_res, axis=1)
-                            st.dataframe(styled_res, width='stretch', hide_index=True)
+                            st.dataframe(styled_res, use_container_width=True, hide_index=True)
                         else:
                             st.info("No resistance levels found")
                     with sa_col2:
@@ -22386,7 +22093,7 @@ def _render_main_analyzer():
                                     return ['background-color:#FFD70040;color:white'] * len(row)
                                 return [''] * len(row)
                             styled_sup = sup_display.style.apply(style_sup, axis=1)
-                            st.dataframe(styled_sup, width='stretch', hide_index=True)
+                            st.dataframe(styled_sup, use_container_width=True, hide_index=True)
                         else:
                             st.info("No support levels found")
                     # Call Capping & Put Capping Zones
@@ -22422,7 +22129,7 @@ def _render_main_analyzer():
                             styles[put_idx] = 'background-color:#FFD70040;color:white;font-weight:bold'
                         return styles
                     styled_class = class_display.style.apply(style_class, axis=1)
-                    st.dataframe(styled_class, width='stretch', hide_index=True)
+                    st.dataframe(styled_class, use_container_width=True, hide_index=True)
                     # Trapped Writers & Breakout/Breakdown
                     trap_col1, trap_col2 = st.columns(2)
                     with trap_col1:
@@ -22433,7 +22140,7 @@ def _render_main_analyzer():
                             tc['CE_OI'] = (tc['CE_OI'] / 100000).round(2).astype(str) + 'L'
                             tc['CE_ChgOI'] = (tc['CE_ChgOI'] / 1000).round(1).astype(str) + 'K'
                             tc.columns = ['Strike', 'OI', 'ChgOI']
-                            st.dataframe(tc, width='stretch', hide_index=True)
+                            st.dataframe(tc, use_container_width=True, hide_index=True)
                             st.caption("Price above strike + OI falling = writers buying back (bullish)")
                         else:
                             st.success("No trapped call writers")
@@ -22445,7 +22152,7 @@ def _render_main_analyzer():
                             tp['PE_OI'] = (tp['PE_OI'] / 100000).round(2).astype(str) + 'L'
                             tp['PE_ChgOI'] = (tp['PE_ChgOI'] / 1000).round(1).astype(str) + 'K'
                             tp.columns = ['Strike', 'OI', 'ChgOI']
-                            st.dataframe(tp, width='stretch', hide_index=True)
+                            st.dataframe(tp, use_container_width=True, hide_index=True)
                             st.caption("Price below strike + OI falling = writers buying back (bearish)")
                         else:
                             st.success("No trapped put writers")
@@ -22458,7 +22165,7 @@ def _render_main_analyzer():
                             bz['CE_OI'] = (bz['CE_OI'] / 100000).round(2).astype(str) + 'L'
                             bz['CE_ChgOI'] = (bz['CE_ChgOI'] / 1000).round(1).astype(str) + 'K'
                             bz.columns = ['Strike', 'OI', 'ChgOI']
-                            st.dataframe(bz, width='stretch', hide_index=True)
+                            st.dataframe(bz, use_container_width=True, hide_index=True)
                             st.caption("Call OI falling + price rising = resistance breaking")
                         else:
                             st.info("No breakout zones detected")
@@ -22470,7 +22177,7 @@ def _render_main_analyzer():
                             bd['PE_OI'] = (bd['PE_OI'] / 100000).round(2).astype(str) + 'L'
                             bd['PE_ChgOI'] = (bd['PE_ChgOI'] / 1000).round(1).astype(str) + 'K'
                             bd.columns = ['Strike', 'OI', 'ChgOI']
-                            st.dataframe(bd, width='stretch', hide_index=True)
+                            st.dataframe(bd, use_container_width=True, hide_index=True)
                             st.caption("Put OI falling + price falling = support breaking")
                         else:
                             st.info("No breakdown zones detected")
@@ -22525,7 +22232,7 @@ def _render_main_analyzer():
                         return [''] * len(row)
                     st.dataframe(
                         _oc_disp.style.apply(_style_oc, axis=1),
-                        width='stretch', hide_index=True
+                        use_container_width=True, hide_index=True
                     )
                 else:
                     st.info("No OC signals stored yet today.")
@@ -22726,7 +22433,7 @@ def _render_main_analyzer():
                 pcr_col1, pcr_col2, pcr_col3, pcr_col4, pcr_col5 = st.columns(5)
                 def display_pcr_with_signal(container, fig, pcr_val):
                     if fig:
-                        container.plotly_chart(fig, width='stretch')
+                        container.plotly_chart(fig, use_container_width=True)
                         if pcr_val > 1.2:
                             container.success("Bullish")
                         elif pcr_val < 0.7:
@@ -22760,7 +22467,7 @@ def _render_main_analyzer():
                     pcr_display = display_df[['Strike', 'Zone', 'PCR', 'PCR_Signal']].copy()
                     pcr_display['CE OI (L)'] = (display_df['openInterest_CE'] / 100000).round(2)
                     pcr_display['PE OI (L)'] = (display_df['openInterest_PE'] / 100000).round(2)
-                    st.dataframe(pcr_display, width='stretch', hide_index=True)
+                    st.dataframe(pcr_display, use_container_width=True, hide_index=True)
                 col_info1, col_info2 = st.columns([3, 1])
                 with col_info1:
                     status = "🟢 Live" if pcr_data_available else "🟡 Using cached history"
@@ -22819,7 +22526,7 @@ def _render_main_analyzer():
                             paper_bgcolor='#1e1e1e',
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                         )
-                        st.plotly_chart(fig_ce, width='stretch')
+                        st.plotly_chart(fig_ce, use_container_width=True)
                     with oi_col2:
                         fig_pe = go.Figure()
                         for i, strike in enumerate(oi_strikes):
@@ -22845,7 +22552,7 @@ def _render_main_analyzer():
                             paper_bgcolor='#1e1e1e',
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                         )
-                        st.plotly_chart(fig_pe, width='stretch')
+                        st.plotly_chart(fig_pe, use_container_width=True)
                     # Per-strike CE vs PE comparison charts
                     st.markdown("### Per-Strike Call vs Put OI")
                     oi_strike_cols = st.columns(min(len(oi_strikes), 5))
@@ -22889,7 +22596,7 @@ def _render_main_analyzer():
                                 plot_bgcolor='#1e1e1e',
                                 paper_bgcolor='#1e1e1e'
                             )
-                            st.plotly_chart(fig_strike, width='stretch')
+                            st.plotly_chart(fig_strike, use_container_width=True)
                             # Analyze OI trend over time for support/resistance strength
                             ce_series = oi_history_df[ce_col] if ce_col in oi_history_df.columns else pd.Series([0])
                             pe_series = oi_history_df[pe_col] if pe_col in oi_history_df.columns else pd.Series([0])
@@ -23033,7 +22740,7 @@ def _render_main_analyzer():
                             paper_bgcolor='#1e1e1e',
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                         )
-                        st.plotly_chart(fig_chg_ce, width='stretch')
+                        st.plotly_chart(fig_chg_ce, use_container_width=True)
                     with chgoi_col2:
                         fig_chg_pe = go.Figure()
                         for i, strike in enumerate(chgoi_strikes):
@@ -23060,7 +22767,7 @@ def _render_main_analyzer():
                             paper_bgcolor='#1e1e1e',
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                         )
-                        st.plotly_chart(fig_chg_pe, width='stretch')
+                        st.plotly_chart(fig_chg_pe, use_container_width=True)
                     # Per-strike Change OI comparison charts
                     st.markdown("### Per-Strike Change in Call vs Put OI")
                     chgoi_strike_cols = st.columns(min(len(chgoi_strikes), 5))
@@ -23105,7 +22812,7 @@ def _render_main_analyzer():
                                 plot_bgcolor='#1e1e1e',
                                 paper_bgcolor='#1e1e1e'
                             )
-                            st.plotly_chart(fig_chg_strike, width='stretch')
+                            st.plotly_chart(fig_chg_strike, use_container_width=True)
                             if current_chg_ce > 0 and current_chg_pe <= 0:
                                 st.error("CE Buildup (Bearish)")
                             elif current_chg_pe > 0 and current_chg_ce <= 0:
@@ -23167,7 +22874,7 @@ def _render_main_analyzer():
                             paper_bgcolor='#1e1e1e',
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                         )
-                        st.plotly_chart(fig_vol_ce, width='stretch')
+                        st.plotly_chart(fig_vol_ce, use_container_width=True)
                     with vol_col2:
                         fig_vol_pe = go.Figure()
                         for i, strike in enumerate(vol_strikes):
@@ -23193,7 +22900,7 @@ def _render_main_analyzer():
                             paper_bgcolor='#1e1e1e',
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                         )
-                        st.plotly_chart(fig_vol_pe, width='stretch')
+                        st.plotly_chart(fig_vol_pe, use_container_width=True)
                     # Per-strike Vol CE vs Vol PE comparison charts
                     st.markdown("### Per-Strike Call vs Put Volume")
                     vol_strike_cols = st.columns(min(len(vol_strikes), 5))
@@ -23247,7 +22954,7 @@ def _render_main_analyzer():
                                 plot_bgcolor='#1e1e1e',
                                 paper_bgcolor='#1e1e1e'
                             )
-                            st.plotly_chart(fig_vol_strike, width='stretch')
+                            st.plotly_chart(fig_vol_strike, use_container_width=True)
                             # Signal interpretation
                             if current_ce_vol > current_pe_vol * 1.2 and ce_increasing:
                                 st.error("Resistance Active 🔴")
@@ -23340,7 +23047,7 @@ def _render_main_analyzer():
                                 plot_bgcolor='#1e1e1e',
                                 paper_bgcolor='#1e1e1e'
                             )
-                            st.plotly_chart(fig_bid_strike, width='stretch')
+                            st.plotly_chart(fig_bid_strike, use_container_width=True)
                             # Signal: snapshot dominance now (not cumulative)
                             # CE Bid = call buyers (bullish bets) → support; PE Bid = put buyers (bearish bets) → resistance
                             if cur_ce_bid > cur_pe_bid * 1.2 and ce_inc:
@@ -23434,7 +23141,7 @@ def _render_main_analyzer():
                                 plot_bgcolor='#1e1e1e',
                                 paper_bgcolor='#1e1e1e'
                             )
-                            st.plotly_chart(fig_ask_strike, width='stretch')
+                            st.plotly_chart(fig_ask_strike, use_container_width=True)
                             # Signal: snapshot dominance now (not cumulative)
                             # CE Ask = call writers (cap upside) → resistance; PE Ask = put writers (floor downside) → support
                             if cur_ce_ask > cur_pe_ask * 1.2 and ce_inc:
@@ -23565,7 +23272,7 @@ def _render_main_analyzer():
                         paper_bgcolor='#1e1e1e',
                         margin=dict(l=50, r=50, t=60, b=50)
                     )
-                    st.plotly_chart(fig_gex, width='stretch')
+                    st.plotly_chart(fig_gex, use_container_width=True)
                     with st.expander("📋 GEX Breakdown by Strike"):
                         gex_display = gex_df.copy()
                         gex_display['Strike'] = gex_display['Strike'].apply(lambda x: f"₹{x:.0f}")
@@ -23585,7 +23292,7 @@ def _render_main_analyzer():
                             except:
                                 return ''
                         styled_gex = gex_display.style.map(color_gex, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
-                        st.dataframe(styled_gex, width='stretch', hide_index=True)
+                        st.dataframe(styled_gex, use_container_width=True, hide_index=True)
                         st.markdown("""
                         **GEX Interpretation:**
                         - **Positive Net GEX (Green)**: Dealers LONG gamma → Price tends to PIN/REVERT
@@ -23694,7 +23401,7 @@ def _render_main_analyzer():
                         gex_col1, gex_col2, gex_col3, gex_col4, gex_col5 = st.columns(5)
                         def display_gex_with_signal(container, fig, gex_val):
                             if fig:
-                                container.plotly_chart(fig, width='stretch')
+                                container.plotly_chart(fig, use_container_width=True)
                                 if gex_val > 10:
                                     container.success("📍 Pin Zone")
                                 elif gex_val < -10:
@@ -23788,7 +23495,7 @@ def _render_main_analyzer():
                                     paper_bgcolor='#1e1e1e',
                                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                                 )
-                                st.plotly_chart(fig_call_gex, width='stretch')
+                                st.plotly_chart(fig_call_gex, use_container_width=True)
                             with gex_ts_col2:
                                 fig_put_gex = go.Figure()
                                 for idx, strike in enumerate(current_strikes):
@@ -23815,7 +23522,7 @@ def _render_main_analyzer():
                                     paper_bgcolor='#1e1e1e',
                                     legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='right', x=1)
                                 )
-                                st.plotly_chart(fig_put_gex, width='stretch')
+                                st.plotly_chart(fig_put_gex, use_container_width=True)
                             # Per-strike Call GEX vs Put GEX comparison
                             st.markdown("### Per-Strike Call GEX vs Put GEX")
                             gex_cmp_cols = st.columns(min(len(current_strikes), 5))
@@ -23860,7 +23567,7 @@ def _render_main_analyzer():
                                         plot_bgcolor='#1e1e1e',
                                         paper_bgcolor='#1e1e1e'
                                     )
-                                    st.plotly_chart(fig_gex_cmp, width='stretch')
+                                    st.plotly_chart(fig_gex_cmp, use_container_width=True)
                                     net = cur_call_gex + cur_put_gex
                                     if net > 5:
                                         st.success("Pin Zone")
@@ -23872,7 +23579,7 @@ def _render_main_analyzer():
                         gex_display = gex_df[['Strike', 'Zone', 'Call_GEX', 'Put_GEX', 'Net_GEX']].copy()
                         gex_display['Strike'] = gex_display['Strike'].apply(lambda x: f"₹{x:.0f}")
                         styled_gex_table = gex_display.style.map(color_gex, subset=['Call_GEX', 'Put_GEX', 'Net_GEX'])
-                        st.dataframe(styled_gex_table, width='stretch', hide_index=True)
+                        st.dataframe(styled_gex_table, use_container_width=True, hide_index=True)
                         gex_info1, gex_info2 = st.columns([3, 1])
                         with gex_info1:
                             history_status = f"📈 {len(st.session_state.gex_history)} data points" if has_history else "⏳ Building history..."
@@ -23898,7 +23605,7 @@ def _render_main_analyzer():
                            'bidQty_CE', 'bidQty_PE', 'askQty_CE', 'askQty_PE']
             detail_cols = [col for col in detail_cols if col in df_summary.columns]
             if detail_cols:
-                st.dataframe(df_summary[detail_cols].style.apply(highlight_atm_row, axis=1), width='stretch')
+                st.dataframe(df_summary[detail_cols].style.apply(highlight_atm_row, axis=1), use_container_width=True)
         csv_data = create_csv_download(option_data['df_summary'])
         st.download_button(
             label="📥 Download Summary as CSV",
@@ -24493,7 +24200,7 @@ def _render_main_analyzer():
                                 'Vol': f"{cn['volume']:,}" if cn['volume'] else '-',
                             })
                         if candle_rows:
-                            st.dataframe(pd.DataFrame(candle_rows), width='stretch', hide_index=True, height=210)
+                            st.dataframe(pd.DataFrame(candle_rows), use_container_width=True, hide_index=True, height=210)
                         st.caption(f"Bull: {cd.get('bull_count', 0)} | Bear: {cd.get('bear_count', 0)} out of last 5")
 
                         st.markdown(f"**📍 Location:** {', '.join(master['location'])}")
@@ -24720,7 +24427,7 @@ def _render_main_analyzer():
                             elif pos == 'Below VAL':
                                 return ['background-color:#ff444415'] * len(row)
                             return ['background-color:#FFD70010'] * len(row)
-                        st.dataframe(_vpfr_df.style.apply(_style_vpfr, axis=1), width='stretch', hide_index=True)
+                        st.dataframe(_vpfr_df.style.apply(_style_vpfr, axis=1), use_container_width=True, hide_index=True)
 
                     # Delta Volume Chart
                     delta_df = master.get('delta_vol_df')
@@ -24757,7 +24464,7 @@ def _render_main_analyzer():
                             hovermode='x unified', barmode='relative',
                         )
                         fig_delta.add_hline(y=0, line_dash="solid", line_color="white", line_width=1, opacity=0.5)
-                        st.plotly_chart(fig_delta, width='stretch')
+                        st.plotly_chart(fig_delta, use_container_width=True)
 
                     # === FULL ALIGNMENT TABLE (below the 3-col section) ===
                     st.markdown("---")
@@ -24792,7 +24499,7 @@ def _render_main_analyzer():
                                 elif d == 'Bearish':
                                     return ['background-color:#ff444415;color:white'] * len(row)
                                 return [''] * len(row)
-                            st.dataframe(pat_df.style.apply(_style_pat, axis=1), width='stretch', hide_index=True)
+                            st.dataframe(pat_df.style.apply(_style_pat, axis=1), use_container_width=True, hide_index=True)
 
                         # Multi-timeframe Sentiment Table
                         st.markdown("### 📊 Multi-Timeframe Sentiment (Price Action)")
@@ -24827,7 +24534,7 @@ def _render_main_analyzer():
                                 elif t == 'Bearish':
                                     return ['background-color:#ff444415;color:white'] * len(row)
                                 return [''] * len(row)
-                            st.dataframe(sent_df.style.apply(_style_sent, axis=1), width='stretch', hide_index=True)
+                            st.dataframe(sent_df.style.apply(_style_sent, axis=1), use_container_width=True, hide_index=True)
 
                         # Summary
                         non_vix_align = {k: v for k, v in align_data.items() if 'VIX' not in k}
@@ -24928,7 +24635,7 @@ def _render_main_analyzer():
                             legend=dict(orientation='h', yanchor='bottom', y=1.02, xanchor='center', x=0.5),
                             hovermode='x unified',
                         )
-                        st.plotly_chart(fig_pct, width='stretch')
+                        st.plotly_chart(fig_pct, use_container_width=True)
 
                         # === MARKET DRIVER ANALYSIS ===
                         st.markdown("### 🔥 Nifty Market Driver Analysis")
@@ -25009,7 +24716,7 @@ def _render_main_analyzer():
                                 elif 'Bearish' in impact:
                                     return ['background-color:#ff444412;color:white'] * len(row)
                                 return [''] * len(row)
-                            st.dataframe(driver_df.style.apply(_style_driver, axis=1), width='stretch', hide_index=True)
+                            st.dataframe(driver_df.style.apply(_style_driver, axis=1), use_container_width=True, hide_index=True)
 
                         # Composite Nifty Fire Signal
                         total_bull_support = direct_bull_10m + inverse_supporting_bull
@@ -25200,7 +24907,7 @@ def _render_main_analyzer():
 
     st.dataframe(
         _sum_df.style.apply(_style_summary, axis=1),
-        width='stretch', hide_index=True
+        use_container_width=True, hide_index=True
     )
 
     # ── Table 2 & 3: Capping + Support ───────────────────────────────────────
@@ -25251,12 +24958,12 @@ def _render_main_analyzer():
 
     with _cap_tab:
         _cap_df = _build_strike_table(_all_instruments, 'capping')
-        st.dataframe(_style_strike_table(_cap_df, is_capping=True), width='stretch', hide_index=True)
+        st.dataframe(_style_strike_table(_cap_df, is_capping=True), use_container_width=True, hide_index=True)
         st.caption("High Conviction = OI > median×1.2 AND Volume > median×1.2 | 🔥 = Volume confirmed active writing above price")
 
     with _sup_tab:
         _sup_df = _build_strike_table(_all_instruments, 'support')
-        st.dataframe(_style_strike_table(_sup_df, is_capping=False), width='stretch', hide_index=True)
+        st.dataframe(_style_strike_table(_sup_df, is_capping=False), use_container_width=True, hide_index=True)
         st.caption("High Conviction = OI > median×1.2 AND Volume > median×1.2 | 🔥 = Volume confirmed active writing below price")
 
     # ── Deep Analysis per Instrument (Market Bias, Resistance, Support, Classification) ──
@@ -25368,7 +25075,7 @@ def _render_main_analyzer():
                         styles[sr_idx] = 'background-color:#00ff8850;font-weight:bold'
                         styles[lv_idx] = 'background-color:#00ff8830'
                     return styles
-                st.dataframe(_pcr_df.style.apply(_style_pcr, axis=1), width='stretch', hide_index=True)
+                st.dataframe(_pcr_df.style.apply(_style_pcr, axis=1), use_container_width=True, hide_index=True)
             else:
                 st.info("PCR data not yet available — load option chain data first.")
 
@@ -25400,7 +25107,7 @@ def _render_main_analyzer():
 
                     st.dataframe(
                         _res_disp[disp_cols].style.apply(_style_res, axis=1),
-                        width='stretch', hide_index=True
+                        use_container_width=True, hide_index=True
                     )
                 else:
                     st.info("No resistance levels")
@@ -25431,7 +25138,7 @@ def _render_main_analyzer():
 
                     st.dataframe(
                         _sup_disp[disp_cols_s].style.apply(_style_sup, axis=1),
-                        width='stretch', hide_index=True
+                        use_container_width=True, hide_index=True
                     )
                 else:
                     st.info("No support levels")
@@ -25476,7 +25183,7 @@ def _render_main_analyzer():
                         if put_i  >= 0: styles[put_i]  = 'background-color:#FFD70040;font-weight:bold'
                     return styles
 
-                st.dataframe(_cls.style.apply(_style_cls, axis=1), width='stretch', hide_index=True)
+                st.dataframe(_cls.style.apply(_style_cls, axis=1), use_container_width=True, hide_index=True)
             else:
                 st.info("No classification data")
 
@@ -25490,7 +25197,7 @@ def _render_main_analyzer():
                     _tc = trapped_ce.copy()
                     _tc['Strike'] = _tc['Strike'].apply(lambda x: f"₹{x:.0f}")
                     _tc['CE_OI'] = (_tc['CE_OI'] / 100000).round(1).astype(str) + 'L'
-                    st.dataframe(_tc, width='stretch', hide_index=True)
+                    st.dataframe(_tc, use_container_width=True, hide_index=True)
                 else:
                     st.success("No trapped call writers")
             with bk_col:
@@ -25558,7 +25265,7 @@ def _render_main_analyzer():
                             elif col == 'Signal':
                                 base[ci] = f'background-color:{_sig_colors.get(sig,"")};font-weight:bold' if sig in _sig_colors else 'font-weight:bold'
                         return base
-                    st.dataframe(_oi_df.style.apply(_style_oi, axis=1), width='stretch', hide_index=True)
+                    st.dataframe(_oi_df.style.apply(_style_oi, axis=1), use_container_width=True, hide_index=True)
 
     # NIFTY tab — use existing sa_result + build OI trend from session_state oi_history
     _nifty_deep = None
@@ -25794,7 +25501,7 @@ def _render_main_analyzer():
 
                     st.dataframe(
                         pat_timeline_df.style.apply(_style_pattern_row, axis=1),
-                        width='stretch', hide_index=True,
+                        use_container_width=True, hide_index=True,
                         height=min(500, 50 + len(pat_timeline_df) * 35)
                     )
                     st.caption(f"🕯 Patterns detected from {_latest_trading_day.strftime('%d-%b-%Y')} {_pat_tf} chart | {len(pattern_rows)} patterns found")
@@ -25864,7 +25571,7 @@ def _render_main_analyzer():
 
                 st.dataframe(
                     display_df.style.apply(_style_signal_row, axis=1),
-                    width='stretch', hide_index=True,
+                    use_container_width=True, hide_index=True,
                     height=min(400, 50 + len(display_df) * 35)
                 )
                 st.caption(f"📊 {len(display_df)} signals today | Stored in Supabase")

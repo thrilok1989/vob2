@@ -879,7 +879,7 @@ def display_bias_dashboard(atm_bias, support_bias, resistance_bias):
                     })
 
                 bias_df = pd.DataFrame(bias_data)
-                st.dataframe(bias_df, width='stretch', height=400)
+                st.dataframe(bias_df, use_container_width=True, height=400)
 
                 # ATM Bias Summary
                 st.markdown(f"""
@@ -4730,7 +4730,7 @@ def display_market_depth_dashboard(spot, depth_analysis, depth_signals, enhanced
             legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
             xaxis=dict(tickformat=",.0f", tickprefix="₹", range=[x_min, x_max]),
         )
-        st.plotly_chart(fig, width='stretch')
+        st.plotly_chart(fig, use_container_width=True)
 
 # -----------------------
 # 🎯 COMPREHENSIVE MARKET DEPTH DASHBOARD (ADVANCED)
@@ -4834,7 +4834,7 @@ def display_comprehensive_depth_analysis(analysis_results):
             })
 
         impact_df = pd.DataFrame(impact_data)
-        st.dataframe(impact_df, width='stretch')
+        st.dataframe(impact_df, use_container_width=True)
 
         # Slippage
         st.markdown("**💸 Slippage Costs:**")
@@ -7463,11 +7463,11 @@ def render_nifty_option_screener():
                 st.markdown("### 📤 Send Options:")
 
                 # Copy to clipboard
-                if st.button("📋 Copy to Clipboard", width='stretch', key="copy_clipboard"):
+                if st.button("📋 Copy to Clipboard", use_container_width=True, key="copy_clipboard"):
                     st.success("✅ Signal copied to clipboard!")
 
                 # Manual send to Telegram
-                if st.button("📱 Send to Telegram", width='stretch', key="send_telegram"):
+                if st.button("📱 Send to Telegram", use_container_width=True, key="send_telegram"):
                     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                         success, message = send_telegram_message(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, telegram_signal)
                         if success:
@@ -7478,7 +7478,7 @@ def render_nifty_option_screener():
                         st.warning("Telegram credentials not configured. Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to secrets.")
 
                 # Save to file
-                if st.button("💾 Save to File", width='stretch', key="save_file"):
+                if st.button("💾 Save to File", use_container_width=True, key="save_file"):
                     filename = f"signal_{get_ist_datetime_str().replace(':', '-').replace(' ', '_')}.txt"
                     with open(filename, 'w') as f:
                         f.write(telegram_signal)
@@ -7803,16 +7803,16 @@ def render_nifty_option_screener():
         
         with action_col1:
             if st.button(f"📊 PLACE {entry_signal['position_type']} ORDER AT ₹{entry_signal['optimal_entry_price']:,.0f}", 
-                        width='stretch', type="primary", key="place_order"):
+                        use_container_width=True, type="primary", key="place_order"):
                 st.success(f"✅ {entry_signal['position_type']} order queued at ₹{entry_signal['optimal_entry_price']:,.2f}")
                 st.balloons()
         
         with action_col2:
-            if st.button("🔔 SET PRICE ALERT", width='stretch', key="set_alert"):
+            if st.button("🔔 SET PRICE ALERT", use_container_width=True, key="set_alert"):
                 st.info(f"📢 Alert set for {entry_signal['optimal_entry_price']:,.2f}")
         
         with action_col3:
-            if st.button("🔄 REFRESH", width='stretch', key="refresh"):
+            if st.button("🔄 REFRESH", use_container_width=True, key="refresh"):
                 st.rerun()
         
         # Signal Reasons
@@ -8100,7 +8100,7 @@ def render_nifty_option_screener():
         {"Activity": "PUT Buying Back (Bearish)", "Strikes": pe_buying_back, "Total OI": f"{oi_pcr_metrics['total_pe_oi']:,}", "Bias": "BEARISH", "Color": "#ff4444"}
     ])
     
-    st.dataframe(seller_activity, width='stretch')
+    st.dataframe(seller_activity, use_container_width=True)
     
     st.markdown("---")
     
@@ -8328,7 +8328,7 @@ def render_nifty_option_screener():
         
         seller_display = merged[seller_cols].copy()
         styled_df = seller_display.style.applymap(color_seller_action, subset=["CE_Seller_Action", "PE_Seller_Action"])
-        st.dataframe(styled_df, width='stretch')
+        st.dataframe(styled_df, use_container_width=True)
     
     with tab2:
         st.markdown("### 🧮 SELLER GREEKS & GEX EXPOSURE")
@@ -8356,7 +8356,7 @@ def render_nifty_option_screener():
             return ""
         
         styled_greeks = greeks_display.style.applymap(color_gex, subset=["GEX_Net"])
-        st.dataframe(styled_greeks, width='stretch')
+        st.dataframe(styled_greeks, use_container_width=True)
         
         # GEX Interpretation
         st.markdown("#### 🎯 GEX INTERPRETATION (SELLER'S VIEW)")
@@ -8401,7 +8401,7 @@ def render_nifty_option_screener():
         styled_pcr = pcr_display.style.applymap(color_pcr, subset=["PCR"])
         
         # Display without sorting again
-        st.dataframe(styled_pcr, width='stretch')
+        st.dataframe(styled_pcr, use_container_width=True)
         
         # PCR Interpretation with OI context
         avg_pcr = ranked_current["PCR"].replace([np.inf, -np.inf], np.nan).mean()

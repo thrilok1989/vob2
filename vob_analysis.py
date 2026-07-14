@@ -719,7 +719,7 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
                 height=300,
                 margin=dict(l=0, r=0, t=30, b=0)
             )
-            st.plotly_chart(fig_price, width='stretch')
+            st.plotly_chart(fig_price, use_container_width=True)
         with col2:
             fig_volume = go.Figure()
             fig_volume.add_trace(go.Bar(
@@ -734,7 +734,7 @@ def display_analytics_dashboard(db, symbol="NIFTY50"):
                 height=300,
                 margin=dict(l=0, r=0, t=30, b=0)
             )
-            st.plotly_chart(fig_volume, width='stretch')
+            st.plotly_chart(fig_volume, use_container_width=True)
         st.subheader("30-Day Summary")
         metrics = [
             ("Average Price", f"₹{analytics_df['day_close'].mean():,.2f}"),

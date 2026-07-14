@@ -593,7 +593,7 @@ for s in window:
         "CE LTP": round(ce["ltp"], 2),
         "PE LTP": round(pe["ltp"], 2),
     })
-st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
+st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 st.markdown("### 🎯 Order Setup")
 c1, c2, c3 = st.columns(3)
@@ -668,7 +668,7 @@ armed = t is not None and t["status"] in ("ARMED", "IN_POSITION")
 
 ac1, ac2 = st.columns(2)
 with ac1:
-    if st.button("🟢 ARM TRADE", type="primary", width='stretch', disabled=armed):
+    if st.button("🟢 ARM TRADE", type="primary", use_container_width=True, disabled=armed):
         sec_id = resolve_option_security_id(cfg["exch"], cfg["underlying_sym"], expiry, strike, opt_type)
         if not sec_id:
             st.error("Could not resolve the option's security id from the Dhan scrip master.")
@@ -689,7 +689,7 @@ with ac1:
                  f"entry {order_type}{'' if order_type=='MARKET' else f' @ {entry_basis} {entry_trigger}'}")
             st.rerun()
 with ac2:
-    if st.button("⏹ DISARM / FLATTEN", width='stretch', disabled=not armed):
+    if st.button("⏹ DISARM / FLATTEN", use_container_width=True, disabled=not armed):
         if t and t["status"] == "IN_POSITION":
             _exit(t, "MANUAL", nifty_spot, sel_leg["ltp"], live_trading)
         else:
@@ -739,7 +739,7 @@ positions = get_open_positions()
 if not positions:
     st.caption("No open positions in your Dhan account.")
 else:
-    if st.button("🔴 EXIT ALL POSITIONS", type="primary", width='stretch', key="exit_all"):
+    if st.button("🔴 EXIT ALL POSITIONS", type="primary", use_container_width=True, key="exit_all"):
         for p in positions:
             res = exit_position(p)
             ok = isinstance(res, dict) and (res.get("orderId") or res.get("orderStatus"))
@@ -763,7 +763,7 @@ else:
             f"**{p.get('tradingSymbol', p.get('securityId', '?'))}** · {side} {abs(net)} · "
             f"avg ₹{float(avg or 0):,.2f} · P&L ₹{pnl:,.0f}"
         )
-        if cols[1].button("Exit", key=f"exit_{i}_{p.get('securityId')}", width='stretch'):
+        if cols[1].button("Exit", key=f"exit_{i}_{p.get('securityId')}", use_container_width=True):
             res = exit_position(p)
             ok = isinstance(res, dict) and (res.get("orderId") or res.get("orderStatus"))
             _log(f"EXIT {p.get('tradingSymbol','?')}: "
