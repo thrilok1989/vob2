@@ -617,9 +617,14 @@ def _dhan_post(url, payload, max_retries=4):
     if not DHAN_CLIENT_ID or not DHAN_ACCESS_TOKEN:
         st.error("Dhan API credentials not configured")
         return None
+    _ist_bp = pytz.timezone('Asia/Kolkata')
+    # Respect the shared 429 back-off window — bail fast so we serve cached data
+    # instead of piling more requests onto an already rate-limited API.
+    _back = st.session_state.get('_dhan_429_until')
+    if _back and datetime.now(_ist_bp) < _back:
+        return None
     headers = {'access-token': DHAN_ACCESS_TOKEN, 'client-id': DHAN_CLIENT_ID, 'Content-Type': 'application/json'}
-    delays = [2, 4, 8, 16]
-    for attempt in range(max_retries + 1):
+    for attempt in range(2):  # one quick retry for a transient network blip only
         try:
             response = requests.post(url, headers=headers, json=payload)
             if response.status_code == 401:
@@ -627,18 +632,22 @@ def _dhan_post(url, payload, max_retries=4):
                 st.error("🔑 **Dhan token expired.** Open **Refresh Dhan Token** in the sidebar and paste your new token.")
                 return None
             if response.status_code == 429:
-                if attempt < max_retries:
-                    d = delays[min(attempt, 3)]
-                    st.warning(f"⏳ Rate limited by Dhan API. Retrying in {d}s... (Attempt {attempt+1}/{max_retries})")
-                    time.sleep(d)
-                    continue
-                st.error("❌ Rate limit exceeded after multiple retries. Please wait a moment and refresh.")
+                # Trip the shared 90s back-off so every other caller stops
+                # hammering; notify at most once per 30s (no per-call spam,
+                # no multi-second blocking sleeps that froze the whole run).
+                _now = datetime.now(_ist_bp)
+                st.session_state['_dhan_429_until'] = _now + timedelta(seconds=90)
+                _last = st.session_state.get('_dhan_429_notified')
+                if not _last or (_now - _last).total_seconds() > 30:
+                    st.session_state['_dhan_429_notified'] = _now
+                    st.warning("⏸️ Dhan rate-limited (DH-904). Throttling for 90s — "
+                               "showing cached data until it clears.")
                 return None
             response.raise_for_status()
             return response.json()
         except requests.exceptions.RequestException as e:
-            if attempt < max_retries and "429" in str(e):
-                time.sleep(delays[min(attempt, 3)])
+            if attempt == 0 and "429" not in str(e):
+                time.sleep(1)
                 continue
             st.error(f"Request error: {e}")
             return None
@@ -19398,7 +19407,14 @@ def _render_main_analyzer():
         need_fetch = not use_cache or df.empty or (datetime.now(pytz.UTC) - df['datetime'].max().tz_convert(pytz.UTC)).total_seconds() > 300
         if need_fetch:
             with st.spinner("Fetching data from API..."):
-                data = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval=interval, days_back=days_back)
+                # De-dupe: when the chart is on the 1m/1-day view, the identical
+                # NIFTY 1m payload was already fetched (and 60s-cached) above for
+                # zone analysis — reuse it instead of issuing a second Dhan call.
+                _reuse_1m = st.session_state.get('_raw_1m_trade') if (interval == "1" and days_back == 1) else None
+                if _reuse_1m and _reuse_1m.get('open'):
+                    data = _reuse_1m
+                else:
+                    data = api.get_intraday_data(security_id="13", exchange_segment="IDX_I", instrument="INDEX", interval=interval, days_back=days_back)
                 if data:
                     df = process_candle_data(data, interval)
                     db.upsert_candles("NIFTY50", "IDX_I", interval, df)
@@ -20438,15 +20454,32 @@ def _render_main_analyzer():
                             return grabs, df_t, vpfr_levels, f"OK · {n_bars} 1m bars · {len(df_3)} 3m bars · {len(grabs)} grab(s){_cache_tag}"
 
                         # 14 legs: ATM-3..ATM+3 × {CE, PE}
-                        _strikes_to_analyze = [
-                            (_atm_strike - 3 * _strike_gap, 'ATM-3'),
-                            (_atm_strike - 2 * _strike_gap, 'ATM-2'),
-                            (_atm_strike - _strike_gap,     'ATM-1'),
-                            (_atm_strike,                    'ATM'),
-                            (_atm_strike + _strike_gap,     'ATM+1'),
-                            (_atm_strike + 2 * _strike_gap, 'ATM+2'),
-                            (_atm_strike + 3 * _strike_gap, 'ATM+3'),
-                        ]
+                        # When Dhan is rate-limited (429 back-off active), shrink
+                        # the leg set from ATM±3 (14 legs) to ATM±2 (10 legs) to
+                        # cut the per-cycle Dhan call burst. Full ATM±3 resumes
+                        # automatically once the throttle window clears.
+                        _rl_back = st.session_state.get('_dhan_429_until')
+                        _rate_limited = bool(_rl_back and datetime.now(pytz.timezone('Asia/Kolkata')) < _rl_back)
+                        if _rate_limited:
+                            _strikes_to_analyze = [
+                                (_atm_strike - 2 * _strike_gap, 'ATM-2'),
+                                (_atm_strike - _strike_gap,     'ATM-1'),
+                                (_atm_strike,                    'ATM'),
+                                (_atm_strike + _strike_gap,     'ATM+1'),
+                                (_atm_strike + 2 * _strike_gap, 'ATM+2'),
+                            ]
+                            st.caption("⏸️ Rate-limited — narrowed to ATM±2 (10 legs) to ease Dhan load; "
+                                       "ATM±3 resumes when the throttle clears.")
+                        else:
+                            _strikes_to_analyze = [
+                                (_atm_strike - 3 * _strike_gap, 'ATM-3'),
+                                (_atm_strike - 2 * _strike_gap, 'ATM-2'),
+                                (_atm_strike - _strike_gap,     'ATM-1'),
+                                (_atm_strike,                    'ATM'),
+                                (_atm_strike + _strike_gap,     'ATM+1'),
+                                (_atm_strike + 2 * _strike_gap, 'ATM+2'),
+                                (_atm_strike + 3 * _strike_gap, 'ATM+3'),
+                            ]
                         # Reset per-leg stores each cycle so the ATM strike
                         # drifting through the day doesn't accumulate STALE
                         # strikes (which caused 42 rows / repeated legs and
@@ -21712,7 +21745,15 @@ def _render_main_analyzer():
                 - **Projected Target**: Based on average of historical swing percentages
                 """)
         else:
-            st.error("No data available. Please check your API credentials and try again.")
+            _now_e = datetime.now(pytz.timezone('Asia/Kolkata'))
+            _bo_e = st.session_state.get('_dhan_429_until')
+            if st.session_state.get('_dhan_token_expired'):
+                st.error("🔑 **Dhan token expired** — open **Refresh Dhan Token** in the sidebar and paste a new token.")
+            elif _bo_e and _now_e < _bo_e:
+                st.warning("⏸️ **Dhan rate-limited (DH-904)** — no cached candles yet on this fresh start. "
+                           "This clears on its own in under a minute; please avoid spam-refreshing (it adds calls).")
+            else:
+                st.error("No data available. Please check your API credentials and try again.")
 
     with col2:
         option_data = analyze_option_chain(selected_expiry, pivots, vob_data)
